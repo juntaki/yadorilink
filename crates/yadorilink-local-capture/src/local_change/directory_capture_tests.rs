@@ -700,3 +700,26 @@ fn an_unreadable_path_does_not_match_a_delete_prepared_for_an_absent_one() {
         "unreadable is not absent"
     );
 }
+
+/// A platform whose disk reports no mode (Windows) cannot differ from the mode
+/// a directory's version records, by event or by scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_directory_whose_disk_reports_no_mode_is_not_recaptured_against_a_recorded_one() {
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, GROUP, &root);
+    std::fs::create_dir(root.join("e")).unwrap();
+    event(&proc, &root, &root.join("e"), FsChangeKind::CreatedOrModified).await;
+    assert_eq!(ops_at(&state, "e"), ["put-dir"]);
+
+    proc.simulate_unobservable_modes();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(root.join("e"), std::fs::Permissions::from_mode(0o750)).unwrap();
+    }
+    event(&proc, &root, &root.join("e"), FsChangeKind::CreatedOrModified).await;
+    proc.scan_existing_files(GROUP, &root).unwrap();
+
+    assert_eq!(ops_at(&state, "e"), ["put-dir"]);
+}

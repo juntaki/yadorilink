@@ -1860,6 +1860,7 @@ mod win_identity {
     /// `FILE_FLAG_BACKUP_SEMANTICS` is required for `CreateFileW` to open
     /// a directory at all.
     pub(super) fn query_path(path: &Path) -> io::Result<IdentityFields> {
+        let path = crate::long_path::for_win32(path);
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         // SAFETY: `wide` is a valid NUL-terminated UTF-16 string kept
         // alive for the duration of the call; the remaining pointer

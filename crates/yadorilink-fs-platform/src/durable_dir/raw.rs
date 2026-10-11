@@ -56,7 +56,8 @@ fn windows_move(from: &Path, to: &Path, replace: Replace) -> io::Result<()> {
         }
         Ok(wide.into_iter().chain(Some(0)).collect())
     };
-    let (from, to) = (wide(from)?, wide(to)?);
+    let (from, to) =
+        (wide(&crate::long_path::for_win32(from))?, wide(&crate::long_path::for_win32(to))?);
     let flags = windows_move_flags(replace);
     // SAFETY: both buffers are NUL-terminated and outlive the call.
     if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } == 0 {

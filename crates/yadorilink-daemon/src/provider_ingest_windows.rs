@@ -191,7 +191,11 @@ pub(crate) fn ingest(
     let path = directory.join(name);
     let wide: Vec<u16> = {
         use std::os::windows::ffi::OsStrExt;
-        path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+        yadorilink_fs_platform::long_path::for_win32(&path)
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     };
     // Reparse points are opened as themselves (and refused below), never followed. Read-only
     // sharing: while this handle is open nobody can write to, rename or delete the copy.

@@ -19,4 +19,5 @@ pub mod durable_dir;
 pub mod fs_capabilities;
 pub mod fs_identity;
 pub mod ignore_patterns;
+pub mod long_path;
 pub mod reserved_namespace;

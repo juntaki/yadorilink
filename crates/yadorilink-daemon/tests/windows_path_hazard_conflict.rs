@@ -522,38 +522,73 @@ async fn concurrent_create_with_illegal_windows_characters() {
 /// appear to add). On the current platform this is expected to simply work,
 /// since Linux/macOS impose no such component-count-independent path-length
 /// ceiling in the range this test builds.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn long_path_near_windows_max_path_length() {
+const LONG_PATH_SEGMENT: &str =
+    "a-fairly-long-directory-name-segment-used-only-to-pad-the-full-path";
+const LONG_PATH_FILE: &str = "deep-file-near-the-windows-max-path-length-threshold.txt";
+
+/// Two synced devices and the directory, past `MAX_PATH`, both create the file
+/// under; `None` when this host rejects such a path during setup.
+async fn long_path_devices(
+    name: &str,
+) -> Option<(TestDevice, TestDevice, std::path::PathBuf, std::path::PathBuf)> {
     const MIN_TOTAL_LEN: usize = 300; // comfortably over the 260 MAX_PATH threshold
-    const SEGMENT: &str = "a-fairly-long-directory-name-segment-used-only-to-pad-the-full-path";
-
-    let rel_dir = deeply_nested_relative_dir(SEGMENT, MIN_TOTAL_LEN);
-    let file_name = "deep-file-near-the-windows-max-path-length-threshold.txt";
-
-    let (device_a, device_b, group_id) = two_synced_devices("windows-hazard-long-path").await;
-    let _ = &group_id;
-
+    let rel_dir = deeply_nested_relative_dir(LONG_PATH_SEGMENT, MIN_TOTAL_LEN);
+    let (device_a, device_b, _group_id) = two_synced_devices(name).await;
     let dir_a = device_a.root.path().join(&rel_dir);
     let dir_b = device_b.root.path().join(&rel_dir);
-    let full_len_a = dir_a.join(file_name).to_string_lossy().len();
+    let full_len_a = dir_a.join(LONG_PATH_FILE).to_string_lossy().len();
     assert!(full_len_a > 260, "test setup bug: path isn't actually long ({full_len_a} chars)");
-
     if std::fs::create_dir_all(&dir_a).is_err() || std::fs::create_dir_all(&dir_b).is_err() {
         eprintln!(
             "skipping: this host filesystem/path-length limit rejected a {full_len_a}-char path \
              during test setup, unrelated to the sync engine itself"
         );
+        return None;
+    }
+    Some((device_a, device_b, dir_a, dir_b))
+}
+
+/// A file made alone under a path past `MAX_PATH` reaches the other device,
+/// byte for byte: long-path support, on every platform and gate state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_under_a_path_past_max_path_length_reaches_the_other_device() {
+    let Some((_device_a, _device_b, dir_a, dir_b)) = long_path_devices("windows-long-path").await
+    else {
+        return;
+    };
+    std::fs::write(dir_a.join(LONG_PATH_FILE), b"from A, deep path").unwrap();
+    wait_until_with_context(
+        || std::fs::read(dir_b.join(LONG_PATH_FILE)).ok().as_deref() == Some(b"from A, deep path"),
+        Duration::from_secs(30),
+        || format!("device-b deep dir={:?}", real_entry_names(&dir_b)),
+    )
+    .await;
+    assert_eq!(real_entry_names(&dir_b), vec![LONG_PATH_FILE.to_string()]);
+}
+
+/// Both devices writing the same file under a path past `MAX_PATH` converge
+/// on a winner and one conflict copy, with the same bytes on both: needs the
+/// winner to replace the loser's original, which the closed Windows gate
+/// withholds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writes_under_a_path_past_max_path_length_converge_on_a_winner_and_a_copy() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "conflict convergence requires durable namespace replacement",
+    ) {
         return;
     }
-
-    std::fs::write(dir_a.join(file_name), b"from A, deep path").unwrap();
+    let Some((_device_a, _device_b, dir_a, dir_b)) =
+        long_path_devices("windows-hazard-long-path").await
+    else {
+        return;
+    };
+    std::fs::write(dir_a.join(LONG_PATH_FILE), b"from A, deep path").unwrap();
     tokio::time::sleep(Duration::from_millis(30)).await; // distinguishable mtime ordering
-    std::fs::write(dir_b.join(file_name), b"from B, deep path, different and longer").unwrap();
+    std::fs::write(dir_b.join(LONG_PATH_FILE), b"from B, deep path, different and longer").unwrap();
 
-    // Full name→content convergence at the deep directory: both devices must
+    // Full name->content convergence at the deep directory: both devices must
     // agree on the bytes under every entry (including the conflict copy), not
-    // merely on the name set, which can match transiently before content has
-    // been materialized under the winning/conflict-copy names.
+    // merely on the name set.
     wait_until_with_context(
         || {
             let a = snapshot(&dir_a);
@@ -572,7 +607,7 @@ async fn long_path_near_windows_max_path_length() {
     .await;
 
     let names = real_entry_names(&dir_a);
-    assert!(names.contains(&file_name.to_string()), "{names:?}");
+    assert!(names.contains(&LONG_PATH_FILE.to_string()), "{names:?}");
     assert_eq!(names.iter().filter(|n| is_conflict_copy(n)).count(), 1, "{names:?}");
 }
 

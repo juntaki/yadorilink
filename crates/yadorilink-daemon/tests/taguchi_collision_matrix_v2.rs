@@ -469,6 +469,46 @@ async fn run_taguchi_v2_row(
         .chain(joined_device.iter())
         .collect();
 
+    // Conflict convergence needs the winner to replace the loser's original,
+    // which the closed Windows gate withholds, so the devices cannot agree
+    // while it is closed. What must still hold is that no device's write is
+    // lost: its content stays on its own device or in a conflict copy beside it.
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "conflict convergence requires durable namespace replacement",
+    ) {
+        let expected: Vec<String> = (0..DEVICE_COUNT)
+            .filter(|idx| Some(*idx) != excluded_idx)
+            .map(|idx| {
+                hex::encode(sha2::Sha256::digest(generate_content(size_level, pattern_level, idx)))
+            })
+            .collect();
+        let present = || -> Vec<String> {
+            let mut hashes = Vec::new();
+            for device in &active_refs {
+                let target = device.root.path().join(&rel_path);
+                let dir = target.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                let dir =
+                    if dir.as_os_str().is_empty() { device.root.path().to_path_buf() } else { dir };
+                for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                    if entry.path().is_file() {
+                        hashes.extend(file_hash(&entry.path()));
+                    }
+                }
+            }
+            hashes
+        };
+        wait_until_with_context(
+            || {
+                let present = present();
+                expected.iter().all(|hash| present.contains(hash))
+            },
+            Duration::from_secs(60),
+            || format!("{row_name}: a device's write is in none of the trees ({expected:?})"),
+        )
+        .await;
+        return;
+    }
+
     wait_for_content_convergence(
         &active_refs,
         &rel_path,
@@ -547,62 +587,32 @@ async fn run_taguchi_v2_row(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_v2_row_01_size_tiny_pattern_text_path_flat_exec_never_churn_none() {
-    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
-        "the winner replacing the loser's original",
-    ) {
-        return;
-    }
     run_taguchi_v2_row("taguchi-v2-01", 1, 1, 1, 1, 1).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_v2_row_02_size_tiny_pattern_binary_path_sub_exec_all_true_churn_join() {
-    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
-        "the winner replacing the loser's original",
-    ) {
-        return;
-    }
     run_taguchi_v2_row("taguchi-v2-02", 1, 2, 2, 2, 2).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_v2_row_03_size_tiny_pattern_compressible_path_deep_exec_alternate_churn_revoke() {
-    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
-        "the winner replacing the loser's original",
-    ) {
-        return;
-    }
     run_taguchi_v2_row("taguchi-v2-03", 1, 3, 3, 3, 3).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_v2_row_04_size_tiny_pattern_incompressible_path_shared_dir_exec_toggle_churn_remove(
 ) {
-    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
-        "the winner replacing the loser's original",
-    ) {
-        return;
-    }
     run_taguchi_v2_row("taguchi-v2-04", 1, 4, 4, 4, 4).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_v2_row_05_size_small_pattern_text_path_sub_exec_alternate_churn_remove() {
-    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
-        "the winner replacing the loser's original",
-    ) {
-        return;
-    }
     run_taguchi_v2_row("taguchi-v2-05", 2, 1, 2, 3, 4).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_v2_row_06_size_small_pattern_binary_path_flat_exec_toggle_churn_revoke() {
-    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
-        "the winner replacing the loser's original",
-    ) {
-        return;
-    }
     run_taguchi_v2_row("taguchi-v2-06", 2, 2, 1, 4, 3).await;
 }
 

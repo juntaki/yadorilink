@@ -1080,7 +1080,10 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
         let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
-        let (f, t) = (wide(from), wide(to));
+        let (f, t) = (
+            wide(&yadorilink_fs_platform::long_path::for_win32(from)),
+            wide(&yadorilink_fs_platform::long_path::for_win32(to)),
+        );
         // SAFETY: both are NUL-terminated wide strings that outlive the call;
         // flags 0 means no replace of an existing destination.
         if unsafe { MoveFileExW(f.as_ptr(), t.as_ptr(), 0) } != 0 {

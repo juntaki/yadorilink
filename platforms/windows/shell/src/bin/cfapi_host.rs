@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use yadorilink_root_authority::durable_dir::{publish_durably, Replace};
+use yadorilink_fs_platform::durable_dir::{publish_durably, Replace};
 use yadorilink_ipc_proto::shellipc::{
     DomainEvidence, EvictResult, ProviderFolder, ProviderRemoval,
 };

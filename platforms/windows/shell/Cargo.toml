@@ -42,7 +42,7 @@ sha2 = "0.11"
 yadorilink-ipc-proto = { path = "../../../crates/yadorilink-ipc-proto" }
 # `durable_dir`: the durable publish, move and removal of the host's own state
 # files and of the user's files it keeps under another name.
-yadorilink-root-authority = { path = "../../../crates/yadorilink-root-authority" }
+yadorilink-fs-platform = { path = "../../../crates/yadorilink-fs-platform" }
 # `macros` (for `#[tokio::test]`) is only exercised by this crate's own
 # tests but declared here rather than a dev-dependency override, matching
 # `platforms/macos/app/fileprovider-core/Cargo.toml`'s own reasoning.

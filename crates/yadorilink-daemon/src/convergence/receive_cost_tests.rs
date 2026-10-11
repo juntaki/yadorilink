@@ -21,7 +21,9 @@
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
-use yadorilink_filesystem_sync::watcher::RealFolderWatchSource;
+use yadorilink_filesystem_sync::watcher::{
+    FolderWatchSource, FsChangeEvent, RealFolderWatchSource, SimulatedFolderWatchSource,
+};
 use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind, VersionBlock};
@@ -33,14 +35,17 @@ use crate::replica_coordinator::ReplicaCoordinator;
 
 pub(super) const GROUP: &str = "receive-cost-group";
 
-/// The most outer write transactions one received path may cost. Receiving
-/// a file took 13 before its pre-write steps were folded into one
-/// transaction (taking 4 away) and its plans stopped opening write
-/// transactions that record nothing (4 more), which left 5: the metadata
-/// apply, the pre-write commit, the proof, a second publication of that
-/// proof and the obligation's completion. Folding the last three into one
-/// commit leaves 3. The bound leaves room above that, and fails if any of
-/// those changes is undone.
+/// The outer write transactions one received path costs, exactly: the metadata
+/// apply, the pre-write commit that opens the content write, the durable record
+/// of the temp file the write will create (so a crash cannot orphan it), and
+/// one commit that publishes the proof, stamps `Present`, clears the intent and
+/// completes the obligation. Receiving a file took 13 before its pre-write
+/// steps were folded into one transaction (taking 4 away) and its plans
+/// stopped opening write transactions that record nothing (4 more), and the
+/// proof, its second publication and the completion were folded into one
+/// commit; the temp-file record is the fourth. The guard runs against a quiet
+/// watcher so the count is this exact number and fails if any change adds to
+/// it; do not raise it to absorb a timing-dependent extra, find that extra.
 const MAX_WRITE_TRANSACTIONS_PER_PATH: u64 = 4;
 
 pub(super) struct Fixture {
@@ -48,11 +53,31 @@ pub(super) struct Fixture {
     pub(super) root: std::path::PathBuf,
     _root_dir: crate::test_support::sync_stack_fixture::ReleasingDir,
     _database_dir: Option<tempfile::TempDir>,
+    /// Keeps a quiet fixture's simulated event channel open.
+    _quiet_events: Option<tokio::sync::mpsc::Sender<FsChangeEvent>>,
 }
 
 /// `on_disk`: the replica database is a file (WAL, `synchronous = FULL`,
 /// as in the daemon) instead of in memory, so its commits really sync.
 pub(super) async fn fixture(on_disk: bool) -> Fixture {
+    fixture_watching(on_disk, Arc::new(RealFolderWatchSource), None).await
+}
+
+/// [`fixture`] whose folder watcher is simulated and never sees an event: the
+/// OS's echo of the daemon's own writes (a dirty-path record, written when the
+/// debounced event lands, which on a slow disk is inside the window being
+/// counted) is the watcher's cost, not the receive's, and would make the count
+/// depend on timing.
+async fn quiet_fixture(on_disk: bool) -> Fixture {
+    let (source, events) = SimulatedFolderWatchSource::new(16);
+    fixture_watching(on_disk, Arc::new(source), Some(events)).await
+}
+
+async fn fixture_watching(
+    on_disk: bool,
+    source: Arc<dyn FolderWatchSource>,
+    quiet_events: Option<tokio::sync::mpsc::Sender<FsChangeEvent>>,
+) -> Fixture {
     let root_dir = tempfile::tempdir().unwrap();
     let root = root_dir.path().canonicalize().unwrap();
     let local_path = root.to_string_lossy().into_owned();
@@ -69,7 +94,7 @@ pub(super) async fn fixture(on_disk: bool) -> Fixture {
     state.replica_coordinator.set_local_policy_head_provider(Arc::new(|_group_id| Ok([0u8; 32])));
     state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
     LinkRuntimeController::new(state.clone())
-        .start_with_source(local_path, GROUP.to_string(), Arc::new(RealFolderWatchSource))
+        .start_with_source(local_path, GROUP.to_string(), source)
         .expect("the watch must start");
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -80,7 +105,7 @@ pub(super) async fn fixture(on_disk: bool) -> Fixture {
     .expect("the initial scan must succeed");
     register_peer_session(&state).await;
     let _root_dir = crate::test_support::sync_stack_fixture::ReleasingDir::new(root_dir, &state);
-    Fixture { state, root, _root_dir, _database_dir: database_dir }
+    Fixture { state, root, _root_dir, _database_dir: database_dir, _quiet_events: quiet_events }
 }
 
 /// A session to a peer that never answers: projection has a driver, and
@@ -212,7 +237,7 @@ pub(super) fn content_of(len: usize, seed: u8) -> Vec<u8> {
 /// and a multi-block file, one path at a time after a warm-up path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn measurement_guard_write_transactions_per_received_path() {
-    let f = fixture(false).await;
+    let f = quiet_fixture(false).await;
     let engine = crate::convergence::engine::ConvergenceEngine::new(f.state.clone());
     // One-time per-group work is not what is being counted.
     f.receive(&engine, "warm.txt", b"warm-up", 1).await;

@@ -375,7 +375,7 @@ pub fn dehydrate_placeholder(path: &Path, expected: u64) -> Result<(), String> {
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
-    let wide_path = wide(&path.to_string_lossy());
+    let wide_path = wide(&yadorilink_fs_platform::long_path::for_win32(path).to_string_lossy());
     // SAFETY: `wide_path` is a valid NUL-terminated UTF-16 buffer for the
     // duration of this call. `GENERIC_READ | GENERIC_WRITE`: dehydrating
     // mutates the placeholder's population state, unlike a read-only

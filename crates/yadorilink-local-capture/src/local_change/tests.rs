@@ -8803,3 +8803,153 @@ async fn a_changed_root_volume_stops_all_tombstoning() {
     let records = proc.scan_existing_files("group-1", &root).unwrap();
     assert!(records.iter().any(|r| r.path == "docs/a.txt" && r.deleted), "{records:?}");
 }
+
+/// A platform that cannot observe a file's unix mode and replicated attributes
+/// (Windows; macOS for attributes) inherits them from the path's semantic
+/// predecessor and never captures their absence as a removal.
+const RECEIVED_MODE: u32 = 0o644;
+
+fn received_xattrs() -> Vec<(String, Vec<u8>)> {
+    vec![("user.origin".to_string(), b"linux".to_vec())]
+}
+
+/// A peer-materialized file whose row records `RECEIVED_MODE` and attributes
+/// the capturing platform cannot read.
+async fn received_file_on_a_platform_that_reads_no_metadata() -> (
+    LocalChangeProcessor,
+    Arc<TestReplica>,
+    std::path::PathBuf,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Arc<CountingBlockStore>,
+) {
+    let (proc, state, store, store_dir, root_dir) = processor_with_counting_store();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    let content = b"received bytes\n";
+    let scratch = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(scratch.path(), content).unwrap();
+    let blocks = yadorilink_local_storage::chunk_file(store.as_ref(), scratch.path()).unwrap();
+    let file_path = root.join("received.bin");
+    const PEER_AUTHORED_MTIME: i64 = 1_600_000_000_000_000_000;
+    yadorilink_local_storage::reconstruct_file(
+        store.as_ref(),
+        &file_path,
+        &blocks,
+        PEER_AUTHORED_MTIME,
+    )
+    .unwrap();
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    state
+        .file_index_repository()
+        .upsert_file(
+            "group-1",
+            &FileRecord {
+                path: "received.bin".to_string(),
+                size: content.len() as u64,
+                mtime_unix_nanos: PEER_AUTHORED_MTIME,
+                blocks,
+                deleted: false,
+            },
+            &permit,
+        )
+        .unwrap();
+    state
+        .file_index_repository()
+        .set_unix_mode("group-1", "received.bin", Some(RECEIVED_MODE), &permit)
+        .unwrap();
+    state
+        .file_index_repository()
+        .set_xattrs("group-1", "received.bin", &received_xattrs(), &permit)
+        .unwrap();
+    proc.simulate_unobservable_modes();
+    (proc, state, file_path, store_dir, root_dir, store)
+}
+
+#[tokio::test]
+async fn a_noop_capture_where_no_metadata_is_readable_keeps_the_recorded_mode_and_attributes() {
+    let (proc, state, file_path, _s, _r, _store) =
+        received_file_on_a_platform_that_reads_no_metadata().await;
+    let root = file_path.parent().unwrap().to_path_buf();
+    let versions = state.sqlite().dag_list_versions("group-1", "received.bin").unwrap().len();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let outcome = proc
+        .process_event(
+            "group-1",
+            &root,
+            &FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::CreatedOrModified },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, LocalChangeOutcome::None), "no metadata read is no edit");
+    proc.scan_existing_files("group-1", &root).unwrap();
+
+    assert_eq!(
+        state.sqlite().dag_list_versions("group-1", "received.bin").unwrap().len(),
+        versions
+    );
+    assert_eq!(
+        state.file_index_repository().get_unix_mode("group-1", "received.bin").unwrap(),
+        Some(RECEIVED_MODE)
+    );
+}
+
+#[tokio::test]
+async fn a_content_edit_where_no_metadata_is_readable_inherits_the_mode_and_attributes() {
+    let (proc, state, file_path, _s, _r, _store) =
+        received_file_on_a_platform_that_reads_no_metadata().await;
+    let root = file_path.parent().unwrap().to_path_buf();
+    std::fs::write(&file_path, b"edited here, where mode and attributes are unreadable\n").unwrap();
+    let outcome = proc
+        .process_event(
+            "group-1",
+            &root,
+            &FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::CreatedOrModified },
+        )
+        .await
+        .unwrap();
+    expect_file_changed(outcome);
+
+    assert_eq!(
+        state.file_index_repository().get_unix_mode("group-1", "received.bin").unwrap(),
+        Some(RECEIVED_MODE),
+        "the edited version must keep the predecessor's mode, not drop it"
+    );
+    assert_eq!(
+        state.file_index_repository().get_xattrs("group-1", "received.bin").unwrap(),
+        received_xattrs(),
+        "the edited version must keep the predecessor's attributes, not drop them"
+    );
+}
+
+#[tokio::test]
+async fn a_new_file_where_no_metadata_is_readable_has_no_mode_and_no_attributes() {
+    let (proc, state, file_path, _s, _r, _store) =
+        received_file_on_a_platform_that_reads_no_metadata().await;
+    let root = file_path.parent().unwrap().to_path_buf();
+    let fresh = root.join("made-here.bin");
+    std::fs::write(&fresh, b"made here\n").unwrap();
+    let outcome = proc
+        .process_event(
+            "group-1",
+            &root,
+            &FsChangeEvent { path: fresh.clone(), kind: FsChangeKind::CreatedOrModified },
+        )
+        .await
+        .unwrap();
+    expect_file_changed(outcome);
+
+    assert_eq!(
+        state.file_index_repository().get_unix_mode("group-1", "made-here.bin").unwrap(),
+        None
+    );
+    assert!(state
+        .file_index_repository()
+        .get_xattrs("group-1", "made-here.bin")
+        .unwrap()
+        .is_empty());
+}

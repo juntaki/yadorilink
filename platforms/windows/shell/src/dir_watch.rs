@@ -45,7 +45,7 @@ pub fn watch(
     on_signal: impl Fn(Signal) -> bool + Send + 'static,
 ) -> std::io::Result<Watch> {
     use std::os::windows::ffi::OsStrExt;
-    let name: Vec<u16> = root.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = yadorilink_fs_platform::long_path::for_win32(root).as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     // SAFETY: `name` is NUL-terminated.
     let handle = unsafe {
         CreateFileW(

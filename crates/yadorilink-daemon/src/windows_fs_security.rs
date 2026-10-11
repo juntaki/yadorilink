@@ -32,7 +32,11 @@ use yadorilink_ipc_proto::pipe_peer::sids_match;
 
 fn wide(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    yadorilink_fs_platform::long_path::for_win32(path)
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// The SIDs this process creates objects under: its token's user and its token's default owner

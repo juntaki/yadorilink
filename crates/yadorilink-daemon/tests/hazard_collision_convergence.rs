@@ -893,6 +893,21 @@ async fn tombstone_of_the_live_file_itself_does_not_corrupt_its_own_index_row_wh
         return;
     }
 
+    // device_a must hold "Photo.jpg" on disk before the colliding sibling is
+    // authored there: a device that learns of the sibling first holds both
+    // names (each collides with the other's row) and never materializes
+    // either, so there is no file of its own for the tombstone below to
+    // remove and no live head for it to supersede. A slower filesystem
+    // (Windows) lets the sibling win that race.
+    wait_until(
+        || {
+            std::fs::read(device_a.root.path().join("Photo.jpg")).ok().as_deref()
+                == Some(b"original photo bytes".as_slice())
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
     // "photo.jpg" is a colliding sibling known (held) from a create
     // collision, same mechanism as the tests above.
     commit_pure_dag_create(&device_a, &group_id, "photo.jpg", b"a completely different photo");

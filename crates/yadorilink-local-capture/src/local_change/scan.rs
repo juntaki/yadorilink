@@ -9,7 +9,6 @@ use crate::scan_block_staging::ScanBlockStaging;
 use yadorilink_filesystem_sync::watcher::FsChangeKind;
 use yadorilink_fs_platform::fs_identity::{disk_race_fingerprint_of, metadata_mtime_matches};
 use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
-use yadorilink_local_storage::{read_replicated_xattrs, unix_mode_from_metadata};
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::SyncPath;
@@ -30,9 +29,10 @@ use super::disk_observation::{
 use super::path_policy::{
     is_excluded_from_sync, path_to_wire_relative_string, skip_reason_for_inadmissible_wire_path,
 };
-use super::record_builder::{indexed_mode_and_xattrs, metadata_columns_for, SymlinkClassification};
+use super::record_builder::{metadata_columns_for, SymlinkClassification};
 #[cfg(test)]
 use super::scan_test_hooks;
+use super::Predecessor;
 use super::{now_unix_nanos, LocalChangeOutcome, LocalChangeProcessor};
 
 /// Whether the file's bytes still match `existing`'s indexed blocks. An
@@ -1639,19 +1639,19 @@ impl LocalChangeProcessor {
                 // applies to a genuine regular file.
                 if file_type.is_file() {
                     if let (Some(existing), Some(metadata)) = (&existing, &entry_metadata) {
-                        let on_disk_unix_mode = unix_mode_from_metadata(metadata);
-                        let (indexed_unix_mode, indexed_xattrs) = indexed_mode_and_xattrs(
-                            self.state.canonical_current_row(group_id, &rel_path)?,
+                        let predecessor = Predecessor::of_row(
+                            self.state.canonical_current_row(group_id, &rel_path)?.as_ref(),
                         );
+                        let on_disk_unix_mode = self.captured_unix_mode(metadata, &predecessor);
+                        let (indexed_unix_mode, indexed_xattrs) =
+                            (predecessor.unix_mode, predecessor.xattrs.clone());
                         // Same reasoning as the exec-bit check just
                         // above, for extended attributes: an
                         // offline `setxattr`-only edit changes neither
                         // size, mtime, content, nor unix_mode, so it must
                         // be checked here too or a re-scan can never
                         // discover it.
-                        let on_disk_xattrs = std::fs::File::open(path)
-                            .map(|f| read_replicated_xattrs(&f))
-                            .unwrap_or_default();
+                        let on_disk_xattrs = self.captured_xattrs(path, &predecessor);
                         // A differing mode or xattr set is a local edit only if
                         // someone made it: the daemon's own untouched write of
                         // an older version still carries that version's
@@ -1757,9 +1757,12 @@ impl LocalChangeProcessor {
                 // metadata, never content integrity. Never scanned for a
                 // symlink, matching `unix_mode`'s own `None` there.
                 let xattrs = if classification.is_none() {
-                    std::fs::File::open(path)
-                        .map(|f| read_replicated_xattrs(&f))
-                        .unwrap_or_default()
+                    self.captured_xattrs(
+                        path,
+                        &Predecessor::of_row(
+                            self.state.canonical_current_row(group_id, &rel_path)?.as_ref(),
+                        ),
+                    )
                 } else {
                     Vec::new()
                 };

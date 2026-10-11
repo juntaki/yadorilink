@@ -1413,7 +1413,11 @@ mod windows_acl {
         if ok == 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut wide: Vec<u16> = yadorilink_fs_platform::long_path::for_win32(path)
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         // SAFETY: `wide` is NUL terminated; `dacl` points into `descriptor`.
         let status = unsafe {
             SetNamedSecurityInfoW(

@@ -26,7 +26,6 @@ use yadorilink_fs_platform::fs_identity::{
     disk_race_fingerprint, FileIdentity, IdentityComparison,
 };
 use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
-use yadorilink_local_storage::{read_replicated_xattrs, unix_mode_from_metadata};
 use yadorilink_replica_domain::file::{FileRecord, FileVersion, RecordKind};
 use yadorilink_replica_domain::ids::SyncPath;
 use yadorilink_replica_domain::local_op::Op;
@@ -196,8 +195,13 @@ impl LocalChangeProcessor {
         {
             return Ok(DirectoryVerdict::Nothing);
         }
-        let unix_mode = unix_mode_from_metadata(lstat);
         let row = self.state.canonical_current_row(group_id, rel_path)?;
+        let unix_mode = self.captured_unix_mode(
+            lstat,
+            &super::Predecessor::of_row(
+                row.as_ref().filter(|row| row.snapshot.record_kind == RecordKind::Directory),
+            ),
+        );
         // Only a leaf that was on disk here can have been replaced: a peer's
         // entry still being written, admitted but not yet projected, or
         // held off disk by a name hazard never stood at the path, so the
@@ -216,7 +220,7 @@ impl LocalChangeProcessor {
             // directory got here is not a change to it.
             if row.snapshot.record_kind != RecordKind::Directory
                 || row.snapshot.unix_mode.is_none()
-                || row.snapshot.unix_mode == unix_mode
+                || unix_mode == row.snapshot.unix_mode
                 || self.state.has_materialization_intent(group_id, rel_path)?
             {
                 return Ok(DirectoryVerdict::Nothing);
@@ -347,7 +351,7 @@ impl LocalChangeProcessor {
         let identity = FileIdentity::observe_path(event_path).ok().filter(|identity| {
             identity.object_kind == yadorilink_fs_platform::fs_identity::ObjectKind::Directory
                 && std::fs::symlink_metadata(event_path)
-                    .is_ok_and(|now| now.is_dir() && unix_mode_from_metadata(&now) == unix_mode)
+                    .is_ok_and(|now| now.is_dir() && self.mode_unchanged_since(&now, unix_mode))
         });
         let directory = CapturedDirectory { record, op, version, meta, identity };
         self.state.commit_captured_directory(
@@ -667,7 +671,8 @@ impl LocalChangeProcessor {
             if !lstat.is_dir() || !exact_leaf_exists_as_directory(root, dest) {
                 return Ok(None);
             }
-            let unix_mode = unix_mode_from_metadata(&lstat);
+            let unix_mode =
+                self.captured_unix_mode(&lstat, &super::Predecessor::of_row(Some(moved)));
             let (record, op, version, meta) = directory_entry(dest, unix_mode);
             let proof = FileIdentity::observe_path(&dest_abs)
                 .ok()
@@ -675,7 +680,7 @@ impl LocalChangeProcessor {
                     identity.object_kind
                         == yadorilink_fs_platform::fs_identity::ObjectKind::Directory
                         && std::fs::symlink_metadata(&dest_abs).is_ok_and(|now| {
-                            now.is_dir() && unix_mode_from_metadata(&now) == unix_mode
+                            now.is_dir() && self.mode_unchanged_since(&now, unix_mode)
                         })
                 })
                 .map(|filesystem_identity| LocalCaptureActualStateEvidence::Present {
@@ -711,10 +716,16 @@ impl LocalChangeProcessor {
             None,
         )?;
         let LocalChangeOutcome::FileChanged(record) = outcome else { return Ok(None) };
+        // The moved entry's predecessor is the row it moved from, for the mode
+        // as for the attributes: the destination has no row of its own.
+        let unix_mode = match (&classification, std::fs::metadata(&dest_abs)) {
+            (None, Ok(now)) => {
+                Some(self.captured_unix_mode(&now, &super::Predecessor::of_row(Some(moved))))
+            }
+            _ => unix_mode,
+        };
         let xattrs = if classification.is_none() {
-            std::fs::File::open(&dest_abs)
-                .map(|file| read_replicated_xattrs(&file))
-                .unwrap_or_default()
+            self.captured_xattrs(&dest_abs, &super::Predecessor::of_row(Some(moved)))
         } else {
             Vec::new()
         };

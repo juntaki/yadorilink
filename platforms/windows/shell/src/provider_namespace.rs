@@ -40,7 +40,8 @@ const ERROR_SHARING_VIOLATION: i32 = 0x8007_0020u32 as i32;
 
 fn wide(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    // Past MAX_PATH a raw wide-character call needs the verbatim form.
+    yadorilink_fs_platform::long_path::for_win32(path).as_os_str().encode_wide().chain(std::iter::once(0)).collect()
 }
 
 /// An open handle, closed on drop.

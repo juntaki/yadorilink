@@ -610,8 +610,23 @@ fn assert_no_content_silently_lost(
     row_name: &str,
     final_snapshot: &HashMap<String, String>,
 ) {
+    if let Some(lost) = lost_edit(devices, op_level, path_level, excluded_idx, final_snapshot) {
+        panic!(
+            "{row_name}: {lost} -- silent data loss (op_level={op_level}, path_level={path_level})"
+        );
+    }
+}
+
+/// The first Edit-device whose round-1 content is in none of `snapshot`'s hashes.
+fn lost_edit(
+    devices: &[TestDevice],
+    op_level: u8,
+    path_level: u8,
+    excluded_idx: Option<usize>,
+    snapshot: &HashMap<String, String>,
+) -> Option<String> {
     if path_level == 4 {
-        return;
+        return None;
     }
     for idx in 0..devices.len() {
         if Some(idx) == excluded_idx {
@@ -626,13 +641,25 @@ fn assert_no_content_silently_lost(
         let target = target_path(path_level, idx);
         let expected_content = format!("row round 1 device {idx} target {}", target.display());
         let expected_hash = hex::encode(sha2::Sha256::digest(expected_content.as_bytes()));
-        assert!(
-            final_snapshot.values().any(|h| h == &expected_hash),
-            "{row_name}: device-{idx}'s round-1 edit (content hash {expected_hash}) is not \
-             present anywhere in the final converged tree -- silent data loss \
-             (op_level={op_level}, path_level={path_level})"
-        );
+        if !snapshot.values().any(|h| h == &expected_hash) {
+            return Some(format!(
+                "device-{idx}'s round-1 edit (content hash {expected_hash}) is not present \
+                 anywhere in the final tree"
+            ));
+        }
     }
+    None
+}
+
+/// Every device's tree, entries named by device so none collides.
+fn union_of_trees(devices: &[&TestDevice]) -> HashMap<String, String> {
+    devices
+        .iter()
+        .enumerate()
+        .flat_map(|(i, d)| {
+            recursive_snapshot(d.root.path()).into_iter().map(move |(k, h)| (format!("{i}/{k}"), h))
+        })
+        .collect()
 }
 
 /// How many canonical (non-conflict-copy) entries a device may end with for the
@@ -811,6 +838,43 @@ async fn run_taguchi_v3_row(
     let timeout =
         if churn_level == 3 { Duration::from_secs(200) } else { Duration::from_secs(150) };
 
+    // The closed Windows gate withholds the winner's replacement of the loser's
+    // original, so the trees cannot converge and the sync work stays pending by
+    // design. What must hold meanwhile is that no edit is lost: its content is
+    // still on the device that made it, or in a conflict copy, somewhere.
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "conflict convergence requires durable namespace replacement",
+    ) {
+        wait_until_with_context(
+            || {
+                lost_edit(
+                    &devices,
+                    op_level,
+                    path_level,
+                    excluded_idx,
+                    &union_of_trees(&active_refs),
+                )
+                .is_none()
+            },
+            timeout,
+            || {
+                format!(
+                    "{row_name}: {:?}; {}",
+                    lost_edit(
+                        &devices,
+                        op_level,
+                        path_level,
+                        excluded_idx,
+                        &union_of_trees(&active_refs)
+                    ),
+                    tree_dump(&active_refs)
+                )
+            },
+        )
+        .await;
+        return;
+    }
+
     // Every row, case-fold included, must reach true quiescence before any
     // tree comparison: equal frontiers, nothing fetchable left unhydrated or
     // unprojected, held for a stable window. A case-fold collision resolves
@@ -987,6 +1051,9 @@ async fn run_taguchi_v3_row(
 // --- L16(4^5) orthogonal array rows: (A partition, B op, C path, D churn, E stagger) ---
 //
 // The case-fold rows 04, 07, 10 and 13 skip on case-sensitive filesystems.
+// With the Windows durability gate closed the winner does not replace the loser's original, so the
+// full-tree convergence cannot complete; every row then checks only that no round-1 edit is lost
+// (see `run_taguchi_v3_row`), and the convergence checks run again when the gate opens.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_v3_row_01_part_none_op_all_edit_path_flat_churn_dc2_stag_sim() {

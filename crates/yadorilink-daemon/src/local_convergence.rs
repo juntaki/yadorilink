@@ -922,7 +922,9 @@ impl LocalConvergenceExecutor {
         let file_type = lstat.file_type();
         let moved_on = match kind {
             RecordKind::Directory if file_type.is_dir() => {
-                version.meta.unix_mode.is_some()
+                // Off Unix a disk has no mode to compare.
+                cfg!(unix)
+                    && version.meta.unix_mode.is_some()
                     && yadorilink_local_storage::unix_mode_from_metadata(&lstat)
                         != version.meta.unix_mode
             }

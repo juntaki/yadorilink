@@ -28,7 +28,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
-use yadorilink_root_authority::durable_dir::{
+use yadorilink_fs_platform::durable_dir::{
     move_durably, publish_durably, remove_file_durably, Replace,
 };
 use yadorilink_ipc_proto::shellipc::{
