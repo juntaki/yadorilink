@@ -13,11 +13,13 @@ use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY,
-    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
-    FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
+    FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
 };
-use windows_sys::Win32::System::IO::CancelIoEx;
+use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent};
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 /// What the watcher reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,15 +39,116 @@ pub struct Watch {
 
 const BUFFER_BYTES: usize = 64 * 1024;
 const ERROR_NOTIFY_ENUM_DIR: i32 = 1022;
+/// How often a re-arm refused with an overflow is retried before the watcher gives up.
+const REARM_ATTEMPTS: usize = 8;
+
+/// The read the watcher has outstanding: the buffer the driver fills and the `OVERLAPPED` it
+/// completes through, at one address from the first arming to the end. Dropping it cancels a
+/// read still queued and waits for the driver to finish with the memory before the event is
+/// closed and the buffer freed, on every way out of the worker (and of a failed spawn).
+struct Armed {
+    handle: isize,
+    overlapped: Box<OVERLAPPED>,
+    buffer: Vec<u8>,
+    /// Whether a read is queued and not yet completed.
+    pending: bool,
+    /// Test-only: the error code the next `arm` fails with, once.
+    fault: Arc<std::sync::atomic::AtomicI32>,
+}
+
+// SAFETY: the pointers inside `OVERLAPPED` (the event handle) are used by one thread at a time:
+// the caller of `watch` until it has armed, the watcher thread after.
+unsafe impl Send for Armed {}
+
+impl Armed {
+    /// Queues the next read; changes made from now on are held by the directory handle until it
+    /// completes, so none falls between one read and the next. `Err` is the OS error code.
+    fn arm(&mut self) -> Result<(), i32> {
+        let injected = self.fault.swap(0, Ordering::SeqCst);
+        if injected != 0 {
+            return Err(injected);
+        }
+        // SAFETY: the event is open; `buffer` and `overlapped` outlive the read (`Drop` cancels
+        // it and waits for it first, and the box is not moved).
+        let queued = unsafe {
+            ResetEvent(self.overlapped.hEvent);
+            ReadDirectoryChangesW(
+                self.handle as HANDLE,
+                self.buffer.as_mut_ptr().cast::<c_void>(),
+                self.buffer.len() as u32,
+                1,
+                FILE_NOTIFY_CHANGE_FILE_NAME
+                    | FILE_NOTIFY_CHANGE_DIR_NAME
+                    | FILE_NOTIFY_CHANGE_SIZE
+                    | FILE_NOTIFY_CHANGE_LAST_WRITE,
+                std::ptr::null_mut(),
+                &mut *self.overlapped,
+                None,
+            ) != 0
+        };
+        if queued {
+            self.pending = true;
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+        }
+    }
+
+    /// Waits for the queued read to complete; `Err` is the OS error code.
+    fn wait(&mut self) -> Result<u32, i32> {
+        let mut returned = 0u32;
+        // SAFETY: the handle is open for as long as this value lives; `overlapped` is the one
+        // the read was queued with.
+        let ok = unsafe {
+            GetOverlappedResult(self.handle as HANDLE, &*self.overlapped, &mut returned, 1)
+        };
+        // Completed, with data or with an error: the driver is done with the buffer.
+        self.pending = false;
+        if ok == 0 {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+        } else {
+            Ok(returned)
+        }
+    }
+}
+
+impl Drop for Armed {
+    fn drop(&mut self) {
+        // SAFETY: the handle is still open (`Watch` closes it only after the worker has ended);
+        // after the cancelled read is waited out nothing refers to the event, the buffer or the
+        // `OVERLAPPED` any more.
+        unsafe {
+            if self.pending {
+                CancelIoEx(self.handle as HANDLE, &*self.overlapped);
+                let mut returned = 0u32;
+                GetOverlappedResult(self.handle as HANDLE, &*self.overlapped, &mut returned, 1);
+            }
+            CloseHandle(self.overlapped.hEvent);
+        }
+    }
+}
 
 /// Starts watching `root` and everything below it; `on_signal` is called from the watcher's own
-/// thread and returns `false` to stop it.
+/// thread and returns `false` to stop it. The first read is queued before this returns, so a
+/// change made right after it is not lost.
 pub fn watch(
     root: &Path,
     on_signal: impl Fn(Signal) -> bool + Send + 'static,
 ) -> std::io::Result<Watch> {
+    start(root, on_signal, Arc::default())
+}
+
+fn start(
+    root: &Path,
+    on_signal: impl Fn(Signal) -> bool + Send + 'static,
+    fault: Arc<std::sync::atomic::AtomicI32>,
+) -> std::io::Result<Watch> {
     use std::os::windows::ffi::OsStrExt;
-    let name: Vec<u16> = yadorilink_fs_platform::long_path::for_win32(root).as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = yadorilink_fs_platform::long_path::for_win32(root)
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     // SAFETY: `name` is NUL-terminated.
     let handle = unsafe {
         CreateFileW(
@@ -54,7 +157,7 @@ pub fn watch(
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null(),
             OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
             std::ptr::null_mut(),
         )
     };
@@ -62,51 +165,77 @@ pub fn watch(
         return Err(std::io::Error::last_os_error());
     }
     let handle = handle as isize;
+    // A manual-reset event the driver sets when a read completes.
+    // SAFETY: no arguments need to outlive the call.
+    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    if event.is_null() {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: the handle was just opened and nothing else holds it.
+        unsafe { CloseHandle(handle as HANDLE) };
+        return Err(error);
+    }
+    // SAFETY: an all-zero `OVERLAPPED` is the documented initial state.
+    let mut overlapped: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
+    overlapped.hEvent = event;
+    // From here `armed` owns the event, and cancels and waits out a queued read when dropped.
+    let mut armed =
+        Armed { handle, overlapped, buffer: vec![0u8; BUFFER_BYTES], pending: false, fault };
+    if let Err(code) = armed.arm() {
+        drop(armed);
+        // SAFETY: nothing else holds the handle.
+        unsafe { CloseHandle(handle as HANDLE) };
+        return Err(std::io::Error::from_raw_os_error(code));
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let stopping = stop.clone();
     let base = root.to_path_buf();
-    let thread =
+    let spawned =
         std::thread::Builder::new().name("yadorilink-dir-watch".into()).spawn(move || {
-            let mut buffer = vec![0u8; BUFFER_BYTES];
+            let mut armed = armed;
             while !stopping.load(Ordering::SeqCst) {
-                let mut returned = 0u32;
-                // SAFETY: `buffer` is writable for its length; the handle stays open until `Drop`
-                // has cancelled this call and joined this thread.
-                let ok = unsafe {
-                    ReadDirectoryChangesW(
-                        handle as HANDLE,
-                        buffer.as_mut_ptr().cast::<c_void>(),
-                        buffer.len() as u32,
-                        1,
-                        FILE_NOTIFY_CHANGE_FILE_NAME
-                            | FILE_NOTIFY_CHANGE_DIR_NAME
-                            | FILE_NOTIFY_CHANGE_SIZE
-                            | FILE_NOTIFY_CHANGE_LAST_WRITE,
-                        &mut returned,
-                        std::ptr::null_mut(),
-                        None,
-                    )
-                };
+                let result = armed.wait();
                 if stopping.load(Ordering::SeqCst) {
                     break;
                 }
-                let signal = if ok == 0 {
-                    match std::io::Error::last_os_error().raw_os_error() {
-                        Some(ERROR_NOTIFY_ENUM_DIR) => Signal::Overflow,
-                        // The directory went away or the handle was cancelled: nothing more to say.
-                        _ => break,
-                    }
-                } else if returned == 0 {
-                    Signal::Overflow
-                } else {
-                    Signal::Paths(parse(&buffer[..returned as usize], &base))
+                let signal = match result {
+                    Err(ERROR_NOTIFY_ENUM_DIR) | Ok(0) => Signal::Overflow,
+                    // The directory went away or the handle was cancelled: nothing more to say.
+                    Err(_) => break,
+                    Ok(returned) => Signal::Paths(parse(&armed.buffer[..returned as usize], &base)),
                 };
+                // Queued again before the callback runs, so its duration is not a blind window.
+                let mut rearmed = armed.arm();
                 if !on_signal(signal) {
                     break;
                 }
+                // A re-arm the driver refuses because it lost changes is itself an overflow: the
+                // receiver looks at everything, and the read is queued again.
+                for _ in 0..REARM_ATTEMPTS {
+                    match rearmed {
+                        Ok(()) => break,
+                        Err(ERROR_NOTIFY_ENUM_DIR) => {
+                            if !on_signal(Signal::Overflow) {
+                                return;
+                            }
+                            rearmed = armed.arm();
+                        }
+                        Err(_) => return,
+                    }
+                }
+                if rearmed.is_err() {
+                    return;
+                }
             }
-        })?;
-    Ok(Watch { handle, stop, thread: Some(thread) })
+        });
+    match spawned {
+        Ok(thread) => Ok(Watch { handle, stop, thread: Some(thread) }),
+        Err(error) => {
+            // The closure, and the `Armed` in it, is gone: its read was cancelled and waited out.
+            // SAFETY: nothing else holds the handle.
+            unsafe { CloseHandle(handle as HANDLE) };
+            Err(error)
+        }
+    }
 }
 
 impl Drop for Watch {
@@ -202,6 +331,72 @@ mod tests {
         assert!(collect(&rx, &renamed), "the new name of a rename was not signalled");
         std::fs::remove_file(&renamed).unwrap();
         assert!(collect(&rx, &renamed), "delete was not signalled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A change made the moment `watch` returns is signalled: the watcher is armed before it
+    /// hands control back, not some moments later on its own thread.
+    #[test]
+    fn a_change_made_as_soon_as_watch_returns_is_signalled() {
+        let mut missed = 0;
+        for round in 0..200 {
+            let dir = temp(&format!("armed-{round}"));
+            let (tx, rx) = channel();
+            let _watch = watch(&dir, move |signal| tx.send(signal).is_ok()).unwrap();
+            let file = dir.join("first.txt");
+            std::fs::write(&file, b"x").unwrap();
+            let seen = (0..10).any(|_| {
+                matches!(rx.recv_timeout(Duration::from_millis(100)), Ok(Signal::Paths(p)) if p.contains(&file))
+            });
+            if !seen {
+                missed += 1;
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert_eq!(missed, 0, "{missed} of 200 first changes were never signalled");
+    }
+
+    /// A callback that asks to stop, followed at once by the drop of the watch: the worker's
+    /// last queued read is cancelled and waited out before its memory goes, every time.
+    #[test]
+    fn stopping_from_the_callback_and_dropping_at_once_is_clean() {
+        for round in 0..100 {
+            let dir = temp(&format!("stopcb-{round}"));
+            let (tx, rx) = channel();
+            let watch = watch(&dir, move |signal| {
+                let _ = tx.send(signal);
+                false
+            })
+            .unwrap();
+            std::fs::write(dir.join("x.txt"), b"x").unwrap();
+            assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
+            let started = std::time::Instant::now();
+            drop(watch);
+            assert!(started.elapsed() < Duration::from_secs(2), "drop waited out its deadline");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A re-arm the driver refuses with an overflow is reported as one, and the watcher keeps
+    /// signalling afterwards.
+    #[test]
+    fn a_refused_rearm_is_an_overflow_and_the_watch_goes_on() {
+        let dir = temp("rearm");
+        let (tx, rx) = channel();
+        let fault = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let _watch = start(&dir, move |signal| tx.send(signal).is_ok(), fault.clone()).unwrap();
+        fault.store(ERROR_NOTIFY_ENUM_DIR, Ordering::SeqCst);
+        std::fs::write(dir.join("one.txt"), b"1").unwrap();
+        let mut overflowed = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !overflowed && std::time::Instant::now() < deadline {
+            overflowed =
+                matches!(rx.recv_timeout(Duration::from_millis(200)), Ok(Signal::Overflow));
+        }
+        assert!(overflowed, "the refused re-arm was not reported as an overflow");
+        let two = dir.join("two.txt");
+        std::fs::write(&two, b"2").unwrap();
+        assert!(collect(&rx, &two), "the watch stopped after the overflow");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
