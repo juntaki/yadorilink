@@ -712,6 +712,74 @@ fn panic_settled_but_different(
 }
 
 /// Runs one Taguchi-array row: sets up devices per Factor D, applies
+/// Factor D's churn action: returns the index of a revoked device, or a
+/// freshly joined one.
+async fn apply_churn(
+    fake: &FakeCoordination,
+    devices: &[TestDevice],
+    churn_level: u8,
+    row_name: &str,
+    group_id: &str,
+) -> (Option<usize>, Option<TestDevice>) {
+    match churn_level {
+        1 | 2 => (None, None),
+        3 => {
+            let new_device =
+                setup_device(fake, &format!("{row_name}-device-churn-join"), &[group_id]).await;
+            // The joiner arrives after `n_synced_devices` ran its
+            // advertisement, so nobody knows where its reconciliation
+            // substrate answers and it knows where nobody else's does.
+            // Re-including the existing devices is idempotent.
+            let mut states: Vec<&std::sync::Arc<DaemonState>> =
+                devices.iter().map(|device| &device.state).collect();
+            states.push(&new_device.state);
+            support::advertise_substrate_between(&states).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            (None, Some(new_device))
+        }
+        4 => {
+            let last = devices.len() - 1;
+            fake.revoke(&devices[last].device_id, group_id);
+            (Some(last), None)
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// With the Windows gate closed the trees cannot converge, so the only
+/// property waited for is that no edit is lost.
+async fn wait_for_no_lost_edit(
+    row_name: &str,
+    devices: &[TestDevice],
+    active_refs: &[&TestDevice],
+    op_level: u8,
+    path_level: u8,
+    excluded_idx: Option<usize>,
+    timeout: Duration,
+) {
+    wait_until_with_context(
+        || {
+            lost_edit(devices, op_level, path_level, excluded_idx, &union_of_trees(active_refs))
+                .is_none()
+        },
+        timeout,
+        || {
+            format!(
+                "{row_name}: {:?}; {}",
+                lost_edit(
+                    devices,
+                    op_level,
+                    path_level,
+                    excluded_idx,
+                    &union_of_trees(active_refs)
+                ),
+                tree_dump(active_refs)
+            )
+        },
+    )
+    .await;
+}
+
 /// Factor A's partition/reconnect timing around two rounds of Factor-B/C-
 /// driven operations (staggered per Factor E), applies Factor D's churn
 /// action between the two rounds, waits for convergence, then asserts both
@@ -789,30 +857,8 @@ async fn run_taguchi_v3_row(
     // freshly offline for 2/3/4). The mesh is already fully connected (see
     // `n_synced_devices`), so a revoke here tears a live, established
     // session down rather than merely preventing a connection.
-    let mut excluded_idx: Option<usize> = None;
-    let mut joined_device: Option<TestDevice> = None;
-    match churn_level {
-        1 | 2 => {}
-        3 => {
-            let new_device =
-                setup_device(&fake, &format!("{row_name}-device-churn-join"), &[group_id]).await;
-            // The joiner arrives after `n_synced_devices` ran its
-            // advertisement, so nobody knows where its reconciliation
-            // substrate answers and it knows where nobody else's does.
-            // Re-including the existing devices is idempotent.
-            let mut states: Vec<&std::sync::Arc<DaemonState>> =
-                devices.iter().map(|device| &device.state).collect();
-            states.push(&new_device.state);
-            support::advertise_substrate_between(&states).await;
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            joined_device = Some(new_device);
-        }
-        4 => {
-            fake.revoke(&devices[device_count - 1].device_id, group_id);
-            excluded_idx = Some(device_count - 1);
-        }
-        _ => unreachable!(),
-    }
+    let (excluded_idx, joined_device) =
+        apply_churn(&fake, &devices, churn_level, row_name, group_id).await;
 
     apply_round_for_devices(&devices, path_level, op_level, 1, stagger).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -845,31 +891,14 @@ async fn run_taguchi_v3_row(
     if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
         "conflict convergence requires durable namespace replacement",
     ) {
-        wait_until_with_context(
-            || {
-                lost_edit(
-                    &devices,
-                    op_level,
-                    path_level,
-                    excluded_idx,
-                    &union_of_trees(&active_refs),
-                )
-                .is_none()
-            },
+        wait_for_no_lost_edit(
+            row_name,
+            &devices,
+            &active_refs,
+            op_level,
+            path_level,
+            excluded_idx,
             timeout,
-            || {
-                format!(
-                    "{row_name}: {:?}; {}",
-                    lost_edit(
-                        &devices,
-                        op_level,
-                        path_level,
-                        excluded_idx,
-                        &union_of_trees(&active_refs)
-                    ),
-                    tree_dump(&active_refs)
-                )
-            },
         )
         .await;
         return;

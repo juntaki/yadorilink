@@ -1643,8 +1643,8 @@ impl LocalChangeProcessor {
                             self.state.canonical_current_row(group_id, &rel_path)?.as_ref(),
                         );
                         let on_disk_unix_mode = self.captured_unix_mode(metadata, &predecessor);
-                        let (indexed_unix_mode, indexed_xattrs) =
-                            (predecessor.unix_mode, predecessor.xattrs.clone());
+                        let indexed_unix_mode = predecessor.unix_mode;
+                        let indexed_xattrs = predecessor.xattrs.clone();
                         // Same reasoning as the exec-bit check just
                         // above, for extended attributes: an
                         // offline `setxattr`-only edit changes neither
@@ -1757,12 +1757,8 @@ impl LocalChangeProcessor {
                 // metadata, never content integrity. Never scanned for a
                 // symlink, matching `unix_mode`'s own `None` there.
                 let xattrs = if classification.is_none() {
-                    self.captured_xattrs(
-                        path,
-                        &Predecessor::of_row(
-                            self.state.canonical_current_row(group_id, &rel_path)?.as_ref(),
-                        ),
-                    )
+                    let row = self.state.canonical_current_row(group_id, &rel_path)?;
+                    self.captured_xattrs(path, &Predecessor::of_row(row.as_ref()))
                 } else {
                     Vec::new()
                 };
