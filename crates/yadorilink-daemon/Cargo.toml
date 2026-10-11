@@ -90,6 +90,7 @@ yadorilink-sync-substrate = { path = "../yadorilink-sync-substrate" }
 # doc comment.
 yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
 yadorilink-peer-session = { path = "../yadorilink-peer-session" }
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync" }
 yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }

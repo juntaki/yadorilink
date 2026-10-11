@@ -8,7 +8,7 @@
 //! (`concurrent_create_of_a_windows_reserved_ basename`,
 //! `concurrent_create_with_trailing_dot_or_space`,
 //! `concurrent_create_with_illegal_windows_characters`) all trip
-//! `yadorilink_root_authority::reserved_namespace::path_has_non_
+//! `yadorilink_fs_platform::reserved_namespace::path_has_non_
 //! portable_wire_component`, invoked via `yadorilink_sync_sqlite::
 //! dag_store::serving_authorization_index::validate_no_reserved_paths`.
 //! Per that function's own doc comment, this check is **platform-independent** (never gated on

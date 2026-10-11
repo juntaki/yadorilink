@@ -2,7 +2,7 @@
 
 use super::*;
 use std::sync::Mutex;
-use yadorilink_root_authority::fs_identity::{FileIdentity, ObjectKind};
+use yadorilink_fs_platform::fs_identity::{FileIdentity, ObjectKind};
 
 /// One call the materializer made on its structural-directory ledger, and
 /// what was on disk at the path when it made it.
@@ -926,7 +926,7 @@ fn staged_file(dir: &Path, name: &str, bytes: &[u8], ledger: &HeldLedger) -> Pat
 
 #[test]
 fn a_reconstructed_file_is_published_by_a_durable_move_and_its_record_released() {
-    use yadorilink_root_authority::durable_dir::trace::{self, Event};
+    use yadorilink_fs_platform::durable_dir::trace::{self, Event};
     let dir = tempfile::tempdir().unwrap();
     let (out, ledger) = (dir.path().join("f"), HeldLedger::default());
     fs::write(&out, b"old").unwrap();
@@ -951,7 +951,7 @@ fn a_reconstructed_file_is_published_by_a_durable_move_and_its_record_released()
 /// after it, the new file. Neither leaves the path without content.
 #[test]
 fn a_crash_around_the_publish_leaves_the_old_or_the_new_file() {
-    use yadorilink_root_authority::durable_dir::{arm_failpoint, disarm_failpoint, NsFailpoint};
+    use yadorilink_fs_platform::durable_dir::{arm_failpoint, disarm_failpoint, NsFailpoint};
     for (failpoint, expected, record_held) in
         [(NsFailpoint::BeforeMove, &b"old"[..], true), (NsFailpoint::AfterMove, b"new", true)]
     {
@@ -975,7 +975,7 @@ fn a_crash_around_the_publish_leaves_the_old_or_the_new_file() {
 #[cfg(unix)]
 #[test]
 fn a_symlink_is_published_by_a_durable_move() {
-    use yadorilink_root_authority::durable_dir::trace::{self, Event};
+    use yadorilink_fs_platform::durable_dir::trace::{self, Event};
     let dir = tempfile::tempdir().unwrap();
     let (out, ledger) = (dir.path().join("l"), HeldLedger::default());
     trace::take();
@@ -990,7 +990,7 @@ fn a_symlink_is_published_by_a_durable_move() {
 
 #[test]
 fn directories_are_published_by_durable_moves_and_their_stage_names_released() {
-    use yadorilink_root_authority::durable_dir::trace::{self, Event};
+    use yadorilink_fs_platform::durable_dir::trace::{self, Event};
     let root = tempfile::tempdir().unwrap();
     let canonical = fs::canonicalize(root.path()).unwrap();
     let ledger = RecordingLedger::over(&canonical);
@@ -1018,7 +1018,7 @@ fn directories_are_published_by_durable_moves_and_their_stage_names_released() {
 /// the writer leaving, as for any other failed `mkdir`.
 #[test]
 fn a_crash_between_the_stage_directory_and_its_publication_creates_nothing_visible() {
-    use yadorilink_root_authority::durable_dir::{arm_failpoint, disarm_failpoint, NsFailpoint};
+    use yadorilink_fs_platform::durable_dir::{arm_failpoint, disarm_failpoint, NsFailpoint};
     let root = tempfile::tempdir().unwrap();
     let canonical = fs::canonicalize(root.path()).unwrap();
     let ledger = RecordingLedger::over(&canonical);
@@ -1040,7 +1040,7 @@ fn a_crash_between_the_stage_directory_and_its_publication_creates_nothing_visib
 
 #[test]
 fn remove_durably_removes_a_file_and_a_gone_file_is_fine() {
-    use yadorilink_root_authority::durable_dir::trace::{self, Event};
+    use yadorilink_fs_platform::durable_dir::trace::{self, Event};
     let dir = tempfile::tempdir().unwrap();
     let (file, ledger) = (dir.path().join("f"), HeldLedger::default());
     fs::write(&file, b"x").unwrap();
@@ -1073,7 +1073,7 @@ fn remove_durably_never_removes_a_directory() {
 
 #[test]
 fn a_no_replace_move_is_durable_and_refuses_an_occupied_name() {
-    use yadorilink_root_authority::durable_dir::trace::{self, Event};
+    use yadorilink_fs_platform::durable_dir::trace::{self, Event};
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = (dir.path().join("a"), dir.path().join("b"));
     fs::write(&a, b"a").unwrap();

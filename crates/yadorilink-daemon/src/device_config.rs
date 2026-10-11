@@ -71,7 +71,7 @@ pub fn link_overlaps_recovery_area(
         for name in rest.into_iter().rev() {
             resolved.push(name);
         }
-        PathBuf::from(yadorilink_root_authority::canonical_fold::canonical_fold(
+        PathBuf::from(yadorilink_fs_platform::canonical_fold::canonical_fold(
             &resolved.to_string_lossy(),
         ))
     };

@@ -517,8 +517,7 @@ fn repair_interrupted_materializations_inner(
                 return Ok(());
             };
             let identity =
-                match yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path)
-                {
+                match yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path) {
                     Ok(identity) => identity,
                     Err(e) => {
                         tracing::warn!(
@@ -1174,7 +1173,7 @@ fn repair_one_interrupted_single_object(
                 .as_ref()
                 .filter(|m| m.file_type().is_symlink())
                 .and_then(|_| std::fs::read_link(&out_path).ok())
-                .map(|t| yadorilink_root_authority::fs_identity::target_to_bytes(&t));
+                .map(|t| yadorilink_fs_platform::fs_identity::target_to_bytes(&t));
             on_disk_target.as_deref() == Some(target.as_slice())
         }
         None => {
@@ -1207,7 +1206,7 @@ fn repair_one_interrupted_single_object(
             return Ok(());
         };
         let identity =
-            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path).ok();
+            yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path).ok();
         let committed = state.commit_recovered_materialized_state(
             group_id,
             path,
@@ -1713,8 +1712,7 @@ pub fn reconcile_restore_operations(
                             .prove(&out_path, &operation.meta.xattrs)
                             .is_ok());
                 let identity = if metadata_proven {
-                    yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path)
-                        .ok()
+                    yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path).ok()
                 } else {
                     None
                 };
@@ -1863,7 +1861,7 @@ mod tests {
         fn complete(
             &self,
             rel_path: &str,
-            _identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+            _identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
         ) -> Result<(), yadorilink_local_storage::StorageError> {
             panic!("quarantining created a directory: {rel_path}")
         }

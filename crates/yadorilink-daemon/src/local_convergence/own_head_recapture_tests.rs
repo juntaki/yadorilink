@@ -532,6 +532,11 @@ async fn a_recapture_that_finds_nothing_newer_does_not_leave_the_path_retrying()
         "sanity: capture finds disk equal to the row"
     );
 
+    // Projecting the head over the row's bytes replaces the file, which needs
+    // durable namespace changes.
+    if !crate::test_support::windows_durability_gate_allows_tests("the head replacing the file") {
+        return;
+    }
     let mut settled = false;
     for _ in 0..3 {
         if reconcile_pass(&h, "notes.txt").await.is_settled("notes.txt") {

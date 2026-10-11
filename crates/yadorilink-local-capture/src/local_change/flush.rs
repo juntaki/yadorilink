@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use crate::error::LocalCaptureError;
 use yadorilink_filesystem_sync::debounce::DebounceFlush;
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
+use yadorilink_fs_platform::fs_identity::FileIdentity;
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_replica_domain::file::FileRecord;
-use yadorilink_root_authority::fs_identity::FileIdentity;
-use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_sync_sqlite::SyncSqliteError;
 
 use super::dirty_journal::dirty_kind_str;
@@ -746,7 +746,7 @@ pub(super) fn path_lock_order<S: AsRef<str>>(paths: impl IntoIterator<Item = S>)
     let mut by_lock_key = std::collections::BTreeMap::new();
     for path in paths {
         by_lock_key
-            .entry(yadorilink_root_authority::canonical_fold::canonical_fold(path.as_ref()))
+            .entry(yadorilink_fs_platform::canonical_fold::canonical_fold(path.as_ref()))
             .or_insert(path);
     }
     by_lock_key.into_values().collect()

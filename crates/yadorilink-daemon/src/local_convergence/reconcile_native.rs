@@ -133,8 +133,8 @@ struct RunIndependence {
 
 impl RunIndependence {
     fn conflicts_with_run(&self, path: &str) -> bool {
+        use yadorilink_fs_platform::canonical_fold::canonical_fold;
         use yadorilink_replica_domain::conflict::is_conflict_copy_of;
-        use yadorilink_root_authority::canonical_fold::canonical_fold;
         let own = canonical_fold(path);
         // An entry that folds onto the directory another entry lives in, or the
         // reverse, is the same kind of collision.
@@ -148,7 +148,7 @@ impl RunIndependence {
     }
 
     fn admit(&mut self, path: &str) {
-        use yadorilink_root_authority::canonical_fold::canonical_fold;
+        use yadorilink_fs_platform::canonical_fold::canonical_fold;
         self.names.insert(canonical_fold(path));
         self.ancestors.extend(proper_ancestors(path).map(canonical_fold));
         self.paths.push(path.to_owned());

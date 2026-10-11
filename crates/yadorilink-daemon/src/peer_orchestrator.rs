@@ -1138,10 +1138,10 @@ fn save_key_pins(path: PathBuf, pins: &HashMap<String, String>) -> Result<(), Da
         file.sync_all()?;
     }
     // Published by a durable move: a pinned key does not revert after a power loss.
-    yadorilink_root_authority::durable_dir::publish_durably(
+    yadorilink_fs_platform::durable_dir::publish_durably(
         &tmp_path,
         &path,
-        yadorilink_root_authority::durable_dir::Replace::Yes,
+        yadorilink_fs_platform::durable_dir::Replace::Yes,
     )?;
     Ok(())
 }

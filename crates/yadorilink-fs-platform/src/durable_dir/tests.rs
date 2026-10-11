@@ -341,7 +341,12 @@ fn a_unix_volume_is_probed_once_and_leaves_nothing_behind() {
 
 // --- the power-loss model (M series) ---
 
+// Windows takes no directory flush (it has only the write-through move), so the
+// directory-sync profile describes the Unix mechanism alone.
+#[cfg(unix)]
 const PROFILES: [Profile; 2] = [Profile::WriteThroughMove, Profile::DirectorySync];
+#[cfg(not(unix))]
+const PROFILES: [Profile; 1] = [Profile::WriteThroughMove];
 
 #[test]
 fn m1_a_created_file_is_never_torn_and_is_durable_when_the_call_returns() {

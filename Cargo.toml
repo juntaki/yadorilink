@@ -8,6 +8,7 @@ members = [
     "crates/yadorilink-dcf-oracle",
     "crates/yadorilink-peer-session",
     "crates/yadorilink-replica-engine",
+    "crates/yadorilink-fs-platform",
     "crates/yadorilink-root-authority",
     "crates/yadorilink-sqlite-runtime",
     "crates/yadorilink-sync-sqlite",
@@ -54,6 +55,7 @@ yadorilink-transport = { path = "crates/yadorilink-transport" }
 yadorilink-replica-domain = { path = "crates/yadorilink-replica-domain" }
 yadorilink-namespace = { path = "crates/yadorilink-namespace" }
 yadorilink-replica-engine = { path = "crates/yadorilink-replica-engine" }
+yadorilink-fs-platform = { path = "crates/yadorilink-fs-platform" }
 yadorilink-root-authority = { path = "crates/yadorilink-root-authority" }
 yadorilink-peer-session = { path = "crates/yadorilink-peer-session" }
 yadorilink-sqlite-runtime = { path = "crates/yadorilink-sqlite-runtime" }

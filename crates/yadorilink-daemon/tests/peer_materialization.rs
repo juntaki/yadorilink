@@ -2046,8 +2046,8 @@ mod exact_version_hash_tests {
             )
         };
 
-        let artefact_path = yadorilink_root_authority::reserved_namespace::artefact_component_name(
-            yadorilink_root_authority::reserved_namespace::ArtefactKind::Stage,
+        let artefact_path = yadorilink_fs_platform::reserved_namespace::artefact_component_name(
+            yadorilink_fs_platform::reserved_namespace::ArtefactKind::Stage,
             "deadbeef",
         )
         .unwrap();
@@ -2926,8 +2926,8 @@ mod exact_version_hash_tests {
 
             let artefact_path = format!(
                 "{}{suffix}",
-                yadorilink_root_authority::reserved_namespace::artefact_component_name(
-                    yadorilink_root_authority::reserved_namespace::ArtefactKind::Stage,
+                yadorilink_fs_platform::reserved_namespace::artefact_component_name(
+                    yadorilink_fs_platform::reserved_namespace::ArtefactKind::Stage,
                     "deadbeef",
                 )
                 .unwrap()
@@ -3308,8 +3308,8 @@ mod exact_version_hash_tests {
 
         let artefact_path = format!(
             "{}::$DATA",
-            yadorilink_root_authority::reserved_namespace::artefact_component_name(
-                yadorilink_root_authority::reserved_namespace::ArtefactKind::Stage,
+            yadorilink_fs_platform::reserved_namespace::artefact_component_name(
+                yadorilink_fs_platform::reserved_namespace::ArtefactKind::Stage,
                 "deadbeef",
             )
             .unwrap()
@@ -3386,8 +3386,8 @@ mod exact_version_hash_tests {
 
         let artefact_path = format!(
             "safe\\{}",
-            yadorilink_root_authority::reserved_namespace::artefact_component_name(
-                yadorilink_root_authority::reserved_namespace::ArtefactKind::Preimage,
+            yadorilink_fs_platform::reserved_namespace::artefact_component_name(
+                yadorilink_fs_platform::reserved_namespace::ArtefactKind::Preimage,
                 "cafef00d",
             )
             .unwrap()

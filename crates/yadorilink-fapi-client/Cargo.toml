@@ -27,7 +27,7 @@ test-support = []
 
 [dependencies]
 # The durable publish of the credential file (`durable_dir::publish_durably`).
-yadorilink-root-authority = { path = "../yadorilink-root-authority" }
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 # ES256 (ECDSA over P-256) is the *only* client-authentication signature
 # algorithm this Authorization Server accepts -- it advertises
 # `token_endpoint_auth_signing_alg_values_supported: ["ES256"]` and rejects

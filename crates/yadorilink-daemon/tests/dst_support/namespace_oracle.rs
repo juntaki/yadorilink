@@ -50,11 +50,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
+use yadorilink_fs_platform::reserved_namespace::is_reserved_component;
 use yadorilink_replica_domain::conflict::is_conflict_copy_of;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME;
 use yadorilink_replica_engine::conflict::PathHead;
-use yadorilink_root_authority::reserved_namespace::is_reserved_component;
 use yadorilink_root_authority::sync_root_lock::SYNC_ROOT_LOCK_FILE_NAME;
 
 /// The per-device sync-root identity marker. Device-local by design, so it

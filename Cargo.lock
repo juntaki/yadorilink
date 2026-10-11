@@ -9171,6 +9171,7 @@ dependencies = [
  "yadorilink-daemon",
  "yadorilink-fapi-client",
  "yadorilink-filesystem-sync",
+ "yadorilink-fs-platform",
  "yadorilink-ipc-proto",
  "yadorilink-local-storage",
  "yadorilink-replica-domain",
@@ -9196,11 +9197,11 @@ dependencies = [
  "windows-sys 0.59.0",
  "wiremock",
  "yadorilink-fapi-client",
+ "yadorilink-fs-platform",
  "yadorilink-ipc-proto",
  "yadorilink-local-storage",
  "yadorilink-product-view",
  "yadorilink-reporting",
- "yadorilink-root-authority",
  "yadorilink-transport",
 ]
 
@@ -9244,6 +9245,7 @@ dependencies = [
  "yadorilink-daemon",
  "yadorilink-fapi-client",
  "yadorilink-filesystem-sync",
+ "yadorilink-fs-platform",
  "yadorilink-http-api",
  "yadorilink-ipc-proto",
  "yadorilink-lane-ports",
@@ -9321,7 +9323,7 @@ dependencies = [
  "uuid",
  "wiremock",
  "yadorilink-fapi-client",
- "yadorilink-root-authority",
+ "yadorilink-fs-platform",
 ]
 
 [[package]]
@@ -9340,11 +9342,29 @@ dependencies = [
  "tracing-subscriber",
  "walkdir",
  "yadorilink-daemon",
+ "yadorilink-fs-platform",
  "yadorilink-local-storage",
  "yadorilink-peer-session",
  "yadorilink-replica-domain",
  "yadorilink-replica-engine",
  "yadorilink-root-authority",
+]
+
+[[package]]
+name = "yadorilink-fs-platform"
+version = "0.1.0"
+dependencies = [
+ "caseless",
+ "libc",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "unicode-normalization",
+ "windows-sys 0.59.0",
+ "yadorilink-fs-platform",
+ "yadorilink-replica-domain",
 ]
 
 [[package]]
@@ -9422,6 +9442,7 @@ dependencies = [
  "walkdir",
  "yadorilink-daemon",
  "yadorilink-filesystem-sync",
+ "yadorilink-fs-platform",
  "yadorilink-local-capture",
  "yadorilink-local-storage",
  "yadorilink-replica-domain",
@@ -9450,6 +9471,7 @@ dependencies = [
  "tracing",
  "walkdir",
  "windows-sys 0.59.0",
+ "yadorilink-fs-platform",
  "yadorilink-replica-domain",
  "yadorilink-root-authority",
  "yadorilink-sqlite-runtime",
@@ -9486,6 +9508,7 @@ dependencies = [
  "unicode-normalization",
  "yadorilink-daemon",
  "yadorilink-filesystem-sync",
+ "yadorilink-fs-platform",
  "yadorilink-ipc-proto",
  "yadorilink-lane-ports",
  "yadorilink-local-capture",
@@ -9544,14 +9567,13 @@ dependencies = [
  "tracing",
  "uuid",
  "wiremock",
- "yadorilink-root-authority",
+ "yadorilink-fs-platform",
 ]
 
 [[package]]
 name = "yadorilink-root-authority"
 version = "0.1.0"
 dependencies = [
- "caseless",
  "fs2",
  "hex",
  "libc",
@@ -9563,9 +9585,8 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "unicode-normalization",
- "windows-sys 0.59.0",
  "yadorilink-daemon",
+ "yadorilink-fs-platform",
  "yadorilink-replica-domain",
  "yadorilink-root-authority",
 ]
@@ -9605,7 +9626,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "yadorilink-root-authority",
+ "yadorilink-fs-platform",
 ]
 
 [[package]]
@@ -9646,6 +9667,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "windows-sys 0.59.0",
+ "yadorilink-fs-platform",
  "yadorilink-local-storage",
  "yadorilink-namespace",
  "yadorilink-replica-domain",
@@ -9700,8 +9722,8 @@ dependencies = [
  "tracing-subscriber",
  "turmoil",
  "windows-sys 0.59.0",
+ "yadorilink-fs-platform",
  "yadorilink-ipc-proto",
- "yadorilink-root-authority",
  "zeroize",
 ]
 

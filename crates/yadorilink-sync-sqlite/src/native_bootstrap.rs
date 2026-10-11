@@ -535,7 +535,7 @@ fn verify_bundle_closures(
 /// empty, absolute, with an empty or dot component, or a path the admission of a
 /// delta refuses (reserved or non-portable names).
 pub(crate) fn projection_name_refusal(name: &str) -> Option<&'static str> {
-    use yadorilink_root_authority::reserved_namespace::{
+    use yadorilink_fs_platform::reserved_namespace::{
         wire_path_admission_refusal, WirePathRefusal,
     };
     if name.is_empty() || name.starts_with('/') || name.contains('\\') || name.contains('\0') {

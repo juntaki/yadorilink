@@ -1478,6 +1478,10 @@ fn probe_metadata_fidelity(dir: &Path) -> Capability {
     if let Ok(metadata) = std::fs::metadata(&path) {
         let mut permissions = metadata.permissions();
         if permissions.readonly() {
+            // The read-only attribute is the Windows file attribute here; the
+            // lint's Unix world-writable concern does not apply to a probe
+            // artefact this process created.
+            #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
             let _ = std::fs::set_permissions(&path, permissions);
         }

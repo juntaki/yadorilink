@@ -122,8 +122,8 @@ async fn wait_for_scan(conn: &rusqlite::Connection, what: &str) {
 /// That is a property of the volume, not of the code under test, which is
 /// why this gates rather than asserts.
 fn can_confirm_repeated_observation(dir: &std::path::Path) -> bool {
-    use yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity;
-    use yadorilink_root_authority::fs_identity::{FileIdentity, IdentityComparison};
+    use yadorilink_fs_platform::fs_capabilities::probe_birth_time_granularity;
+    use yadorilink_fs_platform::fs_identity::{FileIdentity, IdentityComparison};
     let probe = dir.join(".yadorilink-identity-probe");
     if std::fs::write(&probe, b"probe").is_err() {
         return false;

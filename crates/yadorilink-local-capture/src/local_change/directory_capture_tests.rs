@@ -7,7 +7,7 @@
 //! structural-origin ledger, never from what is on disk.
 
 use super::*;
-use yadorilink_root_authority::fs_identity::FileIdentity;
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 
 pub(super) const GROUP: &str = "group-1";
 

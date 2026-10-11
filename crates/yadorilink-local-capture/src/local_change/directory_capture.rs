@@ -22,6 +22,10 @@ use std::path::Path;
 
 use crate::error::LocalCaptureError;
 use crate::ports::CapturedDirectory;
+use yadorilink_fs_platform::fs_identity::{
+    disk_race_fingerprint, FileIdentity, IdentityComparison,
+};
+use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
 use yadorilink_local_storage::{read_replicated_xattrs, unix_mode_from_metadata};
 use yadorilink_replica_domain::file::{FileRecord, FileVersion, RecordKind};
 use yadorilink_replica_domain::ids::SyncPath;
@@ -30,12 +34,6 @@ use yadorilink_replica_domain::native_state::NativeCaptureWitness;
 use yadorilink_replica_domain::recursive_operation::is_ancestor_or_self;
 use yadorilink_replica_domain::session_state::{
     LocalFileMetaColumns, MaterializationState, PreparedLocalMutation,
-};
-use yadorilink_root_authority::fs_identity::{
-    disk_race_fingerprint, FileIdentity, IdentityComparison,
-};
-use yadorilink_root_authority::ignore_patterns::{
-    is_ignore_file_relative_path, EffectiveIgnoreSet,
 };
 use yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence;
 use yadorilink_sync_sqlite::structural_origin::{
@@ -96,7 +94,7 @@ pub(super) fn directory_entry(
 /// one recorded as `recorded` had.
 #[cfg(unix)]
 fn permission_bits_changed(recorded: &FileIdentity, lstat: &std::fs::Metadata) -> bool {
-    yadorilink_root_authority::fs_identity::directory_permission_bits_changed(recorded, lstat)
+    yadorilink_fs_platform::fs_identity::directory_permission_bits_changed(recorded, lstat)
 }
 
 #[cfg(not(unix))]
@@ -347,7 +345,7 @@ impl LocalChangeProcessor {
         // The proof names the directory only if it is still the directory
         // the verdict was taken on, with the mode being authored.
         let identity = FileIdentity::observe_path(event_path).ok().filter(|identity| {
-            identity.object_kind == yadorilink_root_authority::fs_identity::ObjectKind::Directory
+            identity.object_kind == yadorilink_fs_platform::fs_identity::ObjectKind::Directory
                 && std::fs::symlink_metadata(event_path)
                     .is_ok_and(|now| now.is_dir() && unix_mode_from_metadata(&now) == unix_mode)
         });
@@ -429,9 +427,9 @@ impl LocalChangeProcessor {
         match rename_to {
             None => {
                 // The caller holds this one.
-                let held = yadorilink_root_authority::canonical_fold::canonical_fold(rel_path);
+                let held = yadorilink_fs_platform::canonical_fold::canonical_fold(rel_path);
                 to_lock.retain(|path| {
-                    yadorilink_root_authority::canonical_fold::canonical_fold(path) != held
+                    yadorilink_fs_platform::canonical_fold::canonical_fold(path) != held
                 });
             }
             Some(to) => {
@@ -675,7 +673,7 @@ impl LocalChangeProcessor {
                 .ok()
                 .filter(|identity| {
                     identity.object_kind
-                        == yadorilink_root_authority::fs_identity::ObjectKind::Directory
+                        == yadorilink_fs_platform::fs_identity::ObjectKind::Directory
                         && std::fs::symlink_metadata(&dest_abs).is_ok_and(|now| {
                             now.is_dir() && unix_mode_from_metadata(&now) == unix_mode
                         })

@@ -547,32 +547,62 @@ async fn run_taguchi_v2_row(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_v2_row_01_size_tiny_pattern_text_path_flat_exec_never_churn_none() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_taguchi_v2_row("taguchi-v2-01", 1, 1, 1, 1, 1).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_v2_row_02_size_tiny_pattern_binary_path_sub_exec_all_true_churn_join() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_taguchi_v2_row("taguchi-v2-02", 1, 2, 2, 2, 2).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_v2_row_03_size_tiny_pattern_compressible_path_deep_exec_alternate_churn_revoke() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_taguchi_v2_row("taguchi-v2-03", 1, 3, 3, 3, 3).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_v2_row_04_size_tiny_pattern_incompressible_path_shared_dir_exec_toggle_churn_remove(
 ) {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_taguchi_v2_row("taguchi-v2-04", 1, 4, 4, 4, 4).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_v2_row_05_size_small_pattern_text_path_sub_exec_alternate_churn_remove() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_taguchi_v2_row("taguchi-v2-05", 2, 1, 2, 3, 4).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_v2_row_06_size_small_pattern_binary_path_flat_exec_toggle_churn_revoke() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_taguchi_v2_row("taguchi-v2-06", 2, 2, 1, 4, 3).await;
 }
 

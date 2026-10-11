@@ -120,7 +120,7 @@ pub(crate) enum TombstoneRemoval {
     /// the index holds a file), which is kept for good.
     Retained {
         reason: &'static str,
-        removable: Option<Box<yadorilink_root_authority::fs_identity::FileIdentity>>,
+        removable: Option<Box<yadorilink_fs_platform::fs_identity::FileIdentity>>,
     },
 }
 
@@ -237,7 +237,7 @@ pub enum SettlementEvidence {
         // Boxed to keep this variant's size close to the other arms'
         // (clippy large_enum_variant): `FileIdentity` is comparatively
         // large and only this arm carries it.
-        identity: Box<Option<yadorilink_root_authority::fs_identity::FileIdentity>>,
+        identity: Box<Option<yadorilink_fs_platform::fs_identity::FileIdentity>>,
         mutation_generation: i64,
     },
     /// Disk holds the exact desired absence: a tombstone deletion
@@ -250,7 +250,7 @@ pub enum SettlementEvidence {
     /// relocated beside it). Same `mutation_generation` contract as
     /// `ExactObject`.
     StructuralDirectory {
-        identity: Box<Option<yadorilink_root_authority::fs_identity::FileIdentity>>,
+        identity: Box<Option<yadorilink_fs_platform::fs_identity::FileIdentity>>,
         mutation_generation: i64,
     },
     /// A policy-authorized deferral: an on-demand placeholder was
@@ -843,8 +843,7 @@ pub(crate) fn materialize_symlink_at(
     // has landed yet. Dropping the guard unclear is safe -- it has no
     // `Drop` behaviour of its own; the commit below owns the clear.
     let version = written.version_hash;
-    let identity =
-        yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path).ok();
+    let identity = yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path).ok();
     if !state.commit_internal_materialized_state_if_fence_current(
         group_id,
         &record.path,
@@ -1492,7 +1491,7 @@ pub(crate) fn hazard_reason_for_volume(
     // (`hazard_reason_for_siblings`), each answered by an index lookup on the
     // key stored with every row instead of by folding every sibling.
     if volume.case_insensitive {
-        let folded = yadorilink_root_authority::canonical_fold::case_fold(path);
+        let folded = yadorilink_fs_platform::canonical_fold::case_fold(path);
         let matches = state.name_fold_matches(group_id, NameFoldKey::Case, &folded, path)?;
         if let Some(colliding) = matches.first() {
             return Ok(held(hazard::HELD_REASON_CASE_COLLISION, colliding));
@@ -1500,13 +1499,13 @@ pub(crate) fn hazard_reason_for_volume(
     }
     // Both remaining checks match on the combined key: two names equal under
     // NFC alone are equal under it, and the combined check is it exactly.
-    let canonical = yadorilink_root_authority::canonical_fold::canonical_fold(path);
+    let canonical = yadorilink_fs_platform::canonical_fold::canonical_fold(path);
     let candidates = state.name_fold_matches(group_id, NameFoldKey::Canonical, &canonical, path)?;
     if volume.normalization_insensitive {
-        let nfc = yadorilink_root_authority::canonical_fold::nfc(path);
+        let nfc = yadorilink_fs_platform::canonical_fold::nfc(path);
         if let Some(colliding) = candidates
             .iter()
-            .find(|sibling| yadorilink_root_authority::canonical_fold::nfc(sibling) == nfc)
+            .find(|sibling| yadorilink_fs_platform::canonical_fold::nfc(sibling) == nfc)
         {
             return Ok(held(hazard::HELD_REASON_NORMALIZATION_COLLISION, colliding));
         }

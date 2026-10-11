@@ -19,7 +19,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use yadorilink_root_authority::durable_dir::{publish_durably, remove_file_durably, Replace};
+use yadorilink_fs_platform::durable_dir::{publish_durably, remove_file_durably, Replace};
 
 use super::{StoreError, StoreResult};
 

@@ -21,6 +21,7 @@ test-support = [
 # See `yadorilink_filesystem_sync::debounce`'s own doc comment.
 yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync" }
 yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 yadorilink-local-storage = { path = "../yadorilink-local-storage" }
 yadorilink-sync-sqlite = { path = "../yadorilink-sync-sqlite" }

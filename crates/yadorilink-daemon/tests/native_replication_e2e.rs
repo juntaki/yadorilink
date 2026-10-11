@@ -84,6 +84,11 @@ async fn a_remote_write_reaches_the_peers_native_state() {
 /// keeps one head.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_writes_are_forked_into_an_ordinary_copy_on_both_devices() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     setup();
     let (a, b) = two().await;
     write(&a, "c.txt", b"base");
@@ -111,6 +116,11 @@ async fn concurrent_writes_are_forked_into_an_ordinary_copy_on_both_devices() {
 /// device, whichever device wrote it: the copy is an ordinary entry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deleting_a_conflict_copy_removes_it_on_both_devices() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the deletion reaching the original",
+    ) {
+        return;
+    }
     setup();
     let (a, b) = two().await;
     write(&a, "c.txt", b"base");
@@ -177,31 +187,57 @@ async fn relinking_after_unlink_authors_local_differences_as_concurrent_changes(
     // Relink the same folder and reconnect.
     link_eager(&a, GROUP);
     pair(&a, &b, GROUP).await;
-    let tree = converge_where(&[&a, &b], "the unlinked-time changes merge", |tree| {
-        tree.get("w.txt").is_some()
-            && tree.get("y.txt").is_some()
-            && conflict_copies(tree).len() == 1
-    })
-    .await;
-    captured(&a, GROUP).await;
-    native_converged(&a, &b, "native state converges").await;
 
-    assert_eq!(tree["x.txt"], b"x1", "B's unobserved new version of x survives A's delete");
-    assert_eq!(tree["y.txt"], b"y-from-b", "B's new file arrives");
-    assert_eq!(tree["w.txt"], b"w-from-a", "A's new file syncs");
-    let z_copy = conflict_copies(&tree).remove(0);
-    let mut z_versions = [tree["z.txt"].clone(), tree[&z_copy].clone()];
-    z_versions.sort();
-    assert_eq!(
-        z_versions,
-        [b"z-from-a".to_vec(), b"z-from-b".to_vec()],
-        "both concurrent edits of z are preserved"
+    // A platform without durable namespace changes cannot finish the conflict
+    // on z (the winner replacing the loser's original), so there only the
+    // safety properties are checked, after the creations have propagated and
+    // the native state has converged.
+    let resolves_conflicts = yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the conflict winner replacing the loser's original",
     );
+    let tree = if resolves_conflicts {
+        let tree = converge_where(&[&a, &b], "the unlinked-time changes merge", |tree| {
+            tree.get("w.txt").is_some()
+                && tree.get("y.txt").is_some()
+                && conflict_copies(tree).len() == 1
+        })
+        .await;
+        captured(&a, GROUP).await;
+        native_converged(&a, &b, "native state converges").await;
+        Some(tree)
+    } else {
+        support::wait_until_with_context(
+            || tree(&a).contains_key("y.txt") && tree(&b).contains_key("w.txt"),
+            std::time::Duration::from_secs(60),
+            || format!("A: {:?}; B: {:?}", tree(&a).keys(), tree(&b).keys()),
+        )
+        .await;
+        captured(&a, GROUP).await;
+        native_converged(&a, &b, "native state converges").await;
+        None
+    };
+
+    // B's unobserved new version of x survives A's delete, in B's folder and
+    // as the one head A's delete left.
+    assert_eq!(tree_of(b.root.path())["x.txt"], b"x1", "B's unobserved new version of x survives");
+    assert_eq!(tree_of(a.root.path())["y.txt"], b"y-from-b", "B's new file arrives");
+    assert_eq!(tree_of(b.root.path())["w.txt"], b"w-from-a", "A's new file syncs");
     assert_eq!(
         native_head_count(&a, "x.txt"),
         1,
         "A's delete removed only the head it had observed"
     );
+    if let Some(tree) = tree {
+        assert_eq!(tree["x.txt"], b"x1", "B's unobserved new version of x survives A's delete");
+        let z_copy = conflict_copies(&tree).remove(0);
+        let mut z_versions = [tree["z.txt"].clone(), tree[&z_copy].clone()];
+        z_versions.sort();
+        assert_eq!(
+            z_versions,
+            [b"z-from-a".to_vec(), b"z-from-b".to_vec()],
+            "both concurrent edits of z are preserved"
+        );
+    }
 
     // A's history survived the unlink and relink: every version of x it
     // recorded before is still listed (its state moves on, its content hash
@@ -274,6 +310,11 @@ async fn edits_and_deletes_made_while_a_device_was_stopped_reach_its_peer_after_
 /// both sides keep their bytes through the ordinary conflict path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_offline_edit_racing_a_peer_edit_keeps_both_versions_as_a_normal_conflict() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 
     setup();

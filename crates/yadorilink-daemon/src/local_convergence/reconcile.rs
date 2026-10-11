@@ -15,9 +15,9 @@ use yadorilink_replica_domain::session_state::MaterializationPolicy;
 
 use super::types::*;
 use super::{mode_and_xattrs_match_disk, Election, OwnCaptureOnDisk, OwnCaptureRule, Recapture};
+use yadorilink_fs_platform::fs_identity::disk_race_fingerprint;
 use yadorilink_peer_session::peer_session::*;
 use yadorilink_replica_domain::native_plan::{NativePlannedNode, NativeRowIdentity};
-use yadorilink_root_authority::fs_identity::disk_race_fingerprint;
 
 impl super::LocalConvergenceExecutor {
     /// [`Self::block_requirement_for`] once the version is in hand.
@@ -483,7 +483,7 @@ impl super::LocalConvergenceExecutor {
             kind,
             version,
             identity: Box::new(
-                yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path).ok(),
+                yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path).ok(),
             ),
             mutation_generation,
         }))
@@ -955,7 +955,7 @@ impl super::LocalConvergenceExecutor {
                 group_id,
                 target_path,
                 version_hash,
-                yadorilink_root_authority::fs_identity::FileIdentity::observe_path(out_path).ok(),
+                yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(out_path).ok(),
                 &permit,
             )
             .map_err(|error| PeerSessionError::from(crate::sync_error::SyncError::from(error)))
@@ -1436,7 +1436,7 @@ impl super::LocalConvergenceExecutor {
                         kind: RecordKind::File,
                         version: version_hash,
                         identity: Box::new(
-                            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
+                            yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(
                                 &out_path,
                             )
                             .ok(),
@@ -1530,7 +1530,7 @@ impl super::LocalConvergenceExecutor {
                         kind: version.meta.record_kind,
                         version: version_hash,
                         identity: Box::new(
-                            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
+                            yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(
                                 &out_path,
                             )
                             .ok(),

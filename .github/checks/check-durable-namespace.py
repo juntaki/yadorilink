@@ -3,7 +3,7 @@
 
 A change to a name that the product's correctness rests on (a published file, a
 created or removed directory, a removed file whose absence is then recorded) goes
-through `yadorilink_root_authority::durable_dir`: a write-through move on Windows,
+through `yadorilink_fs_platform::durable_dir`: a write-through move on Windows,
 a rename or unlink plus a sync of the directories on Unix. Anything else that
 calls a raw rename, unlink, hard link or move, a Windows `MoveFileExW`,
 `FlushFileBuffers` or placeholder-creating API is a name the product does not
@@ -59,7 +59,7 @@ NAMES = (
 )
 PATTERN = _boundary.call_pattern(NAMES)
 SHELL_GLOB = "platforms/windows/shell/src/**/*.rs"
-GATE_FILE = "crates/yadorilink-root-authority/src/durable_dir.rs"
+GATE_FILE = "crates/yadorilink-fs-platform/src/durable_dir.rs"
 GATE = re.compile(r"WINDOWS_DIRECTORY_DURABILITY_VALIDATED\s*:\s*bool\s*=\s*(true|false)")
 
 C = "crates/"
@@ -67,15 +67,15 @@ S = "platforms/windows/shell/src/"
 
 ALLOWLIST: dict[str, dict[str, int]] = {
     # The durable steps themselves, and the throwaway artefacts of the probes.
-    C + "yadorilink-root-authority/src/durable_dir.rs": {
+    C + "yadorilink-fs-platform/src/durable_dir.rs": {
         "fs::hard_link": 1,
         "fs::remove_dir": 2,
         "fs::remove_file": 4,
         "fs::rename": 1,
     },
-    C + "yadorilink-root-authority/src/durable_dir/raw.rs": {"MoveFileExW": 1, "fs::rename": 1},
-    C + "yadorilink-root-authority/src/durable_dir/probe.rs": {"fs::remove_dir_all": 2},
-    C + "yadorilink-root-authority/src/fs_capabilities.rs": {"fs::remove_file": 20, "fs::rename": 1},
+    C + "yadorilink-fs-platform/src/durable_dir/raw.rs": {"MoveFileExW": 1, "fs::rename": 1},
+    C + "yadorilink-fs-platform/src/durable_dir/probe.rs": {"fs::remove_dir_all": 2},
+    C + "yadorilink-fs-platform/src/fs_capabilities.rs": {"fs::remove_file": 20, "fs::rename": 1},
     C + "yadorilink-peer-session/src/hazard.rs": {"fs::remove_dir_all": 1},
     # The local-storage seam: the removal and replace primitives behind the
     # durable operations, and the plain Windows rename a writer falls back to on
@@ -208,7 +208,7 @@ def evaluate(
         if key not in expected:
             errors.append(
                 f"{rel}:{lines}: `{api}` is not a durable namespace step and is not reviewed; "
-                "use `yadorilink_root_authority::durable_dir`, or add the site to ALLOWLIST "
+                "use `yadorilink_fs_platform::durable_dir`, or add the site to ALLOWLIST "
                 "with the reason losing it is harmless"
             )
         else:

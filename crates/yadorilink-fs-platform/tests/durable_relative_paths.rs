@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::Path;
 
-use yadorilink_root_authority::durable_dir::{
+use yadorilink_fs_platform::durable_dir::{
     move_durably, publish_durably, remove_file_durably, Replace,
 };
 

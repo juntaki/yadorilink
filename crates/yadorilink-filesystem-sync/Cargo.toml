@@ -8,6 +8,7 @@ license.workspace = true
 test-support = []
 
 [dependencies]
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 # `BlockReclamationStore`/`ContentHash`/`GcReport`/`StorageError` for
 # `block_deletion::sweep_globally_unreferenced_blocks` (7D-9C) — a pure leaf

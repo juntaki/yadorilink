@@ -53,7 +53,7 @@ pub enum AbandonedEviction {
     /// blocks), and observed its `identity`. The row goes back to
     /// `Present` with a proof of that version published under the live
     /// fence.
-    Intact { identity: yadorilink_root_authority::fs_identity::FileIdentity },
+    Intact { identity: yadorilink_fs_platform::fs_identity::FileIdentity },
     /// The placeholder write did not happen, but the file no longer
     /// verifies (a local edit or removal landed during the attempt) or
     /// could not be observed. The row goes back to `Present` without a
@@ -321,7 +321,7 @@ impl yadorilink_local_storage::StructuralDirectoryLedger for GroupStructuralLedg
     fn complete(
         &self,
         rel_path: &str,
-        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+        identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
     ) -> Result<(), yadorilink_local_storage::StorageError> {
         self.port
             .complete_structural_directory_origin(self.group_id, rel_path, identity)
@@ -649,7 +649,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
         &self,
         group_id: &str,
         path: &str,
-        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+        identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
     ) -> Result<(), MaterializationExecutionError>;
 
     /// Phase 2 of a structural `mkdir` that did not create the directory
@@ -688,7 +688,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
         group_id: &str,
         path: &str,
         sync_root: &Path,
-        observed: &yadorilink_root_authority::fs_identity::FileIdentity,
+        observed: &yadorilink_fs_platform::fs_identity::FileIdentity,
     ) -> Result<bool, MaterializationExecutionError>;
 
     /// Records the directory now at `path` (`identity`) as structural: its
@@ -699,7 +699,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
         &self,
         group_id: &str,
         path: &str,
-        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+        identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
     ) -> Result<(), MaterializationExecutionError>;
 
     /// Records that the directory at `path` stays on disk, settled, because
@@ -711,7 +711,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
         &self,
         group_id: &str,
         path: &str,
-        removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+        removable: Option<&yadorilink_fs_platform::fs_identity::FileIdentity>,
     ) -> Result<(), MaterializationExecutionError>;
 
     /// Settles a directory removed from disk: nothing is structural or
@@ -738,7 +738,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
     fn commit_restore_operation(
         &self,
         operation_id: &str,
-        identity: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+        identity: Option<&yadorilink_fs_platform::fs_identity::FileIdentity>,
         wrote_under_mutation_generation: Option<i64>,
         permit: &RootCommitPermit,
     ) -> Result<RestoreCommitOutcome, MaterializationExecutionError>;

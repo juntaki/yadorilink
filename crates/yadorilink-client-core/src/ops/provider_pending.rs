@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 /// Publishes the synced temp file over the pending file; durable when it returns.
 fn publish(staged: &Path, target: &Path) -> io::Result<()> {
-    use yadorilink_root_authority::durable_dir::{publish_durably, Replace};
+    use yadorilink_fs_platform::durable_dir::{publish_durably, Replace};
     publish_durably(staged, target, Replace::Yes)
 }
 

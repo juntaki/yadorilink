@@ -936,9 +936,7 @@ fn check_destination(
     new_path: &str,
     moving: Option<&str>,
 ) -> Result<(), ApplyError> {
-    if yadorilink_root_authority::reserved_namespace::wire_path_admission_refusal(new_path)
-        .is_some()
-    {
+    if yadorilink_fs_platform::reserved_namespace::wire_path_admission_refusal(new_path).is_some() {
         return Err(ApplyError::InvalidName("a reserved or non-portable name".into()));
     }
     let inside_moving = |path: &str| {

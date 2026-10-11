@@ -98,7 +98,7 @@ async fn scenario_body(seed: u64, trace: Trace) -> Result<(), String> {
 
     let (watch_source, events_tx) = SimulatedFolderWatchSource::new(64);
     let ignore_set =
-        Arc::new(yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet::defaults_only());
+        Arc::new(yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet::defaults_only());
     let watcher = watch_source.watch(&root, ignore_set).map_err(|e| format!("watch: {e}"))?;
     let (events_rx, overflowed, _guard) = watcher.split();
 

@@ -34,7 +34,7 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use yadorilink_filesystem_sync::debounce;
 use yadorilink_filesystem_sync::watcher::FolderWatchSource;
-use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 
 use crate::error::DaemonError;
 use crate::link_runtime::dependencies::LinkRuntimeDependencies;

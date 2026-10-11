@@ -396,7 +396,7 @@ pub fn real_entry_names(dir: &std::path::Path) -> Vec<String> {
             entries
                 .filter_map(|e| e.ok())
                 .filter(|e| {
-                    !yadorilink_root_authority::reserved_namespace::is_reserved_component(
+                    !yadorilink_fs_platform::reserved_namespace::is_reserved_component(
                         e.file_name().as_os_str(),
                     )
                 })

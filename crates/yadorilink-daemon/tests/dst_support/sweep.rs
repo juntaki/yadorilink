@@ -213,7 +213,7 @@ mod tests {
             "expected a reconstruction finding: {findings:?}"
         );
         assert!(
-            findings.iter().any(|f| f.detail.contains("orphaned")),
+            findings.iter().any(|f| f.detail.contains("removed a recorded temp file")),
             "expected a temp-file cleanup finding: {findings:?}"
         );
 

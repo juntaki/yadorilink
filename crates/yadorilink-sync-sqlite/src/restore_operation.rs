@@ -321,7 +321,7 @@ impl RestoreOperationRepository {
     pub fn commit_restore_operation(
         &self,
         operation_id: &str,
-        identity: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+        identity: Option<&yadorilink_fs_platform::fs_identity::FileIdentity>,
         wrote_under_mutation_generation: Option<i64>,
         permit: &RootCommitPermit,
     ) -> Result<RestoreCommitOutcome, SyncSqliteError> {

@@ -12,6 +12,7 @@ use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 use tempfile::TempDir;
 
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 use yadorilink_replica_domain::author::{AuthorId, IncarnationId};
 use yadorilink_replica_domain::file::{FileMeta, FileRecord, FileVersion, RecordKind};
 use yadorilink_replica_domain::ids::{AuthorSeq, DeviceId, FolderGroupId, SyncPath, VersionHash};
@@ -19,7 +20,6 @@ use yadorilink_replica_domain::local_op::Op;
 use yadorilink_replica_domain::native_state::DeltaHash;
 use yadorilink_replica_domain::session_state::{LocalFileMetaColumns, PreparedLocalMutation};
 use yadorilink_replica_domain::signed_delta::{DeltaOp, DeltaPut, NativeDelta};
-use yadorilink_root_authority::fs_identity::FileIdentity;
 use yadorilink_sqlite_runtime::SyncDatabase;
 
 use crate::error::SyncSqliteError;

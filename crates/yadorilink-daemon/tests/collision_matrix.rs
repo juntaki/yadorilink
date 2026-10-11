@@ -170,6 +170,11 @@ async fn wait_for_convergence(a: &TestDevice, b: &TestDevice, timeout: Duration)
 /// final pair.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_edit_edit_keeps_both_copies_as_original_plus_conflict_copy() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     let (device_a, device_b, group_id) = two_synced_devices("collision-edit-edit").await;
 
     std::fs::write(device_a.root.path().join("shared.txt"), b"base").unwrap();
@@ -375,6 +380,11 @@ async fn concurrent_rename_to_different_targets_both_survive() {
 /// copy), matching scenario 1's outcome shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rename_onto_a_concurrently_created_path_produces_a_conflict_copy() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     let (device_a, device_b, group_id) = two_synced_devices("collision-rename-onto-created").await;
     let _ = group_id;
 

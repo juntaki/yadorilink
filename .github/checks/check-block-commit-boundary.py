@@ -60,7 +60,7 @@ def main() -> int:
         r"\bfs::rename\(": (1, "atomic replace primitive"),
         r"fs::File::open\(path\)\?\.sync_all\(": (1, "Unix directory durability sync"),
         # Windows documents no directory flush: namespace changes there are the
-        # write-through moves of `yadorilink_root_authority::durable_dir`, and
+        # write-through moves of `yadorilink_fs_platform::durable_dir`, and
         # this seam holds neither a directory handle nor a flush.
         r"\bCreateFileW\(": (0, "Windows directory handle open (retired)"),
         r"\bFlushFileBuffers\(": (0, "Windows directory durability flush (retired)"),

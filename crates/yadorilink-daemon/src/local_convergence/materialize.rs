@@ -255,7 +255,7 @@ impl super::LocalConvergenceExecutor {
         // materialization just created at the same path — two processes each
         // believing they exclusively own this sync root, exactly the state
         // `sync_root_lock` exists to make unreachable.
-        if yadorilink_root_authority::reserved_namespace::path_has_artefact_component_in_wire_path(
+        if yadorilink_fs_platform::reserved_namespace::path_has_artefact_component_in_wire_path(
             &record.path,
         ) || yadorilink_root_authority::sync_root_lock::wire_path_names_sync_root_lock(
             &record.path,
@@ -273,7 +273,7 @@ impl super::LocalConvergenceExecutor {
         // must not get a second chance to reach disk here — writing it
         // would let this path silently alias a different on-disk name than
         // the one this device's own index believes it just materialized.
-        if yadorilink_root_authority::reserved_namespace::path_has_non_portable_wire_component(
+        if yadorilink_fs_platform::reserved_namespace::path_has_non_portable_wire_component(
             &record.path,
         ) {
             return Err(PeerSessionError::NonPortablePath(record.path.clone()));

@@ -20,11 +20,11 @@ use yadorilink_filesystem_sync::materialization_execution::{
     AbandonedEviction, MaterializationExecutionError, MaterializationExecutionPort,
     OpenMaterializationIntent,
 };
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 use yadorilink_local_storage::PlaceholderIdentityToRecord;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_root_authority::fs_identity::FileIdentity;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sync_sqlite::exact_materialized_commit::{
     commit_recovered_materialized_state, ExactMaterializedState, ExpectedAuthoring,

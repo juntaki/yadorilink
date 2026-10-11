@@ -6,7 +6,7 @@ use super::{
 };
 use std::ffi::OsStr;
 use std::path::Path;
-use yadorilink_root_authority::reserved_namespace::{
+use yadorilink_fs_platform::reserved_namespace::{
     artefact_component_name, is_reserved_component, path_has_reserved_component, ArtefactKind,
 };
 
@@ -18,7 +18,7 @@ use yadorilink_root_authority::reserved_namespace::{
 /// probe actually creates is excluded.
 #[test]
 fn the_probe_directory_name_is_a_reserved_component() {
-    let name = yadorilink_root_authority::fs_capabilities::probe_artefact_name("case").unwrap();
+    let name = yadorilink_fs_platform::fs_capabilities::probe_artefact_name("case").unwrap();
     assert!(
         is_reserved_component(OsStr::new(&name)),
         "{name:?} must be excluded from indexing by the reserved-namespace predicate"
@@ -33,7 +33,7 @@ fn the_probe_directory_name_is_a_reserved_component() {
 /// every leaf under it, in every spelling.
 #[test]
 fn every_leaf_spelling_either_probe_uses_is_excluded_under_its_reserved_parent() {
-    let parent = yadorilink_root_authority::fs_capabilities::probe_artefact_name("case").unwrap();
+    let parent = yadorilink_fs_platform::fs_capabilities::probe_artefact_name("case").unwrap();
     let decomposed: String = {
         use unicode_normalization::UnicodeNormalization;
         NORMALIZATION_PROBE_LEAF_NAME.nfd().collect()

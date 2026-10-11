@@ -91,10 +91,10 @@ impl ConsentStore {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(error.into());
         }
-        yadorilink_root_authority::durable_dir::publish_durably(
+        yadorilink_fs_platform::durable_dir::publish_durably(
             &tmp_path,
             &self.path,
-            yadorilink_root_authority::durable_dir::Replace::Yes,
+            yadorilink_fs_platform::durable_dir::Replace::Yes,
         )?;
         Ok(())
     }

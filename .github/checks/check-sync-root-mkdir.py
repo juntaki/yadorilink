@@ -77,7 +77,6 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     C + "yadorilink-daemon/src/reporting/counters.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/resource_lock.rs": {"create_dir_all": 2},
     C + "yadorilink-daemon/src/shell_ipc.rs": {"create_dir_all": 1},
-    C + "yadorilink-daemon/src/update/manager.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/update/policy.rs": {"create_dir_all": 1},
     C + "yadorilink-desktop-app/src/account.rs": {"create_dir_all": 1},
     C + "yadorilink-desktop-app/src/actions.rs": {"create_dir_all": 1},
@@ -101,8 +100,8 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     C + "yadorilink-daemon/src/provider_writer.rs": {"DirBuilder::new": 1},
     # `DurableNamespace`: the Stage-directory mkdir, the methods named after it
     # and the probe's own scratch directory.
-    C + "yadorilink-root-authority/src/durable_dir.rs": {"create_dir": 2},
-    C + "yadorilink-root-authority/src/durable_dir/probe.rs": {"create_dir": 2},
+    C + "yadorilink-fs-platform/src/durable_dir.rs": {"create_dir": 2},
+    C + "yadorilink-fs-platform/src/durable_dir/probe.rs": {"create_dir": 2},
     C + "yadorilink-sync-sqlite/src/native_rebootstrap_recovery.rs": {"DirBuilder::new": 3, "create_dir_all": 1},
 }
 

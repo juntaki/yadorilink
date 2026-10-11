@@ -966,36 +966,97 @@ async fn tombstone_of_the_live_file_itself_does_not_corrupt_its_own_index_row_wh
 
     commit_pure_dag_tombstone(&device_a, &group_id, "Photo.jpg");
     publish_and_wake(&device_a, &group_id).await;
-    wait_until_with_context(
-        || {
+    // Whether device_b admits and holds the tombstone depends on the platform
+    // making the deletion durable. Where it cannot, the wait is skipped and
+    // the safety assertions below still have to hold after a settle period.
+    if yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the tombstone being admitted and held",
+    ) {
+        wait_until_with_context(
+            || {
+                native_head_gone(&device_b, &group_id, "Photo.jpg")
+                    && device_b
+                        .state
+                        .replica_coordinator
+                        .materialization_state_repository()
+                        .get_held_state(&group_id, "Photo.jpg")
+                        .unwrap()
+                        .is_some()
+            },
+            Duration::from_secs(20),
+            || {
+                // Which half of the wait is unmet matters: "the tombstone
+                // never arrived" and "it arrived but its target was never
+                // held" are different bugs in different subsystems, and the
+                // index row alone looks identical either way.
+                format!(
+                    "device-b never processed the tombstone: head_gone={:?} held={:?} {}",
+                    native_head_gone(&device_b, &group_id, "Photo.jpg"),
+                    device_b
+                        .state
+                        .replica_coordinator
+                        .materialization_state_repository()
+                        .get_held_state(&group_id, "Photo.jpg"),
+                    index_summary(&device_b, &group_id, "Photo.jpg")
+                )
+            },
+        )
+        .await;
+    } else {
+        // The tombstone must have reached device_b before the settle window
+        // means anything: a device that never received it also keeps its row
+        // and bytes. Receipt is observable as the admitted removal, a hold,
+        // or the projection obligation the admission arms.
+        let received = || {
             native_head_gone(&device_b, &group_id, "Photo.jpg")
-                && device_b
+                || device_b
                     .state
                     .replica_coordinator
                     .materialization_state_repository()
                     .get_held_state(&group_id, "Photo.jpg")
                     .unwrap()
                     .is_some()
-        },
-        Duration::from_secs(20),
-        || {
-            // Which half of the wait is unmet matters: "the tombstone
-            // never arrived" and "it arrived but its target was never
-            // held" are different bugs in different subsystems, and the
-            // index row alone looks identical either way.
-            format!(
-                "device-b never processed the tombstone: head_gone={:?} held={:?} {}",
-                native_head_gone(&device_b, &group_id, "Photo.jpg"),
-                device_b
+                || device_b
                     .state
                     .replica_coordinator
-                    .materialization_state_repository()
-                    .get_held_state(&group_id, "Photo.jpg"),
+                    .sqlite()
+                    .dag_lookup_projection_obligation(&group_id, "Photo.jpg")
+                    .unwrap()
+                    .is_some()
+        };
+        wait_until_with_context(received, Duration::from_secs(20), || {
+            format!(
+                "the tombstone never reached device-b: {}",
                 index_summary(&device_b, &group_id, "Photo.jpg")
             )
-        },
-    )
-    .await;
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        eprintln!(
+            "closed-gate arrival state: head_gone={} held={:?} obligation={:?} row_deleted={:?} \
+             file_exists={} bytes={:?}",
+            native_head_gone(&device_b, &group_id, "Photo.jpg"),
+            device_b
+                .state
+                .replica_coordinator
+                .materialization_state_repository()
+                .get_held_state(&group_id, "Photo.jpg"),
+            device_b
+                .state
+                .replica_coordinator
+                .sqlite()
+                .dag_lookup_projection_obligation(&group_id, "Photo.jpg")
+                .map(|o| o.map(|o| o.state)),
+            device_b
+                .state
+                .replica_coordinator
+                .file_index_repository()
+                .get_file(&group_id, "Photo.jpg")
+                .map(|r| r.map(|r| r.deleted)),
+            live_path.exists(),
+            std::fs::read(&live_path).ok().map(|b| String::from_utf8_lossy(&b).to_string()),
+        );
+    }
 
     let record = device_b
         .state

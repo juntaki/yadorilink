@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use yadorilink_filesystem_sync::watcher::{FolderWatchSource, RealFolderWatchSource};
 #[cfg(test)]
-use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 
 use crate::daemon_state::DaemonState;
 use crate::error::DaemonError;

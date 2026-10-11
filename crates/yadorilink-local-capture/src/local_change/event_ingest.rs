@@ -11,10 +11,8 @@ use yadorilink_replica_domain::ids::SyncPath;
 use yadorilink_replica_domain::local_op::Op;
 use yadorilink_replica_domain::session_state::MaterializationState;
 
-use yadorilink_root_authority::fs_identity::disk_race_fingerprint;
-use yadorilink_root_authority::ignore_patterns::{
-    is_ignore_file_relative_path, EffectiveIgnoreSet,
-};
+use yadorilink_fs_platform::fs_identity::disk_race_fingerprint;
+use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
 use yadorilink_sync_sqlite::file_index::ImportedActualState;
 
 use super::disk_observation::{

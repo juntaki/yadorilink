@@ -891,9 +891,7 @@ impl QuarantineRoot for DaemonQuarantineRoot {
     }
 
     fn remove(&self, path: &str, expected: &Observed) -> Result<(), String> {
-        use yadorilink_root_authority::reserved_namespace::{
-            artefact_component_name, ArtefactKind,
-        };
+        use yadorilink_fs_platform::reserved_namespace::{artefact_component_name, ArtefactKind};
         let _op = self.lease.begin_operation().map_err(|e| e.to_string())?;
         let Some(full) = self.confined(path)? else { return Ok(()) };
         // Compare-then-unlink by name is not atomic: the user could save in between. The

@@ -16,6 +16,7 @@ yadorilink-replica-engine = { path = "../yadorilink-replica-engine" }
 # The `RootCommitPermit` gate on the `materialization_intents`
 # crash-recovery journal writes. No cycle: yadorilink-root-authority only
 # depends on yadorilink-replica-domain (already a dependency here).
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 # `StorageError` and `PlaceholderDiskIdentity`. It depends on no
 # persistence crate, so there is no cycle.
@@ -60,7 +61,8 @@ rusqlite = { version = "0.31", features = ["bundled", "functions", "hooks", "tra
 # Feature-unifies with the `[dependencies]` entry above to enable
 # `RootCommitPermit::for_tests`/`RootLease::for_tests` for this crate's own
 # `dag_store` test fixtures.
-yadorilink-root-authority = { path = "../yadorilink-root-authority", features = ["test-support", "evidence"] }
+yadorilink-root-authority = { path = "../yadorilink-root-authority", features = ["test-support"] }
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform", features = ["test-support", "evidence"] }
 # Integration tests need the crate's own and replica-domain's test-only helpers
 # (previously enabled by feature unification through a daemon dev-dependency).
 yadorilink-sync-sqlite = { path = ".", features = ["test-support"] }

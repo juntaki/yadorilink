@@ -40,7 +40,7 @@ pub struct CapturedDirectory {
     pub op: yadorilink_replica_domain::local_op::Op,
     pub version: yadorilink_replica_domain::file::FileVersion,
     pub meta: LocalFileMetaColumns,
-    pub identity: Option<yadorilink_root_authority::fs_identity::FileIdentity>,
+    pub identity: Option<yadorilink_fs_platform::fs_identity::FileIdentity>,
 }
 
 /// The answer of [`LocalMutationStore::inspect_windows_placeholder`]: whether
@@ -334,7 +334,7 @@ pub trait LocalMutationStore: Send + Sync {
         &self,
         group_id: &str,
         path: &str,
-    ) -> Result<Option<yadorilink_root_authority::fs_identity::FileIdentity>, SyncSqliteError>;
+    ) -> Result<Option<yadorilink_fs_platform::fs_identity::FileIdentity>, SyncSqliteError>;
 
     /// The birth-time granularity of the volume holding `sync_root`, which
     /// decides whether an identity comparison of a directory against its
@@ -342,7 +342,7 @@ pub trait LocalMutationStore: Send + Sync {
     fn birth_time_granularity(
         &self,
         sync_root: &Path,
-    ) -> yadorilink_root_authority::fs_identity::TimestampGranularity;
+    ) -> yadorilink_fs_platform::fs_identity::TimestampGranularity;
 
     /// Whether the regular file at `out_path` is, untouched, what a usable
     /// proof says this device wrote at `path` -- whichever version the row
@@ -498,8 +498,8 @@ pub trait LocalMutationStore: Send + Sync {
         &self,
         group_id: &str,
         to_path: &str,
-        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
-        birth_time_granularity: yadorilink_root_authority::fs_identity::TimestampGranularity,
+        identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
+        birth_time_granularity: yadorilink_fs_platform::fs_identity::TimestampGranularity,
     ) -> Result<Option<String>, SyncSqliteError>;
 
     /// Batch upsert for an initial folder scan, one transaction per chunk —

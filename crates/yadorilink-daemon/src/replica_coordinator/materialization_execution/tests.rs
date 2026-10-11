@@ -3090,7 +3090,7 @@ mod path_local_failure_tests {
         let root = tempfile::tempdir().unwrap();
         adopt_root(&state, GROUP, root.path());
         evicting_row(&state, root.path(), "a.bin", b"the version the eviction revalidated");
-        let identity = yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
+        let identity = yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(
             &root.path().join("a.bin"),
         )
         .unwrap();
@@ -3137,7 +3137,7 @@ mod path_local_failure_tests {
         let root = tempfile::tempdir().unwrap();
         adopt_root(&state, GROUP, root.path());
         let version = evicting_row(&state, root.path(), "a.bin", b"bytes under a swapped root");
-        let identity = yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
+        let identity = yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(
             &root.path().join("a.bin"),
         )
         .unwrap();
@@ -4000,9 +4000,7 @@ mod temp_file_crash_matrix {
     /// removes exactly that.
     #[test]
     fn crash_between_a_stage_directory_and_its_publication() {
-        use yadorilink_root_authority::durable_dir::{
-            arm_failpoint, disarm_failpoint, NsFailpoint,
-        };
+        use yadorilink_fs_platform::durable_dir::{arm_failpoint, disarm_failpoint, NsFailpoint};
         let f = fixture();
         let target = f.root.path().join("d");
         let canonical = std::fs::canonicalize(f.root.path()).unwrap();
@@ -4022,7 +4020,10 @@ mod temp_file_crash_matrix {
         assert_eq!(f.names().len(), 1, "the Stage directory is beside the target");
         assert_eq!(f.recorded().len(), 1, "and a record names it");
 
-        assert_eq!(f.recover().len(), 1);
+        // The record names the stage under the canonical root the directory
+        // was created with, so recovery is handed that same root (the temp
+        // dir is itself behind a symlink on macOS).
+        assert_eq!(f.state.remove_recorded_temp_files(G, &canonical).unwrap().len(), 1);
 
         assert!(f.names().is_empty() && f.recorded().is_empty());
     }

@@ -11,7 +11,7 @@
 use std::fs;
 use std::path::Path;
 
-use yadorilink_root_authority::durable_dir::{DurableNamespace, NameLedger, NsError};
+use yadorilink_fs_platform::durable_dir::{DurableNamespace, NameLedger, NsError};
 
 use crate::error::StorageError;
 use crate::materialize_write::TempFileLedger;
@@ -141,7 +141,7 @@ fn durable_remove_empty_dir(
     path: &Path,
     ledger: &dyn TempFileLedger,
 ) -> Result<EmptyDirectoryRemoval, StorageError> {
-    use yadorilink_root_authority::durable_dir::{DiscardOutcome, RetainReason};
+    use yadorilink_fs_platform::durable_dir::{DiscardOutcome, RetainReason};
     match ns.remove_empty_dir(path, &LedgerNames(ledger)) {
         Ok(DiscardOutcome::Removed) => Ok(EmptyDirectoryRemoval::Removed),
         // Moved aside, which is the removal; the record stays and the next start
@@ -239,13 +239,13 @@ pub fn move_no_replace_durably(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(ns) = durable_namespace_beside(to) {
         return ns
-            .durable_move(from, to, yadorilink_root_authority::durable_dir::Replace::No)
+            .durable_move(from, to, yadorilink_fs_platform::durable_dir::Replace::No)
             .map_err(std::io::Error::from);
     }
-    yadorilink_root_authority::durable_dir::move_durably(
+    yadorilink_fs_platform::durable_dir::move_durably(
         from,
         to,
-        yadorilink_root_authority::durable_dir::Replace::No,
+        yadorilink_fs_platform::durable_dir::Replace::No,
     )
 }
 
@@ -257,7 +257,7 @@ pub(crate) fn create_dir_all_durably(path: &Path) -> Result<(), StorageError> {
     let ns = existing.and_then(|dir| durable_namespace_beside(&dir.join("x")));
     match ns {
         Some(ns) => ns
-            .create_dir_all(path, &yadorilink_root_authority::durable_dir::NoLedger)
+            .create_dir_all(path, &yadorilink_fs_platform::durable_dir::NoLedger)
             .map_err(|error| StorageError::Io(error.into())),
         None => fs::create_dir_all(path).map_err(StorageError::from),
     }

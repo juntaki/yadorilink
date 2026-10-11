@@ -23,7 +23,7 @@ pub mod io_diag;
 /// defense-in-depth re-check. Placed here rather than
 /// `yadorilink-root-authority` because
 /// it needs both this crate's own `free_space` and
-/// `yadorilink_root_authority::ignore_patterns` --
+/// `yadorilink_fs_platform::ignore_patterns` --
 /// `yadorilink-local-storage` already depends on
 /// `yadorilink-root-authority` (for `fs_identity::bytes_to_target`), so
 /// the reverse edge root-authority-depends-on-local-storage that the

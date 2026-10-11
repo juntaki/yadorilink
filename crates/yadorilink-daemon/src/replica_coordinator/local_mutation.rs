@@ -281,14 +281,14 @@ impl LocalMutationStore for ReplicaCoordinator {
         &self,
         group_id: &str,
         path: &str,
-    ) -> Result<Option<yadorilink_root_authority::fs_identity::FileIdentity>, SyncSqliteError> {
+    ) -> Result<Option<yadorilink_fs_platform::fs_identity::FileIdentity>, SyncSqliteError> {
         self.sqlite().dag_materialized_directory_identity(group_id, path)
     }
 
     fn birth_time_granularity(
         &self,
         sync_root: &std::path::Path,
-    ) -> yadorilink_root_authority::fs_identity::TimestampGranularity {
+    ) -> yadorilink_fs_platform::fs_identity::TimestampGranularity {
         super::peer_replica_state::cached_birth_time_granularity(sync_root)
     }
 
@@ -449,8 +449,8 @@ impl LocalMutationStore for ReplicaCoordinator {
         &self,
         group_id: &str,
         to_path: &str,
-        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
-        birth_time_granularity: yadorilink_root_authority::fs_identity::TimestampGranularity,
+        identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
+        birth_time_granularity: yadorilink_fs_platform::fs_identity::TimestampGranularity,
     ) -> Result<Option<String>, SyncSqliteError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

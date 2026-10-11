@@ -502,6 +502,11 @@ fn dump_conflict_diagnostic_snapshot(
               shallower"
 )]
 async fn row14_strict_acceptance() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
     TRACING_INIT.call_once(|| {
         let _ = tracing_subscriber::fmt()

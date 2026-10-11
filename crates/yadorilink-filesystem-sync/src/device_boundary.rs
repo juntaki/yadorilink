@@ -44,8 +44,8 @@ pub fn root_volume_identity(root: &Path) -> Option<String> {
     if let Some(over) = seam::root_identity_override(root) {
         return over;
     }
-    use yadorilink_root_authority::fs_identity::VolumeIdentity;
-    match yadorilink_root_authority::fs_capabilities::observe_volume_identity(root).ok()? {
+    use yadorilink_fs_platform::fs_identity::VolumeIdentity;
+    match yadorilink_fs_platform::fs_capabilities::observe_volume_identity(root).ok()? {
         VolumeIdentity::Unix { device_id } => Some(format!("unix:{device_id}")),
         VolumeIdentity::Windows { volume_serial_number } => {
             Some(format!("windows:{volume_serial_number}"))

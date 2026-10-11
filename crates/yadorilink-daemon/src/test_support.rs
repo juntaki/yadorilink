@@ -27,6 +27,29 @@
 //! across `.await` points in the async tests that need that (e.g.
 //! `reporting_retry::tests`'s `test_state.await`); synchronous tests
 //! (`device_config.rs`) use `blocking_lock` instead.
+/// The platform-wide Windows durability gate, as a test precondition: `true`
+/// where the platform offers durable namespace changes (Unix always, Windows
+/// once `WINDOWS_DIRECTORY_DURABILITY_VALIDATED` is set), `false` otherwise.
+///
+/// While the gate is closed the daemon resolves a conflict by writing the copy
+/// but leaves the destructive update (replace, delete, file-to-directory)
+/// waiting, so a test or test section that waits for it cannot complete. Such
+/// code starts with `if !windows_durability_gate_allows_tests("what") { return; }`.
+///
+/// This is NOT `DurableNamespace::open(root)`, the product's capability check,
+/// which also probes the volume. It deliberately does not probe: once the gate
+/// opens, a CI volume that fails the probe must make these tests fail, not
+/// skip them. Opening the gate re-enables every test that calls this.
+pub fn windows_durability_gate_allows_tests(waits_for: &str) -> bool {
+    let offered = yadorilink_fs_platform::durable_dir::platform_offers_durable_namespace();
+    if !offered {
+        eprintln!(
+            "skipped: this platform offers no durable namespace changes, so it never completes {waits_for}"
+        );
+    }
+    offered
+}
+
 #[cfg(test)]
 pub(crate) static CONFIG_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -113,7 +136,7 @@ pub fn seed_prior_cycle_proof(
         .expect("a seeded row to prove")
         .version_hash();
     let identity =
-        yadorilink_root_authority::fs_identity::FileIdentity::observe_path(on_disk).unwrap();
+        yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(on_disk).unwrap();
     let mutation_generation = coordinator
         .dag_bump_mutation_fence(group_id, path, "hydration_write")
         .expect("bump the fence this seeded cycle publishes under");

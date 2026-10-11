@@ -117,11 +117,11 @@ async fn remotely_deleted_explicit_dir_with_live_child_is_not_reauthored_by_full
     assert_eq!(std::fs::read(h.path("d/f")).unwrap(), b"a child that outlives its directory");
     let origin = h.state.sqlite().dag_structural_directory_origin(GROUP, "d").unwrap();
     let observed =
-        yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&h.path("d")).ok();
+        yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&h.path("d")).ok();
     assert_eq!(
         origin.status(
             observed.as_ref(),
-            yadorilink_root_authority::fs_identity::TimestampGranularity::Fine
+            yadorilink_fs_platform::fs_identity::TimestampGranularity::Fine
         ),
         StructuralOriginStatus::Structural,
         "the kept directory must be adopted as structural"

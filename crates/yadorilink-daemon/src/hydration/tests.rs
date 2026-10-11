@@ -267,7 +267,7 @@ async fn an_unobservable_write_leaves_the_path_retryable_not_stuck() {
     let observed_path = observed.path().join("doc.txt");
     std::fs::write(&observed_path, b"").unwrap();
     let identity =
-        yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&observed_path).unwrap();
+        yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&observed_path).unwrap();
     // A present object's proof has to carry the version the row names,
     // or it matches no desired resolution and closes nothing.
     let current_version_hash = current_version_hash_for(&sync_state, "group-1", "doc.txt");
@@ -2999,7 +2999,7 @@ async fn restoring_a_symlink_version_recreates_a_real_symlink_not_an_empty_regul
         .set_symlink_target(
             GROUP,
             PATH,
-            Some(&yadorilink_root_authority::fs_identity::target_to_bytes(std::path::Path::new(
+            Some(&yadorilink_fs_platform::fs_identity::target_to_bytes(std::path::Path::new(
                 "v1-target",
             ))),
         )
@@ -3042,7 +3042,7 @@ async fn restoring_a_symlink_version_recreates_a_real_symlink_not_an_empty_regul
     );
     assert_eq!(
         state.replica_coordinator.file_index_repository().get_symlink_target(GROUP, PATH).unwrap(),
-        Some(yadorilink_root_authority::fs_identity::target_to_bytes(std::path::Path::new(
+        Some(yadorilink_fs_platform::fs_identity::target_to_bytes(std::path::Path::new(
             "v1-target"
         ))),
         "the current row's symlink_target must be updated to match the restored version"
@@ -3186,7 +3186,7 @@ async fn hydrate_after_a_symlink_restore_does_not_destroy_it() {
         .set_symlink_target(
             GROUP,
             PATH,
-            Some(&yadorilink_root_authority::fs_identity::target_to_bytes(std::path::Path::new(
+            Some(&yadorilink_fs_platform::fs_identity::target_to_bytes(std::path::Path::new(
                 "v1-target",
             ))),
         )

@@ -39,10 +39,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use yadorilink_root_authority::durable_dir::{
+use yadorilink_fs_platform::durable_dir::{
     DiscardOutcome, DurableNamespace, NoLedger, NsError, Replace,
 };
-use yadorilink_root_authority::reserved_namespace::{parse_artefact_component, ArtefactKind};
+use yadorilink_fs_platform::reserved_namespace::{parse_artefact_component, ArtefactKind};
 
 use yadorilink_replica_domain::author::{AuthorId, IncarnationId};
 use yadorilink_replica_domain::file::FileVersion;
@@ -297,7 +297,7 @@ fn fsync_file(file: &fs::File, path: &Path) -> io::Result<()> {
 /// rename) durable at all, which the preserved barrier depends on: Unix
 /// always, Windows once its gate is open.
 pub const fn platform_supports_directory_durability() -> bool {
-    yadorilink_root_authority::durable_dir::platform_offers_durable_namespace()
+    yadorilink_fs_platform::durable_dir::platform_offers_durable_namespace()
 }
 
 /// [`platform_supports_directory_durability`] for the recovery root `root`, with

@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::LocalCaptureError;
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_replica_domain::ids::VersionHash;
-use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_sync_sqlite::CanonicalCurrentRow;
 
 use super::event_ingest::EventOutcome;

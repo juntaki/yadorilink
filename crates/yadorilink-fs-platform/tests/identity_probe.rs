@@ -15,8 +15,8 @@
 //! yadorilink-root-authority --test identity_probe -- --ignored
 //! --nocapture`.
 
-use yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity;
-use yadorilink_root_authority::fs_identity::FileIdentity;
+use yadorilink_fs_platform::fs_capabilities::probe_birth_time_granularity;
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 
 #[ignore = "environment probe -- reports what this host's filesystem supports, asserts nothing"]
 #[test]
@@ -44,7 +44,7 @@ fn report_what_this_filesystem_can_say_about_identity() {
     println!(
         "verdict                 {}",
         match comparison {
-            yadorilink_root_authority::fs_identity::IdentityComparison::SameObject =>
+            yadorilink_fs_platform::fs_identity::IdentityComparison::SameObject =>
                 "this volume can confirm a regular file is unchanged, so zero-work closure \
                  works here for regular files",
             _ =>

@@ -934,12 +934,13 @@ impl RootVerificationStatePort for ReplicaCoordinator {
             RecordKind::Directory => metadata.file_type().is_dir(),
             RecordKind::Symlink => {
                 metadata.file_type().is_symlink()
-                    && std::fs::read_link(&disk_path).ok().map(|target| {
-                        yadorilink_root_authority::fs_identity::target_to_bytes(&target)
-                    }) == self
-                        .file_index_repository
-                        .get_symlink_target(group_id, &record.path)
-                        .map_err(SyncError::from)?
+                    && std::fs::read_link(&disk_path)
+                        .ok()
+                        .map(|target| yadorilink_fs_platform::fs_identity::target_to_bytes(&target))
+                        == self
+                            .file_index_repository
+                            .get_symlink_target(group_id, &record.path)
+                            .map_err(SyncError::from)?
             }
             RecordKind::File => {
                 if !metadata.file_type().is_file() {

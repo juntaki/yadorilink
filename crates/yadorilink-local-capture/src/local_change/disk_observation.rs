@@ -5,11 +5,11 @@
 
 use std::path::Path;
 
-use yadorilink_local_storage::CDC_SIZE_THRESHOLD;
-use yadorilink_replica_domain::file::FileRecord;
-use yadorilink_root_authority::fs_identity::{
+use yadorilink_fs_platform::fs_identity::{
     disk_race_fingerprint, DiskRaceFingerprint, FileIdentity,
 };
+use yadorilink_local_storage::CDC_SIZE_THRESHOLD;
+use yadorilink_replica_domain::file::FileRecord;
 
 /// Whether `error`, from looking a path up, says nothing answers to that
 /// name. Only a missing name or a missing parent directory does. Any other

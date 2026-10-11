@@ -219,7 +219,7 @@ fn recursive_snapshot(root: &Path) -> HashMap<String, String> {
                 && (name == yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME
                     || name == yadorilink_root_authority::sync_root_lock::SYNC_ROOT_LOCK_FILE_NAME))
                 || name.contains(".yadorilink-tmp.")
-                || yadorilink_root_authority::reserved_namespace::is_reserved_component(
+                || yadorilink_fs_platform::reserved_namespace::is_reserved_component(
                     entry.file_name().as_os_str(),
                 )
             {

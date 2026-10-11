@@ -74,10 +74,8 @@ use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
-use yadorilink_root_authority::ignore_patterns::{
-    is_ignore_file_relative_path, EffectiveIgnoreSet,
-};
-use yadorilink_root_authority::reserved_namespace::path_has_reserved_component;
+use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
+use yadorilink_fs_platform::reserved_namespace::path_has_reserved_component;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WatcherError {

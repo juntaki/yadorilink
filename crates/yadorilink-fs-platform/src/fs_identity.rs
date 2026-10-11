@@ -1141,11 +1141,11 @@ pub fn bytes_to_target(bytes: &[u8]) -> std::ffi::OsString {
 #[cfg(windows)]
 pub fn bytes_to_target(bytes: &[u8]) -> Option<std::ffi::OsString> {
     use std::os::windows::ffi::OsStringExt;
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let units: Vec<u16> =
-        bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+        bytes.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
     Some(std::ffi::OsString::from_wide(&units))
 }
 

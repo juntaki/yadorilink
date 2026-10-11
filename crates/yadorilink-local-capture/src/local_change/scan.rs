@@ -7,6 +7,8 @@ use std::path::Path;
 use crate::error::LocalCaptureError;
 use crate::scan_block_staging::ScanBlockStaging;
 use yadorilink_filesystem_sync::watcher::FsChangeKind;
+use yadorilink_fs_platform::fs_identity::{disk_race_fingerprint_of, metadata_mtime_matches};
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_local_storage::{read_replicated_xattrs, unix_mode_from_metadata};
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
@@ -14,8 +16,6 @@ use yadorilink_replica_domain::ids::SyncPath;
 use yadorilink_replica_domain::local_op::{encoded_op_len, Op};
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_replica_domain::session_state::{LocalFileMetaColumns, PreparedLocalMutation};
-use yadorilink_root_authority::fs_identity::{disk_race_fingerprint_of, metadata_mtime_matches};
-use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_root_authority::root_identity::VerifiedRoot;
 use yadorilink_sync_sqlite::file_index::ImportedActualState;
 use yadorilink_sync_sqlite::SyncSqliteError;
@@ -876,7 +876,7 @@ impl LocalChangeProcessor {
             scanned_bytes_still_on_disk(
                 observation.identity_if_still_current(&disk_path).is_some(),
                 version.meta.record_kind != RecordKind::File
-                    || yadorilink_root_authority::fs_identity::FileIdentity::in_place_rewrite_visible(
+                    || yadorilink_fs_platform::fs_identity::FileIdentity::in_place_rewrite_visible(
                         &disk_path,
                     ),
                 || {

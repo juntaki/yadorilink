@@ -409,15 +409,15 @@ impl LocalMutationStore for TestReplica {
         &self,
         group_id: &str,
         path: &str,
-    ) -> Result<Option<yadorilink_root_authority::fs_identity::FileIdentity>, SyncSqliteError> {
+    ) -> Result<Option<yadorilink_fs_platform::fs_identity::FileIdentity>, SyncSqliteError> {
         self.sqlite().dag_materialized_directory_identity(group_id, path)
     }
 
     fn birth_time_granularity(
         &self,
         sync_root: &std::path::Path,
-    ) -> yadorilink_root_authority::fs_identity::TimestampGranularity {
-        yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(sync_root)
+    ) -> yadorilink_fs_platform::fs_identity::TimestampGranularity {
+        yadorilink_fs_platform::fs_capabilities::probe_birth_time_granularity(sync_root)
     }
 
     fn disk_is_untouched_proven_write(
@@ -431,7 +431,7 @@ impl LocalMutationStore for TestReplica {
             group_id,
             path,
             out_path,
-            yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(sync_root),
+            yadorilink_fs_platform::fs_capabilities::probe_birth_time_granularity(sync_root),
         )
     }
 
@@ -565,8 +565,8 @@ impl LocalMutationStore for TestReplica {
         &self,
         group_id: &str,
         to_path: &str,
-        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
-        birth_time_granularity: yadorilink_root_authority::fs_identity::TimestampGranularity,
+        identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
+        birth_time_granularity: yadorilink_fs_platform::fs_identity::TimestampGranularity,
     ) -> Result<Option<String>, SyncSqliteError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -731,7 +731,7 @@ impl LocalMutationStore for TestReplica {
 #[cfg(test)]
 mod structural_origin_port_tests {
     use super::*;
-    use yadorilink_root_authority::fs_identity::{FileIdentity, TimestampGranularity};
+    use yadorilink_fs_platform::fs_identity::{FileIdentity, TimestampGranularity};
     use yadorilink_sync_sqlite::structural_origin::{
         StructuralDirectoryOrigin, StructuralOriginCompletion, StructuralOriginStatus,
     };

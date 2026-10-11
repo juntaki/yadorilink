@@ -92,13 +92,11 @@ impl super::LocalConvergenceExecutor {
             }
             Err(e) => return Err(PeerSessionError::from(e)),
         }
-        let identity =
-            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path)
-                .ok()
-                .filter(|identity| {
-                    identity.object_kind
-                        == yadorilink_root_authority::fs_identity::ObjectKind::Directory
-                });
+        let identity = yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path)
+            .ok()
+            .filter(|identity| {
+                identity.object_kind == yadorilink_fs_platform::fs_identity::ObjectKind::Directory
+            });
         let Some(identity) = identity else {
             return Ok(MaterializeResult::RetryRequired);
         };
@@ -124,7 +122,7 @@ impl super::LocalConvergenceExecutor {
         group_id: &str,
         path: &str,
         out_path: &Path,
-        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+        identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
     ) -> Result<(), PeerSessionError> {
         let live_directory_row =
             self.state.get_file(group_id, path)?.is_some_and(|row| !row.deleted)
@@ -262,7 +260,7 @@ impl super::LocalConvergenceExecutor {
                 return Ok(DirectoryVerdict::Retry);
             }
             let observed =
-                yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path).ok();
+                yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path).ok();
             let structural = self.origin_status(group_id, path, observed.as_ref())?
                 == StructuralOriginStatus::Structural;
             let reason = RETAINED_UNTRACKED_CONTENT;
@@ -309,10 +307,9 @@ impl super::LocalConvergenceExecutor {
                 if !entry.file_type()?.is_dir() {
                     continue;
                 }
-                let observed = yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
-                    &entry.path(),
-                )
-                .ok();
+                let observed =
+                    yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&entry.path())
+                        .ok();
                 if self.origin_status(group_id, &child, observed.as_ref())?
                     == StructuralOriginStatus::Structural
                 {
@@ -346,7 +343,7 @@ impl super::LocalConvergenceExecutor {
         use yadorilink_local_storage::EmptyDirectoryRemoval;
         let out_path = self.local_file_path(group_id, path)?;
         let Ok(observed) =
-            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path)
+            yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path)
         else {
             self.forget_structural_record_of_a_removed_directory(group_id, path, &out_path)?;
             return Ok(None);
@@ -451,7 +448,7 @@ impl super::LocalConvergenceExecutor {
         &self,
         group_id: &str,
         path: &str,
-        observed: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+        observed: Option<&yadorilink_fs_platform::fs_identity::FileIdentity>,
     ) -> Result<StructuralOriginStatus, PeerSessionError> {
         self.state
             .structural_origin_status(group_id, path, &self.sync_root(group_id)?, observed)

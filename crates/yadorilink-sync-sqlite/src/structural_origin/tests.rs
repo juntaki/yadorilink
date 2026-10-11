@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::materialized_generation::{bump_mutation_fence, snapshot_mutation_fence};
-use yadorilink_root_authority::fs_identity::{PlatformObjectId, Timestamp, VolumeIdentity};
+use yadorilink_fs_platform::fs_identity::{PlatformObjectId, Timestamp, VolumeIdentity};
 
 const GROUP: &str = "g";
 

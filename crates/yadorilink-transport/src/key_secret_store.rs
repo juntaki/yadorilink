@@ -234,7 +234,7 @@ fn write_and_publish(
     file.sync_all()?;
     drop(file);
 
-    use yadorilink_root_authority::durable_dir::{publish_durably, Replace};
+    use yadorilink_fs_platform::durable_dir::{publish_durably, Replace};
     match publish {
         // Atomic *and* exclusive. See the module docs for why this is not a
         // plain `rename`.

@@ -348,40 +348,80 @@ async fn run_multiway_row(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_devices_simultaneous_write_never_mismatches_name_and_content() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_multiway_row(3, 0, "multiway-3-sim", ConvergedShape::EveryWriterSurvives).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_devices_staggered_write_never_mismatches_name_and_content() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_multiway_row(3, 50, "multiway-3-stag", ConvergedShape::ReplicasAgree).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn four_devices_simultaneous_write_never_mismatches_name_and_content() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_multiway_row(4, 0, "multiway-4-sim", ConvergedShape::EveryWriterSurvives).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn four_devices_staggered_write_never_mismatches_name_and_content() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_multiway_row(4, 50, "multiway-4-stag", ConvergedShape::ReplicasAgree).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn five_devices_simultaneous_write_never_mismatches_name_and_content() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_multiway_row(5, 0, "multiway-5-sim", ConvergedShape::EveryWriterSurvives).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn five_devices_staggered_write_never_mismatches_name_and_content() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_multiway_row(5, 50, "multiway-5-stag", ConvergedShape::ReplicasAgree).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn six_devices_simultaneous_write_never_mismatches_name_and_content() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_multiway_row(6, 0, "multiway-6-sim", ConvergedShape::EveryWriterSurvives).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn six_devices_staggered_write_never_mismatches_name_and_content() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_multiway_row(6, 50, "multiway-6-stag", ConvergedShape::ReplicasAgree).await;
 }

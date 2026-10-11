@@ -372,3 +372,15 @@ fn non_portable_predicate_leaves_ordinary_tilde_names_alone() {
     // An extension longer than three characters is not 8.3-shaped.
     assert!(!path_has_non_portable_wire_component("REPORT~1.TEXT"));
 }
+
+/// Mirrors `root_identity::only_the_top_level_marker_is_recognized`: a
+/// same-named file nested in a subdirectory is ordinary user content and
+/// must keep syncing, only the root-level lock file is this module's.
+#[test]
+fn only_the_top_level_lock_file_is_recognized() {
+    assert!(is_sync_root_lock_relative_path(".yadorilink-root.lock"));
+    assert!(is_sync_root_lock_relative_path("./.yadorilink-root.lock"));
+    assert!(!is_sync_root_lock_relative_path("nested/.yadorilink-root.lock"));
+    assert!(!is_sync_root_lock_relative_path(".yadorilink-root.lock/inner.txt"));
+    assert!(!is_sync_root_lock_relative_path("notes.txt"));
+}

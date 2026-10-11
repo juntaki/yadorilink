@@ -8,10 +8,10 @@
 //! convergence rehydration) changes how it fetches and writes, not what the guard guarantees.
 
 use yadorilink_filesystem_sync::materialization_execution::MaterializationExecutionError;
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 use yadorilink_peer_session::PeerSessionError;
 use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_root_authority::fs_identity::FileIdentity;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 
 use yadorilink_sync_sqlite::exact_materialized_commit::{

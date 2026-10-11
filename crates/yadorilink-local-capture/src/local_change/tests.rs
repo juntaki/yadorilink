@@ -12,14 +12,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
+use yadorilink_fs_platform::fs_identity::disk_race_fingerprint;
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_local_storage::unix_mode_from_metadata;
 use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::ids::SyncPath;
 use yadorilink_replica_domain::local_op::Op;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_root_authority::fs_identity::disk_race_fingerprint;
-use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_sync_sqlite::SyncSqliteError;
 
 fn processor() -> (LocalChangeProcessor, Arc<TestReplica>, tempfile::TempDir, tempfile::TempDir) {
@@ -1090,7 +1090,7 @@ async fn no_proof_is_published_for_content_overwritten_in_place_before_chunk_com
         yadorilink_sync_sqlite::materialized_generation::revalidate_identity_against_disk(
             basis,
             &victim,
-            yadorilink_root_authority::fs_identity::TimestampGranularity::Fine,
+            yadorilink_fs_platform::fs_identity::TimestampGranularity::Fine,
         )
     });
     assert!(

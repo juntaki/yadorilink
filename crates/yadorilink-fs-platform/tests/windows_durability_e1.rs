@@ -27,11 +27,11 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
 };
-use yadorilink_root_authority::durable_dir::{
+use yadorilink_fs_platform::durable_dir::{
     durable_flush_directory, local_volume_file_system, probe_directory_durability,
     rename_no_replace_durable,
 };
-use yadorilink_root_authority::fs_capabilities::Capability;
+use yadorilink_fs_platform::fs_capabilities::Capability;
 
 fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()

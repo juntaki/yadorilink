@@ -722,7 +722,7 @@ impl ReplicaCoordinator {
         permit: &RootCommitPermit<'_>,
     ) -> Result<bool, PeerSessionError> {
         let identity =
-            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(out_path).ok();
+            yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(out_path).ok();
         let committed = self.commit_internal_materialized_state_if_fence_current(
             group_id,
             path,
@@ -1009,7 +1009,7 @@ impl ReplicaCoordinator {
         version: &VersionHash,
     ) -> Result<Option<String>, PeerSessionError> {
         let Ok(identity) =
-            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(out_path)
+            yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(out_path)
         else {
             return Ok(None);
         };

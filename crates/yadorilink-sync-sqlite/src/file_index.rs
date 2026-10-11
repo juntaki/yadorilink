@@ -11,6 +11,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::dag_store;
 use crate::error::SyncSqliteError;
 use crate::materialized_generation::MaterializedObjectKind;
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::{DeviceId, SyncPath};
@@ -27,7 +28,6 @@ use yadorilink_replica_domain::session_state::{
     ConflictCopyFile, DurabilityRoot, DurabilityRoots, LocalFileMetaColumns, MaterializationState,
     PreparedLocalMutation, RootSetSummary, TrashedFile, VersionRecord, VersionState,
 };
-use yadorilink_root_authority::fs_identity::FileIdentity;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sqlite_runtime::SyncDatabase;
 
@@ -2876,8 +2876,8 @@ pub fn upsert_file_with_authoring_in_tx(
 /// the same functions the hazard check compares with.
 pub(crate) fn name_fold_keys(path: &str) -> (String, String) {
     (
-        yadorilink_root_authority::canonical_fold::case_fold(path),
-        yadorilink_root_authority::canonical_fold::canonical_fold(path),
+        yadorilink_fs_platform::canonical_fold::case_fold(path),
+        yadorilink_fs_platform::canonical_fold::canonical_fold(path),
     )
 }
 
@@ -2988,7 +2988,7 @@ pub fn stamp_hydrated_after_local_emission_in_tx(
 /// already knows.
 #[derive(Clone, Debug)]
 pub struct ImportedActualState {
-    pub filesystem_identity: yadorilink_root_authority::fs_identity::FileIdentity,
+    pub filesystem_identity: yadorilink_fs_platform::fs_identity::FileIdentity,
     pub record_kind: RecordKind,
     pub version_hash: yadorilink_replica_domain::ids::VersionHash,
 }
@@ -3006,7 +3006,7 @@ pub enum LocalCaptureActualStateEvidence {
     /// the batch commit, under the path's lock -- not reused from an
     /// earlier prepare-time observation without a fresh disk-fingerprint
     /// match confirming nothing changed since.
-    Present { filesystem_identity: yadorilink_root_authority::fs_identity::FileIdentity },
+    Present { filesystem_identity: yadorilink_fs_platform::fs_identity::FileIdentity },
     /// A deletion local capture just observed and revalidated as still
     /// absent immediately before this commit.
     Absent,
@@ -3097,7 +3097,7 @@ pub fn adopt_local_capture_actual_state(
     path: &str,
     record_kind: RecordKind,
     version_hash: &yadorilink_replica_domain::ids::VersionHash,
-    filesystem_identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+    filesystem_identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
 ) -> Result<(), SyncSqliteError> {
     let object_kind = match record_kind {
         RecordKind::File => MaterializedObjectKind::RegularFile,

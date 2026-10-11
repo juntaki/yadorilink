@@ -4,18 +4,6 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
-/// Mirrors `root_identity::only_the_top_level_marker_is_recognized`: a
-/// same-named file nested in a subdirectory is ordinary user content and
-/// must keep syncing, only the root-level lock file is this module's.
-#[test]
-fn only_the_top_level_lock_file_is_recognized() {
-    assert!(is_sync_root_lock_relative_path(".yadorilink-root.lock"));
-    assert!(is_sync_root_lock_relative_path("./.yadorilink-root.lock"));
-    assert!(!is_sync_root_lock_relative_path("nested/.yadorilink-root.lock"));
-    assert!(!is_sync_root_lock_relative_path(".yadorilink-root.lock/inner.txt"));
-    assert!(!is_sync_root_lock_relative_path("notes.txt"));
-}
-
 /// The wire-path form must catch what the host form is not safe to be
 /// used for: a peer path spelled with a different case, or an NTFS
 /// alternate-data-stream suffix — mirroring `reserved_namespace`'s own
@@ -241,12 +229,12 @@ fn repeated_verify_still_owns_calls_probe_at_most_once_per_volume() {
 
     owner.verify_still_owns().expect("first call must succeed");
     let count_after_first =
-        crate::fs_capabilities::probe_birth_time_granularity_call_count_for_test();
+        yadorilink_fs_platform::fs_capabilities::probe_birth_time_granularity_call_count_for_test();
 
     owner.verify_still_owns().expect("second call must succeed");
     owner.verify_still_owns().expect("third call must succeed");
     let count_after_more =
-        crate::fs_capabilities::probe_birth_time_granularity_call_count_for_test();
+        yadorilink_fs_platform::fs_capabilities::probe_birth_time_granularity_call_count_for_test();
 
     assert_eq!(
         count_after_more, count_after_first,

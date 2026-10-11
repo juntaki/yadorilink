@@ -43,11 +43,11 @@ fn meta() -> LocalFileMetaColumns {
     }
 }
 
-fn identity() -> yadorilink_root_authority::fs_identity::FileIdentity {
-    use yadorilink_root_authority::fs_identity::{
+fn identity() -> yadorilink_fs_platform::fs_identity::FileIdentity {
+    use yadorilink_fs_platform::fs_identity::{
         ObjectKind, PlatformObjectId, Timestamp, VolumeIdentity,
     };
-    yadorilink_root_authority::fs_identity::FileIdentity {
+    yadorilink_fs_platform::fs_identity::FileIdentity {
         volume_identity: VolumeIdentity::Unix { device_id: 7 },
         object_id: PlatformObjectId::Unix { inode: 42 },
         object_kind: ObjectKind::RegularFile,

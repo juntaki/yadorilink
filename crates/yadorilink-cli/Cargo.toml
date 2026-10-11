@@ -14,6 +14,7 @@ path = "src/main.rs"
 yadorilink-client-core = { path = "../yadorilink-client-core" }
 yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
 yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
 yadorilink-reporting = { path = "../yadorilink-reporting" }

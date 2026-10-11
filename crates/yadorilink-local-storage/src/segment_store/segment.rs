@@ -32,8 +32,8 @@ pub(crate) fn segment_path(root: &Path, segment_id: u64) -> PathBuf {
 /// The reserved Stage name a segment is created under before it is published:
 /// `.yadorilink-v1-stage.seg-<id>` beside `<id>.seg`.
 pub(crate) fn stage_path(root: &Path, segment_id: u64) -> Result<PathBuf, StorageError> {
-    let name = yadorilink_root_authority::reserved_namespace::artefact_component_name(
-        yadorilink_root_authority::reserved_namespace::ArtefactKind::Stage,
+    let name = yadorilink_fs_platform::reserved_namespace::artefact_component_name(
+        yadorilink_fs_platform::reserved_namespace::ArtefactKind::Stage,
         &format!("seg-{segment_id:016}"),
     )
     .map_err(|error| StorageError::InvalidPath(error.to_string()))?;
@@ -43,7 +43,7 @@ pub(crate) fn stage_path(root: &Path, segment_id: u64) -> Result<PathBuf, Storag
 /// The id of the segment a Stage name was made for, or `None` for any other
 /// entry.
 pub(crate) fn segment_id_from_stage_name(name: &str) -> Option<u64> {
-    use yadorilink_root_authority::reserved_namespace::{parse_artefact_component, ArtefactKind};
+    use yadorilink_fs_platform::reserved_namespace::{parse_artefact_component, ArtefactKind};
     let (ArtefactKind::Stage, id) = parse_artefact_component(name)? else { return None };
     let digits = id.strip_prefix("seg-")?;
     if digits.len() != 16 || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -74,14 +74,14 @@ impl StagedSegment {
     /// an occupied name; the file stays open and keeps appending.
     pub(crate) fn publish(
         self,
-        ns: &yadorilink_root_authority::durable_dir::DurableNamespace,
+        ns: &yadorilink_fs_platform::durable_dir::DurableNamespace,
     ) -> Result<SegmentWriter, StorageError> {
         let target = self.stage.with_file_name(format!("{:016}.seg", self.segment_id));
         ns.publish(
             &self.stage,
             &target,
-            yadorilink_root_authority::durable_dir::Replace::No,
-            &yadorilink_root_authority::durable_dir::NoLedger,
+            yadorilink_fs_platform::durable_dir::Replace::No,
+            &yadorilink_fs_platform::durable_dir::NoLedger,
         )
         .map_err(|error| StorageError::Io(error.into()))?;
         Ok(SegmentWriter {

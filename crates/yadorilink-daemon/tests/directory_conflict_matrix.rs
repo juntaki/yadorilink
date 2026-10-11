@@ -154,7 +154,7 @@ fn recursive_snapshot(root: &Path) -> HashMap<String, String> {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name == yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME
                 || name.contains(".yadorilink-tmp.")
-                || yadorilink_root_authority::reserved_namespace::is_reserved_component(
+                || yadorilink_fs_platform::reserved_namespace::is_reserved_component(
                     entry.file_name().as_os_str(),
                 )
             {
@@ -488,6 +488,11 @@ async fn concurrently_creating_same_named_directory_with_different_files_inside(
 /// nested under "newdir/" rather than flattening to the sync root.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrently_creating_same_named_directory_with_a_conflicting_file_inside() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the directory/file replacement",
+    ) {
+        return;
+    }
     let (device_a, device_b, group_id) =
         two_synced_devices("dir-collision-create-create-conflict").await;
     let _ = group_id;
@@ -705,6 +710,11 @@ async fn delete_directory_vs_concurrent_child_keeps_child_and_container() {
 /// tree is exactly these three entries in every arrival order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn file_vs_descendant_structural_conflict_keeps_both() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the directory/file replacement",
+    ) {
+        return;
+    }
     let (device_a, device_b, _group_id) = two_synced_devices("dir-file-vs-descendant").await;
 
     std::fs::write(device_a.root.path().join("a"), b"file a").unwrap();
@@ -726,6 +736,11 @@ async fn file_vs_descendant_structural_conflict_keeps_both() {
 /// lands in that directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_directory_keeps_its_name_against_a_file_before_and_after_its_child() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the directory/file replacement",
+    ) {
+        return;
+    }
     let (device_a, device_b, _group_id) = two_synced_devices("dir-explicit-vs-file").await;
 
     std::fs::write(device_a.root.path().join("a"), b"file a").unwrap();
@@ -776,6 +791,11 @@ async fn explicit_directory_keeps_its_name_against_a_symlink() {
 /// directory entries must keep producing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn directory_rename_across_two_devices_moves_explicit_entries_only() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the directory/file replacement",
+    ) {
+        return;
+    }
     let (device_a, device_b, _group_id) = two_synced_devices("dir-rename-vs-child").await;
 
     std::fs::create_dir(device_a.root.path().join("d")).unwrap();

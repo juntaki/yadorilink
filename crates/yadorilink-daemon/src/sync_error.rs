@@ -244,7 +244,7 @@ pub enum SyncError {
     PolicyUnavailable,
 
     /// A path names a component reserved for transaction artefacts (see
-    /// `yadorilink_root_authority::reserved_namespace`) somewhere it must not: a peer delta
+    /// `yadorilink_fs_platform::reserved_namespace`) somewhere it must not: a peer delta
     /// naming one before native admission, a collision detected at artefact
     /// creation, or one found unexpectedly at startup. Fail-closed and
     /// carries the exact path — the offending path is never admitted,
@@ -258,7 +258,7 @@ pub enum SyncError {
     /// path component in most Win32 APIs, so a component typed with one is
     /// not the same bytes as what actually lands on disk once a Windows
     /// device materializes it (see
-    /// [`yadorilink_root_authority::reserved_namespace::path_has_non_portable_wire_component`]).
+    /// [`yadorilink_fs_platform::reserved_namespace::path_has_non_portable_wire_component`]).
     /// Whether a path is safe cannot depend on which platform happens to be
     /// running the check — the same reasoning `dag_store`'s wire-vs-host
     /// path handling already applies to reserved-artefact aliasing — so

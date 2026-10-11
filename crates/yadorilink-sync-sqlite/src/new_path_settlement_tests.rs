@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 use rusqlite::Connection;
 use tempfile::TempDir;
 
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 use yadorilink_replica_domain::ids::VersionHash;
-use yadorilink_root_authority::fs_identity::FileIdentity;
 
 use crate::materialized_generation::{
     adopt_observed_present_generations_batch, bump_mutation_fence,

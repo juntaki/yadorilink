@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::LocalCaptureError;
 use crate::scan_block_staging::ScanBlockStaging;
+use yadorilink_fs_platform::fs_identity::{disk_race_fingerprint_of, metadata_mtime_matches};
 use yadorilink_local_storage::{
     chunk_open_file, read_replicated_xattrs, unix_mode_from_metadata, CDC_SIZE_THRESHOLD,
 };
@@ -16,7 +17,6 @@ use yadorilink_replica_domain::limits::MAX_SYNCABLE_BLOCKS;
 use yadorilink_replica_domain::local_op::Op;
 use yadorilink_replica_domain::session_state::LocalFileMetaColumns;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_root_authority::fs_identity::{disk_race_fingerprint_of, metadata_mtime_matches};
 use yadorilink_sync_sqlite::SyncSqliteError;
 
 use super::disk_observation::{
@@ -1172,7 +1172,7 @@ impl LocalChangeProcessor {
         // FileMeta::symlink_target`'s doc for why a symlink's captured
         // target must be these exact bytes.
         let raw_target = std::fs::read_link(path)?;
-        let target_bytes = yadorilink_root_authority::fs_identity::target_to_bytes(&raw_target);
+        let target_bytes = yadorilink_fs_platform::fs_identity::target_to_bytes(&raw_target);
         let out_of_root = symlink_target_is_out_of_root(root, path, &raw_target);
         // `size` is derived from the same buffer as the target, not a
         // separately obtained stat length, so the two can never disagree —

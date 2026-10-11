@@ -110,10 +110,10 @@ fn write_config_file_with(
         drop(file);
         after(WriteStep::TempSynced)?;
         // A durable publish: the new name is on disk when this returns.
-        yadorilink_root_authority::durable_dir::publish_durably(
+        yadorilink_fs_platform::durable_dir::publish_durably(
             &temporary,
             path,
-            yadorilink_root_authority::durable_dir::Replace::Yes,
+            yadorilink_fs_platform::durable_dir::Replace::Yes,
         )?;
         after(WriteStep::Renamed)
     })();

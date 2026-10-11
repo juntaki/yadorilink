@@ -24,7 +24,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use yadorilink_root_authority::durable_dir::{durable_flush_directory, rename_no_replace_durable};
+use yadorilink_fs_platform::durable_dir::{durable_flush_directory, rename_no_replace_durable};
 
 fn filetime() -> u64 {
     // 100 ns ticks since 1601-01-01.

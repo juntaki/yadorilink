@@ -25,7 +25,7 @@
 //! artefact: leftover from a crash, a different process, or a future
 //! version this build doesn't understand. An unknown reserved-looking file
 //! must never be deleted, imported, indexed or treated as user content —
-//! see [`crate::error::SyncError::ReservedNamespaceCollision`] for the
+//! see `SyncError::ReservedNamespaceCollision` for the
 //! fail-closed signal a caller raises when it finds one somewhere it did
 //! not expect one.
 //!
@@ -79,6 +79,7 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
+use yadorilink_replica_domain::reserved_paths::SYNC_ROOT_LOCK_FILE_NAME;
 
 /// Every reserved-component name (including the legacy marker) is bounded
 /// by this length, in bytes, once encoded — the portable floor most
@@ -847,9 +848,7 @@ pub enum WirePathRefusal {
 /// Refusal is a property of the path alone: it never becomes admissible
 /// later, which is what makes skipping (rather than retrying) correct.
 pub fn wire_path_admission_refusal(path: &str) -> Option<WirePathRefusal> {
-    if path_has_artefact_component_in_wire_path(path)
-        || crate::sync_root_lock::wire_path_names_sync_root_lock(path)
-    {
+    if path_has_artefact_component_in_wire_path(path) || wire_path_names_sync_root_lock(path) {
         return Some(WirePathRefusal::ReservedNamespace);
     }
     if path_has_non_portable_wire_component(path) {
@@ -860,3 +859,65 @@ pub fn wire_path_admission_refusal(path: &str) -> Option<WirePathRefusal> {
 
 #[cfg(test)]
 mod tests;
+
+/// True for exactly `<root>/.yadorilink-root.lock` and nothing else —
+/// the same top-level-only rule as the root marker's, so the same-named
+/// file nested in a subdirectory (ordinary user content) keeps syncing
+/// normally.
+pub fn is_sync_root_lock_relative_path(relative_path: impl AsRef<Path>) -> bool {
+    let mut segments =
+        relative_path.as_ref().components().filter(|c| !matches!(c, std::path::Component::CurDir));
+    match (segments.next(), segments.next()) {
+        (Some(std::path::Component::Normal(only)), None) => {
+            only == std::ffi::OsStr::new(SYNC_ROOT_LOCK_FILE_NAME)
+        }
+        _ => false,
+    }
+}
+
+/// The **wire-path** counterpart to [`is_sync_root_lock_relative_path`], for
+/// a path **string** that arrived off the wire (a peer-authored path this
+/// process never walked off its own directory tree) — a change's `Put`/
+/// `Delete`/`Move` path, or a peer-supplied `FileRecord::path` about to be
+/// materialized.
+///
+/// Top-level-only and exact, matching [`is_sync_root_lock_relative_path`]'s
+/// semantics exactly — this is deliberately NOT the same shape as
+/// [`path_has_artefact_component_in_wire_path`],
+/// which matches the reserved name at *any* depth because a versioned
+/// artefact name is reserved wherever it appears, including as an
+/// intermediate directory. The sync-root lock is different: like the
+/// identity marker, a same-named file *nested* in a subdirectory is
+/// ordinary user content that must keep syncing (see
+/// [`is_sync_root_lock_relative_path`]'s doc comment) — only a peer path
+/// that is *exactly* the lock file at the root is a genuine collision, so
+/// only a single-component path is checked here.
+///
+/// Must be used instead of the host-`Path` form at every site that rejects a
+/// remote-authored path, for the identical reason
+/// [`path_has_artefact_component_in_wire_path`]
+/// documents: resolving a peer's raw path string through this process's own
+/// `std::path::Path` finds component boundaries only where THIS platform's
+/// separator convention says to, so a peer path shaped like
+/// `"safe\\.yadorilink-root.lock"` would be one component (not a match) on
+/// Unix and two (a match on the second, still correctly excluded here since
+/// it is no longer the *only* component) on Windows — an admission decision
+/// must not depend on which platform is running the check. Reuses
+/// `reserved_namespace`'s own portable component splitter and
+/// alternate-data-stream stripper so this agrees with the versioned-artefact
+/// wire check on what counts as "the same component" in every case, rather
+/// than defining that afresh here and risking the two silently diverging on
+/// the exact NTFS-ADS/backslash edge cases that check's tests already pin
+/// down. ASCII case-folded: this name is fixed ASCII, and the target
+/// folder's filesystem may itself be case-insensitive (NTFS default, APFS
+/// default), so a peer path differing only in case still names the same
+/// on-disk file this device's lock lives at.
+pub fn wire_path_names_sync_root_lock(path: &str) -> bool {
+    let mut components = wire_path_components(path);
+    match (components.next(), components.next()) {
+        (Some(only), None) => {
+            strip_alternate_data_stream_suffix(only).eq_ignore_ascii_case(SYNC_ROOT_LOCK_FILE_NAME)
+        }
+        _ => false,
+    }
+}

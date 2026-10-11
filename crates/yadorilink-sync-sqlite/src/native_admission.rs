@@ -127,7 +127,7 @@ pub enum NativeAdmission {
     Unauthorized(DeltaProofVerificationError),
     /// A path this delta names (an op's own path) is one no replica may ever store — the same permanent,
     /// signed-bytes-only predicate
-    /// (`yadorilink_root_authority::reserved_namespace::
+    /// (`yadorilink_fs_platform::reserved_namespace::
     /// wire_path_admission_refusal`). Final, not a hold: re-delivering the
     /// identical delta can never produce another verdict, so there is
     /// nothing to wait for. Checked before any chain/context gate runs.
@@ -507,10 +507,10 @@ enum Step {
 /// The first path `delta` names that no replica may store, by the same
 /// signed-bytes-only predicate -- every op's own path.
 fn path_refusal(delta: &NativeDelta) -> Option<yadorilink_replica_domain::admission::PathRefusal> {
-    use yadorilink_replica_domain::admission::PathRefusal;
-    use yadorilink_root_authority::reserved_namespace::{
+    use yadorilink_fs_platform::reserved_namespace::{
         wire_path_admission_refusal, WirePathRefusal,
     };
+    use yadorilink_replica_domain::admission::PathRefusal;
     delta.ops.iter().find_map(|op| match wire_path_admission_refusal(op.path.as_str())? {
         WirePathRefusal::ReservedNamespace => {
             Some(PathRefusal::ReservedNamespaceCollision { path: op.path.as_str().to_owned() })
@@ -1364,7 +1364,7 @@ mod tests {
         let a = author("a");
         let key_a = key(1);
         // The wire-path predicate
-        // (`yadorilink_root_authority::reserved_namespace::
+        // (`yadorilink_fs_platform::reserved_namespace::
         // wire_path_admission_refusal`), exercised here through native's
         // own admission path rather than a re-implementation of it.
         let d = delta(&a, 1, None, ".yadorilink-root.lock", 1, vec![], &key_a);

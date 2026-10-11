@@ -97,17 +97,13 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use crate::error::RootAuthorityError;
-use crate::fs_identity::FileIdentity;
-
-/// Lock file placed at the top level of a sync root. Named and handled like
-/// [`yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME`]: excluded from sync
-/// (`local_change::is_excluded_from_sync`), so it is never indexed,
-/// never transmitted, and never a conflicted-copy candidate.
-pub const SYNC_ROOT_LOCK_FILE_NAME: &str = ".yadorilink-root.lock";
+use yadorilink_fs_platform::fs_identity::FileIdentity;
+pub use yadorilink_fs_platform::reserved_namespace::wire_path_names_sync_root_lock;
+pub use yadorilink_replica_domain::reserved_paths::SYNC_ROOT_LOCK_FILE_NAME;
 
 static HELD_ROOT_IDENTITIES: OnceLock<Mutex<HashMap<PathBuf, FileIdentity>>> = OnceLock::new();
 
@@ -136,10 +132,10 @@ fn path_still_names_live_unix_handle(expected: FileIdentity, current: FileIdenti
             current.object_id,
         ),
         (
-            crate::fs_identity::VolumeIdentity::Unix { device_id: expected_device },
-            crate::fs_identity::PlatformObjectId::Unix { inode: expected_inode },
-            crate::fs_identity::VolumeIdentity::Unix { device_id: current_device },
-            crate::fs_identity::PlatformObjectId::Unix { inode: current_inode },
+            yadorilink_fs_platform::fs_identity::VolumeIdentity::Unix { device_id: expected_device },
+            yadorilink_fs_platform::fs_identity::PlatformObjectId::Unix { inode: expected_inode },
+            yadorilink_fs_platform::fs_identity::VolumeIdentity::Unix { device_id: current_device },
+            yadorilink_fs_platform::fs_identity::PlatformObjectId::Unix { inode: current_inode },
         ) if expected_device == current_device
             && expected_inode == current_inode
             && expected.object_kind == current.object_kind
@@ -160,16 +156,17 @@ fn verify_sidecar_identity(root: &Path, expected: FileIdentity) -> Result<(), Ro
     // here re-pays real file-create/stat/unlink I/O, inside the very sync
     // root the filesystem watcher is watching, on every single call. See
     // `cached_probe_birth_time_granularity`'s own doc for the cost.
-    let granularity = crate::fs_capabilities::cached_probe_birth_time_granularity(root);
+    let granularity =
+        yadorilink_fs_platform::fs_capabilities::cached_probe_birth_time_granularity(root);
     match expected.compare(&current, granularity) {
-        crate::fs_identity::IdentityComparison::SameObject => Ok(()),
-        crate::fs_identity::IdentityComparison::DefinitelyDifferent => {
+        yadorilink_fs_platform::fs_identity::IdentityComparison::SameObject => Ok(()),
+        yadorilink_fs_platform::fs_identity::IdentityComparison::DefinitelyDifferent => {
             Err(RootAuthorityError::OwnershipLost(format!(
                 "sync-root lock sidecar {} no longer names the object this process locked",
                 lock_path.display()
             )))
         }
-        crate::fs_identity::IdentityComparison::Ambiguous(reason) => {
+        yadorilink_fs_platform::fs_identity::IdentityComparison::Ambiguous(reason) => {
             #[cfg(unix)]
             if path_still_names_live_unix_handle(expected, current) {
                 return Ok(());
@@ -191,68 +188,6 @@ pub fn verify_registered_root_ownership(root: &Path) -> Result<(), RootAuthority
     match expected {
         Some(expected) => verify_sidecar_identity(&canonical, expected),
         None => Ok(()),
-    }
-}
-
-/// True for exactly `<root>/.yadorilink-root.lock` and nothing else —
-/// identical top-level-only rule to
-/// [`crate::root_identity::is_root_marker_relative_path`], which this
-/// mirrors so the same-named file nested in a subdirectory (ordinary user
-/// content) keeps syncing normally.
-pub fn is_sync_root_lock_relative_path(relative_path: impl AsRef<Path>) -> bool {
-    let mut segments =
-        relative_path.as_ref().components().filter(|c| !matches!(c, Component::CurDir));
-    match (segments.next(), segments.next()) {
-        (Some(Component::Normal(only)), None) => {
-            only == std::ffi::OsStr::new(SYNC_ROOT_LOCK_FILE_NAME)
-        }
-        _ => false,
-    }
-}
-
-/// The **wire-path** counterpart to [`is_sync_root_lock_relative_path`], for
-/// a path **string** that arrived off the wire (a peer-authored path this
-/// process never walked off its own directory tree) — a change's `Put`/
-/// `Delete`/`Move` path, or a peer-supplied `FileRecord::path` about to be
-/// materialized.
-///
-/// Top-level-only and exact, matching [`is_sync_root_lock_relative_path`]'s
-/// semantics exactly — this is deliberately NOT the same shape as
-/// [`crate::reserved_namespace::path_has_artefact_component_in_wire_path`],
-/// which matches the reserved name at *any* depth because a versioned
-/// artefact name is reserved wherever it appears, including as an
-/// intermediate directory. The sync-root lock is different: like the
-/// identity marker, a same-named file *nested* in a subdirectory is
-/// ordinary user content that must keep syncing (see
-/// [`is_sync_root_lock_relative_path`]'s doc comment) — only a peer path
-/// that is *exactly* the lock file at the root is a genuine collision, so
-/// only a single-component path is checked here.
-///
-/// Must be used instead of the host-`Path` form at every site that rejects a
-/// remote-authored path, for the identical reason
-/// [`crate::reserved_namespace::path_has_artefact_component_in_wire_path`]
-/// documents: resolving a peer's raw path string through this process's own
-/// `std::path::Path` finds component boundaries only where THIS platform's
-/// separator convention says to, so a peer path shaped like
-/// `"safe\\.yadorilink-root.lock"` would be one component (not a match) on
-/// Unix and two (a match on the second, still correctly excluded here since
-/// it is no longer the *only* component) on Windows — an admission decision
-/// must not depend on which platform is running the check. Reuses
-/// `reserved_namespace`'s own portable component splitter and
-/// alternate-data-stream stripper so this agrees with the versioned-artefact
-/// wire check on what counts as "the same component" in every case, rather
-/// than defining that afresh here and risking the two silently diverging on
-/// the exact NTFS-ADS/backslash edge cases that check's tests already pin
-/// down. ASCII case-folded: this name is fixed ASCII, and the target
-/// folder's filesystem may itself be case-insensitive (NTFS default, APFS
-/// default), so a peer path differing only in case still names the same
-/// on-disk file this device's lock lives at.
-pub fn wire_path_names_sync_root_lock(path: &str) -> bool {
-    let mut components = crate::reserved_namespace::wire_path_components(path);
-    match (components.next(), components.next()) {
-        (Some(only), None) => crate::reserved_namespace::strip_alternate_data_stream_suffix(only)
-            .eq_ignore_ascii_case(SYNC_ROOT_LOCK_FILE_NAME),
-        _ => false,
     }
 }
 
@@ -461,7 +396,7 @@ fn open_sidecar_file(
             ),
         ))
     })?;
-    if identity.object_kind != crate::fs_identity::ObjectKind::RegularFile {
+    if identity.object_kind != yadorilink_fs_platform::fs_identity::ObjectKind::RegularFile {
         return Err(RootAuthorityError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(

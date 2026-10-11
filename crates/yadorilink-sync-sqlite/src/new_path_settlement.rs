@@ -17,11 +17,11 @@ use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
 
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 use yadorilink_replica_domain::file::{FileVersion, RecordKind};
 use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_replica_domain::native_plan::NativeRowIdentity;
 use yadorilink_replica_domain::native_state::LiveHead;
-use yadorilink_root_authority::fs_identity::FileIdentity;
 
 use crate::error::SyncSqliteError;
 use crate::materialized_generation::{MaterializedObjectKind, ObservedPresent};

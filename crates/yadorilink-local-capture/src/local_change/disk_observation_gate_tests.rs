@@ -2,7 +2,7 @@
 
 use super::*;
 use std::path::Path;
-use yadorilink_root_authority::fs_identity::FileIdentity;
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 
 fn observed(path: &Path) -> DiskObservation {
     DiskObservation { identity: FileIdentity::observe_path(path).expect("observe") }

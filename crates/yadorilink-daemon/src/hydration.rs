@@ -208,7 +208,7 @@ const WORKER_IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from
 /// would mean hashing the file at every re-check, a full read of it each
 /// time.
 pub(crate) type DiskIdentity =
-    Option<(yadorilink_root_authority::fs_identity::DiskRaceFingerprint, Option<(u64, u64)>)>;
+    Option<(yadorilink_fs_platform::fs_identity::DiskRaceFingerprint, Option<(u64, u64)>)>;
 
 pub(crate) fn disk_identity(path: &std::path::Path) -> Result<DiskIdentity, SyncError> {
     Ok(std::fs::symlink_metadata(path).ok().as_ref().map(disk_identity_of))
@@ -216,7 +216,7 @@ pub(crate) fn disk_identity(path: &std::path::Path) -> Result<DiskIdentity, Sync
 
 pub(crate) fn disk_identity_of(
     meta: &std::fs::Metadata,
-) -> (yadorilink_root_authority::fs_identity::DiskRaceFingerprint, Option<(u64, u64)>) {
+) -> (yadorilink_fs_platform::fs_identity::DiskRaceFingerprint, Option<(u64, u64)>) {
     #[cfg(unix)]
     let file_id = {
         use std::os::unix::fs::MetadataExt as _;
@@ -224,7 +224,7 @@ pub(crate) fn disk_identity_of(
     };
     #[cfg(not(unix))]
     let file_id = None;
-    (yadorilink_root_authority::fs_identity::disk_race_fingerprint_of(meta), file_id)
+    (yadorilink_fs_platform::fs_identity::disk_race_fingerprint_of(meta), file_id)
 }
 
 /// Journals `path` dirty when the file on disk is no longer the one the
@@ -303,7 +303,7 @@ fn heal_hydrated_proof_for_current_version(
     // An observation that fails costs the re-prove, nothing else: the
     // claim stays unproven and the caller fails closed, which is where it
     // was already heading.
-    let Ok(identity) = yadorilink_root_authority::fs_identity::FileIdentity::observe_path(out_path)
+    let Ok(identity) = yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(out_path)
     else {
         return Ok(false);
     };
@@ -2332,8 +2332,7 @@ async fn hydrate_inner(
             // primitive below accepts an optional identity: a hydration
             // that cannot see what it just wrote has nothing to vouch for.
             let identity =
-                match yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path)
-                {
+                match yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path) {
                     Ok(identity) => identity,
                     Err(error) => {
                         tracing::warn!(

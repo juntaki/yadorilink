@@ -83,8 +83,13 @@ async fn the_winner_replaces_the_loser_only_after_the_loser_stands_at_its_copy()
 
     let copy = copy_path("x", &mine);
     assert_eq!(std::fs::read(h.path(&copy)).unwrap(), b"guard: this device's x");
-    assert_ne!(std::fs::read(h.path("x")).unwrap(), b"guard: this device's x");
     assert_eq!(h.state.file_index_repository().contested_path_count(GROUP).unwrap(), 0);
+    // The replacement itself needs durable namespace changes.
+    if crate::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the original",
+    ) {
+        assert_ne!(std::fs::read(h.path("x")).unwrap(), b"guard: this device's x");
+    }
 }
 
 /// A platform that cannot make a directory entry durable (Windows, until its
@@ -110,6 +115,13 @@ async fn without_directory_durability_the_conflict_is_resolved_but_the_file_wait
     );
     assert_eq!(h.state.file_index_repository().contested_path_count(GROUP).unwrap(), 0);
 
+    // Lifting the forced refusal only helps where the platform can make the
+    // update durable at all.
+    if !crate::test_support::windows_durability_gate_allows_tests(
+        "the waiting update once the refusal lifts",
+    ) {
+        return;
+    }
     yadorilink_sync_sqlite::displacement_guard::set_force_no_directory_durability(&root, false);
     for _ in 0..4 {
         pass(&h).await;

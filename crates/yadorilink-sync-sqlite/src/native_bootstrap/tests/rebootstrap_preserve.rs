@@ -6,10 +6,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use yadorilink_fs_platform::durable_dir::trace;
 use yadorilink_replica_domain::history_truncation::{HistoryTruncations, RetainedSummary};
 use yadorilink_replica_domain::native_checkpoint_seal::NativeSealPolicy;
 use yadorilink_replica_domain::signed_delta::RecursivePart;
-use yadorilink_root_authority::durable_dir::trace;
 
 use crate::native_rebootstrap::{
     begin_rebootstrap, expire_candidate, plan_preservation, rebootstrap_status,
@@ -1280,9 +1280,9 @@ fn creating_the_area_publishes_each_created_directory() {
 
 /// The targets of the durable moves in `trace`, in order.
 fn published(
-    trace: &[yadorilink_root_authority::durable_dir::trace::Event],
+    trace: &[yadorilink_fs_platform::durable_dir::trace::Event],
 ) -> Vec<std::path::PathBuf> {
-    use yadorilink_root_authority::durable_dir::trace::Event;
+    use yadorilink_fs_platform::durable_dir::trace::Event;
     trace
         .iter()
         .filter_map(|event| match event {
@@ -1756,7 +1756,7 @@ fn a_platform_without_directory_durability_starts_nothing() {
 fn a_durable_write_flushes_a_stage_file_then_publishes_it_by_a_durable_move() {
     use crate::native_rebootstrap_recovery::test_hooks::FILE_SYNCS;
     use crate::native_rebootstrap_recovery::write_durable;
-    use yadorilink_root_authority::durable_dir::trace::Event;
+    use yadorilink_fs_platform::durable_dir::trace::Event;
     let dir = private_tempdir();
     FILE_SYNCS.with(|n| n.set(0));
     trace::take();
@@ -1769,8 +1769,8 @@ fn a_durable_write_flushes_a_stage_file_then_publishes_it_by_a_durable_move() {
     let name = stage.file_name().unwrap().to_string_lossy().into_owned();
     assert!(
         matches!(
-            yadorilink_root_authority::reserved_namespace::parse_artefact_component(&name),
-            Some((yadorilink_root_authority::reserved_namespace::ArtefactKind::Stage, _))
+            yadorilink_fs_platform::reserved_namespace::parse_artefact_component(&name),
+            Some((yadorilink_fs_platform::reserved_namespace::ArtefactKind::Stage, _))
         ),
         "{name}"
     );

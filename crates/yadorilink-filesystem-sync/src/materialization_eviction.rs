@@ -30,10 +30,10 @@ use crate::materialization_execution::{
 /// race this same fingerprint also closes, eviction's outcome on a false
 /// match is more destructive: removing the object below destroys the
 /// user's just-edited bytes, not merely stale remote content.
-type DiskIdentity = Option<yadorilink_root_authority::fs_identity::DiskRaceFingerprint>;
+type DiskIdentity = Option<yadorilink_fs_platform::fs_identity::DiskRaceFingerprint>;
 
 fn disk_identity(path: &Path) -> Result<DiskIdentity, MaterializationExecutionError> {
-    Ok(yadorilink_root_authority::fs_identity::disk_race_fingerprint(path))
+    Ok(yadorilink_fs_platform::fs_identity::disk_race_fingerprint(path))
 }
 
 /// A point between eviction's last check of the object and its removal, at
@@ -78,8 +78,8 @@ pub fn eviction_quarantine_path(
 ) -> Result<std::path::PathBuf, MaterializationExecutionError> {
     use sha2::{Digest, Sha256};
     let id = hex::encode(Sha256::digest(format!("evict\0{rel_path}").as_bytes()));
-    let name = yadorilink_root_authority::reserved_namespace::artefact_component_name(
-        yadorilink_root_authority::reserved_namespace::ArtefactKind::Preimage,
+    let name = yadorilink_fs_platform::reserved_namespace::artefact_component_name(
+        yadorilink_fs_platform::reserved_namespace::ArtefactKind::Preimage,
         &id,
     )
     .map_err(|e| MaterializationExecutionError::CorruptState(e.to_string()))?;
@@ -678,8 +678,7 @@ pub fn evict_file(
                 && disk_bytes_match_indexed_blocks(&out_path, &record.blocks).unwrap_or(false);
             let abandoned = match intact
                 .then(|| {
-                    yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path)
-                        .ok()
+                    yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path).ok()
                 })
                 .flatten()
             {

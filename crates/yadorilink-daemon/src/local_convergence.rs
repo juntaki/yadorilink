@@ -36,11 +36,9 @@ use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_replica_domain::session_state::LinkGate;
 use yadorilink_root_authority::root_commit::{RootCommitPermit, RootLease};
 
+use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
 use yadorilink_peer_session::hazard;
 use yadorilink_peer_session::peer_session::RootCommitAuthorityProvider;
-use yadorilink_root_authority::ignore_patterns::{
-    is_ignore_file_relative_path, EffectiveIgnoreSet,
-};
 
 /// The local half of convergence: everything decided from this device alone.
 pub struct LocalConvergenceExecutor {
@@ -934,7 +932,7 @@ impl LocalConvergenceExecutor {
                     .map_err(yadorilink_local_storage::StorageError::Io)?;
                 version.meta.symlink_target.as_deref()
                     != Some(
-                        yadorilink_root_authority::fs_identity::target_to_bytes(&target).as_slice(),
+                        yadorilink_fs_platform::fs_identity::target_to_bytes(&target).as_slice(),
                     )
             }
             RecordKind::Symlink => file_type.is_file(),
@@ -1347,7 +1345,7 @@ impl LocalConvergenceExecutor {
         out_path: &Path,
     ) -> Result<bool, PeerSessionError> {
         let Ok(observed) =
-            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(out_path)
+            yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(out_path)
         else {
             return Ok(false);
         };
@@ -1405,7 +1403,7 @@ impl LocalConvergenceExecutor {
                 // never a different directory made at the same path.
                 EmptyDirectoryRemoval::NotEmpty => Some(TombstoneRemoval::Retained {
                     reason: self.retained_directory_reason_for(group_id, rel_path)?,
-                    removable: yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
+                    removable: yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(
                         out_path,
                     )
                     .ok()
@@ -1434,7 +1432,7 @@ impl LocalConvergenceExecutor {
         group_id: &str,
         rel_path: &str,
         reason: &str,
-        removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+        removable: Option<&yadorilink_fs_platform::fs_identity::FileIdentity>,
     ) -> Result<(), PeerSessionError> {
         self.state
             .keep_retained_directory(group_id, rel_path, reason, removable)
@@ -1482,7 +1480,7 @@ impl LocalConvergenceExecutor {
     ) -> Result<Option<SettlementEvidence>, PeerSessionError> {
         let out_path = self.local_file_path(group_id, rel_path)?;
         let Ok(observed) =
-            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path)
+            yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path)
         else {
             return Ok(None);
         };

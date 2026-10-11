@@ -481,7 +481,7 @@ impl LinkFlushHandle {
         }
         self.flush_all_pending_local_changes(group_id).await;
         let ignore_set =
-            yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet::load_for_link_root(
+            yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet::load_for_link_root(
                 &self.root,
             )
             .map_err(|e| e.to_string())?;

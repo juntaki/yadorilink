@@ -8,7 +8,7 @@ use yadorilink_replica_domain::session_state::MaterializationState;
 
 use super::super::types::*;
 use super::MaterializationPlan;
-use yadorilink_root_authority::fs_identity::{disk_race_fingerprint, DiskRaceFingerprint};
+use yadorilink_fs_platform::fs_identity::{disk_race_fingerprint, DiskRaceFingerprint};
 
 // The eager lane is a pipeline. Each stage consumes the value the
 // previous one produced, so a stage can only run once everything before it
@@ -1120,9 +1120,9 @@ fn disk_still_the_verified_object(
     path: &str,
     out_path: &std::path::Path,
     blocks: &[yadorilink_replica_domain::file::BlockInfo],
-    verified: Option<yadorilink_root_authority::fs_identity::FileIdentity>,
+    verified: Option<yadorilink_fs_platform::fs_identity::FileIdentity>,
 ) -> bool {
-    use yadorilink_root_authority::fs_identity::FileIdentity;
+    use yadorilink_fs_platform::fs_identity::FileIdentity;
     let identity_unchanged = verified.is_some()
         && super::super::types::require_physical_kind_matches(path, out_path, RecordKind::File)
             .is_ok()

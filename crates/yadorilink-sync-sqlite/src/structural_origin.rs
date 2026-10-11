@@ -89,7 +89,7 @@ use crate::file_identity_codec::{
     decode_file_identity, encode_file_identity, encode_object_address,
 };
 use crate::materialized_generation::{bump_mutation_fence, snapshot_mutation_fence};
-use yadorilink_root_authority::fs_identity::{
+use yadorilink_fs_platform::fs_identity::{
     FileIdentity, IdentityComparison, ObjectKind, TimestampGranularity,
 };
 

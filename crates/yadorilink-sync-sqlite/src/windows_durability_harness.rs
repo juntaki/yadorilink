@@ -31,7 +31,7 @@ use crate::native_rebootstrap_recovery::{
 /// The directory flush the primitive experiments measure; no product code path
 /// relies on it any more.
 fn sync_dir(dir: &Path) -> Result<(), crate::native_rebootstrap_recovery::AreaError> {
-    yadorilink_root_authority::durable_dir::durable_flush_directory(dir).map_err(Into::into)
+    yadorilink_fs_platform::durable_dir::durable_flush_directory(dir).map_err(Into::into)
 }
 
 /// Which flushes the workload performs. `Full` is the product behaviour; the
@@ -238,7 +238,7 @@ fn join(dir: &str, name: &str) -> String {
 fn rename_write_through(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
-        yadorilink_root_authority::durable_dir::rename_no_replace_durable(from, to)
+        yadorilink_fs_platform::durable_dir::rename_no_replace_durable(from, to)
     }
     #[cfg(not(windows))]
     {

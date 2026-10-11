@@ -22,6 +22,7 @@ yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
 # `fs_identity::bytes_to_target` for symlink-target byte<->OS-path
 # conversion in `materialize_write::materialize_symlink*`. A
 # pure leaf crate over `yadorilink-replica-domain` only -- no cycle risk.
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 # The block store's persistent index is a SQLite database, opened through
 # the workspace's one SQLite runtime (pool, in-process writer gate, WAL +

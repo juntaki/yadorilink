@@ -49,10 +49,10 @@
 
 use rusqlite::Transaction;
 
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_root_authority::fs_identity::FileIdentity;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 
 use crate::error::SyncSqliteError;

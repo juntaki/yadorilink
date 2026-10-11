@@ -66,7 +66,7 @@ fn persist_db(source: &Connection, path: &Path) -> io::Result<Connection> {
     source.execute("VACUUM INTO ?1", [path.to_str().unwrap()]).map_err(io::Error::other)?;
     std::fs::OpenOptions::new().write(true).open(path)?.sync_all()?;
     if let Some(parent) = path.parent() {
-        yadorilink_root_authority::durable_dir::durable_flush_directory(parent)?;
+        yadorilink_fs_platform::durable_dir::durable_flush_directory(parent)?;
     }
     Connection::open(path).map_err(io::Error::other)
 }

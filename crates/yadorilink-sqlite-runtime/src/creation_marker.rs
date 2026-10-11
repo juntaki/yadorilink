@@ -91,10 +91,10 @@ pub fn record_database_created(db_path: &Path) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&staged);
         return Err(error);
     }
-    match yadorilink_root_authority::durable_dir::publish_durably(
+    match yadorilink_fs_platform::durable_dir::publish_durably(
         &staged,
         &marker,
-        yadorilink_root_authority::durable_dir::Replace::No,
+        yadorilink_fs_platform::durable_dir::Replace::No,
     ) {
         Ok(()) => Ok(()),
         // Another writer recorded it first.

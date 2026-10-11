@@ -47,6 +47,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+use yadorilink_fs_platform::fs_identity::{FileIdentity, ObjectKind};
+use yadorilink_fs_platform::reserved_namespace::{artefact_component_name, ArtefactKind};
 use yadorilink_local_storage::{
     apply_unix_mode, create_dir_all_never_through_a_symlink, create_explicit_directory,
     intent_target_hash, remove_empty_dir_in, verify_write_target_within_root,
@@ -55,8 +57,6 @@ use yadorilink_local_storage::{
 use yadorilink_replica_domain::conflict::conflict_copy_path;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::session_state::HeldPath;
-use yadorilink_root_authority::fs_identity::{FileIdentity, ObjectKind};
-use yadorilink_root_authority::reserved_namespace::{artefact_component_name, ArtefactKind};
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 
 use crate::materialization_execution::{
@@ -785,7 +785,7 @@ fn object_digest(
     } else if file_type.is_symlink() {
         hasher.update(b"symlink");
         let target = std::fs::read_link(path)?;
-        hasher.update(yadorilink_root_authority::fs_identity::target_to_bytes(&target));
+        hasher.update(yadorilink_fs_platform::fs_identity::target_to_bytes(&target));
     } else {
         hasher.update(b"other");
         #[cfg(unix)]
@@ -917,7 +917,7 @@ mod tests {
         fn complete(
             &self,
             rel_path: &str,
-            _identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+            _identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
         ) -> Result<(), yadorilink_local_storage::StorageError> {
             panic!("moving aside created a directory: {rel_path}")
         }

@@ -77,7 +77,7 @@ fn an_observed_eager_batch_write_publishes_a_versioned_proof_under_its_own_epoch
     let observed_file = observed_dir.path().join("doc.txt");
     std::fs::write(&observed_file, b"").unwrap();
     let identity =
-        yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&observed_file).unwrap();
+        yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&observed_file).unwrap();
     let version_hash = current_version_of(&coordinator, "doc.txt");
     open_the_batch_row(&coordinator, "doc.txt", &permit);
 
@@ -248,7 +248,7 @@ fn an_eager_batch_write_that_loses_its_publish_cas_keeps_its_materialization_int
     let observed_file = observed_dir.path().join("doc.txt");
     std::fs::write(&observed_file, b"").unwrap();
     let identity =
-        yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&observed_file).unwrap();
+        yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&observed_file).unwrap();
 
     let finished = vec![yadorilink_peer_session::ports::FinishedProjectedUpsert {
         rel_path: "doc.txt".to_string(),
@@ -491,7 +491,7 @@ fn an_eager_batch_write_publishes_the_hash_the_desired_resolution_will_be_compar
 /// value instead of re-probing.
 #[test]
 fn granularity_cache_reprobes_on_a_different_volume_identity_but_not_the_same_one() {
-    use yadorilink_root_authority::fs_identity::{TimestampGranularity, VolumeIdentity};
+    use yadorilink_fs_platform::fs_identity::{TimestampGranularity, VolumeIdentity};
 
     let volume_a = VolumeIdentity::Unix { device_id: 0xAAAA };
     let volume_b = VolumeIdentity::Unix { device_id: 0xBBBB };

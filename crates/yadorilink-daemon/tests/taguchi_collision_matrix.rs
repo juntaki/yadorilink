@@ -398,6 +398,11 @@ async fn run_taguchi_row(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_row_01_dc3_op_all_edit_stag_sim_path_all_same_r1() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_taguchi_row("taguchi-01", 1, 1, 1, 1, 1).await;
 }
 
@@ -418,6 +423,11 @@ async fn taguchi_row_04_dc3_op_c_e_d_r_stag_large_path_all_different_r10() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_row_05_dc4_op_all_edit_stag_micro_path_rename_race_r10() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_taguchi_row("taguchi-05", 2, 1, 2, 3, 4).await;
 }
 
@@ -433,6 +443,11 @@ async fn taguchi_row_07_dc4_op_all_delete_stag_large_path_all_same_r3() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_row_08_dc4_op_c_e_d_r_stag_small_path_two_groups_r1() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_taguchi_row("taguchi-08", 2, 4, 3, 2, 1).await;
 }
 
@@ -443,6 +458,11 @@ async fn taguchi_row_09_dc5_op_all_edit_stag_small_path_all_different_r3() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_row_10_dc5_op_edit_del_rename_stag_large_path_rename_race_r1() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_taguchi_row("taguchi-10", 3, 2, 4, 3, 1).await;
 }
 
@@ -453,16 +473,31 @@ async fn taguchi_row_11_dc5_op_all_delete_stag_sim_path_two_groups_r10() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_row_12_dc5_op_c_e_d_r_stag_micro_path_all_same_r5() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_taguchi_row("taguchi-12", 3, 4, 2, 1, 3).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_row_13_dc6_op_all_edit_stag_large_path_two_groups_r5() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_taguchi_row("taguchi-13", 4, 1, 4, 2, 3).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_row_14_dc6_op_edit_del_rename_stag_small_path_all_same_r10() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_taguchi_row("taguchi-14", 4, 2, 3, 1, 4).await;
 }
 
@@ -473,5 +508,10 @@ async fn taguchi_row_15_dc6_op_all_delete_stag_micro_path_all_different_r1() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_row_16_dc6_op_c_e_d_r_stag_sim_path_rename_race_r3() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     run_taguchi_row("taguchi-16", 4, 4, 1, 3, 2).await;
 }

@@ -12,7 +12,7 @@
 //! [`ReplicaCoordinator::abandon_structural_directory_intent`]; recovery,
 //! adoption, rekeying and forgetting are the operations below.
 
-use yadorilink_root_authority::fs_identity::FileIdentity;
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 use yadorilink_sync_sqlite::structural_origin::StructuralOriginCompletion;
 use yadorilink_sync_sqlite::SyncSqliteError;
 
@@ -175,7 +175,7 @@ impl ReplicaCoordinator {
         match FileIdentity::observe_path(&target) {
             Ok(identity) => Some(
                 (identity.object_kind
-                    == yadorilink_root_authority::fs_identity::ObjectKind::Directory)
+                    == yadorilink_fs_platform::fs_identity::ObjectKind::Directory)
                     .then_some(identity),
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(None),
@@ -242,7 +242,7 @@ impl ReplicaCoordinator {
         sync_root: &std::path::Path,
         observed: &FileIdentity,
     ) -> Result<bool, SyncSqliteError> {
-        use yadorilink_root_authority::fs_identity::IdentityComparison;
+        use yadorilink_fs_platform::fs_identity::IdentityComparison;
         Ok(self.sqlite().dag_materialized_directory_identity(group_id, path)?.is_some_and(
             |recorded| {
                 recorded.compare(
@@ -264,7 +264,7 @@ impl ReplicaCoordinator {
         sync_root: &std::path::Path,
         observed: &FileIdentity,
     ) -> Result<bool, SyncSqliteError> {
-        use yadorilink_root_authority::fs_identity::IdentityComparison;
+        use yadorilink_fs_platform::fs_identity::IdentityComparison;
         use yadorilink_sync_sqlite::structural_origin::RetainedDirectory;
         Ok(match self.sqlite().retained_directory(group_id, path)? {
             RetainedDirectory::RemovableWhenEmpty(recorded) => {

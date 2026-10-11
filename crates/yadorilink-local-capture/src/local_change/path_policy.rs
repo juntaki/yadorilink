@@ -3,12 +3,10 @@
 
 use std::path::Path;
 
-use yadorilink_root_authority::ignore_patterns::{
-    is_ignore_file_relative_path, EffectiveIgnoreSet,
-};
-use yadorilink_root_authority::reserved_namespace::path_has_reserved_component;
+use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
+use yadorilink_fs_platform::reserved_namespace::is_sync_root_lock_relative_path;
+use yadorilink_fs_platform::reserved_namespace::path_has_reserved_component;
 use yadorilink_root_authority::root_identity::is_root_marker_relative_path;
-use yadorilink_root_authority::sync_root_lock::is_sync_root_lock_relative_path;
 
 /// The link-relative, forward-slash-normalized key for `path` under `root` —
 /// the exact form the index and the `local_dirty_paths` journal use as a path
@@ -31,7 +29,7 @@ pub(super) fn relative_key(root: &Path, path: &Path) -> Option<String> {
 /// Why this path can never become a local change, or `None` if it can.
 ///
 /// A thin wrapper over
-/// [`yadorilink_root_authority::reserved_namespace::wire_path_admission_refusal`]
+/// [`yadorilink_fs_platform::reserved_namespace::wire_path_admission_refusal`]
 /// -- the single predicate native admission itself reads
 /// (`dag_store::serving_authorization_index::validate_no_reserved_paths`,
 /// on both the receiving and local-authoring call sites) -- turned into a
@@ -70,7 +68,7 @@ pub(super) fn relative_key(root: &Path, path: &Path) -> Option<String> {
 /// it, it is simply not represented in the group's history, which is the
 /// same end state admission was always going to enforce.
 pub(super) fn skip_reason_for_inadmissible_wire_path(rel_path: &str) -> Option<&'static str> {
-    use yadorilink_root_authority::reserved_namespace::{
+    use yadorilink_fs_platform::reserved_namespace::{
         wire_path_admission_refusal, WirePathRefusal,
     };
     match wire_path_admission_refusal(rel_path) {

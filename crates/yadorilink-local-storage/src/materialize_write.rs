@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::content_ports::BlockContentStore;
 use crate::error::StorageError;
 use crate::fs_ops::{durable_namespace_beside, remove_path, rename_path, LedgerNames};
+use yadorilink_fs_platform::durable_dir::Replace;
 use yadorilink_replica_domain::file::BlockInfo;
-use yadorilink_root_authority::durable_dir::Replace;
 
 fn unique_tmp_path(path: &Path) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -213,7 +213,7 @@ pub trait StructuralDirectoryLedger {
     fn complete(
         &self,
         rel_path: &str,
-        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+        identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
     ) -> Result<(), StorageError>;
     fn abandon(&self, rel_path: &str) -> Result<(), StorageError>;
     fn interrupted(&self, rel_path: &str) -> Result<(), StorageError>;
@@ -429,7 +429,7 @@ fn create_structural_directory(
     match make_directory(dir, ledger) {
         Ok(()) => {
             let identity =
-                match yadorilink_root_authority::fs_identity::FileIdentity::observe_path(dir) {
+                match yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(dir) {
                     Ok(identity) => identity,
                     Err(e) => {
                         // Created, but its identity cannot be read: nothing to
@@ -1658,7 +1658,7 @@ pub fn materialize_symlink_in(
     let tmp_path = unique_tmp_path(out_path);
     ledger.record(&tmp_path)?;
     if let Err(e) = std::os::unix::fs::symlink(
-        yadorilink_root_authority::fs_identity::bytes_to_target(target),
+        yadorilink_fs_platform::fs_identity::bytes_to_target(target),
         &tmp_path,
     ) {
         // Not created by this call, so not this call's to remove.
@@ -1730,7 +1730,7 @@ pub fn materialize_symlink_windows_in(
     // `fs_identity::bytes_to_target`'s doc) for any target this crate itself
     // ever captured; a malformed byte string has nothing well-formed to
     // materialize.
-    let Some(target) = yadorilink_root_authority::fs_identity::bytes_to_target(target) else {
+    let Some(target) = yadorilink_fs_platform::fs_identity::bytes_to_target(target) else {
         return Err(StorageError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(

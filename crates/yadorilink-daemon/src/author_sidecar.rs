@@ -86,10 +86,10 @@ pub fn write_sidecar(db_path: &Path, sidecar: &InstanceSidecar) -> io::Result<()
         file.write_all(&encode(sidecar))?;
         file.sync_all()?;
         drop(file);
-        yadorilink_root_authority::durable_dir::publish_durably(
+        yadorilink_fs_platform::durable_dir::publish_durably(
             &temp,
             &sidecar_path(db_path),
-            yadorilink_root_authority::durable_dir::Replace::Yes,
+            yadorilink_fs_platform::durable_dir::Replace::Yes,
         )
     })();
     if written.is_err() {

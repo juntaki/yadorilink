@@ -363,7 +363,7 @@ pub fn normalization_collision<'a>(
 /// case-insensitive AND normalization-insensitive (the macOS default, both
 /// HFS+ and APFS), that pair collides to one physical file despite
 /// differing on every axis tested independently.
-pub use yadorilink_root_authority::canonical_fold::canonical_fold;
+pub use yadorilink_fs_platform::canonical_fold::canonical_fold;
 
 /// the already-indexed sibling in `siblings` that `path` collides with
 /// under the COMBINED case-fold-and-normalization equivalence
@@ -498,7 +498,7 @@ const NORMALIZATION_PROBE_LEAF_NAME: &str = "nfc-probe-\u{e9}";
 /// neither is optional:
 ///
 /// 1. **The artefact must not be indexable content.** `probe_dir_name` comes
-///    from [`yadorilink_root_authority::fs_capabilities::probe_artefact_name`], which builds a
+///    from [`yadorilink_fs_platform::fs_capabilities::probe_artefact_name`], which builds a
 ///    name in the engine's reserved namespace
 ///    (`.yadorilink-v1-probe.<id>`). That is the exact predicate — via
 ///    `reserved_namespace::path_has_reserved_component` — that the watcher,
@@ -560,8 +560,8 @@ fn probe_in_owned_dir<T>(
     label: &str,
     probe: impl Fn(&Path) -> std::io::Result<T>,
 ) -> std::io::Result<T> {
-    for _ in 0..yadorilink_root_authority::fs_capabilities::MAX_ARTEFACT_NAME_ATTEMPTS {
-        let name = yadorilink_root_authority::fs_capabilities::probe_artefact_name(label)
+    for _ in 0..yadorilink_fs_platform::fs_capabilities::MAX_ARTEFACT_NAME_ATTEMPTS {
+        let name = yadorilink_fs_platform::fs_capabilities::probe_artefact_name(label)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         match probe_in_named_dir(parent, &name, &probe) {
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,

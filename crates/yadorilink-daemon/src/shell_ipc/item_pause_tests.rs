@@ -457,10 +457,17 @@ async fn resuming_a_paused_item_catches_up_every_held_change() {
          top of a change its author never saw"
     );
 
+    // Where the platform offers no durable namespace changes, the remote
+    // winner cannot replace the local original, so only the projection of the
+    // remote file is awaited there.
+    let replaces = crate::test_support::windows_durability_gate_allows_tests(
+        "the remote winner replacing the local original",
+    );
     let both_sides = vec![Vec::new(), b"local edit".to_vec()];
     assert!(
         f.drive_projection_until(|f| {
-            f.read("dir/incoming.txt").is_some() && f.contents_named("dir", "shared") == both_sides
+            f.read("dir/incoming.txt").is_some()
+                && (!replaces || f.contents_named("dir", "shared") == both_sides)
         })
         .await,
         "after resume the remote file must be projected and a file changed on both sides while \
@@ -526,6 +533,15 @@ async fn concurrent_local_and_remote_edits_both_survive(local_wins: bool) {
         "sanity: the two edits are concurrent heads"
     );
 
+    // A remote winner replacing the local original needs durable namespace
+    // changes; the sanity checks above still hold without them.
+    if !local_wins
+        && !crate::test_support::windows_durability_gate_allows_tests(
+            "the remote winner replacing the local original",
+        )
+    {
+        return;
+    }
     let both_sides = vec![Vec::new(), b"local edit".to_vec()];
     assert!(
         f.drive_projection_until(|f| f.contents_named("dir", "shared") == both_sides).await,
