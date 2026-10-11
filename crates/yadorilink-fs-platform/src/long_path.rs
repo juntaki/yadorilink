@@ -31,10 +31,9 @@ pub fn verbatim_form(path: &str) -> Option<String> {
         && bytes[2] == b'\\'
     {
         (&normalized[3..], format!(r"\\?\{}:\", &normalized[..1]))
-    } else if let Some(unc) = normalized.strip_prefix(r"\\") {
-        (unc, r"\\?\UNC\".to_string())
     } else {
-        return None;
+        let unc = normalized.strip_prefix(r"\\")?;
+        (unc, r"\\?\UNC\".to_string())
     };
     let literal = rest.split('\\').all(|component| {
         !component.is_empty()
