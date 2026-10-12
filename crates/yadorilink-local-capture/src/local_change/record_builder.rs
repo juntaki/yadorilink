@@ -6,9 +6,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::LocalCaptureError;
 use crate::scan_block_staging::ScanBlockStaging;
-use yadorilink_local_storage::{
-    chunk_open_file, read_replicated_xattrs, unix_mode_from_metadata, CDC_SIZE_THRESHOLD,
-};
+use yadorilink_fs_platform::fs_identity::{disk_race_fingerprint_of, metadata_mtime_matches};
+use yadorilink_local_storage::{chunk_open_file, CDC_SIZE_THRESHOLD};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::{BlockHash, SyncPath};
@@ -16,29 +15,19 @@ use yadorilink_replica_domain::limits::MAX_SYNCABLE_BLOCKS;
 use yadorilink_replica_domain::local_op::Op;
 use yadorilink_replica_domain::session_state::LocalFileMetaColumns;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_root_authority::fs_identity::{disk_race_fingerprint_of, metadata_mtime_matches};
 use yadorilink_sync_sqlite::SyncSqliteError;
 
 use super::disk_observation::{
     cfapi_placeholder_untouched, disk_bytes_match_indexed_blocks_off_worker,
     run_capture_pass_off_worker,
 };
-use super::{LocalChangeOutcome, LocalChangeProcessor};
+use super::{LocalChangeOutcome, LocalChangeProcessor, Predecessor};
 
 /// [`build_record_for_created_or_modified`]'s Unix-mode-to-persist output:
 /// the outer `None` means nothing to persist (a symlink, or nothing
 /// changed); the inner `Option<u32>` is `unix_mode_from_metadata`'s own
 /// value (itself `None` on a platform with no Unix permission-bits model).
 pub(super) type PendingUnixModeUpdate = Option<Option<u32>>;
-
-/// The indexed exec bit and replicated xattrs of one current row, taken
-/// from a single read -- `(None, [])` when there is no row, exactly what
-/// the old per-column reads returned for a missing row.
-pub(super) fn indexed_mode_and_xattrs(
-    row: Option<yadorilink_sync_sqlite::CanonicalCurrentRow>,
-) -> (Option<u32>, Vec<(String, Vec<u8>)>) {
-    row.map(|row| (row.snapshot.unix_mode, row.snapshot.xattrs)).unwrap_or_default()
-}
 
 /// The `FileRecord` a `get_file` read would return for one current-row
 /// read, so a caller that also needs the row's other columns reads them
@@ -724,10 +713,12 @@ impl LocalChangeProcessor {
                         // peer's advertised bit — mirrored here for local
                         // capture: bump the version (broadcast-worthy)
                         // without re-chunking.
-                        let on_disk_unix_mode = unix_mode_from_metadata(&metadata);
-                        let (indexed_unix_mode, indexed_xattrs) = indexed_mode_and_xattrs(
-                            self.state.canonical_current_row(group_id, &rel_path)?,
+                        let predecessor = Predecessor::of_row(
+                            self.state.canonical_current_row(group_id, &rel_path)?.as_ref(),
                         );
+                        let on_disk_unix_mode = self.captured_unix_mode(&metadata, &predecessor);
+                        let (indexed_unix_mode, indexed_xattrs) =
+                            (predecessor.unix_mode, predecessor.xattrs.clone());
                         // Same reasoning as the exec bit just above, for
                         // extended attributes: a `setxattr`-only
                         // edit touches none of size/mtime/content/unix_mode
@@ -736,9 +727,7 @@ impl LocalChangeProcessor {
                         // captured, never emitted, and a peer's next sync
                         // would overwrite this device's real xattr edit
                         // with the stale indexed value.
-                        let on_disk_xattrs = std::fs::File::open(path)
-                            .map(|f| read_replicated_xattrs(&f))
-                            .unwrap_or_default();
+                        let on_disk_xattrs = self.captured_xattrs(path, &predecessor);
                         if on_disk_unix_mode == indexed_unix_mode
                             && on_disk_xattrs == indexed_xattrs
                         {
@@ -1056,13 +1045,13 @@ impl LocalChangeProcessor {
         {
             if intent_target == yadorilink_local_storage::intent_target_hash(&blocks) {
                 if let Ok(metadata) = std::fs::metadata(path) {
-                    let on_disk_unix_mode = unix_mode_from_metadata(&metadata);
                     let indexed_row = self.state.canonical_current_row(group_id, &rel_path)?;
                     let has_row = indexed_row.is_some();
-                    let (indexed_unix_mode, indexed_xattrs) = indexed_mode_and_xattrs(indexed_row);
-                    let on_disk_xattrs = std::fs::File::open(path)
-                        .map(|f| read_replicated_xattrs(&f))
-                        .unwrap_or_default();
+                    let predecessor = Predecessor::of_row(indexed_row.as_ref());
+                    let on_disk_unix_mode = self.captured_unix_mode(&metadata, &predecessor);
+                    let (indexed_unix_mode, indexed_xattrs) =
+                        (predecessor.unix_mode, predecessor.xattrs.clone());
+                    let on_disk_xattrs = self.captured_xattrs(path, &predecessor);
                     // A row that records no mode has none for the disk to diverge from
                     // while the write that owns the intent is still open. (No row at
                     // all is a different thing: nothing says what the file should be.)
@@ -1096,17 +1085,17 @@ impl LocalChangeProcessor {
         if let Some(existing) = &existing {
             if !existing.deleted && existing.blocks == blocks {
                 if let Ok(metadata) = std::fs::metadata(path) {
-                    let on_disk_unix_mode = unix_mode_from_metadata(&metadata);
-                    let (indexed_unix_mode, indexed_xattrs) = indexed_mode_and_xattrs(
-                        self.state.canonical_current_row(group_id, &rel_path)?,
+                    let predecessor = Predecessor::of_row(
+                        self.state.canonical_current_row(group_id, &rel_path)?.as_ref(),
                     );
+                    let on_disk_unix_mode = self.captured_unix_mode(&metadata, &predecessor);
+                    let (indexed_unix_mode, indexed_xattrs) =
+                        (predecessor.unix_mode, predecessor.xattrs.clone());
                     // Same reasoning as the exec-bit check just above, for
                     // extended attributes -- see the size+mtime
                     // fast path's own identical comment for the full
                     // rationale.
-                    let on_disk_xattrs = std::fs::File::open(path)
-                        .map(|f| read_replicated_xattrs(&f))
-                        .unwrap_or_default();
+                    let on_disk_xattrs = self.captured_xattrs(path, &predecessor);
                     if on_disk_unix_mode != indexed_unix_mode || on_disk_xattrs != indexed_xattrs {
                         // Content is genuinely unchanged (so no re-chunk,
                         // no re-versioned block list), but the exec bit is
@@ -1139,7 +1128,9 @@ impl LocalChangeProcessor {
         // fetched for `mtime_unix_nanos`, so a brand-new executable file's
         // exec bit is indexed from its first appearance rather than only
         // discoverable later via a subsequent metadata-only update.
-        let unix_mode = unix_mode_from_metadata(&metadata);
+        let predecessor =
+            Predecessor::of_row(self.state.canonical_current_row(group_id, &rel_path)?.as_ref());
+        let unix_mode = self.captured_unix_mode(&metadata, &predecessor);
 
         let record = FileRecord {
             path: rel_path,
@@ -1172,7 +1163,7 @@ impl LocalChangeProcessor {
         // FileMeta::symlink_target`'s doc for why a symlink's captured
         // target must be these exact bytes.
         let raw_target = std::fs::read_link(path)?;
-        let target_bytes = yadorilink_root_authority::fs_identity::target_to_bytes(&raw_target);
+        let target_bytes = yadorilink_fs_platform::fs_identity::target_to_bytes(&raw_target);
         let out_of_root = symlink_target_is_out_of_root(root, path, &raw_target);
         // `size` is derived from the same buffer as the target, not a
         // separately obtained stat length, so the two can never disagree —

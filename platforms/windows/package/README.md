@@ -33,7 +33,11 @@ SmartScreen will warn, so verify its SHA-256 first. See "Current status" and
 "Known limitation" below.
 
 The installer registers a `YadoriLinkDaemon` Scheduled Task so the daemon
-starts at every logon. First run, in a terminal:
+starts at every logon. First run: leave "Set up YadoriLink now" checked on
+the installer's last page and follow the steps (Welcome, sign in with Google
+in your browser, register this device, set up a share).
+
+Advanced / command line: the same setup from a terminal:
 
 ```powershell
 yadorilink login
@@ -156,6 +160,12 @@ powershell -ExecutionPolicy Bypass -File platforms\windows\package\build-install
    automatically at every logon instead of requiring a manual
    `yadorilink daemon start` from a terminal every session.
 
+4. Registers the `yadorilink://` URL scheme (`[Registry]`, under `HKA\Software\Classes`)
+   so a clicked invite link runs `yadorilink-status-app.exe "<url>"`. Acting on the
+   URL argument (parse with `yadorilink_client_core::wording::parse_invite_input`,
+   forward to a running instance, confirm and accept) is not implemented yet: it
+   is to be connected when the WinUI app (#76) replaces the egui tray app.
+
 Uninstalling (via "Apps & Features" or the generated uninstaller) runs
 `daemon-task.ps1 -Uninstall` (stops the process, removes the
 `YadoriLinkDaemon` task) and then `install.ps1 -Uninstall` (stops/removes
@@ -224,7 +234,7 @@ status. One detail that affects this directory: `yadorilink.iss`'s
 line switch, which writes `InstallSource=<name>` to
 `HKLM\Software\yadorilink` (cleaned up on uninstall). The WinGet manifest's
 `InstallerSwitches` pass `/PACKAGEMANAGER=winget`; the running daemon's
-`install_windows::detect_package_manager_marker` reads that registry value
+`install_source::detect_package_manager_marker` reads that registry value
 so its built-in updater defers to `winget upgrade` instead of running its
 own installer over a WinGet-managed install (see `manager::dispatch_install`
 in `crates/yadorilink-daemon/src/update/manager.rs`). **This has not been

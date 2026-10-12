@@ -11,6 +11,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::dag_store;
 use crate::error::SyncSqliteError;
 use crate::materialized_generation::MaterializedObjectKind;
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::{DeviceId, SyncPath};
@@ -27,7 +28,6 @@ use yadorilink_replica_domain::session_state::{
     ConflictCopyFile, DurabilityRoot, DurabilityRoots, LocalFileMetaColumns, MaterializationState,
     PreparedLocalMutation, RootSetSummary, TrashedFile, VersionRecord, VersionState,
 };
-use yadorilink_root_authority::fs_identity::FileIdentity;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sqlite_runtime::SyncDatabase;
 
@@ -66,19 +66,6 @@ pub(crate) fn now_unix_nanos_checked() -> Option<i64> {
 /// [`now_unix_nanos_checked`] there, for the reason given on it.
 fn now_unix_nanos() -> i64 {
     now_unix_nanos_checked().unwrap_or(0)
-}
-
-/// Runs once between a plan's read and the write transaction it then needs,
-/// on the planning thread, so a test can change what is recorded in between.
-#[cfg(test)]
-pub(crate) fn set_between_plan_phases_hook(hook: Box<dyn FnOnce()>) {
-    BETWEEN_PLAN_PHASES.with(|slot| *slot.borrow_mut() = Some(hook));
-}
-
-#[cfg(test)]
-thread_local! {
-    static BETWEEN_PLAN_PHASES: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        const { std::cell::RefCell::new(None) };
 }
 
 pub struct FileIndexRepository {
@@ -393,16 +380,10 @@ impl FileIndexRepository {
             // per file; a lone mutation (a live edit) is still its own delta.
             // The whole batch is one transaction: a stale or unauthorable
             // mutation fails every run, as it did when each was its own delta.
-            let row_paths: Vec<yadorilink_replica_domain::ids::SyncPath> = mutations
-                .iter()
-                .map(|m| yadorilink_replica_domain::ids::SyncPath(m.record().path.clone()))
-                .collect();
             let items: Vec<crate::native_authoring::BulkOp<'_>> = mutations
                 .iter()
-                .zip(&row_paths)
-                .map(|(mutation, row_path)| crate::native_authoring::BulkOp {
+                .map(|mutation| crate::native_authoring::BulkOp {
                     op: mutation.op(),
-                    row_path,
                     witness: mutation.native_witness(),
                 })
                 .collect();
@@ -418,60 +399,6 @@ impl FileIndexRepository {
                     emission.author,
                 )?;
             }
-            emission.permit.verify()?;
-            Ok(())
-        })
-    }
-
-    /// Commits the deletion of a copy written through to its source as a
-    /// signed change: `Delete(source)`, committed only while the row at
-    /// `copy_path` still shows what `native_witness` recorded at capture.
-    /// Refused with [`SyncSqliteError::LocalWriteCaptureStale`] when the row
-    /// no longer shows it.
-    // One argument per fact the deletion needs.
-    #[allow(clippy::too_many_arguments)]
-    pub fn commit_write_through_deletion(
-        &self,
-        group_id: &str,
-        copy_path: &str,
-        source: &str,
-        native_witness: Option<yadorilink_replica_domain::native_state::NativeCaptureWitness>,
-        origin_device_id: &str,
-        observed_at_unix_nanos: i64,
-        emission: SignedEmissionContext<'_>,
-    ) -> Result<(), SyncSqliteError> {
-        let mut record = self.get_file(group_id, copy_path)?.ok_or_else(|| {
-            SyncSqliteError::NotFound(format!("no row at {copy_path:?} to delete through"))
-        })?;
-        record.deleted = true;
-        record.mtime_unix_nanos = observed_at_unix_nanos;
-        let mutation = PreparedLocalMutation::Delete {
-            record,
-            op: Op::Delete { path: SyncPath(source.to_string()) },
-            native_witness,
-        };
-        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            // A copy row replaced since capture is stale, whatever it is now.
-            crate::native_projection_binding::require_fresh_native_capture(
-                tx,
-                group_id,
-                copy_path,
-                mutation.native_witness(),
-            )?;
-            if !crate::write_through::write_through_op_path(tx, group_id, copy_path, source)? {
-                return Err(SyncSqliteError::InvalidInput(format!(
-                    "{copy_path:?} is not a copy name of {source:?}; nothing to delete through"
-                )));
-            }
-            crate::held_path::refuse_local_authoring_if_held(tx, group_id, copy_path)?;
-            commit_local_mutation_in_tx(
-                tx,
-                group_id,
-                &mutation,
-                Some(&LocalCaptureActualStateEvidence::Absent),
-                origin_device_id,
-                emission.author,
-            )?;
             emission.permit.verify()?;
             Ok(())
         })
@@ -792,7 +719,7 @@ impl FileIndexRepository {
 
     /// Native's own capture witness for `path`, read at the same
     /// moment a caller reads [`canonical_current_row`] -- see
-    /// [`crate::native_projection_binding::capture_native_witness`] for
+    /// [`crate::native_capture::capture_native_witness`] for
     /// the exact semantics.
     pub fn native_capture_witness(
         &self,
@@ -805,13 +732,13 @@ impl FileIndexRepository {
         // same instant, or a head that arrives between the reads would be
         // recorded as one the writer saw.
         self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
-            crate::native_projection_binding::capture_native_witness(conn, &group_id, path)
+            crate::native_capture::capture_native_witness(conn, &group_id, path)
         })
     }
 
     /// [`Self::native_capture_witness`] for every path native knows in the
     /// group, from one read; a path missing from the result is absent
-    /// ([`crate::native_projection_binding::absent_native_witness`]).
+    /// ([`crate::native_capture::absent_native_witness`]).
     pub fn native_capture_witnesses(
         &self,
         group_id: &str,
@@ -824,46 +751,7 @@ impl FileIndexRepository {
     > {
         let group = yadorilink_replica_domain::ids::FolderGroupId(group_id.to_string());
         self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
-            crate::native_projection_binding::capture_native_witnesses(conn, &group)
-        })
-    }
-
-    /// Records that the reconciler left the entry of `source_path` at the
-    /// copy name `physical_path` for a reason only this device's disk knows
-    /// ([`crate::native_projection_binding::record_native_reconciliation_hold`]).
-    pub fn record_native_reconciliation_hold(
-        &self,
-        group_id: &str,
-        physical_path: &str,
-        source_path: &str,
-    ) -> Result<bool, SyncSqliteError> {
-        self.database.write::<_, SyncSqliteError>(|conn| {
-            crate::native_projection_binding::record_native_reconciliation_hold(
-                conn,
-                group_id,
-                physical_path,
-                source_path,
-            )
-        })
-    }
-
-    /// The physical names that stand for `source_path` besides its own: the
-    /// copies and relocated entries the placement authority still records
-    /// for it (they outlive their head until their row goes).
-    pub fn native_placed_names_of(
-        &self,
-        group_id: &str,
-        source_path: &str,
-    ) -> Result<Vec<String>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            Ok(crate::stable_projection_binding::native_placements_for_source(
-                conn,
-                group_id,
-                source_path,
-            )?
-            .into_iter()
-            .map(|row| row.physical_path)
-            .collect())
+            crate::native_capture::capture_native_witnesses(conn, &group)
         })
     }
 
@@ -897,85 +785,79 @@ impl FileIndexRepository {
         })
     }
 
+    /// The number of contested paths of `group_id`
+    /// ([`crate::native_contest_candidates::count`]).
+    pub fn contested_path_count(&self, group_id: &str) -> Result<u64, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::native_contest_candidates::count(conn, group_id)
+        })
+    }
+
+    /// [`crate::displacement_guard::version_present_elsewhere`].
+    pub fn version_present_elsewhere(
+        &self,
+        group_id: &str,
+        path: &str,
+        version: &yadorilink_replica_domain::ids::VersionHash,
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
+            crate::displacement_guard::version_present_elsewhere(conn, group_id, path, version)
+        })
+    }
+
+    /// The displacement guard for `path` about to show `planned`
+    /// ([`crate::displacement_guard::displacement_guard`]).
+    pub fn displacement_guard(
+        &self,
+        group_id: &str,
+        path: &str,
+        planned: Option<&yadorilink_replica_domain::ids::VersionHash>,
+    ) -> Result<crate::displacement_guard::DisplacementGuard, SyncSqliteError> {
+        self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
+            crate::displacement_guard::displacement_guard(conn, group_id, path, planned)
+        })
+    }
+
     /// One directory level of native's materialization plan
-    /// ([`crate::native_desired_state::native_plan_level`]). Assigns the
-    /// placements the level needs, so it runs as a write.
+    /// ([`crate::native_desired_state::native_plan_level`]).
     pub fn native_plan_level(
         &self,
         group_id: &str,
         parent: &str,
     ) -> Result<yadorilink_replica_domain::native_plan::NativeLevelPlan, SyncSqliteError> {
-        // Deriving the plan assigns stable names and placements in several
-        // statements; they commit together with the plan or not at all.
-        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            crate::native_desired_state::native_plan_level(tx, group_id, parent)
+        self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
+            crate::native_desired_state::native_plan_level(conn, group_id, parent)
         })
     }
 
     /// The node of [`Self::native_plan_level`] at `path`, computed without reading the
     /// siblings of `path` ([`crate::native_desired_state::native_plan_node`]).
-    /// Planned as [`Self::plan_reading_first`] describes.
     pub fn native_plan_node(
         &self,
         group_id: &str,
         path: &str,
     ) -> Result<Option<yadorilink_replica_domain::native_plan::NativePlannedNode>, SyncSqliteError>
     {
-        self.plan_reading_first(
-            |conn| crate::native_desired_state::read_native_plan_node(conn, group_id, path),
-            |tx| crate::native_desired_state::native_plan_node(tx, group_id, path),
-        )
+        self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
+            crate::native_desired_state::native_plan_node(conn, group_id, path)
+        })
     }
 
     /// The nodes of [`Self::native_plan_level`] that `names` are or stand for
-    /// ([`crate::native_desired_state::native_plan_nodes`]). Planned as
-    /// [`Self::plan_reading_first`] describes.
+    /// ([`crate::native_desired_state::native_plan_nodes`]).
     pub fn native_plan_nodes(
         &self,
         group_id: &str,
         parent: &str,
         names: &std::collections::BTreeSet<String>,
     ) -> Result<yadorilink_replica_domain::native_plan::NativeLevelPlan, SyncSqliteError> {
-        self.plan_reading_first(
-            |conn| {
-                crate::native_desired_state::read_native_plan_nodes(conn, group_id, parent, names)
-            },
-            |tx| crate::native_desired_state::native_plan_nodes(tx, group_id, parent, names),
-        )
-    }
-
-    /// Plans in a read snapshot first, and opens a write transaction only
-    /// when that plan finds a placement it would have to record. A plan
-    /// whose placements are all recorded already writes nothing, so asking
-    /// for it under the writer gate cost a commit's worth of waiting for
-    /// nothing, several times per received path.
-    ///
-    /// The read's plan is returned only when it needed nothing recorded: it
-    /// is then exactly what `write` gives on that same snapshot. Otherwise
-    /// the read's work is discarded. `PlanRead::NeedsPlacements` carries no
-    /// data on purpose, so `write` plans again from scratch inside its own
-    /// transaction, against whatever another writer recorded in between,
-    /// and decides there; nothing seen by the read reaches it.
-    fn plan_reading_first<T>(
-        &self,
-        read: impl Fn(
-            &rusqlite::Connection,
-        ) -> Result<crate::native_desired_state::PlanRead<T>, SyncSqliteError>,
-        write: impl Fn(&rusqlite::Transaction<'_>) -> Result<T, SyncSqliteError>,
-    ) -> Result<T, SyncSqliteError> {
-        let read = self.database.read_snapshot::<_, SyncSqliteError>(|conn| read(conn))?;
-        if let crate::native_desired_state::PlanRead::Planned(plan) = read {
-            return Ok(plan);
-        }
-        #[cfg(test)]
-        if let Some(hook) = BETWEEN_PLAN_PHASES.with(|slot| slot.borrow_mut().take()) {
-            hook();
-        }
-        self.database.write_immediate::<_, SyncSqliteError>(|tx| write(tx))
+        self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
+            crate::native_desired_state::native_plan_nodes(conn, group_id, parent, names)
+        })
     }
 
     /// Whether native still shows `witness` at its physical path: the
-    /// verdict [`crate::native_projection_binding::require_fresh_native_capture`]
+    /// verdict [`crate::native_capture::require_fresh_native_capture`]
     /// enforces at commit, asked early so capture can leave a stale path
     /// journaled dirty instead of failing a whole batch.
     pub fn native_capture_is_fresh(
@@ -986,10 +868,8 @@ impl FileIndexRepository {
         let group = yadorilink_replica_domain::ids::FolderGroupId(group_id.to_string());
         self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
             Ok(matches!(
-                crate::native_projection_binding::verify_native_capture_witness(
-                    conn, &group, witness
-                )?,
-                crate::native_projection_binding::NativeStaleCaptureVerdict::Fresh
+                crate::native_capture::verify_native_capture_witness(conn, &group, witness)?,
+                crate::native_capture::NativeStaleCaptureVerdict::Fresh
             ))
         })
     }
@@ -1213,18 +1093,6 @@ impl FileIndexRepository {
     ) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             crate::held_path::has_live_descendant_row(conn, group_id, path)
-        })
-    }
-
-    /// The source entry a local operation on the copy name `path` is an
-    /// operation on ([`crate::write_through::write_through_source`]).
-    pub fn write_through_source(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Option<String>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::write_through::write_through_source(conn, group_id, path)
         })
     }
 
@@ -1910,27 +1778,19 @@ pub(crate) fn expire_superseded_and_trashed_versions_in_tx(
 pub const RECURSIVE_PART_OP_LIMIT: usize = 256;
 
 /// The most encoded op bytes one part of a recursive operation carries:
-/// half of [`MAX_CHANGE_OP_BYTES`], leaving the other half for conflict
-/// copies the emission may derive into the same change.
+/// half of [`MAX_CHANGE_OP_BYTES`].
 pub const RECURSIVE_PART_OP_BYTES: usize = MAX_CHANGE_OP_BYTES / 2;
 
 /// Cuts `mutations` into the index ranges of a recursive operation's
 /// parts, in order: each at most [`RECURSIVE_PART_OP_LIMIT`] ops and
 /// [`RECURSIVE_PART_OP_BYTES`] encoded bytes (a single op larger than that
-/// still gets a part of its own). A mutation `absorbed` into the one
-/// before it carries no op and stays in that one's part.
-fn recursive_operation_parts(
-    mutations: &[PreparedLocalMutation],
-    absorbed: &[bool],
-) -> Vec<std::ops::Range<usize>> {
+/// still gets a part of its own).
+fn recursive_operation_parts(mutations: &[PreparedLocalMutation]) -> Vec<std::ops::Range<usize>> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut ops = 0;
     let mut bytes = 0;
     for (index, mutation) in mutations.iter().enumerate() {
-        if absorbed[index] {
-            continue;
-        }
         let len = encoded_op_len(mutation.op());
         if index > start
             && (ops >= RECURSIVE_PART_OP_LIMIT || bytes + len > RECURSIVE_PART_OP_BYTES)
@@ -2089,23 +1949,11 @@ pub fn commit_recursive_operation_in_tx(
     if let RecursiveOperationKind::RenameTree { from, to } = &kind {
         crate::provider::rename_tree_in_tx(tx, group_id, from.as_str(), to.as_str())?;
     }
-    let written =
-        crate::write_through::write_recursive_operation_through(tx, group_id, kind, mutations)?;
-    let absorbed: Vec<bool> = written.iter().map(|w| w.absorbed).collect();
     let evidence: Vec<Option<&LocalCaptureActualStateEvidence>> =
-        written.iter().map(|w| evidence.get(w.index).and_then(|e| e.as_ref())).collect();
-    let written: Vec<PreparedLocalMutation> = written.into_iter().map(|w| w.mutation).collect();
-    let mutations = written.as_slice();
-    for mutation in mutations {
-        if let Op::Put { path, .. } | Op::Delete { path } = mutation.op() {
-            if path.as_str() != mutation.record().path {
-                crate::held_path::refuse_local_authoring_if_held(tx, group_id, path.as_str())?;
-            }
-        }
-    }
+        (0..mutations.len()).map(|index| evidence.get(index).and_then(|e| e.as_ref())).collect();
     if check_fresh {
         for mutation in mutations {
-            crate::native_projection_binding::require_fresh_native_capture(
+            crate::native_capture::require_fresh_native_capture(
                 tx,
                 group_id,
                 &mutation.record().path,
@@ -2113,16 +1961,14 @@ pub fn commit_recursive_operation_in_tx(
             )?;
         }
     }
-    let parts = recursive_operation_parts(mutations, &absorbed);
+    let parts = recursive_operation_parts(mutations);
     // The content versions first (see `commit_local_mutation_in_tx`).
     for mutation in mutations {
         if let PreparedLocalMutation::Upsert { version, .. } = mutation {
             dag_store::put_file_version(tx, group_id, version)?;
         }
     }
-    // One native delta per part. Native's part keeps the copies whose
-    // deletes were folded into their source's: each names the head its
-    // row shows, which the source's delete does not.
+    // One native delta per part.
     let mut authored = crate::native_authoring::AuthoredPuts::default();
     let operation_id = RecursiveOperationId(rand::random());
     let group = yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned());
@@ -2130,12 +1976,7 @@ pub fn commit_recursive_operation_in_tx(
     // left to remove authors none, and the operation's count must not
     // wait for it.
     let part_ops = |range: &std::ops::Range<usize>| {
-        mutations[range.clone()]
-            .iter()
-            .map(|m| {
-                (m.op().clone(), yadorilink_replica_domain::ids::SyncPath(m.record().path.clone()))
-            })
-            .collect::<Vec<(Op, yadorilink_replica_domain::ids::SyncPath)>>()
+        mutations[range.clone()].iter().map(|m| m.op().clone()).collect::<Vec<Op>>()
     };
     let part_witnesses = |range: &std::ops::Range<usize>| {
         mutations[range.clone()].iter().map(|m| m.native_witness()).collect::<Vec<_>>()
@@ -2149,6 +1990,7 @@ pub fn commit_recursive_operation_in_tx(
         let deltas = crate::native_authoring::recursive_part_delta_count(
             tx,
             &group,
+            &author.author,
             &part_ops(range),
             &part_witnesses(range),
         )?;
@@ -2174,7 +2016,7 @@ pub fn commit_recursive_operation_in_tx(
     for range in &parts {
         for (offset, mutation) in mutations[range.clone()].iter().enumerate() {
             let native_put = match mutation.op() {
-                Op::Put { path, version } => authored.put_of(path, version),
+                Op::Put { path, .. } => authored.put_at(path),
                 _ => None,
             };
             apply_local_mutation_in_tx(
@@ -2255,19 +2097,10 @@ pub fn commit_local_mutation_group_checked_in_tx(
     author: &crate::local_author::LocalAuthor<'_>,
     check_fresh: bool,
 ) -> Result<(), SyncSqliteError> {
-    let mut write_through = Vec::with_capacity(mutations.len());
     for mutation in mutations {
         let row_path = mutation.record().path.as_str();
-        let mut is_write_through = false;
-        if let Op::Put { path, .. } | Op::Delete { path } = mutation.op() {
-            if crate::write_through::write_through_op_path(tx, group_id, row_path, path.as_str())? {
-                is_write_through = true;
-                crate::held_path::refuse_local_authoring_if_held(tx, group_id, path.as_str())?;
-            }
-        }
-        write_through.push(is_write_through);
         if check_fresh {
-            crate::native_projection_binding::require_fresh_native_capture(
+            crate::native_capture::require_fresh_native_capture(
                 tx,
                 group_id,
                 row_path,
@@ -2280,7 +2113,7 @@ pub fn commit_local_mutation_group_checked_in_tx(
     // first head: their rows are written finished, in one insert, and what they need afterwards
     // comes from the authoring's own writes.
     let NewPaths { fresh: new_paths, open_namespace } =
-        brand_new_put_paths(tx, group_id, mutations, evidence, &write_through)?;
+        brand_new_put_paths(tx, group_id, mutations, evidence)?;
 
     // The content versions first: storing a version that is new re-arms the
     // paths whose heads name it as remote news, which would undo the local
@@ -2296,16 +2129,10 @@ pub fn commit_local_mutation_group_checked_in_tx(
 
     // Native observes the ops under the same author; it is inside the same
     // transaction as the rows, so its failure fails the whole commit.
-    let row_paths: Vec<yadorilink_replica_domain::ids::SyncPath> = mutations
-        .iter()
-        .map(|m| yadorilink_replica_domain::ids::SyncPath(m.record().path.clone()))
-        .collect();
     let items: Vec<crate::native_authoring::BulkOp<'_>> = mutations
         .iter()
-        .zip(&row_paths)
-        .map(|(mutation, row_path)| crate::native_authoring::BulkOp {
+        .map(|mutation| crate::native_authoring::BulkOp {
             op: mutation.op(),
-            row_path,
             witness: mutation.native_witness(),
         })
         .collect();
@@ -2361,9 +2188,7 @@ pub fn commit_local_mutation_group_checked_in_tx(
                 continue;
             };
             let path = SyncPath(record.path.clone());
-            if !open_namespace.contains(&record.path)
-                || authored.placed_head_of(&path) != Some(None)
-            {
+            if !open_namespace.contains(&record.path) {
                 continue;
             }
             if let Some(proof) = crate::new_path_settlement::NewPathProof::new(
@@ -2411,16 +2236,6 @@ pub fn commit_local_mutation_group_checked_in_tx(
                 native_put,
             )?,
         }
-        // A write-through edit leaves the copy row showing the new content.
-        if let (true, Op::Put { version, .. }) = (write_through[index], mutation.op()) {
-            crate::native_projection_binding::follow_write_through_edit(
-                tx,
-                group_id,
-                &mutation.record().path,
-                &author.author,
-                version,
-            )?;
-        }
     }
     Ok(())
 }
@@ -2434,7 +2249,6 @@ fn brand_new_put_paths(
     group_id: &str,
     mutations: &[PreparedLocalMutation],
     evidence: &[Option<&LocalCaptureActualStateEvidence>],
-    write_through: &[bool],
 ) -> Result<NewPaths, SyncSqliteError> {
     if !crate::new_path_rows::enabled() {
         return Ok(NewPaths::default());
@@ -2450,8 +2264,7 @@ fn brand_new_put_paths(
             }
         }
         if let Some(witness) = mutation.native_witness() {
-            own.push(witness.logical_source_path.as_str());
-            own.push(witness.physical_path.as_str());
+            own.push(witness.path.as_str());
         }
         own.sort_unstable();
         own.dedup();
@@ -2469,8 +2282,7 @@ fn brand_new_put_paths(
                 return false;
             };
             let Op::Put { path, .. } = mutation.op() else { return false };
-            !write_through[*index]
-                && !record.deleted
+            !record.deleted
                 && path.as_str() == record.path
                 && meta.record_kind == RecordKind::File
                 && matches!(
@@ -2479,11 +2291,9 @@ fn brand_new_put_paths(
                 )
                 && touched.get(record.path.as_str()) == Some(&1)
                 && native_witness.as_ref().is_none_or(|witness| {
-                    witness.shown_head.is_none()
-                        && witness.shown_class.is_empty()
+                    witness.shown_class.is_empty()
                         && witness.shown_version.is_none()
-                        && witness.physical_path.as_str() == record.path
-                        && witness.logical_source_path.as_str() == record.path
+                        && witness.path.as_str() == record.path
                 })
         })
         .map(|(_, mutation)| mutation.record().path.as_str())
@@ -2519,14 +2329,7 @@ pub(crate) fn commit_local_mutation_reference_in_tx(
     author: &crate::local_author::LocalAuthor<'_>,
 ) -> Result<(), SyncSqliteError> {
     let row_path = mutation.record().path.as_str();
-    let mut is_write_through = false;
-    if let Op::Put { path, .. } | Op::Delete { path } = mutation.op() {
-        if crate::write_through::write_through_op_path(tx, group_id, row_path, path.as_str())? {
-            is_write_through = true;
-            crate::held_path::refuse_local_authoring_if_held(tx, group_id, path.as_str())?;
-        }
-    }
-    crate::native_projection_binding::require_fresh_native_capture(
+    crate::native_capture::require_fresh_native_capture(
         tx,
         group_id,
         row_path,
@@ -2547,7 +2350,6 @@ pub(crate) fn commit_local_mutation_reference_in_tx(
         &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned()),
         author,
         mutation.op(),
-        &yadorilink_replica_domain::ids::SyncPath(row_path.to_owned()),
         mutation.native_witness(),
     )?;
 
@@ -2557,16 +2359,6 @@ pub(crate) fn commit_local_mutation_reference_in_tx(
     };
     apply_local_mutation_in_tx(tx, group_id, mutation, evidence, origin_device_id, native_put)?;
 
-    // A write-through edit leaves the copy row showing the new content.
-    if let (true, Op::Put { version, .. }) = (is_write_through, mutation.op()) {
-        crate::native_projection_binding::follow_write_through_edit(
-            tx,
-            group_id,
-            row_path,
-            &author.author,
-            version,
-        )?;
-    }
     Ok(())
 }
 
@@ -3084,8 +2876,8 @@ pub fn upsert_file_with_authoring_in_tx(
 /// the same functions the hazard check compares with.
 pub(crate) fn name_fold_keys(path: &str) -> (String, String) {
     (
-        yadorilink_root_authority::canonical_fold::case_fold(path),
-        yadorilink_root_authority::canonical_fold::canonical_fold(path),
+        yadorilink_fs_platform::canonical_fold::case_fold(path),
+        yadorilink_fs_platform::canonical_fold::canonical_fold(path),
     )
 }
 
@@ -3196,7 +2988,7 @@ pub fn stamp_hydrated_after_local_emission_in_tx(
 /// already knows.
 #[derive(Clone, Debug)]
 pub struct ImportedActualState {
-    pub filesystem_identity: yadorilink_root_authority::fs_identity::FileIdentity,
+    pub filesystem_identity: yadorilink_fs_platform::fs_identity::FileIdentity,
     pub record_kind: RecordKind,
     pub version_hash: yadorilink_replica_domain::ids::VersionHash,
 }
@@ -3214,7 +3006,7 @@ pub enum LocalCaptureActualStateEvidence {
     /// the batch commit, under the path's lock -- not reused from an
     /// earlier prepare-time observation without a fresh disk-fingerprint
     /// match confirming nothing changed since.
-    Present { filesystem_identity: yadorilink_root_authority::fs_identity::FileIdentity },
+    Present { filesystem_identity: yadorilink_fs_platform::fs_identity::FileIdentity },
     /// A deletion local capture just observed and revalidated as still
     /// absent immediately before this commit.
     Absent,
@@ -3305,7 +3097,7 @@ pub fn adopt_local_capture_actual_state(
     path: &str,
     record_kind: RecordKind,
     version_hash: &yadorilink_replica_domain::ids::VersionHash,
-    filesystem_identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+    filesystem_identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
 ) -> Result<(), SyncSqliteError> {
     let object_kind = match record_kind {
         RecordKind::File => MaterializedObjectKind::RegularFile,
@@ -3371,30 +3163,10 @@ fn settle_obligation_against_local_presence_in_tx(
     if obligation.state != "pending" {
         return Ok(());
     }
-    let heads = crate::native_store::native_heads_at(
-        tx,
-        &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned()),
-        &SyncPath(path.to_owned()),
-    )?;
-    // A resolution carrying conflict copies is not satisfied by this path
-    // alone: the losing heads still have to be materialized at their own
-    // copy paths, and those paths have no obligation of their own (nothing
-    // named them in this write's ops). Closing here on the winner's proof
-    // would be closing the only row that gets the copies written.
-    if let yadorilink_replica_domain::native_state::PathMaterialization::Present {
-        conflict_copies,
-        ..
-    } = yadorilink_replica_domain::native_state::resolve_path(heads)
-    {
-        if !conflict_copies.is_empty() {
-            return Ok(());
-        }
-    }
     // The namespace decides what the path must be, not the path's own
-    // heads alone: a captured File at a path a live descendant needs is
-    // relocated, and the path itself has to be a directory, which the
-    // proof this capture just published does not show. Read in this
-    // transaction, after the write was authored.
+    // heads alone: a captured File at a path a live descendant needs makes
+    // the path contested, and a contested path is owed nothing yet. Read in
+    // this transaction, after the write was authored.
     let desired = match crate::native_desired_state::native_desired_path_state(tx, group_id, path) {
         Ok(state) => state,
         // "Not yet resolvable", not "absent" -- see that function's own
@@ -3403,7 +3175,7 @@ fn settle_obligation_against_local_presence_in_tx(
         Err(e) => return Err(e),
     };
     if let crate::desired_state::DesiredPathState::StructuralDirectory = desired {
-        // Its relocated entry is owed at a copy name no obligation names.
+        // The directory the path has to be is the engine's to place.
         return Ok(());
     }
     let desired = desired.resolved_path_state_hash(group_id, path);

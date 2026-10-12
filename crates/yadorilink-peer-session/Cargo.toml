@@ -17,6 +17,7 @@ test-support = ["yadorilink-root-authority/test-support", "yadorilink-local-stor
 yadorilink-transport = { path = "../yadorilink-transport" }
 yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
 yadorilink-replica-engine = { path = "../yadorilink-replica-engine" }
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 yadorilink-local-storage = { path = "../yadorilink-local-storage" }
 yadorilink-sync-wire = { path = "../yadorilink-sync-wire" }

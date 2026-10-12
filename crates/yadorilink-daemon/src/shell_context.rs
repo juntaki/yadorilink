@@ -145,6 +145,10 @@ impl ShellContext {
                 crate::provider_status::provider_root_lines(&coordinator, &eager, &inputs, now_ms)
             }));
         }
+        control.provider_evict.install(Arc::new(crate::provider_evict::ProviderEvictor::new(
+            state.clone(),
+            provider_host.clone(),
+        )));
         Self {
             application: control.application.clone(),
             queries: control.queries.clone(),

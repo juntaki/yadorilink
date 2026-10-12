@@ -1010,7 +1010,8 @@ pub struct UpdateStatus {
 pub enum UpdateInstallOutcome {
     Installing,
     Deferred,
-    /// Updates come from a store; `guidance` says where.
+    /// Updates are installed manually (or by a package manager / store);
+    /// `guidance` says where to get the new version.
     StoreManaged {
         guidance: String,
     },

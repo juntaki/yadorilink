@@ -50,7 +50,7 @@ type Outcome = Result<(), ()>;
 /// gives for its lock key: an unfolded key would let two racing callers
 /// for what is physically one file each become their own leader.
 fn fold_key(path: &str) -> String {
-    yadorilink_root_authority::canonical_fold::canonical_fold(path)
+    yadorilink_fs_platform::canonical_fold::canonical_fold(path)
 }
 
 /// One instance lives on [`crate::daemon_state::DaemonState`] -- per

@@ -31,8 +31,8 @@ use crate::file_identity_codec::{
     decode_file_identity, encode_file_identity, GenerationId,
     MATERIALIZED_GENERATION_ENCODING_VERSION,
 };
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 use yadorilink_replica_domain::ids::VersionHash;
-use yadorilink_root_authority::fs_identity::FileIdentity;
 
 /// Creates `path_materialized_generations` and the mutation fences. A proof
 /// stores the path's reflected heads ([`crate::materialization_basis`]).
@@ -1002,7 +1002,7 @@ pub enum IdentityRevalidation {
 pub fn revalidate_identity_against_disk(
     basis: &DiskGenerationBasis,
     out_path: &std::path::Path,
-    birth_time_granularity: yadorilink_root_authority::fs_identity::TimestampGranularity,
+    birth_time_granularity: yadorilink_fs_platform::fs_identity::TimestampGranularity,
 ) -> IdentityRevalidation {
     revalidate_identity_against_projected_disk(
         basis,
@@ -1035,7 +1035,7 @@ pub enum ProjectedAtPath {
 pub fn revalidate_identity_against_projected_disk(
     basis: &DiskGenerationBasis,
     out_path: &std::path::Path,
-    birth_time_granularity: yadorilink_root_authority::fs_identity::TimestampGranularity,
+    birth_time_granularity: yadorilink_fs_platform::fs_identity::TimestampGranularity,
     projected: ProjectedAtPath,
 ) -> IdentityRevalidation {
     if basis.object_kind == MaterializedObjectKind::Absent {
@@ -1088,11 +1088,11 @@ pub fn revalidate_identity_against_projected_disk(
         return IdentityRevalidation::NotAMatch;
     }
     match observed.compare(&expected, birth_time_granularity) {
-        yadorilink_root_authority::fs_identity::IdentityComparison::SameObject => {
+        yadorilink_fs_platform::fs_identity::IdentityComparison::SameObject => {
             IdentityRevalidation::Confirmed
         }
-        yadorilink_root_authority::fs_identity::IdentityComparison::DefinitelyDifferent
-        | yadorilink_root_authority::fs_identity::IdentityComparison::Ambiguous(_) => {
+        yadorilink_fs_platform::fs_identity::IdentityComparison::DefinitelyDifferent
+        | yadorilink_fs_platform::fs_identity::IdentityComparison::Ambiguous(_) => {
             IdentityRevalidation::NotAMatch
         }
     }

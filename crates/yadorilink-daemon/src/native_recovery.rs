@@ -287,7 +287,15 @@ impl RecoveryPort for DaemonRecovery {
             if !self.admit_seal(group) {
                 return Err(RefusalReason::Overloaded);
             }
-            let bundle = seal_own_state(&state, group).await?;
+            let bundle = match seal_own_state(&state, group).await {
+                Ok(bundle) => bundle,
+                Err(reason) => {
+                    // Nothing was sealed, so the retry is not a repeat of a seal: the
+                    // cooldown must not hold off the ask that follows this refusal.
+                    self.last_sealed.lock().unwrap_or_else(|p| p.into_inner()).remove(&group.0);
+                    return Err(reason);
+                }
+            };
             encode_recovery_bundle(&bundle).map_err(|error| {
                 tracing::warn!(%error, group = %group.0, "native recovery: could not encode the bundle");
                 RefusalReason::NotFound

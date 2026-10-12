@@ -3,7 +3,7 @@
 //! A capture that puts a file at a path this replica has never known runs the same chain per
 //! file as an edit of an existing one: the version insert, the metadata update, the hydration
 //! stamp and the re-read that checks the row shows the head it was produced from. For a path with
-//! no earlier row, no hold, no native head and no placement, binding or kept copy, every one of
+//! no earlier row, no hold, no native head, every one of
 //! those is determined before the first statement runs, so a chunk of such paths is written as
 //! one multi-row insert of the finished rows (and one multi-row authoring witness), and checked
 //! once, set-based, afterwards. Everything else stays on the per-path chain.
@@ -87,16 +87,8 @@ pub(crate) fn brand_new_paths(
 }
 
 /// Every table and column whose rows a path of the new-path insert must not appear in.
-const TABLES_NAMING_A_PATH: [(&str, &str); 8] = [
-    ("files", "path"),
-    ("held_paths", "path"),
-    ("native_heads", "path"),
-    ("native_physical_placement", "physical_path"),
-    ("native_physical_placement", "source_path"),
-    ("native_stable_projection_binding", "source_path"),
-    ("native_stable_projection_binding", "stable_path"),
-    ("native_head_keep", "path"),
-];
+const TABLES_NAMING_A_PATH: [(&str, &str); 3] =
+    [("files", "path"), ("held_paths", "path"), ("native_heads", "path")];
 
 /// Writes the finished `files` row of every entry of `rows`, with the authoring witness each cites,
 /// and then checks, set-based, that each row shows the version of the head it was produced from.

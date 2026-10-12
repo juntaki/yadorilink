@@ -217,10 +217,10 @@ public final class UpdatesModel {
     public func install() async {
         await work {
             switch try await self.client.installUpdate() {
-            case .installing: self.notice = Notice(kind: .success, text: "Installing the update. YadoriLink will restart.")
-            case .deferred: self.notice = Notice(kind: .success, text: "The update will install when syncing is idle.")
+            case .installing: self.notice = Notice(kind: .success, text: "Download the new version from the YadoriLink releases page.")
+            case .deferred: self.notice = Notice(kind: .success, text: "Download the new version from the YadoriLink releases page.")
             case .storeManaged(let guidance): self.notice = Notice(kind: .success, text: guidance)
-            case .other(let raw): self.notice = Notice(kind: .success, text: "Update requested.", detail: raw)
+            case .other(let raw): self.notice = Notice(kind: .success, text: "Download the new version from the YadoriLink releases page.", detail: raw)
             }
         }
     }

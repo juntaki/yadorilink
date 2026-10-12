@@ -329,3 +329,17 @@ fn non_matching_platform_entry_is_ignored() {
     let manifest = sample_manifest(vec![entry]);
     assert_eq!(select_applicable(&manifest, &sample_ctx()), Applicability::UpToDate);
 }
+
+/// The release gate requires the shipped version to equal the tag. This pins
+/// why: under the update comparator a beta sorts below its release, so a
+/// beta tag over a 0.1.0 build never notifies, while betas order among
+/// themselves and below the final release.
+#[test]
+fn prerelease_versions_order_under_the_update_comparator() {
+    let v = |s: &str| parse_semver(s).unwrap();
+    assert!(v("0.1.0-beta.2") > v("0.1.0-beta.1"));
+    assert!(v("0.1.0-beta.10") > v("0.1.0-beta.2"));
+    assert!(v("0.1.0") > v("0.1.0-beta.2"));
+    assert!(v("v0.1.0-beta.2") > v("0.1.0-beta.1"));
+    assert!(!(v("0.1.0-beta.1") > v("0.1.0")));
+}

@@ -93,6 +93,13 @@ fn snapshot(root: &std::path::Path) -> std::collections::HashMap<String, String>
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_devices_editing_the_same_new_file_simultaneously_never_mismatches_name_and_content()
 {
+    // The three-way conflict converges only once a winner replaces the loser's
+    // original, which the closed Windows gate withholds.
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     support::ensure_isolated_config_dir();
 
     let devices: Vec<TestDevice> = (0..3).map(|i| setup_device(&format!("device-{i}"))).collect();

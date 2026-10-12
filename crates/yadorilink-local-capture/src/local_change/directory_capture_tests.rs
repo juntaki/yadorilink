@@ -7,7 +7,7 @@
 //! structural-origin ledger, never from what is on disk.
 
 use super::*;
-use yadorilink_root_authority::fs_identity::FileIdentity;
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 
 pub(super) const GROUP: &str = "group-1";
 
@@ -259,7 +259,7 @@ async fn a_directory_whose_structural_provenance_was_lost_is_kept_and_not_author
     let root = canonical_root(&root_dir);
     adopt_root(&state, GROUP, &root);
     state.sqlite().dag_record_structural_intent(GROUP, "lost", 1).unwrap();
-    state.sqlite().dag_drop_unresolved_structural_intents(i64::MAX).unwrap();
+    state.sqlite().dag_drop_unresolved_structural_intents().unwrap();
     std::fs::create_dir(root.join("lost")).unwrap();
     let identity = FileIdentity::observe_path(&root.join("lost")).unwrap();
     // The mkdir's own completion finds its intent gone.
@@ -699,4 +699,27 @@ fn an_unreadable_path_does_not_match_a_delete_prepared_for_an_absent_one() {
         !super::disk_observation::disk_matches_prepare(&missing, &None),
         "unreadable is not absent"
     );
+}
+
+/// A platform whose disk reports no mode (Windows) cannot differ from the mode
+/// a directory's version records, by event or by scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_directory_whose_disk_reports_no_mode_is_not_recaptured_against_a_recorded_one() {
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, GROUP, &root);
+    std::fs::create_dir(root.join("e")).unwrap();
+    event(&proc, &root, &root.join("e"), FsChangeKind::CreatedOrModified).await;
+    assert_eq!(ops_at(&state, "e"), ["put-dir"]);
+
+    proc.simulate_unobservable_modes();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(root.join("e"), std::fs::Permissions::from_mode(0o750)).unwrap();
+    }
+    event(&proc, &root, &root.join("e"), FsChangeKind::CreatedOrModified).await;
+    proc.scan_existing_files(GROUP, &root).unwrap();
+
+    assert_eq!(ops_at(&state, "e"), ["put-dir"]);
 }

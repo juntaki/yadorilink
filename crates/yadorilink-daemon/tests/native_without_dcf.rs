@@ -99,6 +99,24 @@ async fn native_operation_leaves_no_dcf_state() {
     write(&a, "dir/nested.txt", b"nested");
     converge_to(&[&a, &b], &[("doc.txt", b"one"), ("dir/nested.txt", b"nested")], "create").await;
 
+    // The rest needs a conflict winner to replace the loser's original and a
+    // removal to reach the peer, which a platform without durable namespace
+    // changes holds back; the create-and-sync half above still has to leave
+    // no DCF state there.
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the conflict winner replacing the original and removals reaching the peer",
+    ) {
+        for node in [&a, &b] {
+            assert_eq!(
+                dcf_state_present(node),
+                Vec::<String>::new(),
+                "{} holds DCF state",
+                node.device_id
+            );
+        }
+        return;
+    }
+
     // Concurrent edits keep both versions, one as a copy, on both.
     partition(&a, &b).await;
     write(&a, "doc.txt", b"from a");

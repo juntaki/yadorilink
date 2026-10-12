@@ -62,9 +62,9 @@ use rusqlite::Connection;
 
 use crate::recovery_snapshot::RecoverySnapshotReader;
 use crate::sync_error::SyncError;
+use crate::sync_runtime::group_wake::GroupWake;
 use crate::sync_runtime::materialization_wake::MaterializationWake;
 use crate::sync_runtime::path_locks::PathLockRegistry;
-use crate::sync_runtime::retirement_wake::RetirementWake;
 use crate::sync_runtime::schema::map_replica_schema_error;
 use crate::sync_runtime::startup_readiness::StartupReadinessRegistry;
 use yadorilink_replica_domain::file::{FileRecord, FileVersion};
@@ -103,6 +103,7 @@ pub struct ReplicaCoordinator {
     file_index_repository: yadorilink_sync_sqlite::file_index::FileIndexRepository,
     materialization_state_repository: yadorilink_sync_sqlite::MaterializationStateRepository,
     materialization_intent_repository: yadorilink_sync_sqlite::MaterializationIntentRepository,
+    temp_releases: Arc<yadorilink_sync_sqlite::TempReleaseQueue>,
     policy_watermark_repository: yadorilink_sync_sqlite::PolicyWatermarkRepository,
     offline_peer_authorization_repository:
         yadorilink_sync_sqlite::OfflinePeerAuthorizationRepository,
@@ -138,17 +139,11 @@ pub struct ReplicaCoordinator {
     #[cfg(test)]
     pub(crate) test_observers: crate::replica_coordinator::test_observers::TestObservers,
     materialization_wake: MaterializationWake,
-    retirement_wake: RetirementWake,
-    /// Same per-group dirty/generation shape as `retirement_wake` (a
-    /// separate `RetirementWake` instance, not shared -- `pending`/
-    /// `complete` are consumer-specific, so retirement's own loop
-    /// completing a generation must never clear the hazard-recheck loop's
-    /// independent one, and vice versa), driving `HazardHeld` liveness: a
-    /// held path has no re-arm event of its own when the sibling that
-    /// caused its hold changes, so this reuses the same "native frontier
-    /// advanced or a materialization job completed" wake points that
-    /// already fire `retirement_wake` to trigger a re-check sweep instead.
-    hazard_recheck_wake: RetirementWake,
+    /// Per-group dirty/generation wake driving `HazardHeld` liveness: a held
+    /// path has no re-arm event of its own when the sibling that caused its
+    /// hold changes, so the "native frontier advanced or a materialization
+    /// job completed" wake points trigger a re-check sweep instead.
+    hazard_recheck_wake: GroupWake,
     /// Raised when a local edit that could not be authored was held for
     /// reconciliation: every link's live repair pass, which reconciles
     /// holds, runs now rather than at its next interval. A generation
@@ -246,6 +241,7 @@ impl ReplicaCoordinator {
                 yadorilink_sync_sqlite::MaterializationStateRepository::new(database.clone()),
             materialization_intent_repository:
                 yadorilink_sync_sqlite::MaterializationIntentRepository::new(database.clone()),
+            temp_releases: Arc::default(),
             policy_watermark_repository: yadorilink_sync_sqlite::PolicyWatermarkRepository::new(
                 database.clone(),
             ),
@@ -281,8 +277,7 @@ impl ReplicaCoordinator {
             #[cfg(test)]
             test_observers: Default::default(),
             materialization_wake: MaterializationWake::new(),
-            retirement_wake: RetirementWake::new(),
-            hazard_recheck_wake: RetirementWake::new(),
+            hazard_recheck_wake: GroupWake::new(),
             held_path_wake: tokio::sync::watch::Sender::new(0),
         }
     }
@@ -535,6 +530,16 @@ impl ReplicaCoordinator {
         &self.materialization_intent_repository
     }
 
+    /// The temp-file ledger of `group_id`: writers record the temp file they
+    /// are about to create in it, and link start removes what a crash left.
+    pub fn temp_ledger(&self, group_id: &str) -> yadorilink_sync_sqlite::MaterializationTempLedger {
+        yadorilink_sync_sqlite::MaterializationTempLedger::new(
+            self.database.clone(),
+            group_id,
+            self.temp_releases.clone(),
+        )
+    }
+
     pub fn policy_watermark_repository(
         &self,
     ) -> &yadorilink_sync_sqlite::PolicyWatermarkRepository {
@@ -662,11 +667,7 @@ impl ReplicaCoordinator {
         &self.materialization_wake
     }
 
-    pub fn retirement_wake(&self) -> &RetirementWake {
-        &self.retirement_wake
-    }
-
-    pub fn hazard_recheck_wake(&self) -> &RetirementWake {
+    pub fn hazard_recheck_wake(&self) -> &GroupWake {
         &self.hazard_recheck_wake
     }
 
@@ -676,6 +677,11 @@ impl ReplicaCoordinator {
     /// subscriber was not waiting.
     pub fn subscribe_held_path(&self) -> tokio::sync::watch::Receiver<u64> {
         self.held_path_wake.subscribe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_path_subscribers(&self) -> usize {
+        self.held_path_wake.receiver_count()
     }
 
     /// A hold was recorded that needs reconciling: wakes every link's live
@@ -795,6 +801,35 @@ impl ReplicaCoordinator {
         .map_err(SyncError::from)
     }
 
+    /// Moves the losing heads of contested paths of `group_id` to their copy
+    /// paths, signing as `emitter` (its own heads always; another author's
+    /// only where `eligible` admits it, told whether that author is closed).
+    pub fn author_contest_forks(
+        &self,
+        emitter: &LocalAuthorKey,
+        group_id: &str,
+        eligible: &dyn Fn(&yadorilink_replica_domain::author::AuthorId, bool) -> bool,
+    ) -> Result<yadorilink_sync_sqlite::native_authoring::ForkAuthored, SyncError> {
+        let group = yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned());
+        // Nothing new is contested since the last pass: no policy read, no write.
+        let work = self.database.read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            yadorilink_sync_sqlite::native_contest_candidates::has_unattempted(conn, group_id)
+        })?;
+        if !work {
+            return Ok(yadorilink_sync_sqlite::native_authoring::ForkAuthored::default());
+        }
+        self.local_policy_head(group_id)?;
+        self.with_local_author(emitter, |author| {
+            let author = local_author_of(author);
+            self.database.write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                yadorilink_sync_sqlite::native_authoring::author_all_forks(
+                    conn, &group, &author, eligible,
+                )
+            })
+        })
+        .map_err(SyncError::from)
+    }
+
     /// Expires superseded/trashed file versions older than
     /// `now_unix_nanos`, excluding any version keys currently pinned by a
     /// handoff lease.
@@ -899,12 +934,13 @@ impl RootVerificationStatePort for ReplicaCoordinator {
             RecordKind::Directory => metadata.file_type().is_dir(),
             RecordKind::Symlink => {
                 metadata.file_type().is_symlink()
-                    && std::fs::read_link(&disk_path).ok().map(|target| {
-                        yadorilink_root_authority::fs_identity::target_to_bytes(&target)
-                    }) == self
-                        .file_index_repository
-                        .get_symlink_target(group_id, &record.path)
-                        .map_err(SyncError::from)?
+                    && std::fs::read_link(&disk_path)
+                        .ok()
+                        .map(|target| yadorilink_fs_platform::fs_identity::target_to_bytes(&target))
+                        == self
+                            .file_index_repository
+                            .get_symlink_target(group_id, &record.path)
+                            .map_err(SyncError::from)?
             }
             RecordKind::File => {
                 if !metadata.file_type().is_file() {

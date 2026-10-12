@@ -103,7 +103,7 @@ pub enum ViolationKind {
     /// An
     /// *informational* finding, never a hard failure -- the harness's
     /// self-healing lifecycle sweep (`repair_interrupted_materializations`
-    /// / `cleanup_stale_temp_files`, `dst_support::sweep::run_self_healing`)
+    /// / `remove_recorded_temp_files`, `dst_support::sweep::run_self_healing`)
     /// performed a repair the production daemon's periodic task would also
     /// have performed. Recorded so the signal about how often the repair
     /// path is exercised stays visible rather than silently

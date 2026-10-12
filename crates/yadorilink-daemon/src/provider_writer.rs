@@ -49,13 +49,19 @@ fn ensure_plain_directory(dir: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(dir) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = std::fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            match builder.create(dir) {
+            #[cfg(windows)]
+            let created = crate::windows_fs_security::create_private_dir_all(dir);
+            #[cfg(not(windows))]
+            let created = {
+                let mut builder = std::fs::DirBuilder::new();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(0o700);
+                }
+                builder.create(dir)
+            };
+            match created {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(format!("{}: {e}", dir.display())),
@@ -107,17 +113,11 @@ impl ProviderWriter {
         )
     }
 
-    /// The author handle this device signs with, for `group_id` (a group with no history yet is
-    /// recorded as native authority, as when a plain link starts).
-    pub(crate) fn author(&self, group_id: &str) -> Result<Arc<LocalAuthorKey>, String> {
-        let author = self.state.local_author().ok_or_else(|| {
+    /// The author handle this device signs with.
+    pub(crate) fn author(&self, _group_id: &str) -> Result<Arc<LocalAuthorKey>, String> {
+        self.state.local_author().ok_or_else(|| {
             "this device has no signing key; refusing to author provider changes".to_string()
-        })?;
-        match self.state.replica_coordinator.adopt_native_authority_if_fresh(group_id) {
-            Ok(true) => Ok(author),
-            Ok(false) => Err(format!("group {group_id} holds state from before native authority")),
-            Err(error) => Err(error.to_string()),
-        }
+        })
     }
 
     /// Follow-up for a change that just committed: publishes the group's pending native checkpoint

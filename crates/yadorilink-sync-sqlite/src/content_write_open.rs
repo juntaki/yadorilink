@@ -183,7 +183,11 @@ mod tests {
         );
         drop(tx);
         let intents: i64 = conn
-            .query_row("SELECT COUNT(*) FROM materialization_intents", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM materialization_intents WHERE kind = 'write'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(intents, 0, "the rolled-back transaction left an item behind");
 

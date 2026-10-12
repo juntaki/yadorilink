@@ -35,7 +35,7 @@ enum Event {
     LimitsSaved(Result<LimitsShowResponse, String>),
     UpdateStatusFetched(Result<Box<UpdateStatusResponse>, String>),
     UpdateCheckDone(Result<(), String>),
-    UpdateInstallDone(Result<(), String>),
+    UpdateDownloadDone(Result<(), String>),
     UpdateConfigSaved(Result<(), String>),
     DiagnosticsExported(Result<String, String>),
 }
@@ -127,11 +127,11 @@ fn spawn_update_check(sink: EventSink<Event>) {
     );
 }
 
-fn spawn_update_install(sink: EventSink<Event>) {
+fn spawn_update_download(sink: EventSink<Event>) {
     spawn_task(
         sink,
-        async move { crate::actions::install_update().await.map_err(|e| e.to_string()) },
-        Event::UpdateInstallDone,
+        async move { crate::actions::download_update().await.map_err(|e| e.to_string()) },
+        Event::UpdateDownloadDone,
     );
 }
 
@@ -290,9 +290,10 @@ impl eframe::App for SettingsApp {
                     self.update_fetch_in_flight = true;
                     spawn_update_status_fetch(self.sink.clone());
                 }
-                Event::UpdateInstallDone(result) => {
+                Event::UpdateDownloadDone(result) => {
                     self.update_action_in_flight = false;
-                    self.update_message = Some(result.map(|()| "Install requested.".to_string()));
+                    self.update_message =
+                        Some(result.map(|()| "Opened the download page.".to_string()));
                     self.update_fetch_in_flight = true;
                     spawn_update_status_fetch(self.sink.clone());
                 }
@@ -469,9 +470,6 @@ impl SettingsApp {
             if !status.holdback_reason.is_empty() {
                 ui.label(format!("Held back: {}", status.holdback_reason));
             }
-            if status.waiting_for_safe_point {
-                ui.label("Waiting for a safe point to install.");
-            }
         }
         if !status.last_error_category.is_empty() {
             ui.colored_label(
@@ -497,11 +495,11 @@ impl SettingsApp {
                 spawn_update_check(self.sink.clone());
             }
             if !status.available_version.is_empty()
-                && ui.add_enabled(!busy, egui::Button::new("Install update")).clicked()
+                && ui.add_enabled(!busy, egui::Button::new("Download new version")).clicked()
             {
                 self.update_action_in_flight = true;
                 self.update_message = None;
-                spawn_update_install(self.sink.clone());
+                spawn_update_download(self.sink.clone());
             }
             if busy {
                 ui.spinner();
@@ -521,20 +519,6 @@ impl SettingsApp {
             self.update_message = None;
             spawn_update_config_save(self.sink.clone(), Some(checks_on), None);
         }
-        let mut auto_install = status.automatic_install_mode == "automatic";
-        if ui
-            .add_enabled(
-                !busy,
-                egui::Checkbox::new(&mut auto_install, "Install updates automatically"),
-            )
-            .changed()
-        {
-            let mode = if auto_install { "automatic" } else { "manual" }.to_string();
-            self.update_action_in_flight = true;
-            self.update_message = None;
-            spawn_update_config_save(self.sink.clone(), None, Some(mode));
-        }
-
         if let Some(msg) = &self.update_message {
             render_result_label(ui, msg);
         }

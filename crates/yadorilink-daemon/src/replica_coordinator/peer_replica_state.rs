@@ -65,22 +65,22 @@ use super::ReplicaCoordinator;
 static BIRTH_TIME_GRANULARITY_CACHE: std::sync::OnceLock<
     std::sync::Mutex<
         HashMap<
-            yadorilink_root_authority::fs_identity::VolumeIdentity,
-            yadorilink_root_authority::fs_identity::TimestampGranularity,
+            yadorilink_fs_platform::fs_identity::VolumeIdentity,
+            yadorilink_fs_platform::fs_identity::TimestampGranularity,
         >,
     >,
 > = std::sync::OnceLock::new();
 
 pub(in crate::replica_coordinator) fn cached_birth_time_granularity(
     sync_root: &Path,
-) -> yadorilink_root_authority::fs_identity::TimestampGranularity {
+) -> yadorilink_fs_platform::fs_identity::TimestampGranularity {
     let Ok(volume_identity) =
-        yadorilink_root_authority::fs_capabilities::observe_volume_identity(sync_root)
+        yadorilink_fs_platform::fs_capabilities::observe_volume_identity(sync_root)
     else {
-        return yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(sync_root);
+        return yadorilink_fs_platform::fs_capabilities::probe_birth_time_granularity(sync_root);
     };
     cached_granularity_for_volume(volume_identity, || {
-        yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(sync_root)
+        yadorilink_fs_platform::fs_capabilities::probe_birth_time_granularity(sync_root)
     })
 }
 
@@ -89,9 +89,9 @@ pub(in crate::replica_coordinator) fn cached_birth_time_granularity(
 /// cached probe; a different one re-probes" directly with synthetic
 /// identities, without needing to actually remount a real volume.
 fn cached_granularity_for_volume(
-    volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity,
-    probe: impl FnOnce() -> yadorilink_root_authority::fs_identity::TimestampGranularity,
-) -> yadorilink_root_authority::fs_identity::TimestampGranularity {
+    volume_identity: yadorilink_fs_platform::fs_identity::VolumeIdentity,
+    probe: impl FnOnce() -> yadorilink_fs_platform::fs_identity::TimestampGranularity,
+) -> yadorilink_fs_platform::fs_identity::TimestampGranularity {
     let cache = BIRTH_TIME_GRANULARITY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard.entry(volume_identity).or_insert_with(probe)
@@ -1087,10 +1087,10 @@ impl ReplicaCoordinator {
         Ok(self.sqlite().dag_usable_proof_names_current_version(group_id, path)?)
     }
 
-    /// `SqliteSyncStore::dag_disk_is_untouched_proven_write`
+    /// `SqliteSyncStore::disk_is_untouched_proven_write_at`
     /// for a path under this group's live root. Fail-closed: a group with no
     /// live link, or any error, is `false`.
-    pub fn dag_disk_is_untouched_proven_write(
+    pub fn disk_is_untouched_proven_write_at(
         &self,
         group_id: &str,
         path: &str,
@@ -1108,7 +1108,7 @@ impl ReplicaCoordinator {
             LinkGate::NoLiveLink => return Ok(false),
         };
         self.sqlite()
-            .dag_disk_is_untouched_proven_write(
+            .disk_is_untouched_proven_write_at(
                 group_id,
                 path,
                 out_path,

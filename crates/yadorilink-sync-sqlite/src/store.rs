@@ -464,7 +464,7 @@ impl SqliteSyncStore {
         &self,
         group_id: &str,
         path: &str,
-        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+        identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
         now_unix_nanos: i64,
     ) -> Result<crate::structural_origin::StructuralOriginCompletion, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
@@ -494,27 +494,20 @@ impl SqliteSyncStore {
     /// [`crate::structural_origin::drop_unresolved_structural_intents`].
     pub fn dag_drop_unresolved_structural_intents(
         &self,
-        recorded_before_unix_nanos: i64,
     ) -> Result<Vec<(String, String)>, SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
-            crate::structural_origin::drop_unresolved_structural_intents(
-                conn,
-                recorded_before_unix_nanos,
-            )
+            crate::structural_origin::drop_unresolved_structural_intents(conn)
         })
     }
 
-    /// The structural intents recorded before `recorded_before_unix_nanos`
+    /// The structural intents of `group_id` (all groups when `None`)
     /// -- [`crate::structural_origin::list_unresolved_structural_intents`].
     pub fn dag_list_unresolved_structural_intents(
         &self,
-        recorded_before_unix_nanos: i64,
+        group_id: Option<&str>,
     ) -> Result<Vec<crate::structural_origin::UnresolvedStructuralIntent>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::structural_origin::list_unresolved_structural_intents(
-                conn,
-                recorded_before_unix_nanos,
-            )
+            crate::structural_origin::list_unresolved_structural_intents(conn, group_id)
         })
     }
 
@@ -527,7 +520,7 @@ impl SqliteSyncStore {
         &self,
         resolutions: &[(
             crate::structural_origin::UnresolvedStructuralIntent,
-            Option<yadorilink_root_authority::fs_identity::FileIdentity>,
+            Option<yadorilink_fs_platform::fs_identity::FileIdentity>,
         )],
         now_unix_nanos: i64,
     ) -> Result<Vec<(String, String)>, SyncSqliteError> {
@@ -557,7 +550,7 @@ impl SqliteSyncStore {
         &self,
         group_id: &str,
         path: &str,
-        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+        identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
         now_unix_nanos: i64,
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
@@ -577,8 +570,8 @@ impl SqliteSyncStore {
         &self,
         group_id: &str,
         to_path: &str,
-        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
-        birth_time_granularity: yadorilink_root_authority::fs_identity::TimestampGranularity,
+        identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
+        birth_time_granularity: yadorilink_fs_platform::fs_identity::TimestampGranularity,
         now_unix_nanos: i64,
     ) -> Result<Option<String>, SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
@@ -628,7 +621,7 @@ impl SqliteSyncStore {
         group_id: &str,
         path: &str,
         reason: &str,
-        removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+        removable: Option<&yadorilink_fs_platform::fs_identity::FileIdentity>,
         now_unix_nanos: i64,
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
@@ -717,12 +710,12 @@ impl SqliteSyncStore {
     /// Fail-closed: no usable proof, a proof of anything but a regular file,
     /// a changed identity or metadata token, or any error observing the path
     /// is `false`.
-    pub fn dag_disk_is_untouched_proven_write(
+    pub fn disk_is_untouched_proven_write_at(
         &self,
         group_id: &str,
         path: &str,
         out_path: &std::path::Path,
-        birth_time_granularity: yadorilink_root_authority::fs_identity::TimestampGranularity,
+        birth_time_granularity: yadorilink_fs_platform::fs_identity::TimestampGranularity,
     ) -> Result<bool, SyncSqliteError> {
         use crate::materialized_generation::{
             revalidate_identity_against_disk, IdentityRevalidation, MaterializedObjectKind,
@@ -747,7 +740,7 @@ impl SqliteSyncStore {
         &self,
         group_id: &str,
         path: &str,
-    ) -> Result<Option<yadorilink_root_authority::fs_identity::FileIdentity>, SyncSqliteError> {
+    ) -> Result<Option<yadorilink_fs_platform::fs_identity::FileIdentity>, SyncSqliteError> {
         use crate::materialized_generation::MaterializedObjectKind;
         self.database.read::<_, SyncSqliteError>(|conn| {
             Ok(crate::materialized_generation::lookup_materialized_generation_diagnostic(
@@ -800,17 +793,6 @@ impl SqliteSyncStore {
     ) -> Result<crate::desired_state::DesiredPathState, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             crate::native_desired_state::native_desired_path_state(tx, group_id, path)
-        })
-    }
-
-    /// [`Self::dag_desired_level_projection`] from native state.
-    pub fn native_desired_level_projection(
-        &self,
-        group_id: &str,
-        parent: &str,
-    ) -> Result<yadorilink_replica_engine::namespace::NamespaceProjection, SyncSqliteError> {
-        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            crate::native_desired_state::native_desired_level_projection(tx, group_id, parent)
         })
     }
 

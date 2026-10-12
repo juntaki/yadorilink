@@ -10,7 +10,7 @@ use yadorilink_ipc_proto::daemonctl::{
     UpdateStatusResponse,
 };
 
-use crate::application::{InstallOutcome, UpdateConfigCommand};
+use crate::application::UpdateConfigCommand;
 
 /// `UpdateStatusView` (`crate::queries::update_status`, `DaemonState`-
 /// independent) -> the IPC wire type. Shared by `StatusResponse`'s
@@ -45,18 +45,10 @@ pub(crate) fn encode_check_response(
     UpdateCheckResponse { status: Some(encode_update_status(status)) }
 }
 
-pub(crate) fn encode_install_response(outcome: InstallOutcome) -> UpdateInstallResponse {
-    match outcome {
-        InstallOutcome::Deferred => {
-            UpdateInstallResponse { outcome: "deferred".into(), guidance: String::new() }
-        }
-        InstallOutcome::StoreManaged { guidance } => {
-            UpdateInstallResponse { outcome: "store_managed".into(), guidance }
-        }
-        InstallOutcome::HandoffLaunched | InstallOutcome::Installed => {
-            UpdateInstallResponse { outcome: "installing".into(), guidance: String::new() }
-        }
-    }
+/// v1 ships manual updates: the daemon never installs, it points the user
+/// at the official download page.
+pub(crate) fn encode_download_response(guidance: String) -> UpdateInstallResponse {
+    UpdateInstallResponse { outcome: "manual_download".into(), guidance }
 }
 
 pub(crate) fn decode_config_request(req: UpdateConfigRequest) -> UpdateConfigCommand {

@@ -23,7 +23,7 @@ use std::path::Path;
 
 use yadorilink_local_storage::{
     apply_file_metadata, create_or_defer_placeholder, disk_bytes_match_indexed_blocks,
-    disk_matches_expected_object, intent_target_hash, reconstruct_file,
+    disk_matches_expected_object, intent_target_hash, reconstruct_file_in,
     verify_write_target_within_root, BlockContentStore, DiskContentComparison, ExpectedObject,
 };
 use yadorilink_replica_domain::file::RecordKind;
@@ -57,11 +57,13 @@ pub struct MaterializationRepairReport {
     /// also missing locally — demoted from `Present` to `Remote` so
     /// normal on-demand hydration re-fetches it from a peer.
     pub demoted_to_placeholder: Vec<String>,
-    /// Existing disk bytes differed from the indexed block identity and might
-    /// be an offline or pending user edit. Rather than overwrite them from the
-    /// older index, they were moved to the paired conflict-copy path recorded
-    /// here before the canonical path was repaired — `(original_path,
-    /// quarantine_path)`.
+    /// Existing disk bytes differed from the indexed block identity while a
+    /// materialization intent was open on the path, and the row could not
+    /// explain them. Rather than overwrite them, they were moved to the paired
+    /// conflict-copy path recorded here before the canonical path was
+    /// repaired — `(original_path, quarantine_path)`. A divergent file with
+    /// no intent is not listed: it is left in place and journaled as an
+    /// ordinary local edit.
     pub quarantined_dirty: Vec<(String, String)>,
     /// A `Present` record whose on-disk file was missing *and* had no
     /// in-progress materialization intent journaled — i.e. the write had
@@ -94,9 +96,11 @@ pub struct MaterializationRepairReport {
 /// record whose on-disk bytes have no in-progress materialization intent
 /// means. At startup, before any watcher exists, this can only be an
 /// offline user edit or deletion made while the daemon was stopped --
-/// quarantining a present-but-divergent file (or deferring a missing
-/// one's tombstone to the startup reconcile scan) is the correct,
-/// conservative disambiguation. On the live cadence, the SAME
+/// leaving a present-but-divergent file in place for the dirty journal /
+/// startup scan to author as an ordinary local edit (and deferring a
+/// missing one's tombstone to the startup reconcile scan) is the correct
+/// disambiguation. Only a divergence under an open intent that the row
+/// cannot explain is quarantined. On the live cadence, the SAME
 /// observation can just as easily be a user edit **in progress right
 /// now** -- sitting in the debounce accumulator, or captured but not yet
 /// past its own per-path lock -- neither of which this repair pass's own
@@ -425,6 +429,20 @@ fn repair_interrupted_materializations_inner(
             return Ok(());
         }
 
+        // A settled row owes nothing, so the live sweep does not look at its
+        // file: `Present`, a proof that names the current version, and no
+        // intent open (every write in flight holds one). Hashing the file
+        // would only be inferring a problem from bytes; a divergence with no
+        // intent is an ordinary local edit, which capture owns. Startup still
+        // compares: it is the one pass that must see an offline edit.
+        if mode == RepairMode::Live
+            && row_state == MaterializationState::Present
+            && !outstanding_intents.contains(&path)
+            && state.has_usable_materialized_generation(group_id, &path)?
+        {
+            return Ok(());
+        }
+
         let out_path = root.join(&path);
         diag_disk_compared += 1;
         let on_disk_size = std::fs::metadata(&out_path).ok().map(|m| m.len());
@@ -452,8 +470,10 @@ fn repair_interrupted_materializations_inner(
         // after its bytes landed and before its mode or xattrs did leaves
         // right bytes under wrong metadata, and proving that publishes an
         // exact proof of metadata disk never got. Such a file is divergent:
-        // it takes the arms below, which quarantine it (or, live, defer it)
-        // and reconstruct the whole version, metadata included.
+        // it takes the arms below: with an intent open it is quarantined and the
+        // whole version, metadata included, is reconstructed; with no intent
+        // the path is left in place and journaled as a local edit (the
+        // capture then authors the metadata change).
         //
         // The xattrs are compared with the strict reader, not the
         // best-effort `xattrs_already_match_disk`, which reads a failed
@@ -497,8 +517,7 @@ fn repair_interrupted_materializations_inner(
                 return Ok(());
             };
             let identity =
-                match yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path)
-                {
+                match yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path) {
                     Ok(identity) => identity,
                     Err(e) => {
                         tracing::warn!(
@@ -636,10 +655,11 @@ fn repair_interrupted_materializations_inner(
 
         // An existing mismatched file is ambiguous: it may be a stale
         // interrupted write, or a user edit made while the daemon was stopped
-        // (which has no dirty marker). Preserve it unconditionally before
-        // healing the canonical path. Full block-identity verification above
-        // also catches same-size offline edits that the old size-only fast
-        // path silently missed.
+        // (which has no dirty marker). With an intent open it is
+        // quarantined before the canonical path is healed; with none it is
+        // left in place (below). Full block-identity verification above also
+        // catches same-size offline edits that the old size-only fast path
+        // silently missed.
         //
         // Deliberately asymmetric with the missing-file arm above: nothing
         // from here down ever consults `has_unsettled_projection_
@@ -661,7 +681,20 @@ fn repair_interrupted_materializations_inner(
         // offline edit the way it does at startup -- it may be a live edit
         // not yet captured. Defer to the dirty-journal backstop instead of
         // touching the file at all.
-        if on_disk_size.is_some() && !has_intent && mode == RepairMode::Live {
+        // At startup this is an offline edit: no intent means no interrupted
+        // write explains the divergence. Leave the bytes in place and hand the
+        // path to the dirty journal / initial scan, which author an ordinary
+        // local Put (a concurrent peer change then takes normal conflict
+        // semantics when the row is concurrent with it; when the row already
+        // holds a peer version the edit was based on, it supersedes it). Repair
+        // itself writes nothing to such a path, so nothing here can overwrite
+        // the file. Between this pass and the initial scan's capture a peer's
+        // version can still be applied; the executor's pre-write check
+        // (`disk_holds_uncaptured_local_bytes`) protects changed content by
+        // comparing bytes, but a metadata-only change (mode, xattrs) with
+        // equal bytes is not covered. Only a path WITH an intent that disk
+        // cannot explain is quarantined below.
+        if on_disk_size.is_some() && !has_intent {
             state.record_dirty_path(
                 group_id,
                 &path,
@@ -1140,7 +1173,7 @@ fn repair_one_interrupted_single_object(
                 .as_ref()
                 .filter(|m| m.file_type().is_symlink())
                 .and_then(|_| std::fs::read_link(&out_path).ok())
-                .map(|t| yadorilink_root_authority::fs_identity::target_to_bytes(&t));
+                .map(|t| yadorilink_fs_platform::fs_identity::target_to_bytes(&t));
             on_disk_target.as_deref() == Some(target.as_slice())
         }
         None => {
@@ -1173,7 +1206,7 @@ fn repair_one_interrupted_single_object(
             return Ok(());
         };
         let identity =
-            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path).ok();
+            yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path).ok();
         let committed = state.commit_recovered_materialized_state(
             group_id,
             path,
@@ -1196,14 +1229,27 @@ fn repair_one_interrupted_single_object(
 
     let intent_kind = state.materialization_intent_kind(group_id, path)?;
     let on_disk_exists = lstat.is_some();
-    // A missing link under an open delete intent is a tombstone delete
-    // interrupted after its removal, not an interrupted write: see the
-    // regular-file arm. Never rebuild it; the delete settles it.
-    if !on_disk_exists && intent_kind == Some(MaterializationIntentKind::Delete) {
+    // An open delete intent is a tombstone delete interrupted around its
+    // removal, not an interrupted write: see the regular-file arm. Never
+    // rebuild the link, whether the path is missing or something a user
+    // put there since; the delete settles it.
+    if intent_kind == Some(MaterializationIntentKind::Delete) {
         tracing::debug!(
             group_id,
             path = %path,
-            "a Hydrated symlink is missing under an open delete intent; leaving it to that delete"
+            "a Hydrated symlink is under an open delete intent; leaving it to that delete"
+        );
+        return Ok(());
+    }
+    // Only a symlink is this arm's to replace: a regular file or directory
+    // at the path may be a user's, and is never overwritten (as for the
+    // directory arm below).
+    if target.is_some() && lstat.as_ref().is_some_and(|m| !m.file_type().is_symlink()) {
+        tracing::warn!(
+            group_id,
+            path,
+            "a symlink's path holds something that is not a symlink; left untouched rather \
+             than replaced"
         );
         return Ok(());
     }
@@ -1409,9 +1455,17 @@ fn rebuild_interrupted_symlink<'a>(
         permit,
     )?;
     #[cfg(unix)]
-    yadorilink_local_storage::materialize_symlink(out_path, target)?;
+    yadorilink_local_storage::materialize_symlink_in(
+        out_path,
+        target,
+        &crate::materialization_execution::GroupTempLedger::new(state, group_id),
+    )?;
     #[cfg(windows)]
-    yadorilink_local_storage::materialize_symlink_windows(out_path, target)?;
+    yadorilink_local_storage::materialize_symlink_windows_in(
+        out_path,
+        target,
+        &crate::materialization_execution::GroupTempLedger::new(state, group_id),
+    )?;
     Ok(Some(opened))
 }
 
@@ -1482,7 +1536,13 @@ fn reconstruct_file_journaled(
     // opens a window with neither an intent nor a proof, in which a crash or
     // a failed metadata write or commit leaves nothing recording that this
     // write was ever in flight.
-    reconstruct_file(request.store, request.out_path, request.blocks, request.mtime_unix_nanos)?;
+    reconstruct_file_in(
+        request.store,
+        request.out_path,
+        request.blocks,
+        request.mtime_unix_nanos,
+        &crate::materialization_execution::GroupTempLedger::new(request.state, request.group_id),
+    )?;
     #[cfg(any(test, feature = "test-support"))]
     if FAIL_AFTER_RENAME.with(std::cell::Cell::get) {
         return Err(MaterializationExecutionError::CorruptState(
@@ -1652,8 +1712,7 @@ pub fn reconcile_restore_operations(
                             .prove(&out_path, &operation.meta.xattrs)
                             .is_ok());
                 let identity = if metadata_proven {
-                    yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path)
-                        .ok()
+                    yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path).ok()
                 } else {
                     None
                 };
@@ -1802,11 +1861,17 @@ mod tests {
         fn complete(
             &self,
             rel_path: &str,
-            _identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+            _identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
         ) -> Result<(), yadorilink_local_storage::StorageError> {
             panic!("quarantining created a directory: {rel_path}")
         }
         fn abandon(&self, rel_path: &str) -> Result<(), yadorilink_local_storage::StorageError> {
+            panic!("quarantining created a directory: {rel_path}")
+        }
+        fn interrupted(
+            &self,
+            rel_path: &str,
+        ) -> Result<(), yadorilink_local_storage::StorageError> {
             panic!("quarantining created a directory: {rel_path}")
         }
     }

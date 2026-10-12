@@ -17,7 +17,6 @@ mod lan;
 mod lane;
 mod link;
 mod native_replication_transport;
-mod network;
 mod node;
 mod observe;
 mod path_witness;
@@ -42,7 +41,6 @@ pub use native_replication_transport::{
     NativeReplicationConnection, NativeReplicationConnections, NativeReplicationReader,
     NativeReplicationWriter, YADORI_NATIVE_REPLICATION_ALPN,
 };
-pub use network::YadoriNetwork;
 pub use node::{is_relay_url, NetworkConfig, SubstrateNode, YADORI_SYNC_ALPN};
 pub use observe::{DialFailure, LinkEvent, LinkObserver};
 pub use path_witness::{verdict_for, PathBytes, PathKind, PathWitness, TransferVerdict};

@@ -34,7 +34,7 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use yadorilink_filesystem_sync::debounce;
 use yadorilink_filesystem_sync::watcher::FolderWatchSource;
-use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 
 use crate::error::DaemonError;
 use crate::link_runtime::dependencies::LinkRuntimeDependencies;
@@ -134,9 +134,17 @@ impl LinkRuntimeFactory {
         // unlink/relink for the same path. Runs while this link's `LinkSlot` is
         // still `Starting` -- visible (so a racing `stop_link_watch` waits for
         // it via `LinkSlotStartingGuard`) but not yet serving anything.
-        let stale_root_tmp = yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files(
-            Path::new(&local_path),
-        );
+        let stale_root_tmp = deps
+            .replica_coordinator
+            .remove_recorded_temp_files(&group_id, Path::new(&local_path))
+            .map_err(crate::sync_error::SyncError::from)?;
+        // Structural-directory intents a dead process left for this group
+        // (startup keeps the ones whose root it could not look at).
+        if let Err(error) =
+            deps.replica_coordinator.resolve_structural_intents_at_link_start(&group_id)
+        {
+            tracing::warn!(%error, group_id = %group_id, "could not resolve structural-directory intents at link start");
+        }
         if !stale_root_tmp.is_empty() {
             tracing::info!(
                 count = stale_root_tmp.len(),

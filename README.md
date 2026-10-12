@@ -18,7 +18,7 @@ YadoriLink coordinates them, but does not store your files.
 - Account-based sharing, permissions, and revocation
 - Versions, conflicts, and on-demand storage
 
-Runs on macOS, Windows, and Linux.
+Runs on macOS 14+ (Apple silicon only), Windows, and Linux.
 
 ## Install
 
@@ -35,11 +35,15 @@ Each file has a `.sha256` checksum next to it.
 
 **Windows:** the installer is currently not code-signed, so Windows
 SmartScreen shows an "unknown publisher" warning. Compare the SHA-256 of
-the download with the published `.sha256` before choosing "Run anyway". A
-Windows device that was offline so long that it needs its synced history
-rebuilt is not supported yet: the daemon refuses with `the rebootstrap is
-blocked: DurabilityUnsupported` and leaves the folder untouched. Install steps, first run,
-updates, and uninstalling are in the platform READMEs:
+the download with the published `.sha256` before choosing "Run anyway".
+
+**Windows, long-offline devices:** a Windows device that was offline so long
+that it can no longer catch up, and would need its synced history rebuilt,
+is not supported yet. YadoriLink refuses to start the rebuild (the log says
+"rebootstrap is blocked") and leaves the folder as it was. Devices that stay
+reasonably in sync are not affected.
+
+Install steps, first run, updates, and uninstalling are in the platform READMEs:
 [macOS](platforms/macos/package/README.md), [Windows](platforms/windows/package/README.md),
 [Linux](platforms/linux/package/README.md).
 
@@ -51,9 +55,18 @@ automatically. To use a different coordination service, set
 
 ## First run
 
-After installing, start the daemon (the installers start it for you on
-macOS and Windows; on Linux run `systemctl --user enable --now
-yadorilink-daemon`), then:
+1. Install and open YadoriLink. On macOS, open `YadoriLink.app`; on Windows,
+   keep "Set up YadoriLink now" checked on the installer's last page.
+2. Sign in with Google in your browser.
+3. Choose the folder to sync. On macOS, review it and click "Link Folder".
+
+Linux has no desktop app yet; use the command line below.
+
+## Advanced / command line
+
+The same setup is available from a terminal. The installers start the daemon
+for you on macOS and Windows; on Linux run `systemctl --user enable --now
+yadorilink-daemon`, then:
 
 ```bash
 yadorilink login
@@ -62,9 +75,12 @@ yadorilink share create my-share --path ~/some/folder
 yadorilink status
 ```
 
-`yadorilink status` and `yadorilink doctor` show what the daemon sees. If a
-folder group was reset and items were set aside, `yadorilink preserved list`
-shows them (`preserved restore`, `retry` and `discard` act on them).
+`yadorilink status` and `yadorilink doctor` show what the daemon sees. When a
+shared folder's history is rebuilt, YadoriLink keeps ("preserves") versions
+or local changes it could not carry over instead of deleting them.
+`yadorilink preserved list` shows them; `preserved restore <item-id>` writes
+a kept version back as a new change, `retry <item-id>` re-submits one of your
+own changes, and `discard <item-id>` deletes the item.
 
 Add another of your devices:
 

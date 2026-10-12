@@ -23,8 +23,8 @@ use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
     ContextAction, ContextActionRequest, FolderFileEntry, HydrateRequest, ListFolderFilesRequest,
-    ListProviderFoldersRequest, LocalTransition, ShellIpcMessage, StatusQuery,
-    SyncState,
+    ListProviderFoldersRequest, LocalTransition, ProviderFolder, ProviderRemoval, ShellIpcMessage,
+    StatusQuery, SyncState,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(200);
@@ -71,7 +71,7 @@ fn pipe_name() -> String {
     format!(r"\\.\pipe\yadorilink-{user}")
 }
 
-async fn connect() -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+pub(crate) async fn connect() -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
     let name = pipe_name();
     let mut attempt = 0;
     loop {
@@ -204,11 +204,9 @@ async fn is_placeholder_inner(path: &str) -> bool {
         return false;
     }
     match read_message::<ShellIpcMessage>(&mut stream).await {
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::StatusResponse(r)) })) => {
-            r.local_state.is_some_and(|s| {
-                !s.current_content_present && s.transition() == LocalTransition::None
-            })
-        }
+        Ok(Some(ShellIpcMessage { payload: Some(Payload::StatusResponse(r)) })) => r
+            .local_state
+            .is_some_and(|s| !s.current_content_present && s.transition() == LocalTransition::None),
         _ => false,
     }
 }
@@ -254,74 +252,64 @@ async fn hydrate_inner(path: &str) -> bool {
     )
 }
 
-/// Lists every OnDemand-policy linked folder the daemon currently knows
-/// about (addressing a gap where `daemon_control.proto`'s
-/// `ListLinks` reports per-group aggregates, not enough for a cfapi host
-/// to know which local paths to register as sync roots). Empty on any
-/// failure or if the daemon isn't reachable — the cfapi host's caller is
-/// expected to just register nothing and retry on its own poll interval,
-/// matching this client's fail-soft-never-hang contract elsewhere.
-/// Discovers every OnDemand-linked folder group (the reconciliation
-/// input `cfapi_host`'s poll loop converges the CfAPI sync-root set
-/// against). Mirrors `platforms/macos/app/fileprovider-core/src/ipc_client.rs`'s
-/// `list_on_demand_folders` exactly, including its `None`/`Some(vec![])`
-/// contract -- both platforms answer the identical
-/// `ListOnDemandFoldersRequest`/`Response` pair.
+/// The provider roots the daemon declares for this device, and the roots it wants removed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProviderSnapshot {
+    pub folders: Vec<ProviderFolder>,
+    pub removals: Vec<ProviderRemoval>,
+}
+
+/// Lists the provider roots (the reconciliation input of the host's loop). `app_group_container`
+/// is the host's private data directory: the daemon adopts it once, as the place of its provider
+/// temp root (`<container>\provider`).
 ///
-/// `None` on any failure to confirm the daemon's current desired state
-/// (unreachable daemon, timeout, malformed response, or an explicit
-/// `snapshot_available: false` -- see `shellipc.proto`'s own doc comment
-/// on that field), deliberately distinct from `Some(vec![])`, a
-/// *confirmed* "no OnDemand folders exist right now" snapshot. The caller
-/// (`cfapi_host`'s `reconcile_sync_roots`, which both registers missing
-/// roots AND unregisters stale ones) must treat `None` as "cannot
-/// currently reconcile, leave existing sync roots untouched" -- collapsing
-/// this into an empty `Vec` would make a transient daemon-unreachable
-/// moment look identical to "every sync root should be removed," which is
-/// exactly the fail-open mistake a snapshot-based reconciliation must not
-/// make.
-pub fn list_on_demand_folders() -> Option<Vec<OnDemandFolder>> {
+/// `None` on any failure to confirm the daemon's current declarations (unreachable daemon,
+/// timeout, malformed response, or an explicit `snapshot_available: false`), deliberately distinct
+/// from `Some` of an empty snapshot, a confirmed "no provider roots": the caller registers and
+/// unregisters sync roots against a snapshot, and must leave them untouched when it cannot
+/// confirm one.
+pub fn list_provider_folders(app_group_container: &str) -> Option<ProviderSnapshot> {
     runtime().block_on(async {
-        tokio::time::timeout(LIST_TIMEOUT, list_on_demand_folders_inner()).await.ok()?
+        tokio::time::timeout(LIST_TIMEOUT, list_provider_folders_inner(app_group_container))
+            .await
+            .ok()?
     })
 }
 
-async fn list_on_demand_folders_inner() -> Option<Vec<OnDemandFolder>> {
+async fn list_provider_folders_inner(app_group_container: &str) -> Option<ProviderSnapshot> {
     let mut stream = connect().await.ok()?;
-    list_on_demand_folders_over(&mut stream).await
+    list_provider_folders_over(&mut stream, app_group_container).await
 }
 
-/// The stream-generic core of `list_on_demand_folders_inner`, split out so
-/// the load-bearing `None`-vs-`Some` distinction is testable against an
-/// in-memory duplex stream instead of a real named pipe + daemon.
-async fn list_on_demand_folders_over<S>(stream: &mut S) -> Option<Vec<OnDemandFolder>>
+/// The stream-generic core of `list_provider_folders_inner`, split out so the load-bearing
+/// `None`-versus-`Some` distinction is testable against an in-memory duplex stream.
+async fn list_provider_folders_over<S>(
+    stream: &mut S,
+    app_group_container: &str,
+) -> Option<ProviderSnapshot>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let msg = ShellIpcMessage {
-        payload: Some(Payload::ListProviderFoldersRequest(ListProviderFoldersRequest { app_group_container: String::new() })),
+        payload: Some(Payload::ListProviderFoldersRequest(ListProviderFoldersRequest {
+            app_group_container: app_group_container.to_string(),
+        })),
     };
     write_message(stream, &msg).await.ok()?;
-    match read_message::<ShellIpcMessage>(stream).await {
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListProviderFoldersResponse(r)) }))
-            if r.snapshot_available =>
-        {
-            // The daemon lists provider roots by `root_id`, with no directory. There is no
-            // Windows provider kind until the CfAPI checkpoint, so no root is registered
-            // as a sync root from this snapshot: a confirmed empty desired set.
-            Some(Vec::new())
+    loop {
+        match read_message::<ShellIpcMessage>(stream).await {
+            Ok(Some(ShellIpcMessage {
+                payload: Some(Payload::ListProviderFoldersResponse(r)),
+            })) => {
+                return r
+                    .snapshot_available
+                    .then_some(ProviderSnapshot { folders: r.folders, removals: r.removals });
+            }
+            // A status update pushed on the connection before the answer.
+            Ok(Some(ShellIpcMessage { payload: Some(Payload::StatusPush(_)) })) => {}
+            _ => return None,
         }
-        _ => None,
     }
-}
-
-/// A linked folder to register as a CfAPI sync root. Windows-local: the shell protocol
-/// no longer carries a directory for provider roots, and no Windows provider kind exists
-/// yet (UNVERIFIED, mechanical).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OnDemandFolder {
-    pub local_path: String,
-    pub group_id: String,
 }
 
 /// Lists every non-deleted file the daemon has indexed under the OnDemand
@@ -445,10 +433,10 @@ async fn send_context_action_inner(path: &str, action: ContextAction) -> bool {
 }
 
 #[cfg(test)]
-mod list_on_demand_folders_tests {
+mod list_provider_folders_tests {
     use super::*;
 
-    async fn respond_with(response: Option<ShellIpcMessage>) -> Option<Vec<OnDemandFolder>> {
+    async fn respond_with(response: Option<ShellIpcMessage>) -> Option<ProviderSnapshot> {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let server_task = tokio::spawn(async move {
             let _ = read_message::<ShellIpcMessage>(&mut server).await;
@@ -456,55 +444,56 @@ mod list_on_demand_folders_tests {
                 let _ = write_message(&mut server, &response).await;
             }
         });
-        let result = list_on_demand_folders_over(&mut client).await;
+        let result = list_provider_folders_over(&mut client, "C:\\host").await;
         server_task.await.unwrap();
         result
     }
 
-    fn response(folders: Vec<OnDemandFolder>, snapshot_available: bool) -> ShellIpcMessage {
-        let _ = folders;
+    fn response(folders: Vec<ProviderFolder>, snapshot_available: bool) -> ShellIpcMessage {
         ShellIpcMessage {
             payload: Some(Payload::ListProviderFoldersResponse(
                 yadorilink_ipc_proto::shellipc::ListProviderFoldersResponse {
-                    folders: Vec::new(),
+                    folders,
                     snapshot_available,
+                    removals: vec![ProviderRemoval {
+                        root_id: vec![2],
+                        display_name: "Old".into(),
+                    }],
                 },
             )),
         }
     }
 
-    fn folder(local_path: &str, group_id: &str) -> OnDemandFolder {
-        OnDemandFolder { local_path: local_path.to_string(), group_id: group_id.to_string() }
+    fn folder(root: u8, name: &str) -> ProviderFolder {
+        ProviderFolder { root_id: vec![root], display_name: name.into(), ..Default::default() }
     }
 
     #[tokio::test]
-    async fn confirmed_empty_snapshot_is_some_empty_vec() {
-        let result = respond_with(Some(response(vec![], true))).await;
-        assert_eq!(result, Some(vec![]));
+    async fn a_confirmed_snapshot_carries_its_folders_and_removals() {
+        let snapshot = respond_with(Some(response(vec![folder(1, "Photos")], true))).await.unwrap();
+        assert_eq!(snapshot.folders, vec![folder(1, "Photos")]);
+        assert_eq!(snapshot.removals[0].root_id, vec![2]);
     }
 
     #[tokio::test]
-    async fn a_confirmed_snapshot_registers_no_sync_root_without_a_windows_provider() {
-        let result = respond_with(Some(response(vec![folder("C:\\A", "group-a")], true))).await;
-        assert_eq!(result, Some(vec![]));
+    async fn a_confirmed_empty_snapshot_is_some_and_empty() {
+        let snapshot = respond_with(Some(response(vec![], true))).await.unwrap();
+        assert!(snapshot.folders.is_empty());
     }
 
     #[tokio::test]
     async fn snapshot_unavailable_is_none_even_with_folders_present() {
-        let result = respond_with(Some(response(vec![folder("C:\\A", "group-a")], false))).await;
-        assert_eq!(result, None);
+        assert_eq!(respond_with(Some(response(vec![folder(1, "Photos")], false))).await, None);
     }
 
     #[tokio::test]
     async fn server_closes_without_responding_is_none() {
-        let result = respond_with(None).await;
-        assert_eq!(result, None);
+        assert_eq!(respond_with(None).await, None);
     }
 
     #[tokio::test]
     async fn malformed_response_payload_is_none() {
         let msg = ShellIpcMessage { payload: Some(Payload::HydrateResponse(Default::default())) };
-        let result = respond_with(Some(msg)).await;
-        assert_eq!(result, None);
+        assert_eq!(respond_with(Some(msg)).await, None);
     }
 }

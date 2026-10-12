@@ -188,13 +188,23 @@ fn a_held_heads_provenance_does_not_license_another_identity() {
     };
 
     write(&db, &record("held", 1, false), Some(&held));
-    write(&db, &record("elsewhere", 1, false), Some(&other_path));
-    write(&db, &record("later", 1, false), Some(&other_dot));
-
-    let flagged = unauthored(&db);
-    assert!(!flagged.contains("held"));
-    assert!(flagged.contains("elsewhere"), "another path's identity was never verified");
-    assert!(flagged.contains("later"), "another dot's identity was never verified");
+    let refused = |name: &str, identity: &NativeRowIdentity| {
+        db.write_immediate::<_, SyncSqliteError>(|tx| {
+            upsert_file_with_authoring_in_tx(
+                tx,
+                GROUP,
+                &record(name, 1, false),
+                "device-a",
+                Some(identity),
+            )
+        })
+        .is_err()
+    };
+    // The group has native history, so a row citing evidence that was never
+    // verified is refused outright.
+    assert!(refused("elsewhere", &other_path), "another path's identity was never verified");
+    assert!(refused("later", &other_dot), "another dot's identity was never verified");
+    assert!(!unauthored(&db).contains("held"));
 }
 
 fn install_head(

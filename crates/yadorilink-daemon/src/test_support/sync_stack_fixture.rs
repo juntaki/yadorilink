@@ -698,7 +698,7 @@ fn watch_folder_over(
 
     let (watch_source, events) = SimulatedFolderWatchSource::new(32);
     let ignore_set =
-        Arc::new(yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet::defaults_only());
+        Arc::new(yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet::defaults_only());
     let watcher = watch_source.watch(&canonical, ignore_set).expect("watch the linked folder");
     let (events_rx, overflowed, guard) = watcher.split();
     // The guard keeps the watch alive; the folder outlives it by construction

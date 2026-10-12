@@ -500,18 +500,6 @@ fn storage_mode_words_map_to_the_on_demand_flag_and_back() {
 }
 
 #[test]
-fn extract_invite_code_accepts_either_the_bare_code_or_the_full_url() {
-    assert_eq!(extract_invite_code("yadorilink://invite/abc123"), "abc123");
-    assert_eq!(extract_invite_code("abc123"), "abc123");
-}
-
-#[test]
-fn extract_invite_code_round_trips_through_invite_url() {
-    let code = "0123456789abcdef";
-    assert_eq!(extract_invite_code(&crate::wording::invite_url(code)), code);
-}
-
-#[test]
 fn list_pending_invites_response_deserializes_the_coordination_planes_camelcase_shape() {
     let body = serde_json::json!({
         "invites": [{
@@ -593,4 +581,94 @@ async fn without_a_local_device_identity_every_member_keeps_the_services_presenc
     .await;
 
     assert!(!members[0].online);
+}
+
+fn pend(group_id: &str, device_id: &str) -> PendingApproval {
+    PendingApproval {
+        group_id: group_id.to_string(),
+        group_name: "photos".to_string(),
+        device_id: device_id.to_string(),
+        role: Some("viewer".to_string()),
+    }
+}
+
+fn mem(device_id: &str) -> GroupMemberInfo {
+    GroupMemberInfo {
+        device_id: device_id.to_string(),
+        device_name: "laptop".to_string(),
+        role: "editor".to_string(),
+        is_same_account: true,
+        is_caller_account: true,
+        storage_mode: "eager".to_string(),
+        online: true,
+        last_seen_unix: 1_700_000_000,
+    }
+}
+
+/// A request that is genuinely still waiting is denied, and the button
+/// does exactly what it says.
+#[test]
+fn a_request_that_is_still_waiting_is_denied() {
+    let pending = [pend("group-1", "device-a")];
+    assert_eq!(deny_precheck(&pending, &[], "group-1", "device-a"), DenyPrecheck::StillWaiting);
+}
+
+/// The bug this guard exists for: the requests panel is not refreshed on
+/// a timer, so a row can still say "waiting" long after the request was
+/// approved from somewhere else. Denying IS revoking, so sending that
+/// denial would remove a member whose access is live and working. A
+/// device that appears in the member listing is never denied.
+#[test]
+fn a_request_already_approved_elsewhere_is_never_denied() {
+    // Exactly what the stale panel still shows -- and what the fresh
+    // read says instead: nobody is waiting, and the device is a member.
+    let members = [mem("device-a")];
+    assert_eq!(
+        deny_precheck(&[], &members, "group-1", "device-a"),
+        DenyPrecheck::NotWaiting(DenyRefusal::AlreadyAdmitted)
+    );
+}
+
+/// Membership wins over a waiting request outright: the two listings are
+/// two separate reads, so an approval landing between them shows up in
+/// both, and the reading that stops a removal is the safe one.
+#[test]
+fn being_listed_as_a_member_outweighs_a_request_still_in_the_other_listing() {
+    let pending = [pend("group-1", "device-a")];
+    let members = [mem("device-a")];
+    assert_eq!(
+        deny_precheck(&pending, &members, "group-1", "device-a"),
+        DenyPrecheck::NotWaiting(DenyRefusal::AlreadyAdmitted)
+    );
+}
+
+/// Decided or withdrawn somewhere else: nothing to deny, and nothing to
+/// remove either.
+#[test]
+fn a_request_that_is_gone_from_both_listings_is_not_denied() {
+    assert_eq!(
+        deny_precheck(&[], &[], "group-1", "device-a"),
+        DenyPrecheck::NotWaiting(DenyRefusal::NoLongerListed)
+    );
+}
+
+/// The waiting listing is account-wide, so it is narrowed by group id
+/// here exactly as `pending_rows` narrows it -- a request for ANOTHER
+/// folder must never make this window's Deny proceed.
+#[test]
+fn a_request_waiting_on_a_different_folder_does_not_make_this_deny_proceed() {
+    let pending = [pend("group-2", "device-a")];
+    assert_eq!(
+        deny_precheck(&pending, &[], "group-1", "device-a"),
+        DenyPrecheck::NotWaiting(DenyRefusal::NoLongerListed)
+    );
+}
+
+#[test]
+fn refusal_reasons_are_plain_and_distinct() {
+    let admitted = DenyRefusal::AlreadyAdmitted.reason();
+    let gone = DenyRefusal::NoLongerListed.reason();
+    assert!(admitted.contains("already approved"));
+    assert!(gone.contains("no longer waiting") && gone.contains("Nothing was changed"));
+    assert_ne!(admitted, gone);
 }

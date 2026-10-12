@@ -157,6 +157,8 @@ install_user_file "$PLIST_PATH" 644 <<PLIST
 	<dict>
 		<key>YADORILINK_SHELL_IPC_SOCKET</key>
 		<string>${GROUP_CONTAINER}/shell.sock</string>
+		<key>YADORILINK_LOG_FILE</key>
+		<string>${LOG_DIR}/daemon.log</string>
 	</dict>
 	<key>RunAtLoad</key>
 	<true/>
@@ -234,13 +236,14 @@ fi
 # It has to run once so it can register File Provider domains (an
 # extension can't register its own; ProviderHostService does) and,
 # on its first launch, turn on open-at-login. On a FRESH install only —
-# this machine has never registered a device, so `~/.yadorilink/device.json`
+# this machine has never registered a device, so
+# `~/Library/Application Support/yadorilink/device.json`
 # does not exist yet — it opens with `--onboarding` so the setup window
 # shows; an upgrade launches it in the background instead. `launchctl
-# asuser` runs it in the console user's GUI session. Honors
-# YADORILINK_CONFIG_DIR by falling back to the default `~/.yadorilink` only
-# (an installer can't know a per-user override).
-DEVICE_JSON="$USER_HOME/.yadorilink/device.json"
+# asuser` runs it in the console user's GUI session. Only the
+# default config dir is checked (an installer can't know a per-user
+# YADORILINK_CONFIG_DIR override).
+DEVICE_JSON="$USER_HOME/Library/Application Support/yadorilink/device.json"
 if [ -d "$APP_PATH" ]; then
     if [ ! -f "$DEVICE_JSON" ]; then
         /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" \

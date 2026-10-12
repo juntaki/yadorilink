@@ -115,6 +115,7 @@ pub(super) struct Harness {
     pub(super) convergence: Arc<super::LocalConvergenceExecutor>,
     pub(super) state: Arc<ReplicaCoordinator>,
     processor: Arc<LocalChangeProcessor>,
+    pub(super) store: Arc<SegmentBlockStore>,
     root: std::path::PathBuf,
     flush: Arc<LinkFlushHandle>,
     pending_sibling: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
@@ -131,6 +132,42 @@ impl Harness {
     /// harness captures with. Otherwise the guard is the permissive no-op
     /// (it captures nothing), which is what "a write the flush did not
     /// capture" looks like to the materialize under test.
+    /// What the fork scheduler does once contests are ingested: the losing
+    /// heads move to their copy paths. The harness has one signer, so a
+    /// peer's losing head is moved by it as well, standing for the peer's
+    /// own fork (the delta is an ordinary writer's delta either way).
+    pub(super) fn try_fork_contests(&self) -> Result<(), crate::sync_error::SyncError> {
+        let key = crate::test_support::local_seam::replica_author_key(
+            &self.state,
+            LOCAL_DEVICE,
+            SigningKey::from_bytes(&[7u8; 32]),
+        )
+        .unwrap();
+        self.state.author_contest_forks(&key, GROUP, &|_, _| true).map(|_| ())
+    }
+
+    /// Every path native holds a head for: what a pass seeded by the armed
+    /// obligations covers once forks have named their copy paths.
+    pub(super) fn head_paths(&self) -> std::collections::BTreeSet<String> {
+        self.state
+            .database()
+            .read(|conn| {
+                yadorilink_sync_sqlite::native_store::load_state(
+                    conn,
+                    &yadorilink_replica_domain::ids::FolderGroupId(GROUP.to_owned()),
+                )
+            })
+            .unwrap()
+            .heads
+            .keys()
+            .map(|path| path.as_str().to_owned())
+            .collect()
+    }
+
+    pub(super) fn fork_own_contests(&self) {
+        self.try_fork_contests().unwrap();
+    }
+
     pub(super) fn new(through_link_flush: bool) -> Self {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
@@ -150,6 +187,17 @@ impl Harness {
             .unwrap();
         yadorilink_root_authority::root_identity::VerifiedRoot::open(&root, GROUP, state.as_ref())
             .unwrap();
+        // An established link: its volume identity is already recorded.
+        state
+            .link_repository()
+            .set_capture_volume_identity_for_group(
+                GROUP,
+                &yadorilink_filesystem_sync::device_boundary::root_volume_identity(&root).unwrap(),
+            )
+            .unwrap();
+        // A live link whose startup completed: peer apply defers otherwise.
+        let generation = state.startup_readiness().begin_group_startup(GROUP);
+        state.startup_readiness().mark_group_ready(GROUP, generation);
 
         let root_lock =
             yadorilink_root_authority::sync_root_lock::SyncRootLock::acquire(&root).unwrap();
@@ -254,6 +302,7 @@ impl Harness {
             convergence,
             state,
             processor,
+            store,
             root,
             flush: handle,
             pending_sibling,
@@ -683,6 +732,34 @@ async fn tombstone_is_not_applied_over_bytes_changed_since_they_were_captured() 
     assert_eq!(result, MaterializeResult::RetryRequired);
 }
 
+/// A symlink swapped in over a captured file is local state capture has not
+/// recorded; a tombstone must not unlink it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tombstone_is_not_applied_over_a_symlink_swapped_in_since_capture() {
+    let h = Harness::new(false);
+    std::fs::write(h.path("notes.txt"), b"captured").unwrap();
+    assert!(matches!(h.capture("notes.txt").await, LocalChangeOutcome::FileChanged(_)));
+    std::fs::remove_file(h.path("notes.txt")).unwrap();
+    std::os::unix::fs::symlink("elsewhere", h.path("notes.txt")).unwrap();
+
+    let mut tombstone = h.state.get_file(GROUP, "notes.txt").unwrap().unwrap();
+    tombstone.deleted = true;
+    tombstone.blocks.clear();
+    tombstone.size = 0;
+    let result = h
+        .convergence
+        .materialize_tombstone(GROUP, &tombstone, "device-remote", &RootCommitPermit::for_tests())
+        .await
+        .expect("materialize_tombstone must not error");
+
+    assert!(
+        std::fs::symlink_metadata(h.path("notes.txt")).unwrap().file_type().is_symlink(),
+        "a tombstone must not unlink a symlink this device never captured"
+    );
+    assert_eq!(result, MaterializeResult::RetryRequired);
+}
+
 /// A peer's delete that descends from this device's own capture makes the
 /// path resolve Absent, and projecting that deletes whatever is on disk.
 /// When the guard cannot capture the file (it changes while it is read),
@@ -956,6 +1033,267 @@ async fn the_older_bytes_a_failed_write_left_under_the_newer_row_are_not_authore
     assert!(h.state.materialization_intent_target(GROUP, "notes.txt").unwrap().is_none());
 }
 
+/// A write of a peer's newer version whose reconstruct keeps failing (here:
+/// the root is not writable) is demoted: the row holds the newer version, the
+/// disk still holds this device's own older bytes, and the write's fence bump
+/// has already voided the older bytes' proof. Startup repair must not read
+/// those bytes as an offline edit and author them over the peer's version: it
+/// quarantines them and rebuilds the row's version from the local blocks.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_repair_does_not_author_the_older_bytes_a_demoted_write_left_under_the_newer_row() {
+    use crate::test_support::remote_admission_fixture::{admit_remote, put};
+    use std::os::unix::fs::PermissionsExt;
+    use yadorilink_filesystem_sync::materialization_repair::{
+        repair_interrupted_materializations, RepairMode,
+    };
+    use yadorilink_local_capture::ports::LocalMutationStore as _;
+    let h = Harness::new(false);
+    let (older, newer): (&[u8], &[u8]) = (b"older v1", b"the peer's newer version");
+    std::fs::write(h.path("scratch.bin"), newer).unwrap();
+    assert!(matches!(h.capture("scratch.bin").await, LocalChangeOutcome::FileChanged(_)));
+    let newer_version = yadorilink_replica_domain::ids::VersionHash(
+        h.own_head("scratch.bin").content.unwrap().version_hash,
+    );
+    let stored = h.state.dag_get_file_version(GROUP, &newer_version).unwrap().expect("stored");
+    std::fs::write(h.path("notes.txt"), older).unwrap();
+    assert!(matches!(h.capture("notes.txt").await, LocalChangeOutcome::FileChanged(_)));
+    let own = yadorilink_replica_domain::ids::DeltaHash(h.own_head("notes.txt").change_hash);
+    admit_remote(
+        &h.state,
+        GROUP,
+        "device-remote",
+        vec![put("notes.txt", newer_version, vec![own])],
+        &[stored],
+    );
+    let driver = h.session.clone()
+        as Arc<dyn yadorilink_peer_session::convergence_driver::ConvergenceDriver>;
+
+    let root = h.path("");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let _ = h
+        .convergence
+        .reconcile_paths_directly(&driver, GROUP, BTreeSet::from(["notes.txt".to_string()]))
+        .await;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(std::fs::read(h.path("notes.txt")).unwrap(), older, "sanity: write never landed");
+    assert_eq!(
+        h.state.get_materialization_state(GROUP, "notes.txt").unwrap(),
+        Some(MaterializationState::Present),
+        "sanity: the failed write was demoted with the older object under the newer row"
+    );
+    assert!(
+        h.state.materialization_intent_target(GROUP, "notes.txt").unwrap().is_some(),
+        "the intent stays open while the older object sits under the newer row"
+    );
+
+    let permit = RootCommitPermit::for_tests();
+    let report = repair_interrupted_materializations(
+        h.state.as_ref(),
+        h.store.as_ref(),
+        &root,
+        GROUP,
+        RepairMode::Startup,
+        &permit,
+    )
+    .unwrap();
+
+    assert_eq!(report.quarantined_dirty.len(), 1, "{report:?}");
+    assert_eq!(
+        std::fs::read(h.path(&report.quarantined_dirty[0].1)).unwrap(),
+        older,
+        "the older bytes are preserved"
+    );
+    assert_eq!(std::fs::read(h.path("notes.txt")).unwrap(), newer, "the row's version is rebuilt");
+    assert!(h.state.materialization_intent_target(GROUP, "notes.txt").unwrap().is_none());
+    h.redrive().await;
+    let heads: Vec<_> = h.native_heads("notes.txt");
+    assert_eq!(heads.len(), 1, "no local head beside the peer's version");
+    assert_eq!(heads[0].dot.author.device.0, "device-remote");
+    assert_eq!(heads[0].payload.version.0, newer_version.0);
+}
+
+/// A peer's newer version whose blocks are not available is recorded without
+/// its content: the row holds the newer version, the disk still holds this
+/// device's own older bytes, untouched. Nothing was written, so those bytes
+/// are neither an edit nor an interrupted write: startup repair must leave
+/// them alone (no conflict copy), and the intent must not stay open.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_repair_keeps_the_untouched_older_bytes_under_an_incomplete_content_row() {
+    use crate::test_support::remote_admission_fixture::{admit_remote, put};
+    use yadorilink_filesystem_sync::materialization_repair::{
+        repair_interrupted_materializations, RepairMode,
+    };
+    use yadorilink_local_capture::ports::LocalMutationStore as _;
+    let h = Harness::new(false);
+    let peer = Harness::new(false);
+    let (older, newer): (&[u8], &[u8]) = (b"older v1", b"the peer's newer version");
+    std::fs::write(peer.path("scratch.bin"), newer).unwrap();
+    assert!(matches!(peer.capture("scratch.bin").await, LocalChangeOutcome::FileChanged(_)));
+    let newer_version = yadorilink_replica_domain::ids::VersionHash(
+        peer.own_head("scratch.bin").content.unwrap().version_hash,
+    );
+    let stored = peer.state.dag_get_file_version(GROUP, &newer_version).unwrap().expect("stored");
+    std::fs::write(h.path("notes.txt"), older).unwrap();
+    assert!(matches!(h.capture("notes.txt").await, LocalChangeOutcome::FileChanged(_)));
+    let own = yadorilink_replica_domain::ids::DeltaHash(h.own_head("notes.txt").change_hash);
+    admit_remote(
+        &h.state,
+        GROUP,
+        "device-remote",
+        vec![put("notes.txt", newer_version, vec![own])],
+        &[stored],
+    );
+    let driver = h.session.clone()
+        as Arc<dyn yadorilink_peer_session::convergence_driver::ConvergenceDriver>;
+    let _ = h
+        .convergence
+        .reconcile_paths_directly(&driver, GROUP, BTreeSet::from(["notes.txt".to_string()]))
+        .await;
+    assert_eq!(std::fs::read(h.path("notes.txt")).unwrap(), older, "sanity: nothing written");
+    assert_eq!(
+        h.state.get_materialization_state(GROUP, "notes.txt").unwrap(),
+        Some(MaterializationState::Present),
+        "sanity: the newer row was recorded without its content over the older object"
+    );
+
+    let root = h.path("");
+    let report = repair_interrupted_materializations(
+        h.state.as_ref(),
+        h.store.as_ref(),
+        &root,
+        GROUP,
+        RepairMode::Startup,
+        &RootCommitPermit::for_tests(),
+    )
+    .unwrap();
+
+    assert!(report.quarantined_dirty.is_empty(), "{report:?}");
+    assert_eq!(std::fs::read(h.path("notes.txt")).unwrap(), older, "untouched bytes stay");
+    assert!(!h.state.dirty_path_repository().is_path_dirty(GROUP, "notes.txt").unwrap());
+    assert!(h.state.materialization_intent_target(GROUP, "notes.txt").unwrap().is_none());
+    let heads = h.native_heads("notes.txt");
+    assert_eq!(heads.len(), 1, "no local head beside the peer's version");
+    assert_eq!(heads[0].dot.author.device.0, "device-remote");
+}
+
+/// #60: the row ran ahead of the disk (the newer row was recorded, the write
+/// never landed) and the user then edits the older bytes still on disk. The
+/// edit saw the older version, not the row's: it must not supersede the
+/// peer's newer head, which no one here has looked at. Both stay live, as a
+/// contest.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edit_of_the_bytes_on_disk_never_supersedes_the_newer_version_the_row_ran_ahead_to() {
+    use crate::test_support::remote_admission_fixture::{admit_remote, put};
+    let h = Harness::new(false);
+    let peer = Harness::new(false);
+    let (older, newer): (&[u8], &[u8]) = (b"older v1", b"the peer's newer version");
+    std::fs::write(peer.path("scratch.bin"), newer).unwrap();
+    assert!(matches!(peer.capture("scratch.bin").await, LocalChangeOutcome::FileChanged(_)));
+    let newer_version = yadorilink_replica_domain::ids::VersionHash(
+        peer.own_head("scratch.bin").content.unwrap().version_hash,
+    );
+    let stored = peer.state.dag_get_file_version(GROUP, &newer_version).unwrap().expect("stored");
+    std::fs::write(h.path("notes.txt"), older).unwrap();
+    assert!(matches!(h.capture("notes.txt").await, LocalChangeOutcome::FileChanged(_)));
+    let own = yadorilink_replica_domain::ids::DeltaHash(h.own_head("notes.txt").change_hash);
+    admit_remote(
+        &h.state,
+        GROUP,
+        "device-remote",
+        vec![put("notes.txt", newer_version, vec![own])],
+        &[stored],
+    );
+    let driver = h.session.clone()
+        as Arc<dyn yadorilink_peer_session::convergence_driver::ConvergenceDriver>;
+    let _ = h
+        .convergence
+        .reconcile_paths_directly(&driver, GROUP, BTreeSet::from(["notes.txt".to_string()]))
+        .await;
+    assert_eq!(std::fs::read(h.path("notes.txt")).unwrap(), older, "sanity: nothing written");
+
+    // The user edits the bytes that are on disk.
+    std::fs::write(h.path("notes.txt"), b"older v1, edited").unwrap();
+    let _ = h.capture("notes.txt").await;
+
+    let heads = h.native_heads("notes.txt");
+    let authors: Vec<&str> = heads.iter().map(|head| head.dot.author.device.0.as_str()).collect();
+    assert!(
+        authors.contains(&"device-remote"),
+        "the peer's newer version must survive the edit: {authors:?}"
+    );
+}
+
+/// Same as above, but the older bytes hold no proof (the fence moved after
+/// they were captured). Nothing vouches for them, so the demotion keeps its
+/// intent and startup repair recovers them instead of authoring them as a
+/// local Put over the peer's newer version.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_repair_does_not_author_unproven_older_bytes_under_an_incomplete_content_row() {
+    use crate::test_support::remote_admission_fixture::{admit_remote, put};
+    use yadorilink_filesystem_sync::materialization_repair::{
+        repair_interrupted_materializations, RepairMode,
+    };
+    use yadorilink_local_capture::ports::LocalMutationStore as _;
+    let h = Harness::new(false);
+    let peer = Harness::new(false);
+    let (older, newer): (&[u8], &[u8]) = (b"older v1", b"the peer's newer version");
+    std::fs::write(peer.path("scratch.bin"), newer).unwrap();
+    assert!(matches!(peer.capture("scratch.bin").await, LocalChangeOutcome::FileChanged(_)));
+    let newer_version = yadorilink_replica_domain::ids::VersionHash(
+        peer.own_head("scratch.bin").content.unwrap().version_hash,
+    );
+    let stored = peer.state.dag_get_file_version(GROUP, &newer_version).unwrap().expect("stored");
+    std::fs::write(h.path("notes.txt"), older).unwrap();
+    assert!(matches!(h.capture("notes.txt").await, LocalChangeOutcome::FileChanged(_)));
+    let own = yadorilink_replica_domain::ids::DeltaHash(h.own_head("notes.txt").change_hash);
+    admit_remote(
+        &h.state,
+        GROUP,
+        "device-remote",
+        vec![put("notes.txt", newer_version, vec![own])],
+        &[stored],
+    );
+    h.state.dag_bump_mutation_fence(GROUP, "notes.txt", "test_void_proof").unwrap();
+    let driver = h.session.clone()
+        as Arc<dyn yadorilink_peer_session::convergence_driver::ConvergenceDriver>;
+    let _ = h
+        .convergence
+        .reconcile_paths_directly(&driver, GROUP, BTreeSet::from(["notes.txt".to_string()]))
+        .await;
+    assert_eq!(std::fs::read(h.path("notes.txt")).unwrap(), older, "sanity: nothing written");
+    assert_eq!(
+        h.state.get_materialization_state(GROUP, "notes.txt").unwrap(),
+        Some(MaterializationState::Present),
+        "sanity: the newer row was recorded without its content over the older object"
+    );
+
+    assert!(
+        h.state.materialization_intent_target(GROUP, "notes.txt").unwrap().is_some(),
+        "an unproven older object keeps the intent"
+    );
+    let root = h.path("");
+    let report = repair_interrupted_materializations(
+        h.state.as_ref(),
+        h.store.as_ref(),
+        &root,
+        GROUP,
+        RepairMode::Startup,
+        &RootCommitPermit::for_tests(),
+    )
+    .unwrap();
+
+    assert_eq!(report.quarantined_dirty.len(), 1, "{report:?}");
+    assert!(!h.state.dirty_path_repository().is_path_dirty(GROUP, "notes.txt").unwrap());
+    h.redrive().await;
+    let heads = h.native_heads("notes.txt");
+    assert_eq!(heads.len(), 1, "no local Put beside the peer's version");
+    assert_eq!(heads[0].dot.author.device.0, "device-remote");
+}
+
 /// The newer of two quick peer versions, V1 then V2. V1's bytes reach disk
 /// but its proof commit loses (the path moved on while it was written), so
 /// nothing proves V1 is there; V2's write then replaces V1's intent, moves
@@ -1182,4 +1520,34 @@ async fn a_peer_symlink_is_not_renamed_over_an_uncaptured_local_edit() {
     let meta = std::fs::symlink_metadata(h.path("notes.txt")).unwrap();
     assert!(meta.is_file(), "the peer's symlink must not replace the file");
     assert_eq!(std::fs::read(h.path("notes.txt")).unwrap(), b"edited after the guard");
+}
+
+/// A chmod or xattr change moves no bytes, yet capture records it as an edit:
+/// a peer's version must not be written over it before capture has.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_metadata_only_local_edit_counts_as_uncaptured() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let h = Harness::new(false);
+    let file = h.path("notes.txt");
+    std::fs::write(&file, b"same bytes").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(h.capture("notes.txt").await, LocalChangeOutcome::FileChanged(_)));
+    let blocks = h.state.get_file(GROUP, "notes.txt").unwrap().unwrap().blocks;
+    let check = || {
+        h.convergence.disk_holds_uncaptured_local_bytes(GROUP, "notes.txt", &file, Some(&blocks))
+    };
+    assert!(!check().unwrap(), "sanity: nothing edited yet");
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(check().unwrap(), "a chmod alone is an uncaptured edit");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!check().unwrap());
+
+    #[cfg(target_os = "linux")]
+    {
+        yadorilink_local_storage::apply_xattrs(&file, &[("user.tag".into(), b"mine".to_vec())])
+            .unwrap();
+        assert!(check().unwrap(), "an xattr alone is an uncaptured edit");
+    }
 }

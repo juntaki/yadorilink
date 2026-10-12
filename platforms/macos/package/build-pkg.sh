@@ -181,6 +181,11 @@ cp "$YADORILINK_DAEMON_BIN" "$STAGE_DIR/usr/local/bin/yadorilink-daemon"
 SOURCE_REF="${YADORILINK_SOURCE_REF:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
 "$REPO_ROOT/.github/release/write-source-notice.sh" "$SOURCE_REF" \
     "$STAGE_DIR/usr/local/share/doc/yadorilink"
+# Ship the uninstaller: a .pkg has no built-in uninstall, and users of the
+# released pkg do not have this repository checked out.
+mkdir -p "$STAGE_DIR/usr/local/share/yadorilink"
+cp "$SCRIPT_DIR/uninstall.sh" "$STAGE_DIR/usr/local/share/yadorilink/uninstall.sh"
+chmod 755 "$STAGE_DIR/usr/local/share/yadorilink/uninstall.sh"
 # The eframe status app (yadorilink-status-app) is not shipped on macOS:
 # YadoriLink.app is the menu bar app there.
 chmod 755 \

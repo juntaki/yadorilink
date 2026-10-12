@@ -9,7 +9,7 @@ use crate::dto::{
     GroupSummary, InviteSummary, MemberSummary, MembershipOutcome, PendingApprovalSummary,
     PendingInviteSummary, RevokeEdgeOutcome, ShareSummary,
 };
-use crate::error::DesktopError;
+use crate::error::{CoreError, DesktopError};
 use crate::ops;
 
 fn role_name(role: AssignableRole) -> &'static str {
@@ -136,7 +136,10 @@ impl ClientCore {
         Ok(dto::membership_outcome(&outcome))
     }
 
-    /// Turns down a device waiting for approval. Never forced.
+    /// Turns down a device waiting for approval. Never forced. Re-reads the
+    /// pending and member listings first and refuses (`InvalidInput`, with a
+    /// plain reason) when the request is no longer waiting, so an approved
+    /// member is never removed by a stale Deny.
     ///
     /// # Errors
     /// `DurabilityBlocked{can_force: false}` when the daemon's durability
@@ -146,10 +149,24 @@ impl ClientCore {
         group_id: String,
         device_id: String,
     ) -> Result<MembershipOutcome, DesktopError> {
-        let outcome = ops::shares::revoke_resolved(group_id, device_id, false)
+        let attempt = ops::shares::deny_checked(group_id, device_id)
             .await
             .map_err(|e| DesktopError::from_core(e, false))?;
-        Ok(dto::membership_outcome(&outcome))
+        match attempt {
+            ops::shares::DenyAttempt::Refused(refusal) => {
+                Err(DesktopError::invalid_input(refusal.reason(), "device_id"))
+            }
+            ops::shares::DenyAttempt::Attempted(ops::shares::RevokeAttempt::Committed(outcome)) => {
+                Ok(dto::membership_outcome(&outcome))
+            }
+            ops::shares::DenyAttempt::Attempted(ops::shares::RevokeAttempt::NotDurable {
+                message,
+                group_ids,
+            }) => Err(DesktopError::from_core(
+                CoreError::DurabilityBlocked { message, group_ids },
+                false,
+            )),
+        }
     }
 
     /// # Errors
@@ -238,6 +255,17 @@ impl ClientCore {
     /// Coordination failures.
     pub async fn cancel_invite(&self, invite_id: String) -> Result<(), DesktopError> {
         Ok(ops::shares::cancel_invite(&invite_id).await?)
+    }
+
+    /// Validates a pasted or clicked invite (link or bare code) and returns
+    /// the code. Performs no I/O.
+    ///
+    /// # Errors
+    /// `InvalidInput{field: "invite"}` with a plain-language message.
+    pub fn parse_invite_link(&self, input: &str) -> Result<String, DesktopError> {
+        crate::wording::parse_invite_input(input)
+            .map(str::to_owned)
+            .map_err(|e| DesktopError::invalid_input(e.to_string(), "invite"))
     }
 
     /// Redeems an invite (its code or its `yadorilink://invite/` link) and

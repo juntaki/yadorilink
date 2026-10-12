@@ -7,26 +7,7 @@
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeviceConfig {
-    pub device_id: String,
-    pub coordination_addr: String,
-    /// Base64-encoded public half of this device's registered Ed25519
-    /// change-signing key -- this device's one key, and the one that
-    /// authenticates its transport. Required: a config that cannot
-    /// identify the registered key is not a valid current config.
-    pub signing_public_key: String,
-    /// Current config shape marker. Missing markers are rejected by serde;
-    /// configs written by newer builds are rejected explicitly below.
-    pub config_version: u32,
-}
-
-/// Current pre-release `device.json` shape. Older development files are not
-/// migrated; absence of this required field fails deserialization.
-pub const CONFIG_VERSION: u32 = 3;
+pub use yadorilink_local_storage::device_config::{DeviceConfig, CONFIG_VERSION};
 
 pub fn config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("YADORILINK_CONFIG_DIR") {
@@ -44,11 +25,26 @@ pub fn recovery_root() -> PathBuf {
     config_dir().join("recovery")
 }
 
+/// The part of [`recovery_root`] one device's rebootstraps use. The restart sweep removes every
+/// area of a group that never reached its barrier, so two daemons sharing a state directory
+/// (as in-process test daemons do) must not share an area directory either: one's sweep would
+/// remove the other's rebootstrap in flight.
+pub fn recovery_root_of(device_id: &str) -> PathBuf {
+    recovery_root().join(device_id)
+}
+
 /// Where the versions a rebootstrap set aside stay until the user restores or discards them:
 /// under the daemon's state directory, outside every folder it syncs and apart from
 /// [`recovery_root`], whose areas end with their rebootstrap.
 pub fn recovery_items_root() -> PathBuf {
     config_dir().join("recovery-items")
+}
+
+/// The part of [`recovery_items_root`] one device uses: its sweep removes every item directory
+/// its own database does not register, so a daemon sharing the state directory must not share
+/// the directories either.
+pub fn recovery_items_root_of(device_id: &str) -> PathBuf {
+    recovery_items_root().join(device_id)
 }
 
 /// Whether linking `local_path` would put the recovery area inside the folder or
@@ -75,7 +71,7 @@ pub fn link_overlaps_recovery_area(
         for name in rest.into_iter().rev() {
             resolved.push(name);
         }
-        PathBuf::from(yadorilink_root_authority::canonical_fold::canonical_fold(
+        PathBuf::from(yadorilink_fs_platform::canonical_fold::canonical_fold(
             &resolved.to_string_lossy(),
         ))
     };

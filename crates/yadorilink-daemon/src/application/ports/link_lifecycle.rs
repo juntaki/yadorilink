@@ -41,6 +41,8 @@ pub(crate) enum LinkOutcome {
 /// an empty group. The link key is a synthetic locator derived from the request token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderLinkTarget {
+    /// The OS adapter that serves the root (macOS File Provider or Windows CfAPI).
+    pub(crate) kind: yadorilink_replica_domain::session_state::ProviderKind,
     pub(crate) display_name: String,
     pub(crate) empty_owner: bool,
     /// The folder is created in on-demand mode (the OS fetches content on first access).

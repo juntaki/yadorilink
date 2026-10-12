@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use crate::free_space::{self, FreeSpaceState, VolumeFreeSpace};
 
-use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 
 /// Directory-scan cap (handling huge folders by making deep scans optional): once this many entries
 /// (ignored or not) have been visited, the scan stops early and
@@ -373,13 +373,12 @@ fn scan_directory(root: &Path) -> ScanResult {
         // unlink, would otherwise always warn about files the user never
         // created and must not rename.
         let is_own_root_file =
-            yadorilink_root_authority::sync_root_lock::is_sync_root_lock_relative_path(relative)
+            yadorilink_fs_platform::reserved_namespace::is_sync_root_lock_relative_path(relative)
                 || yadorilink_root_authority::root_identity::is_root_marker_relative_path(relative);
-        if yadorilink_root_authority::reserved_namespace::path_has_reserved_component(relative)
+        if yadorilink_fs_platform::reserved_namespace::path_has_reserved_component(relative)
             || is_own_root_file
         {
-            if yadorilink_root_authority::reserved_namespace::path_has_artefact_component(relative)
-            {
+            if yadorilink_fs_platform::reserved_namespace::path_has_artefact_component(relative) {
                 reserved_namespace_blocked_paths.push(relative.to_string_lossy().into_owned());
             }
             ignored_entry_count += 1;

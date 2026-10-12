@@ -7,11 +7,15 @@
 
 pub mod chunker;
 mod content_ports;
+pub mod device_config;
 pub mod disk_verification;
 mod error;
 pub mod free_space;
 mod fs_ops;
-pub use fs_ops::{remove_empty_dir, EmptyDirectoryRemoval};
+pub use fs_ops::{
+    move_no_replace_durably, remove_durably, remove_empty_dir, remove_empty_dir_in,
+    EmptyDirectoryRemoval,
+};
 pub mod io_diag;
 /// Shared link preflight model (folder existence/empty-state/free-space/
 /// ignored-summary/risky-location checks) used by both `yadorilink-cli`'s
@@ -19,7 +23,7 @@ pub mod io_diag;
 /// defense-in-depth re-check. Placed here rather than
 /// `yadorilink-root-authority` because
 /// it needs both this crate's own `free_space` and
-/// `yadorilink_root_authority::ignore_patterns` --
+/// `yadorilink_fs_platform::ignore_patterns` --
 /// `yadorilink-local-storage` already depends on
 /// `yadorilink-root-authority` (for `fs_identity::bytes_to_target`), so
 /// the reverse edge root-authority-depends-on-local-storage that the
@@ -47,21 +51,26 @@ pub use error::StorageError;
 pub use free_space::{FreeSpaceState, VolumeFreeSpace};
 #[cfg(unix)]
 pub use materialize_write::materialize_symlink;
+#[cfg(unix)]
+pub use materialize_write::materialize_symlink_in;
 #[cfg(windows)]
 pub use materialize_write::materialize_symlink_windows;
+#[cfg(windows)]
+pub use materialize_write::materialize_symlink_windows_in;
 pub use materialize_write::{
     apply_file_metadata, apply_file_metadata_verified, apply_unix_mode, apply_xattrs,
     create_dir_all_never_through_a_symlink, create_explicit_directory, create_or_defer_placeholder,
-    mint_windows_placeholder_generation, mtime_already_matches_disk, persist_reconstructed_file,
-    reconstruct_file, reconstruct_file_to_temp, remove_evicted_object, rename_no_replace,
-    resolve_read_path_without_traversal, stamp_mtime_at_path, sync_parent_dir,
-    unix_mode_already_matches_disk, verify_delete_target_within_canonical_root,
-    verify_delete_target_within_root, verify_replicated_xattrs_exact,
-    verify_write_target_within_canonical_root, verify_write_target_within_root,
-    xattrs_already_match_disk, AppliedFileMetadata, ExplicitDirectoryCreation,
-    PlaceholderDiskIdentity, PlaceholderIdentityToRecord, StructuralDirectoryLedger, XattrEvidence,
-    XattrProofRefused, XattrsConfirmedInAttempt, XattrsNotConfirmed,
-    WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+    discard_temp_file, mint_windows_placeholder_generation, mtime_already_matches_disk,
+    persist_reconstructed_file, persist_reconstructed_file_in, reconstruct_file,
+    reconstruct_file_in, reconstruct_file_to_temp, reconstruct_file_to_temp_in,
+    remove_evicted_object, rename_no_replace, resolve_read_path_without_traversal,
+    stamp_mtime_at_path, sync_parent_dir, unix_mode_already_matches_disk,
+    verify_delete_target_within_canonical_root, verify_delete_target_within_root,
+    verify_replicated_xattrs_exact, verify_write_target_within_canonical_root,
+    verify_write_target_within_root, xattrs_already_match_disk, AppliedFileMetadata,
+    ExplicitDirectoryCreation, NoTempLedger, PlaceholderDiskIdentity, PlaceholderIdentityToRecord,
+    StructuralDirectoryLedger, TempFileLedger, XattrEvidence, XattrProofRefused,
+    XattrsConfirmedInAttempt, XattrsNotConfirmed, WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
 };
 pub use segment_store::{
     CommitPoint, CompactionReport, DurableReceipt, FaultPlan, GroupCommitLimits, RecoveryReport,

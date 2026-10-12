@@ -133,7 +133,8 @@ impl LinkRepository {
             }
             // Same path, same group: a deliberate re-link (including the
             // idempotent retry after a failed link's rollback). Un-orphan and
-            // un-pause EXPLICITLY, preserving `root_token` and the
+            // un-pause EXPLICITLY, preserving `root_token`, the recorded volume identity (only unlinking
+            // and linking again records a new one) and the
             // materialization policy — leaving the row untouched instead would
             // make re-linking an orphaned folder a silent no-op.
             Some(prior) => {
@@ -245,7 +246,10 @@ impl LinkRepository {
         })
     }
 
-    /// Whether this device holds a live (non-orphaned) link for `group_id`.
+    /// Whether this device holds a live (non-orphaned) filesystem link for `group_id`: the
+    /// question "does this group owe a startup scan". A provider-backed link has no folder to
+    /// scan and never registers a startup gate, so it does not count (counting it made the
+    /// startup barrier read as failed for a provider group, deferring its peer apply).
     /// Scoped to one group rather than reusing `list_links` because this runs
     /// on the peer-apply path, once per change batch.
     ///
@@ -259,7 +263,8 @@ impl LinkRepository {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Self::ensure_unambiguous_group_on_conn(conn, group_id, None)?;
             let live: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM links WHERE group_id = ?1 AND orphaned = 0",
+                "SELECT COUNT(*) FROM links WHERE group_id = ?1 AND orphaned = 0 \
+                 AND provider_kind = 'none'",
                 [group_id],
                 |r| r.get(0),
             )?;
@@ -632,6 +637,69 @@ impl LinkRepository {
                 )
                 .optional()?;
             Ok(flag.unwrap_or(0) != 0)
+        })
+    }
+
+    /// The persisted capture volume identity of `group_id`'s single live link.
+    /// `Ok(None)` when the group has no live link row (a bare-directory scan);
+    /// `Ok(Some(None))` when the link predates the column (not yet adopted).
+    pub fn capture_volume_identity_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<Option<String>>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            Self::ensure_unambiguous_group_on_conn(conn, group_id, None)?;
+            Ok(conn
+                .query_row(
+                    "SELECT capture_volume_identity FROM links \
+                     WHERE group_id = ?1 AND orphaned = 0 ORDER BY local_path",
+                    [group_id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?)
+        })
+    }
+
+    /// Same as [`Self::capture_volume_identity_for_group`], keyed by the
+    /// link's local path (status reads every link, ambiguous or not).
+    pub fn capture_volume_identity_for_path(
+        &self,
+        local_path: &str,
+    ) -> Result<Option<String>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT capture_volume_identity FROM links WHERE local_path = ?1",
+                    [local_path],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten())
+        })
+    }
+
+    /// Records the volume identity of `group_id`'s live link. Called only for
+    /// a first adoption (NULL -> value) by a safe full scan, or by a
+    /// deliberate relink; never to "follow" a changed volume.
+    pub fn set_capture_volume_identity_for_group(
+        &self,
+        group_id: &str,
+        identity: &str,
+    ) -> Result<(), SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            let affected = tx.execute(
+                "UPDATE links SET capture_volume_identity = ?2 \
+                 WHERE group_id = ?1 AND orphaned = 0",
+                rusqlite::params![group_id, identity],
+            )?;
+            if affected > 1 {
+                let local_paths = Self::live_link_paths_on_conn(tx, group_id)?;
+                return Err(SyncSqliteError::AmbiguousLink {
+                    group_id: group_id.to_string(),
+                    local_paths,
+                });
+            }
+            Ok(())
         })
     }
 

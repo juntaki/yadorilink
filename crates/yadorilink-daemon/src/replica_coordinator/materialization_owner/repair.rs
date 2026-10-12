@@ -20,11 +20,11 @@ use yadorilink_filesystem_sync::materialization_execution::{
     AbandonedEviction, MaterializationExecutionError, MaterializationExecutionPort,
     OpenMaterializationIntent,
 };
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 use yadorilink_local_storage::PlaceholderIdentityToRecord;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_root_authority::fs_identity::FileIdentity;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sync_sqlite::exact_materialized_commit::{
     commit_recovered_materialized_state, ExactMaterializedState, ExpectedAuthoring,
@@ -42,8 +42,8 @@ fn is_native_placeholder(_object: &std::path::Path) -> bool {
     {
         use std::os::windows::fs::MetadataExt as _;
         const RECALL: u32 = 0x0000_1000 | 0x0004_0000 | 0x0040_0000;
-        return std::fs::symlink_metadata(_object)
-            .is_ok_and(|metadata| metadata.file_attributes() & RECALL != 0);
+        std::fs::symlink_metadata(_object)
+            .is_ok_and(|metadata| metadata.file_attributes() & RECALL != 0)
     }
     #[cfg(not(windows))]
     false
@@ -306,6 +306,67 @@ impl ReplicaCoordinator {
                 Err(error),
             ),
         }
+    }
+
+    /// Link start: removes the temp files a crash left under `root`, which
+    /// are exactly the ones `materialization_tmp_files` names -- written
+    /// before each was created, deleted after each was renamed away or
+    /// removed. Nothing here looks at a file name to decide a file is ours.
+    ///
+    /// A named path that no longer exists only has its record dropped. One
+    /// that is a directory is removed only if it is empty, by a single
+    /// non-recursive `rmdir` (a Stage directory a crash left, or a directory
+    /// moved aside to be removed); a directory with anything inside is never
+    /// touched and keeps its record. A path outside `root` is not touched. A
+    /// removal that fails keeps its record for the next start. Returns what was
+    /// removed.
+    pub fn remove_recorded_temp_files(
+        &self,
+        group_id: &str,
+        root: &Path,
+    ) -> Result<Vec<std::path::PathBuf>, yadorilink_sync_sqlite::SyncSqliteError> {
+        let ledger = self.temp_ledger(group_id);
+        let mut removed = Vec::new();
+        for recorded in ledger.list()? {
+            let path = std::path::PathBuf::from(&recorded);
+            // Resolved without walking through a symlinked directory, so a
+            // component swapped for a link while stopped cannot aim the removal
+            // outside the root. A name that cannot be resolved that way is not
+            // removed.
+            let resolved = path
+                .strip_prefix(root)
+                .ok()
+                .and_then(|relative| {
+                    yadorilink_local_storage::resolve_read_path_without_traversal(root, relative)
+                        .ok()
+                })
+                .map(|_| path.clone());
+            if let Some(path) = resolved {
+                match std::fs::symlink_metadata(&path) {
+                    Ok(meta) if !meta.is_dir() => match std::fs::remove_file(&path) {
+                        Ok(()) => removed.push(path),
+                        Err(error) => {
+                            tracing::warn!(%error, path = %recorded, "could not remove a recorded temp file; kept for the next start");
+                            continue;
+                        }
+                    },
+                    Ok(_) => match std::fs::remove_dir(&path) {
+                        Ok(()) => removed.push(path),
+                        Err(error) => {
+                            tracing::warn!(%error, path = %recorded, "a recorded directory is not empty or could not be removed; left as it is and kept for the next start");
+                            continue;
+                        }
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::warn!(%error, path = %recorded, "could not inspect a recorded temp file; kept for the next start");
+                        continue;
+                    }
+                }
+            }
+            ledger.forget(&recorded)?;
+        }
+        Ok(removed)
     }
 
     /// Open half of the repair sweep's quarantine of divergent on-disk

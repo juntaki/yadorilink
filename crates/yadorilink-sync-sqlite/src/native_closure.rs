@@ -198,6 +198,9 @@ pub(crate) fn install_closed_state(
             cutoff.map(|entry| entry.tip.0.to_vec()),
         ),
     )?;
+    // A Closed author can never act: its losing heads are now forkable by any
+    // writer, which the fork pass has not yet had cause to consider.
+    crate::native_contest_candidates::reset_attempts(conn, group_id.as_str())?;
     Ok(())
 }
 

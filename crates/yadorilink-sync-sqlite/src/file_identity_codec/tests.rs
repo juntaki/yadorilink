@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use yadorilink_root_authority::fs_identity::Timestamp;
+use yadorilink_fs_platform::fs_identity::Timestamp;
 
 fn sample_identity() -> FileIdentity {
     FileIdentity {

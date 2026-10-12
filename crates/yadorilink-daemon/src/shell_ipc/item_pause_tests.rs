@@ -171,6 +171,39 @@ impl Fixture {
             .unwrap()
     }
 
+    /// The live heads of every path in `dir` whose name starts with `stem`: a
+    /// file and the copies its losers were moved to.
+    fn live_heads_named(
+        &self,
+        dir: &str,
+        stem: &str,
+    ) -> Vec<yadorilink_replica_domain::native_state::LiveHead> {
+        let prefix = format!("{dir}/{stem}");
+        self.state
+            .replica_coordinator
+            .database()
+            .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                let state = yadorilink_sync_sqlite::native_store::load_state(
+                    conn,
+                    &yadorilink_replica_domain::ids::FolderGroupId(GROUP.to_owned()),
+                )?;
+                Ok(state
+                    .heads
+                    .iter()
+                    .filter(|(path, _)| path.as_str().starts_with(&prefix))
+                    .flat_map(|(_, heads)| {
+                        heads.iter().map(|(dot, payload)| {
+                            yadorilink_replica_domain::native_state::LiveHead {
+                                dot: dot.clone(),
+                                payload: payload.clone(),
+                            }
+                        })
+                    })
+                    .collect())
+            })
+            .unwrap()
+    }
+
     /// The devices whose deltas put `rel_path`'s live heads, sorted.
     fn head_authors(&self, rel_path: &str) -> Vec<String> {
         let mut authors: Vec<String> = self
@@ -257,6 +290,14 @@ impl Fixture {
     async fn drive_projection_until(&self, done: impl Fn(&Self) -> bool) -> bool {
         let engine = crate::convergence::engine::ConvergenceEngine::new(self.state.clone());
         for _ in 0..50 {
+            // The scheduler's fork: this device moves its own losing heads, and
+            // the peer (a simulated device) moves its own.
+            self.state.fork_contested_heads(GROUP);
+            crate::test_support::remote_admission_fixture::admit_remote_forks(
+                &self.state.replica_coordinator,
+                GROUP,
+                "device-peer",
+            );
             crate::convergence::engine::drive_obligations_once_for_test(&engine, 128, 256).await;
             if done(self) {
                 return true;
@@ -400,21 +441,33 @@ async fn resuming_a_paused_item_catches_up_every_held_change() {
     assert!(resumed.ok, "resuming a paused item must succeed: {}", resumed.error);
 
     assert_eq!(f.versions("dir/new-local.txt"), 1, "a file created while paused is authored");
-    let heads = f.live_heads("dir/shared.txt");
-    let mut authors: Vec<&str> =
-        heads.iter().map(|head| head.dot.author.device.0.as_str()).collect();
+    // The edit was authored beside the remote one (never on top of a change its
+    // author did not see); the loser's author may already have moved its head to
+    // its copy path, so look at the path and its copies.
+    let mut authors: Vec<String> = f
+        .live_heads_named("dir", "shared")
+        .into_iter()
+        .map(|head| head.dot.author.device.0.clone())
+        .collect();
     authors.sort();
     assert_eq!(
         authors,
-        vec!["device-local", "device-peer"],
+        vec!["device-local".to_string(), "device-peer".to_string()],
         "the local edit made while paused is authored concurrent with the remote edit, not on \
          top of a change its author never saw"
     );
 
+    // Where the platform offers no durable namespace changes, the remote
+    // winner cannot replace the local original, so only the projection of the
+    // remote file is awaited there.
+    let replaces = crate::test_support::windows_durability_gate_allows_tests(
+        "the remote winner replacing the local original",
+    );
     let both_sides = vec![Vec::new(), b"local edit".to_vec()];
     assert!(
         f.drive_projection_until(|f| {
-            f.read("dir/incoming.txt").is_some() && f.contents_named("dir", "shared") == both_sides
+            f.read("dir/incoming.txt").is_some()
+                && (!replaces || f.contents_named("dir", "shared") == both_sides)
         })
         .await,
         "after resume the remote file must be projected and a file changed on both sides while \
@@ -480,6 +533,15 @@ async fn concurrent_local_and_remote_edits_both_survive(local_wins: bool) {
         "sanity: the two edits are concurrent heads"
     );
 
+    // A remote winner replacing the local original needs durable namespace
+    // changes; the sanity checks above still hold without them.
+    if !local_wins
+        && !crate::test_support::windows_durability_gate_allows_tests(
+            "the remote winner replacing the local original",
+        )
+    {
+        return;
+    }
     let both_sides = vec![Vec::new(), b"local edit".to_vec()];
     assert!(
         f.drive_projection_until(|f| f.contents_named("dir", "shared") == both_sides).await,

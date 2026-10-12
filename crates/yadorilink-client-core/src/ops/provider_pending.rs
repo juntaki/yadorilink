@@ -12,29 +12,21 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Syncs a directory so a rename inside it is durable.
-fn sync_directory(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(dir)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        // A directory cannot be opened for syncing here; the file itself was synced before the rename.
-        let _ = dir;
-        Ok(())
-    }
+/// Publishes the synced temp file over the pending file; durable when it returns.
+fn publish(staged: &Path, target: &Path) -> io::Result<()> {
+    use yadorilink_fs_platform::durable_dir::{publish_durably, Replace};
+    publish_durably(staged, target, Replace::Yes)
 }
 
 pub(crate) struct PendingStore {
     path: PathBuf,
-    /// How the parent directory is made durable (replaced by a failing one in tests).
-    sync_parent: fn(&Path) -> io::Result<()>,
+    /// How the synced temp file replaces the pending file (replaced by a failing one in tests).
+    publish: fn(&Path, &Path) -> io::Result<()>,
 }
 
 impl PendingStore {
     pub(crate) fn at(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into(), sync_parent: sync_directory }
+        Self { path: path.into(), publish }
     }
 
     pub(crate) fn default_path() -> PathBuf {
@@ -74,8 +66,9 @@ impl PendingStore {
         }
     }
 
-    /// Replaces the file atomically and durably: a temp file of its own (unique per writer), synced, renamed,
-    /// then the parent directory synced. Any failure is an error: the new content is not known to be durable.
+    /// Replaces the file atomically and durably: a temp file of its own (unique per writer), synced, then
+    /// published over the target by a durable move. Any failure is an error: the new content is not known
+    /// to be durable.
     fn save(&self, map: &BTreeMap<String, String>) -> io::Result<()> {
         use std::io::Write;
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
@@ -90,11 +83,11 @@ impl PendingStore {
             file.write_all(&serde_json::to_vec(map).map_err(io::Error::other)?)?;
             file.sync_all()
         })();
-        if let Err(error) = written.and_then(|()| std::fs::rename(&tmp, &self.path)) {
+        if let Err(error) = written.and_then(|()| (self.publish)(&tmp, &self.path)) {
             let _ = std::fs::remove_file(&tmp);
             return Err(error);
         }
-        (self.sync_parent)(parent)
+        Ok(())
     }
 
     /// The token of the pending request with this payload signature, minted and made durable first if
@@ -283,13 +276,13 @@ mod tests {
         assert!(PendingStore::at(&other).token_for("sig").is_err());
     }
 
-    /// The replacement counts only once the parent directory is synced too: if that fails, the caller
+    /// The replacement counts only once the durable publish returned: if that fails, the caller
     /// gets an error and must not send.
     #[test]
-    fn a_failed_directory_sync_refuses_to_mint() {
+    fn a_failed_durable_publish_refuses_to_mint() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = store(&dir);
-        store.sync_parent = |_| Err(std::io::Error::other("cannot sync the directory"));
+        store.publish = |_, _| Err(std::io::Error::other("cannot publish durably"));
         assert!(store.token_for("sig").is_err());
     }
 

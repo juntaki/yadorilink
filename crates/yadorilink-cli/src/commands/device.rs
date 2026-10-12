@@ -35,7 +35,14 @@ pub async fn list() -> Result<(), CliError> {
 /// not leave any folder group without a confirmed-ready full replica.
 /// `--force` bypasses a refusal with a data-loss warning and an audit log
 /// line.
-pub async fn remove(device_id: String, force: bool) -> Result<(), CliError> {
+pub async fn remove(device_id: String, force: bool, yes: bool) -> Result<(), CliError> {
+    super::confirm_destructive(
+        &format!(
+            "Remove device {device_id} and revoke its access to every folder group? Files \
+             already on that device stay on its disk."
+        ),
+        yes,
+    )?;
     let outcome = ops::remove_device(&device_id, force).await?;
     crate::commands::membership_render::render_membership_outcome("remove", &outcome);
     println!("Removed device: {device_id}");

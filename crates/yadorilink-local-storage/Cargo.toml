@@ -14,13 +14,15 @@ license.workspace = true
 # this, since `cfg(test)` alone is not active for an ordinary dependency
 # of another crate's own test build. Same shape as every other
 # test-support feature in this workspace.
-test-support = []
+test-support = ["yadorilink-root-authority/test-support"]
 
 [dependencies]
+serde.workspace = true
 yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
 # `fs_identity::bytes_to_target` for symlink-target byte<->OS-path
 # conversion in `materialize_write::materialize_symlink*`. A
 # pure leaf crate over `yadorilink-replica-domain` only -- no cycle risk.
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 # The block store's persistent index is a SQLite database, opened through
 # the workspace's one SQLite runtime (pool, in-process writer gate, WAL +
@@ -59,6 +61,9 @@ windows-sys = { version = "0.59", features = [
 libc = "0.2"
 
 [dev-dependencies]
+# The durable-move trace and failpoints the publish tests drive.
+yadorilink-root-authority = { path = "../yadorilink-root-authority", features = ["test-support"] }
+serde_json = "1"
 tempfile = "3"
 # `chunker`'s CDC tests need pseudo-random content (real byte entropy
 # matters for boundary-finding behavior, unlike the fixed-size tests).

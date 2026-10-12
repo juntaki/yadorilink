@@ -74,10 +74,8 @@ use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
-use yadorilink_root_authority::ignore_patterns::{
-    is_ignore_file_relative_path, EffectiveIgnoreSet,
-};
-use yadorilink_root_authority::reserved_namespace::path_has_reserved_component;
+use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
+use yadorilink_fs_platform::reserved_namespace::path_has_reserved_component;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WatcherError {
@@ -644,13 +642,19 @@ fn reconcile_new_directory_subtree(
     start: &Path,
     ignore_set: &EffectiveIgnoreSet,
 ) {
-    let walker =
-        walkdir::WalkDir::new(start).follow_links(false).into_iter().filter_entry(|entry| {
+    let walker = walkdir::WalkDir::new(start)
+        .follow_links(false)
+        .same_file_system(true)
+        .into_iter()
+        .filter_entry(|entry| {
             if entry.depth() == 0 {
                 return true;
             }
             if !entry.file_type().is_dir() {
                 return true;
+            }
+            if crate::device_boundary::is_foreign_device_dir(root, entry.path()) {
+                return false;
             }
             let Ok(relative_path) = entry.path().strip_prefix(root) else { return false };
             !ignore_set.is_ignored(relative_path, true)
@@ -913,13 +917,19 @@ fn record_non_ignored_directories(
         _ => return Ok(Vec::new()),
     }
 
-    let walker =
-        walkdir::WalkDir::new(start).follow_links(false).into_iter().filter_entry(|entry| {
+    let walker = walkdir::WalkDir::new(start)
+        .follow_links(false)
+        .same_file_system(true)
+        .into_iter()
+        .filter_entry(|entry| {
             if entry.depth() == 0 && entry.path() == root {
                 return true;
             }
             if !entry.file_type().is_dir() {
                 return true;
+            }
+            if crate::device_boundary::is_foreign_device_dir(root, entry.path()) {
+                return false;
             }
             let Ok(relative_path) = entry.path().strip_prefix(root) else { return false };
             // Same ordering as every other entry point: the reserved

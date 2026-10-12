@@ -30,6 +30,20 @@ settings:
     # app and both extensions via this shared base block.
     ENABLE_HARDENED_RUNTIME: YES
 
+# Debug launches use the live client. The fixture client is selected only by
+# YADORILINK_CLIENT=fake, which this scheme sets for its Run action. The app
+# then shows a "Fixture" badge. (Checked by .github/checks/check-macos-client-selection.py.)
+schemes:
+  YadoriLink Fixtures:
+    build:
+      targets:
+        YadoriLink: all
+    run:
+      config: Debug
+      environmentVariables:
+        YADORILINK_CLIENT: fake
+        YADORILINK_FIXTURE: healthy
+
 targets:
   # NOTE: this.xcodeproj/project.yml keeps its
   # original name/directory (YadoriLinkFinderSync) even though it now also

@@ -51,10 +51,11 @@ fn empty_state_renders_unknown_not_healthy() {
 }
 
 #[test]
-fn reason_lines_pass_through_attention_reasons_unmodified() {
+fn reason_lines_hide_internal_codes() {
     let mut status = base_status();
     status.attention_reasons = vec!["conflict:group-1".into(), "low_disk:/data".into()];
-    assert_eq!(reason_lines(&status), vec!["conflict:group-1", "low_disk:/data"]);
+    assert_eq!(reason_lines(&status), vec!["A file conflict needs review", "Disk space is low"]);
+    assert_eq!(reason_sentence("durability_unknown:g1:x"), "Something needs attention");
 }
 
 #[test]
@@ -66,7 +67,7 @@ fn folder_label_uses_the_last_path_segment() {
 fn paused_folder_label_shows_paused_suffix() {
     let mut link = base_link();
     link.paused = true;
-    assert_eq!(folder_menu_label(&link), "Photos  (paused)");
+    assert_eq!(folder_menu_label(&link), "Photos  (paused by you)");
 }
 
 #[test]
@@ -109,9 +110,8 @@ fn healthy_idle_folder_shows_no_suffix() {
 fn paused_takes_precedence_over_other_conditions() {
     let mut link = base_link();
     link.paused = true;
-    link.degraded = true;
     link.conflict_count = 3;
-    assert_eq!(folder_menu_label(&link), "Photos  (paused)");
+    assert_eq!(folder_menu_label(&link), "Photos  (paused by you)");
 }
 
 /// A folder group linked at two folders syncs NOTHING until the user
@@ -138,4 +138,62 @@ fn ambiguity_outranks_pause_in_the_folder_label() {
 
     assert!(label.contains("not syncing"), "got {label:?}");
     assert!(!label.contains("(paused)"), "pause must not mask the refusal, got {label:?}");
+}
+
+#[test]
+fn healthy_with_some_paused_folders_is_not_reported_as_synced() {
+    let mut status = base_status();
+    status.overall_state = "healthy".into();
+    let mut paused = base_link();
+    paused.paused = true;
+    status.links = vec![paused.clone(), base_link(), paused.clone()];
+    assert_eq!(headline(&status), "YadoriLink: 2 folders paused");
+    status.links = vec![paused.clone()];
+    assert_eq!(headline(&status), "YadoriLink: syncing is paused");
+}
+
+#[test]
+fn paused_and_low_disk_label_gives_the_reason() {
+    let mut link = base_link();
+    link.paused = true;
+    link.degraded = true;
+    link.degraded_reason = "insufficient free space to write big.bin".into();
+    assert_eq!(folder_menu_label(&link), "Photos  (paused; low disk space)");
+    link.degraded_reason = "database error".into();
+    assert_eq!(folder_menu_label(&link), "Photos  (paused; needs attention)");
+}
+
+#[test]
+fn action_notice_success_and_failure_are_plain() {
+    let ok = action_notice(TrayAction::PauseAll, Ok(()));
+    assert_eq!((ok.text.as_str(), ok.is_error), ("Syncing paused", false));
+    let err = action_notice(TrayAction::SignOut, Err("revoke failed: HTTP 500".into()));
+    assert!(err.is_error);
+    assert!(!err.text.contains("HTTP"));
+    assert_eq!(err.details.as_deref(), Some("revoke failed: HTTP 500"));
+    let down =
+        action_notice(TrayAction::Unlink, Err("daemon is not running or not reachable".into()));
+    assert_eq!(down.text, "Could not remove the folder because YadoriLink is not running");
+}
+
+#[test]
+fn tray_state_maps_status_and_icons_differ() {
+    assert_eq!(tray_state(None), TrayState::Attention);
+    let mut s = base_status();
+    s.overall_state = "healthy".into();
+    s.links = vec![base_link()];
+    assert_eq!(tray_state(Some(&s)), TrayState::Idle);
+    s.links[0].has_active_transfer = true;
+    assert_eq!(tray_state(Some(&s)), TrayState::Syncing);
+    s.links[0].paused = true;
+    assert_eq!(tray_state(Some(&s)), TrayState::Paused);
+    s.overall_state = "attention".into();
+    assert_eq!(tray_state(Some(&s)), TrayState::Attention);
+    let all = [TrayState::Idle, TrayState::Syncing, TrayState::Paused, TrayState::Attention];
+    for (i, a) in all.iter().enumerate() {
+        assert_eq!(tray_icon_rgba(*a, 16).len(), 16 * 16 * 4);
+        for b in &all[i + 1..] {
+            assert_ne!(tray_icon_rgba(*a, 16), tray_icon_rgba(*b, 16));
+        }
+    }
 }

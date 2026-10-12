@@ -2,7 +2,7 @@
 
 use super::*;
 use std::sync::Mutex;
-use yadorilink_root_authority::fs_identity::{FileIdentity, ObjectKind};
+use yadorilink_fs_platform::fs_identity::{FileIdentity, ObjectKind};
 
 /// One call the materializer made on its structural-directory ledger, and
 /// what was on disk at the path when it made it.
@@ -22,6 +22,9 @@ enum LedgerCall {
     Abandon {
         path: String,
     },
+    Interrupted {
+        path: String,
+    },
 }
 
 /// A ledger that records every call, against a root it can look at, and
@@ -38,6 +41,9 @@ struct RecordingLedger {
     on_intent: Option<(String, IntentHook)>,
     fail_intent_for: Option<String>,
     fail_complete_for: Option<String>,
+    panic_in_complete_for: Option<String>,
+    /// The Stage names recorded for the directories it was asked to create.
+    held: HeldLedger,
 }
 
 impl RecordingLedger {
@@ -55,6 +61,10 @@ impl RecordingLedger {
 }
 
 impl StructuralDirectoryLedger for RecordingLedger {
+    fn names(&self) -> &dyn TempFileLedger {
+        &self.held
+    }
+
     fn record_intent(&self, rel_path: &str) -> Result<(), StorageError> {
         if self.fail_intent_for.as_deref() == Some(rel_path) {
             return Err(StorageError::Io(std::io::Error::other("injected intent failure")));
@@ -78,6 +88,9 @@ impl StructuralDirectoryLedger for RecordingLedger {
             path: rel_path.to_string(),
             identity_is_the_directory_there,
         });
+        if self.panic_in_complete_for.as_deref() == Some(rel_path) {
+            panic!("injected panic between the mkdir and its completion");
+        }
         if self.fail_complete_for.as_deref() == Some(rel_path) {
             return Err(StorageError::Io(std::io::Error::other("injected completion failure")));
         }
@@ -86,6 +99,11 @@ impl StructuralDirectoryLedger for RecordingLedger {
 
     fn abandon(&self, rel_path: &str) -> Result<(), StorageError> {
         self.calls.lock().unwrap().push(LedgerCall::Abandon { path: rel_path.to_string() });
+        Ok(())
+    }
+
+    fn interrupted(&self, rel_path: &str) -> Result<(), StorageError> {
+        self.calls.lock().unwrap().push(LedgerCall::Interrupted { path: rel_path.to_string() });
         Ok(())
     }
 }
@@ -162,7 +180,30 @@ fn a_structural_mkdir_whose_completion_fails_surfaces_the_error() {
     assert!(result.is_err());
     assert!(root.path().join("a").is_dir());
     assert!(!root.path().join("a/b").exists(), "nothing below may be created past the failure");
-    assert_eq!(ledger.calls(), vec![intent("a"), completed("a")]);
+    assert_eq!(
+        ledger.calls(),
+        vec![intent("a"), completed("a"), LedgerCall::Interrupted { path: "a".to_string() }],
+        "a completion that fails leaves the intent to be resolved, not pending"
+    );
+}
+
+/// A panic unwinding between the `mkdir` and its completion resolves the
+/// intent on the way out: nothing is left pending for a sweep to age out.
+#[test]
+fn a_panic_between_mkdir_and_completion_resolves_the_intent() {
+    let root = tempfile::tempdir().unwrap();
+    let canonical_root = fs::canonicalize(root.path()).unwrap();
+    let ledger = RecordingLedger {
+        panic_in_complete_for: Some("a".to_string()),
+        ..RecordingLedger::over(&canonical_root)
+    };
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = verify_write_target_within_root(&root.path().join("a/f.txt"), root.path(), &ledger);
+    }));
+
+    assert!(outcome.is_err());
+    assert_eq!(ledger.calls().last(), Some(&LedgerCall::Interrupted { path: "a".to_string() }));
 }
 
 /// A user's `mkdir` of the same name between the intent and the
@@ -766,4 +807,316 @@ fn xattrs_already_match_disk_reports_an_unreadable_file_as_not_matching() {
 
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     assert!(matches!(result, Ok(false)), "got {result:?}");
+}
+
+/// A ledger that remembers every name it was asked to hold.
+#[derive(Default)]
+struct HeldLedger {
+    held: std::sync::Mutex<Vec<PathBuf>>,
+    refuse: bool,
+}
+impl TempFileLedger for HeldLedger {
+    fn record(&self, tmp_path: &Path) -> Result<(), StorageError> {
+        if self.refuse {
+            return Err(StorageError::Io(std::io::Error::other("refused")));
+        }
+        self.held.lock().unwrap().push(tmp_path.to_path_buf());
+        Ok(())
+    }
+    fn release(&self, tmp_path: &Path) {
+        self.held.lock().unwrap().retain(|p| p != tmp_path);
+    }
+}
+
+/// The record is made before the file exists and is released with the file on
+/// every exit: a failed assembly leaves neither.
+#[test]
+fn a_failed_assembly_removes_its_temp_file_and_its_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = crate::SegmentBlockStore::new(store_dir.path()).unwrap();
+    let missing = vec![BlockInfo { hash: vec![7; 32], offset: 0, size: 4 }];
+    let ledger = HeldLedger::default();
+
+    let result = reconstruct_file_to_temp_in(&store, &dir.path().join("f"), &missing, 0, &ledger);
+
+    assert!(result.is_err());
+    assert!(ledger.held.lock().unwrap().is_empty());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+/// A name that could not be made durable is never created.
+#[test]
+fn a_refused_record_creates_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = crate::SegmentBlockStore::new(store_dir.path()).unwrap();
+    let ledger = HeldLedger { refuse: true, ..Default::default() };
+
+    let result = reconstruct_file_to_temp_in(&store, &dir.path().join("f"), &[], 0, &ledger);
+
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+/// A rename that fails removes the temp file and releases its record.
+#[test]
+fn a_failed_publish_removes_the_temp_file_and_its_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = crate::SegmentBlockStore::new(store_dir.path()).unwrap();
+    let ledger = HeldLedger::default();
+    let out = dir.path().join("target");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("occupant"), b"x").unwrap();
+    let tmp = reconstruct_file_to_temp_in(&store, &out, &[], 0, &ledger).unwrap();
+    assert_eq!(ledger.held.lock().unwrap().len(), 1);
+
+    assert!(persist_reconstructed_file_in(&tmp, &out, &ledger).is_err());
+
+    assert!(!tmp.exists());
+    assert!(ledger.held.lock().unwrap().is_empty());
+}
+
+/// A temp file that cannot be removed keeps its record, so the next link
+/// start tries again.
+#[test]
+fn a_failed_removal_keeps_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let stuck = dir.path().join("stuck");
+    std::fs::create_dir(&stuck).unwrap();
+    let ledger = HeldLedger::default();
+    ledger.record(&stuck).unwrap();
+
+    discard_temp_file(&stuck, &ledger);
+
+    assert_eq!(ledger.held.lock().unwrap().len(), 1);
+}
+
+/// A symlink is published only once its parent directory entry is durable: a
+/// parent that cannot be flushed (write+search but not read, so it cannot be
+/// opened to fsync) makes the publish an error instead of a silent success the
+/// caller would record as present.
+#[cfg(unix)]
+#[test]
+fn materialize_symlink_fails_when_the_parent_cannot_be_flushed() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("unreadable");
+    fs::create_dir(&parent).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o300)).unwrap();
+    if fs::read_dir(&parent).is_ok() {
+        return; // running as root: permissions do not apply
+    }
+
+    let result = materialize_symlink(&parent.join("link"), b"target");
+
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(result.is_err(), "an unflushable parent must not report the link as published");
+}
+
+// --- publishing by a durable move ---------------------------------------------------------
+
+fn staged_file(dir: &Path, name: &str, bytes: &[u8], ledger: &HeldLedger) -> PathBuf {
+    let tmp = dir.join(name);
+    ledger.record(&tmp).unwrap();
+    fs::write(&tmp, bytes).unwrap();
+    tmp
+}
+
+#[test]
+fn a_reconstructed_file_is_published_by_a_durable_move_and_its_record_released() {
+    use yadorilink_fs_platform::durable_dir::trace::{self, Event};
+    let dir = tempfile::tempdir().unwrap();
+    let (out, ledger) = (dir.path().join("f"), HeldLedger::default());
+    fs::write(&out, b"old").unwrap();
+    let tmp = staged_file(dir.path(), "f.yadorilink-tmp.1.1", b"new", &ledger);
+    trace::take();
+
+    persist_reconstructed_file_in(&tmp, &out, &ledger).unwrap();
+
+    assert_eq!(fs::read(&out).unwrap(), b"new");
+    assert!(!tmp.exists());
+    assert!(ledger.held.lock().unwrap().is_empty());
+    let steps = trace::take();
+    assert!(
+        steps
+            .iter()
+            .any(|e| matches!(e, Event::Move { from, to, .. } if *from == tmp && *to == out)),
+        "{steps:?}"
+    );
+}
+
+/// A kill right before the move leaves the old file and a recorded temp file; right
+/// after it, the new file. Neither leaves the path without content.
+#[test]
+fn a_crash_around_the_publish_leaves_the_old_or_the_new_file() {
+    use yadorilink_fs_platform::durable_dir::{arm_failpoint, disarm_failpoint, NsFailpoint};
+    for (failpoint, expected, record_held) in
+        [(NsFailpoint::BeforeMove, &b"old"[..], true), (NsFailpoint::AfterMove, b"new", true)]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (out, ledger) = (dir.path().join("f"), HeldLedger::default());
+        fs::write(&out, b"old").unwrap();
+        let tmp = staged_file(dir.path(), "f.yadorilink-tmp.1.1", b"new", &ledger);
+
+        arm_failpoint(failpoint);
+        let result = persist_reconstructed_file_in(&tmp, &out, &ledger);
+        disarm_failpoint();
+
+        assert!(result.is_err(), "{failpoint:?}");
+        assert_eq!(fs::read(&out).unwrap(), expected, "{failpoint:?}");
+        // The record is released only by a publish that finished: a restart
+        // clears it, and nothing guesses from the name.
+        assert_eq!(ledger.held.lock().unwrap().len(), usize::from(record_held), "{failpoint:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_is_published_by_a_durable_move() {
+    use yadorilink_fs_platform::durable_dir::trace::{self, Event};
+    let dir = tempfile::tempdir().unwrap();
+    let (out, ledger) = (dir.path().join("l"), HeldLedger::default());
+    trace::take();
+
+    materialize_symlink_in(&out, b"target", &ledger).unwrap();
+
+    assert!(fs::symlink_metadata(&out).unwrap().file_type().is_symlink());
+    assert!(ledger.held.lock().unwrap().is_empty());
+    let steps = trace::take();
+    assert!(steps.iter().any(|e| matches!(e, Event::Move { to, .. } if *to == out)), "{steps:?}");
+}
+
+#[test]
+fn directories_are_published_by_durable_moves_and_their_stage_names_released() {
+    use yadorilink_fs_platform::durable_dir::trace::{self, Event};
+    let root = tempfile::tempdir().unwrap();
+    let canonical = fs::canonicalize(root.path()).unwrap();
+    let ledger = RecordingLedger::over(&canonical);
+    let out = canonical.join("a/b/leaf");
+    trace::take();
+
+    let created = create_explicit_directory(&out, &canonical, &ledger).unwrap();
+
+    assert_eq!(created, ExplicitDirectoryCreation::Created);
+    assert!(out.is_dir());
+    let published: Vec<PathBuf> = trace::take()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Move { to, .. } => Some(to),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(published, [canonical.join("a"), canonical.join("a/b"), out.clone()]);
+    assert_eq!(fs::read_dir(&canonical).unwrap().count(), 1, "no Stage name is left");
+    assert!(ledger.held.held.lock().unwrap().is_empty(), "every Stage record was released");
+}
+
+/// A kill between a Stage directory and its publication leaves a recorded empty
+/// directory and no directory at the name; the structural intent is resolved by
+/// the writer leaving, as for any other failed `mkdir`.
+#[test]
+fn a_crash_between_the_stage_directory_and_its_publication_creates_nothing_visible() {
+    use yadorilink_fs_platform::durable_dir::{arm_failpoint, disarm_failpoint, NsFailpoint};
+    let root = tempfile::tempdir().unwrap();
+    let canonical = fs::canonicalize(root.path()).unwrap();
+    let ledger = RecordingLedger::over(&canonical);
+
+    arm_failpoint(NsFailpoint::AfterStage);
+    let result = create_explicit_directory(&canonical.join("a/b"), &canonical, &ledger);
+    disarm_failpoint();
+
+    assert!(result.is_err());
+    assert!(!canonical.join("a").exists());
+    let leftovers: Vec<_> = fs::read_dir(&canonical).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+    assert_eq!(*ledger.held.held.lock().unwrap(), leftovers, "a record names the Stage directory");
+    assert!(
+        !ledger.calls().iter().any(|c| matches!(c, LedgerCall::Complete { .. })),
+        "nothing is claimed for a directory that was not published"
+    );
+}
+
+#[test]
+fn remove_durably_removes_a_file_and_a_gone_file_is_fine() {
+    use yadorilink_fs_platform::durable_dir::trace::{self, Event};
+    let dir = tempfile::tempdir().unwrap();
+    let (file, ledger) = (dir.path().join("f"), HeldLedger::default());
+    fs::write(&file, b"x").unwrap();
+    trace::take();
+
+    crate::remove_durably(&file, &ledger).unwrap();
+    crate::remove_durably(&file, &ledger).unwrap();
+
+    assert!(!file.exists());
+    #[cfg(unix)]
+    {
+        let steps = trace::take();
+        assert!(
+            matches!(steps.first(), Some(Event::Remove { path }) if *path == file),
+            "{steps:?}"
+        );
+        assert!(steps.iter().any(|e| matches!(e, Event::FlushDir { .. })));
+    }
+    assert!(ledger.held.lock().unwrap().is_empty());
+}
+
+#[test]
+fn remove_durably_never_removes_a_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("d");
+    fs::create_dir(&sub).unwrap();
+    assert!(crate::remove_durably(&sub, &HeldLedger::default()).is_err());
+    assert!(sub.is_dir());
+}
+
+#[test]
+fn a_no_replace_move_is_durable_and_refuses_an_occupied_name() {
+    use yadorilink_fs_platform::durable_dir::trace::{self, Event};
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    fs::write(&a, b"a").unwrap();
+    fs::write(&b, b"b").unwrap();
+    assert_eq!(
+        crate::move_no_replace_durably(&a, &b).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(fs::read(&b).unwrap(), b"b");
+    fs::remove_file(&b).unwrap();
+    trace::take();
+
+    crate::move_no_replace_durably(&a, &b).unwrap();
+
+    assert_eq!(fs::read(&b).unwrap(), b"a");
+    assert!(trace::take().iter().any(|e| matches!(e, Event::Move { to, .. } if *to == b)));
+}
+
+#[test]
+fn remove_empty_dir_in_removes_only_what_is_empty() {
+    use crate::{remove_empty_dir_in, EmptyDirectoryRemoval};
+    let root = tempfile::tempdir().unwrap();
+    let ledger = HeldLedger::default();
+    fs::create_dir(root.path().join("empty")).unwrap();
+    fs::create_dir(root.path().join("full")).unwrap();
+    fs::write(root.path().join("full/child"), b"x").unwrap();
+    assert_eq!(
+        remove_empty_dir_in(&root.path().join("empty"), &ledger).unwrap(),
+        EmptyDirectoryRemoval::Removed
+    );
+    assert_eq!(
+        remove_empty_dir_in(&root.path().join("full"), &ledger).unwrap(),
+        EmptyDirectoryRemoval::NotEmpty
+    );
+    assert!(root.path().join("full/child").exists());
+    assert_eq!(
+        remove_empty_dir_in(&root.path().join("empty"), &ledger).unwrap(),
+        EmptyDirectoryRemoval::Absent
+    );
+}
+
+#[test]
+fn remove_durably_treats_a_missing_parent_as_already_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::remove_durably(&dir.path().join("gone/dir/file"), &HeldLedger::default()).unwrap();
 }

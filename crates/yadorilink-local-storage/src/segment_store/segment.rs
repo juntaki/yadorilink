@@ -29,6 +29,29 @@ pub(crate) fn segment_path(root: &Path, segment_id: u64) -> PathBuf {
     root.join(SEGMENTS_DIR).join(format!("{segment_id:016}.seg"))
 }
 
+/// The reserved Stage name a segment is created under before it is published:
+/// `.yadorilink-v1-stage.seg-<id>` beside `<id>.seg`.
+pub(crate) fn stage_path(root: &Path, segment_id: u64) -> Result<PathBuf, StorageError> {
+    let name = yadorilink_fs_platform::reserved_namespace::artefact_component_name(
+        yadorilink_fs_platform::reserved_namespace::ArtefactKind::Stage,
+        &format!("seg-{segment_id:016}"),
+    )
+    .map_err(|error| StorageError::InvalidPath(error.to_string()))?;
+    Ok(root.join(SEGMENTS_DIR).join(name))
+}
+
+/// The id of the segment a Stage name was made for, or `None` for any other
+/// entry.
+pub(crate) fn segment_id_from_stage_name(name: &str) -> Option<u64> {
+    use yadorilink_fs_platform::reserved_namespace::{parse_artefact_component, ArtefactKind};
+    let (ArtefactKind::Stage, id) = parse_artefact_component(name)? else { return None };
+    let digits = id.strip_prefix("seg-")?;
+    if digits.len() != 16 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// The id encoded in a segment file's name, or `None` for any other entry.
 pub(crate) fn segment_id_from_file_name(name: &str) -> Option<u64> {
     let digits = name.strip_suffix(".seg")?;
@@ -36,6 +59,37 @@ pub(crate) fn segment_id_from_file_name(name: &str) -> Option<u64> {
         return None;
     }
     digits.parse().ok()
+}
+
+/// A segment under its Stage name: complete header, flushed, not yet visible
+/// under its own name.
+pub(crate) struct StagedSegment {
+    segment_id: u64,
+    file: File,
+    stage: PathBuf,
+}
+
+impl StagedSegment {
+    /// Publishes the segment under its own name by a durable move that refuses
+    /// an occupied name; the file stays open and keeps appending.
+    pub(crate) fn publish(
+        self,
+        ns: &yadorilink_fs_platform::durable_dir::DurableNamespace,
+    ) -> Result<SegmentWriter, StorageError> {
+        let target = self.stage.with_file_name(format!("{:016}.seg", self.segment_id));
+        ns.publish(
+            &self.stage,
+            &target,
+            yadorilink_fs_platform::durable_dir::Replace::No,
+            &yadorilink_fs_platform::durable_dir::NoLedger,
+        )
+        .map_err(|error| StorageError::Io(error.into()))?;
+        Ok(SegmentWriter {
+            segment_id: self.segment_id,
+            file: self.file,
+            write_end: SEGMENT_HEADER_LEN,
+        })
+    }
 }
 
 /// An open segment this store appends to.
@@ -62,6 +116,23 @@ impl SegmentWriter {
         let header = encode_segment_header(segment_id);
         file.write_all(&header)?;
         Ok(Self { segment_id, file, write_end: SEGMENT_HEADER_LEN })
+    }
+
+    /// Creates a brand-new segment under a reserved Stage name beside its final
+    /// one, writes its header and flushes it. Nothing is visible under the
+    /// segment's own name until [`StagedSegment::publish`].
+    ///
+    /// The Stage name is fixed by the segment id, so a crash that leaves it is
+    /// told apart by the same rule as any other segment file no committed
+    /// transaction mentions: nothing refers to it.
+    pub(crate) fn stage(root: &Path, segment_id: u64) -> Result<StagedSegment, StorageError> {
+        let path = stage_path(root, segment_id)?;
+        let mut file = io_diag::time(Op::SegmentCreate, 0, || {
+            OpenOptions::new().write(true).read(true).create_new(true).open(&path)
+        })?;
+        file.write_all(&encode_segment_header(segment_id))?;
+        file.sync_all()?;
+        Ok(StagedSegment { segment_id, file, stage: path })
     }
 
     /// Reopens an existing segment for further appends, positioned at

@@ -47,6 +47,13 @@ impl Fixture {
         let coordinator: &yadorilink_daemon::replica_coordinator::ReplicaCoordinator = &state;
         yadorilink_root_authority::root_identity::VerifiedRoot::open(&root, GROUP, coordinator)
             .unwrap();
+        state
+            .link_repository()
+            .set_capture_volume_identity_for_group(
+                GROUP,
+                &yadorilink_filesystem_sync::device_boundary::root_volume_identity(&root).unwrap(),
+            )
+            .unwrap();
         Self { proc, state, root, _store_dir: store_dir, _root_dir: root_dir }
     }
 
@@ -236,7 +243,7 @@ async fn absence_after_a_crash_between_evicting_and_remote_is_not_evidence() {
     let before_reset = fx.scan();
     assert!(!before_reset.iter().any(|r| r.path == "crashed.txt" && r.deleted), "{before_reset:?}");
 
-    fx.state.materialization_state_repository().reset_stale_evicting().unwrap();
+    fx.state.materialization_state_repository().reset_stale_transients(&[], &[]).unwrap();
     assert_eq!(fx.materialization_state("crashed.txt"), Some(MaterializationState::Remote));
     let after_reset = fx.scan();
 

@@ -15,11 +15,9 @@ use yadorilink_replica_domain::session_state::MaterializationPolicy;
 
 use super::types::*;
 use super::{mode_and_xattrs_match_disk, Election, OwnCaptureOnDisk, OwnCaptureRule, Recapture};
+use yadorilink_fs_platform::fs_identity::disk_race_fingerprint;
 use yadorilink_peer_session::peer_session::*;
-use yadorilink_replica_domain::native_plan::{
-    NativeLocatedHead, NativePlannedNode, NativeRowIdentity,
-};
-use yadorilink_root_authority::fs_identity::disk_race_fingerprint;
+use yadorilink_replica_domain::native_plan::{NativePlannedNode, NativeRowIdentity};
 
 impl super::LocalConvergenceExecutor {
     /// [`Self::block_requirement_for`] once the version is in hand.
@@ -485,7 +483,7 @@ impl super::LocalConvergenceExecutor {
             kind,
             version,
             identity: Box::new(
-                yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path).ok(),
+                yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path).ok(),
             ),
             mutation_generation,
         }))
@@ -793,6 +791,21 @@ impl Drop for HeadroomReservation {
 }
 
 impl super::LocalConvergenceExecutor {
+    /// Peer apply waits for the group's startup (initial scan and dirty-journal
+    /// redrive) to have captured local state: an offline delete or edit is
+    /// otherwise indistinguishable from an absent path and would be written
+    /// over. Polled, not parked, so a slow startup never stalls other groups;
+    /// not-yet-ready and failed alike defer and the caller retries. Local
+    /// capture never asks, so it is never held.
+    pub(crate) fn startup_admits_peer_apply(&self, group_id: &str) -> bool {
+        matches!(
+            futures_util::FutureExt::now_or_never(self.state.wait_group_ready(group_id)),
+            Some(Ok(()))
+        )
+    }
+}
+
+impl super::LocalConvergenceExecutor {
     /// One bounded reconciliation attempt: acquires
     /// `MaterializationAuditGuard` for `group_id`, runs
     /// `reconcile_group_paths(paths)` under it, and releases the guard
@@ -819,6 +832,9 @@ impl super::LocalConvergenceExecutor {
             self.state.directory_link_gate_for_group(group_id)?,
             Some(LinkGate::Live { .. })
         ) {
+            return Ok(None);
+        }
+        if !self.startup_admits_peer_apply(group_id) {
             return Ok(None);
         }
         let Some(_guard) = MaterializationAuditGuard::try_acquire(&self.state, group_id) else {
@@ -872,29 +888,6 @@ impl super::LocalConvergenceExecutor {
         .await
     }
 
-    /// [`Self::materialize_native_entry`] for a head the reconciler writes at a
-    /// name of its own choosing (see [`Election::NativeHold`]).
-    pub(crate) async fn materialize_native_hold(
-        &self,
-        group_id: &str,
-        hold_path: &str,
-        head: &NativeLocatedHead,
-        policy: MaterializationPolicy,
-    ) -> Result<MaterializeResult, PeerSessionError> {
-        self.materialize_head_under(
-            group_id,
-            hold_path,
-            &Election::NativeHold { head },
-            policy,
-            None,
-            // A hold is written at a name of the reconciler's own choosing,
-            // not at the claimed path.
-            None,
-            OwnCaptureRule::RecaptureFirst,
-        )
-        .await
-    }
-
     /// The node native's plan puts at `target_path` now, when there is one.
     pub(crate) fn native_planned_node(
         &self,
@@ -936,6 +929,12 @@ impl super::LocalConvergenceExecutor {
         else {
             return Ok(None);
         };
+        // Under the path lock: what this path gives up lives on at another
+        // path, and is on disk there.
+        let planned = matches!(expected, NativePlannedNode::Entry { .. }).then(|| head.version());
+        if !self.displacement_allowed(group_id, target_path, planned.as_ref())? {
+            return Ok(None);
+        }
         Ok(Some(Head::of_native(head)))
     }
 
@@ -956,7 +955,7 @@ impl super::LocalConvergenceExecutor {
                 group_id,
                 target_path,
                 version_hash,
-                yadorilink_root_authority::fs_identity::FileIdentity::observe_path(out_path).ok(),
+                yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(out_path).ok(),
                 &permit,
             )
             .map_err(|error| PeerSessionError::from(crate::sync_error::SyncError::from(error)))
@@ -988,7 +987,7 @@ impl super::LocalConvergenceExecutor {
             return Ok(Recapture::StillChanging);
         }
         let still_elected = match election {
-            Election::Native { .. } | Election::NativeHold { .. } => {
+            Election::Native { .. } => {
                 matches!(
                     self.native_planned_node(group_id, target_path)?,
                     Some(NativePlannedNode::Entry { head: entry, .. } | NativePlannedNode::ExplicitDirectory { head: entry })
@@ -1102,14 +1101,6 @@ impl super::LocalConvergenceExecutor {
                     Some(projected) => projected,
                     None => return Ok(MaterializeResult::RetryRequired),
                 }
-            }
-            Election::NativeHold { head } => {
-                let planned = self.native_planned_node(group_id, head.source_path.as_str())?;
-                if !matches!(&planned, Some(NativePlannedNode::Entry { head: fresh, .. }) if fresh == *head)
-                {
-                    return Ok(MaterializeResult::RetryRequired);
-                }
-                Head::of_native(head)
             }
         };
         let version_hash = projected.version_hash;
@@ -1445,7 +1436,7 @@ impl super::LocalConvergenceExecutor {
                         kind: RecordKind::File,
                         version: version_hash,
                         identity: Box::new(
-                            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
+                            yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(
                                 &out_path,
                             )
                             .ok(),
@@ -1539,7 +1530,7 @@ impl super::LocalConvergenceExecutor {
                         kind: version.meta.record_kind,
                         version: version_hash,
                         identity: Box::new(
-                            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
+                            yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(
                                 &out_path,
                             )
                             .ok(),

@@ -92,37 +92,28 @@ pub struct LiveHead {
 pub type PathHeads = BTreeMap<Dot, HeadPayload>;
 
 /// Capture witness: what a local writer was shown, at prepare time, for the
-/// PHYSICAL row it is about to act on.
+/// path it is about to act on.
 ///
-/// `physical_path` is the literal path the watcher observed (may be a
-/// conflict-copy's own physical name). `logical_source_path` is the
-/// SAME-account logical path the write is causally chained against --
-/// equal to `physical_path` for an ordinary row; for a conflict-copy row,
-/// resolved through the stable-projection-binding authority
-/// (`resolve_native_physical_path`), NEVER guessed by parsing the
-/// physical filename string. `shown_head` is the exact live head
-/// (identity + payload) `physical_path` showed at that moment: for an
-/// ordinary row, the path's current winner (if any); for a conflict-copy
-/// row, the specific bound loser that row represents, not the logical
-/// path's overall winner. `None` means the row was absent (no head, no
-/// binding) at capture time.
+/// `shown_version` is the content the index row displayed when the writer
+/// looked, and `shown_class` is every live head at the path whose version is
+/// that content, sorted. Heads of one version at one path are one visible
+/// piece of content, so an edit or delete of the row supersedes all of them,
+/// and only those: a head that arrives after the capture was never seen and
+/// survives, and so does every head of another version. Both are empty when
+/// the row showed nothing.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NativeCaptureWitness {
-    pub physical_path: SyncPath,
-    pub logical_source_path: SyncPath,
-    pub shown_head: Option<LiveHead>,
-    /// Every live head at `logical_source_path` whose version is the one the
-    /// row displayed when it was captured, sorted. Heads of one version at one
-    /// path are one visible piece of content, so an edit or delete of the row
-    /// supersedes all of them -- and only those: a head of that version that
-    /// arrives after the capture was never seen and survives. Empty when the
-    /// row showed nothing native holds.
+    pub path: SyncPath,
     pub shown_class: Vec<Dot>,
-    /// The version the index row displayed at capture: what `shown_class` is
-    /// the class of. Authoring takes it from here, never by re-reading the
-    /// row at commit, and a row that has since changed to another version
-    /// makes the capture stale. `None` when the row showed nothing.
+    /// The version the disk is guaranteed to hold (the usable materialization
+    /// proof's), whatever the index row says: what `shown_class` is the class
+    /// of. Authoring takes it from here, never by re-reading anything at
+    /// commit. `None` when nothing vouches for the disk.
     pub shown_version: Option<VersionHash>,
+    /// The version the index row displayed at capture. A row that has since
+    /// changed to another version makes the capture stale; it decides nothing
+    /// about what an edit supersedes.
+    pub row_version: Option<VersionHash>,
 }
 
 /// A replica state. An absent author has context 0 (no prior sequence); an
@@ -549,62 +540,6 @@ pub fn resolve_winner<'a>(
         .max_by_key(|head| (win_key(false, head.payload.version), head.payload.provenance))
 }
 
-/// The deterministic materialization outcome of one path's live heads
-/// (native's analog of `yadorilink_replica_engine::conflict::
-/// resolve_path_heads`, mirroring its two decided rules exactly):
-///
-/// * empty `heads` -> [`PathMaterialization::Absent`];
-/// * otherwise, the head with the highest version is the
-///   winner ([`resolve_winner`]);
-/// * **identical-content collapse**: any other live head whose `version`
-///   equals the winner's is not a conflict, so a
-///   per-device initial import of the same tree does not materialize a
-///   copy storm here either;
-/// * every other *distinct* version among the remaining heads gets
-///   exactly one conflict-copy representative — the head
-///   of that version's equivalence class (again via [`resolve_winner`]
-///   restricted to that class) — never one entry per losing head.
-///
-/// Deliberately does **not** assign a conflict-copy path name: a
-/// conflict-copy name typically embeds a file's mtime (metadata the domain
-/// model does not track — a materialization-time cosmetic detail, not causal
-/// state), so naming a representative's copy path is a job for a
-/// materializer that has that metadata in hand, not this pure function.
-/// Callers compare content sets per path, not path strings.
-pub fn resolve_path(heads: impl IntoIterator<Item = LiveHead>) -> PathMaterialization {
-    let heads: Vec<LiveHead> = heads.into_iter().collect();
-    let Some(winner) = resolve_winner(heads.iter()) else {
-        return PathMaterialization::Absent;
-    };
-    let winner_dot = winner.dot.clone();
-    let winner_version = winner.payload.version;
-
-    let mut classes: BTreeMap<VersionHash, Vec<&LiveHead>> = BTreeMap::new();
-    for head in &heads {
-        if head.payload.version == winner_version {
-            continue;
-        }
-        classes.entry(head.payload.version).or_default().push(head);
-    }
-    let conflict_copies = classes
-        .into_values()
-        .filter_map(resolve_winner)
-        .map(|representative| representative.dot.clone())
-        .collect();
-
-    PathMaterialization::Present { winner: winner_dot, conflict_copies }
-}
-
-/// The outcome of [`resolve_path`].
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum PathMaterialization {
-    /// Every live head removed the path (or there were none) — absent.
-    Absent,
-    /// The path holds `winner`'s content; `conflict_copies` names one
-    /// representative dot per distinct other live version.
-    Present { winner: Dot, conflict_copies: Vec<Dot> },
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,62 +783,6 @@ mod tests {
             "the original's position is untouched"
         );
         s.check_invariants().unwrap();
-    }
-
-    fn live(a: &str, seq: u64, v: u8, prov: u8) -> LiveHead {
-        LiveHead { dot: Dot { author: author(a), seq: AuthorSeq(seq) }, payload: payload(v, prov) }
-    }
-
-    #[test]
-    fn resolve_path_of_no_heads_is_absent() {
-        assert_eq!(resolve_path(std::iter::empty()), PathMaterialization::Absent);
-    }
-
-    #[test]
-    fn resolve_path_single_head_is_present_with_no_conflict_copies() {
-        let h = live("a", 1, 1, 1);
-        let dot = h.dot.clone();
-        assert_eq!(
-            resolve_path([h]),
-            PathMaterialization::Present { winner: dot, conflict_copies: vec![] }
-        );
-    }
-
-    /// Identical-content collapse: two heads with the *same* version are
-    /// not a conflict, whichever one is picked as winner.
-    #[test]
-    fn resolve_path_collapses_identical_content_to_no_conflict_copy() {
-        let a = live("a", 1, 9, 2);
-        let b = live("b", 1, 9, 1); // same version (9), smaller provenance
-        let winner_dot = a.dot.clone();
-        assert_eq!(
-            resolve_path([a, b]),
-            PathMaterialization::Present { winner: winner_dot, conflict_copies: vec![] }
-        );
-    }
-
-    /// Distinct-content heads each get exactly one conflict-copy
-    /// representative, keyed by version, not one entry per losing head.
-    #[test]
-    fn resolve_path_gives_one_representative_per_distinct_losing_version() {
-        let winner = live("a", 1, 9, 1); // the highest version wins outright
-        let loser_v2_low = live("b", 1, 2, 1);
-        let loser_v2_high = live("c", 1, 2, 2); // same version (2), larger provenance
-        let loser_v3 = live("d", 1, 3, 1);
-
-        let resolution =
-            resolve_path([winner.clone(), loser_v2_low, loser_v2_high.clone(), loser_v3.clone()]);
-        let PathMaterialization::Present { winner: winner_dot, conflict_copies } = resolution
-        else {
-            panic!("expected Present");
-        };
-        assert_eq!(winner_dot, winner.dot);
-        let copies: std::collections::BTreeSet<Dot> = conflict_copies.into_iter().collect();
-        assert_eq!(
-            copies,
-            std::collections::BTreeSet::from([loser_v2_high.dot, loser_v3.dot]),
-            "exactly one representative per distinct losing version, the larger-provenance one for the tied version"
-        );
     }
 
     // --- `receive_verified` (remote admission's best-effort apply) --

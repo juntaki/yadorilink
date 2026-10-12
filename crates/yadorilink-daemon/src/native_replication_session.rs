@@ -24,10 +24,8 @@ use yadorilink_replica_domain::limits::MAX_ENCODED_VERSION_BYTES;
 use yadorilink_replica_domain::protocol5::{
     self, DeltaBatchEntry, Message, ProtocolError, RefusalReason, RequestId,
 };
-use yadorilink_replica_domain::signed_delta::NativeDelta;
 use yadorilink_sync_sqlite::native_admission::NativeAdmission;
 use yadorilink_sync_sqlite::native_replication::{self, ServeRefusal};
-use yadorilink_sync_sqlite::native_store;
 use yadorilink_sync_sqlite::SyncSqliteError;
 
 /// A resolver for a delta's or checkpoint's author key, live.
@@ -145,6 +143,9 @@ pub struct Answer {
     /// Set when the message was one chunk of a recovery bundle the peer is
     /// sending; the driver assembles the chunks.
     pub recovery_chunk: Option<RecoveryChunkIn>,
+    /// Set when the peer, having accepted a recovery request, could not seal its state after
+    /// all: the request will not be answered, so the next round may ask again.
+    pub recovery_refused: Option<RequestId>,
 }
 
 /// One received chunk of a recovery bundle.
@@ -289,9 +290,12 @@ pub fn answer_message(
             })
         }
         // A response or a push this session does not act on.
-        Message::SummaryResponse { .. }
-        | Message::FrontierDiffResponse { .. }
-        | Message::Refused { .. } => Ok(Answer::default()),
+        Message::SummaryResponse { .. } | Message::FrontierDiffResponse { .. } => {
+            Ok(Answer::default())
+        }
+        Message::Refused { request_id, .. } => {
+            Ok(Answer { recovery_refused: Some(request_id), ..Answer::default() })
+        }
     }
 }
 
@@ -409,9 +413,6 @@ pub struct IngestReport {
     pub held: usize,
     /// Refused: bad signature, unauthorized, equivocation, invalid path...
     pub rejected: Vec<String>,
-    /// Paths planned after admission (which also settles their physical
-    /// placements).
-    pub paths_compared: usize,
 }
 
 /// Stores the content versions a batch entry carried, inside the admission's
@@ -514,13 +515,8 @@ fn ingest_with(
             continue;
         }
         match admission {
-            NativeAdmission::Admitted { dot, released } => {
+            NativeAdmission::Admitted { released, .. } => {
                 report.admitted += 1 + released.len();
-                let mut applied = vec![dot];
-                applied.extend(released);
-                for dot in applied {
-                    report.paths_compared += compare_paths_of(conn, group_id, &dot);
-                }
             }
             NativeAdmission::Duplicate => report.duplicates += 1,
             NativeAdmission::Held { .. } => report.held += 1,
@@ -528,30 +524,6 @@ fn ingest_with(
         }
     }
     report
-}
-
-/// Plans every path the admitted delta `dot` touched, which gives the path's
-/// placements their chance to appear.
-fn compare_paths_of(
-    conn: &Connection,
-    group_id: &FolderGroupId,
-    dot: &yadorilink_replica_domain::native_state::Dot,
-) -> usize {
-    let Ok(Some(body)) = native_store::fetch_delta_body(conn, group_id, &dot.author, dot.seq)
-    else {
-        return 0;
-    };
-    let Ok(delta) = NativeDelta::from_wire_bytes(&body) else { return 0 };
-    let mut compared = 0;
-    for op in &delta.ops {
-        yadorilink_sync_sqlite::native_desired_state::ensure_path_placements(
-            conn,
-            group_id.as_str(),
-            &op.path.0,
-        );
-        compared += 1;
-    }
-    compared
 }
 
 #[cfg(test)]

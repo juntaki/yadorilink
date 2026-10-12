@@ -297,6 +297,11 @@ final class LiveYadoriLinkClient: YadoriLinkClient {
         try await mapped { try await core.cancelInvite(inviteId: inviteId) }
     }
 
+    func parseInviteLink(_ input: String) throws -> String {
+        do { return try core.parseInviteLink(input: input) }
+        catch let error as YadoriLinkFFI.DesktopError { throw YadoriLinkModel.DesktopError(error) }
+    }
+
     func acceptInvite(codeOrUrl: String, localPath: String, mode: YadoriLinkModel.FolderMode, acknowledgeRisks: Bool) async throws -> YadoriLinkModel.AcceptInviteOutcome {
         try await mapped {
             YadoriLinkModel.AcceptInviteOutcome(try await core.acceptInvite(

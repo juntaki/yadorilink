@@ -25,6 +25,7 @@ pub mod dto;
 pub mod error;
 mod facade;
 pub mod ops;
+pub mod presentation;
 pub mod session;
 pub mod wording;
 

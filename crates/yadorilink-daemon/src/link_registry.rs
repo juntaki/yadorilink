@@ -100,7 +100,12 @@ pub struct DegradedLinkInfo {
     /// increasing interval. `0` for a link that just became degraded.
     pub backoff_attempt: u32,
     pub next_recheck_unix: i64,
+    /// Terminal (ownership lost): never rechecked; only relink/restart clears it.
+    pub terminal: bool,
 }
+
+/// `DegradedLinkInfo::reason` of an ownership-lost link; the status rollup keys on it.
+pub const OWNERSHIP_LOST_REASON: &str = "ownership_lost";
 
 pub struct LinkRegistry {
     /// local_path -> that link's single runtime record: `Starting`
@@ -286,6 +291,9 @@ impl LinkRegistry {
         recheck_delay_secs: impl FnOnce(u32) -> i64,
     ) {
         let mut degraded = self.lock_degraded();
+        if degraded.get(local_path).is_some_and(|i| i.terminal) {
+            return;
+        }
         let (since_unix, backoff_attempt) = match degraded.get(local_path) {
             Some(existing) => (existing.since_unix, existing.backoff_attempt + 1),
             None => (now_unix, 0),
@@ -293,14 +301,55 @@ impl LinkRegistry {
         let next_recheck_unix = now_unix + recheck_delay_secs(backoff_attempt);
         degraded.insert(
             local_path.to_string(),
-            DegradedLinkInfo { reason, since_unix, backoff_attempt, next_recheck_unix },
+            DegradedLinkInfo {
+                reason,
+                since_unix,
+                backoff_attempt,
+                next_recheck_unix,
+                terminal: false,
+            },
         );
     }
 
-    /// Clears `local_path`'s Degraded state, if any -- a no-op if it
-    /// wasn't degraded.
+    /// Marks `local_path` terminally OwnershipLost. Returns true only on the
+    /// first transition, so callers log once.
+    pub fn mark_ownership_lost(&self, local_path: &str, now_unix: i64) -> bool {
+        let mut degraded = self.lock_degraded();
+        if degraded.get(local_path).is_some_and(|i| i.terminal) {
+            return false;
+        }
+        degraded.insert(
+            local_path.to_string(),
+            DegradedLinkInfo {
+                reason: OWNERSHIP_LOST_REASON.to_string(),
+                since_unix: now_unix,
+                backoff_attempt: 0,
+                next_recheck_unix: i64::MAX,
+                terminal: true,
+            },
+        );
+        true
+    }
+
+    pub fn is_ownership_lost(&self, local_path: &str) -> bool {
+        self.lock_degraded().get(local_path).is_some_and(|i| i.terminal)
+    }
+
+    /// Clears a terminal OwnershipLost mark (a fresh link start).
+    pub fn clear_ownership_lost(&self, local_path: &str) {
+        let mut degraded = self.lock_degraded();
+        if degraded.get(local_path).is_some_and(|i| i.terminal) {
+            degraded.remove(local_path);
+        }
+    }
+
+    /// Clears `local_path`'s disk-pressure Degraded state, if any -- a no-op if it
+    /// wasn't degraded; a terminal OwnershipLost mark is left alone.
     pub fn clear_degraded(&self, local_path: &str) {
-        self.lock_degraded().remove(local_path);
+        let mut degraded = self.lock_degraded();
+        if !degraded.get(local_path).is_some_and(|i| i.terminal) {
+            degraded.remove(local_path);
+        }
     }
 
     pub fn is_degraded(&self, local_path: &str) -> bool {
@@ -316,7 +365,7 @@ impl LinkRegistry {
     pub fn degraded_due_snapshot(&self, now_unix: i64) -> Vec<(String, String)> {
         self.lock_degraded()
             .iter()
-            .filter(|(_, info)| info.next_recheck_unix <= now_unix)
+            .filter(|(_, info)| !info.terminal && info.next_recheck_unix <= now_unix)
             .map(|(path, info)| (path.clone(), info.reason.clone()))
             .collect()
     }

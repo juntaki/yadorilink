@@ -17,12 +17,12 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use rusqlite::{ffi, Connection};
 
+use yadorilink_fs_platform::fs_identity::FileIdentity;
 use yadorilink_replica_domain::author::{AuthorId, IncarnationId};
 use yadorilink_replica_domain::file::{FileMeta, FileRecord, FileVersion, RecordKind};
 use yadorilink_replica_domain::ids::{DeviceId, SyncPath};
 use yadorilink_replica_domain::local_op::Op;
 use yadorilink_replica_domain::session_state::{LocalFileMetaColumns, PreparedLocalMutation};
-use yadorilink_root_authority::fs_identity::FileIdentity;
 use yadorilink_sqlite_runtime::SyncDatabase;
 
 use crate::error::SyncSqliteError;

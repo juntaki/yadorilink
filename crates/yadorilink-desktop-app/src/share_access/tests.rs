@@ -308,65 +308,6 @@ fn turning_a_request_down_says_the_invite_cannot_be_reused() {
     assert!(line.contains("cannot be redeemed again"), "{line}");
 }
 
-/// A request that is genuinely still waiting is denied, and the button
-/// does exactly what it says.
-#[test]
-fn a_request_that_is_still_waiting_is_denied() {
-    let pending = [approval("group-1", "device-a", Some("viewer"))];
-    assert_eq!(deny_precheck(&pending, &[], "group-1", "device-a"), DenyPrecheck::StillWaiting);
-}
-
-/// The bug this guard exists for: the requests panel is not refreshed on
-/// a timer, so a row can still say "waiting" long after the request was
-/// approved from somewhere else. Denying IS revoking, so sending that
-/// denial would remove a member whose access is live and working. A
-/// device that appears in the member listing is never denied.
-#[test]
-fn a_request_already_approved_elsewhere_is_never_denied() {
-    // Exactly what the stale panel still shows -- and what the fresh
-    // read says instead: nobody is waiting, and the device is a member.
-    let members = [member("device-a")];
-    assert_eq!(
-        deny_precheck(&[], &members, "group-1", "device-a"),
-        DenyPrecheck::NotWaiting(DenyRefusal::AlreadyAdmitted)
-    );
-}
-
-/// Membership wins over a waiting request outright: the two listings are
-/// two separate reads, so an approval landing between them shows up in
-/// both, and the reading that stops a removal is the safe one.
-#[test]
-fn being_listed_as_a_member_outweighs_a_request_still_in_the_other_listing() {
-    let pending = [approval("group-1", "device-a", Some("viewer"))];
-    let members = [member("device-a")];
-    assert_eq!(
-        deny_precheck(&pending, &members, "group-1", "device-a"),
-        DenyPrecheck::NotWaiting(DenyRefusal::AlreadyAdmitted)
-    );
-}
-
-/// Decided or withdrawn somewhere else: nothing to deny, and nothing to
-/// remove either.
-#[test]
-fn a_request_that_is_gone_from_both_listings_is_not_denied() {
-    assert_eq!(
-        deny_precheck(&[], &[], "group-1", "device-a"),
-        DenyPrecheck::NotWaiting(DenyRefusal::NoLongerListed)
-    );
-}
-
-/// The waiting listing is account-wide, so it is narrowed by group id
-/// here exactly as `pending_rows` narrows it -- a request for ANOTHER
-/// folder must never make this window's Deny proceed.
-#[test]
-fn a_request_waiting_on_a_different_folder_does_not_make_this_deny_proceed() {
-    let pending = [approval("group-2", "device-a", Some("viewer"))];
-    assert_eq!(
-        deny_precheck(&pending, &[], "group-1", "device-a"),
-        DenyPrecheck::NotWaiting(DenyRefusal::NoLongerListed)
-    );
-}
-
 /// A Deny that was stopped must never report itself the way a carried-out
 /// denial reports itself. "was turned down" is the exact claim
 /// `deny_done_line` makes, and it is the claim that made a real removal

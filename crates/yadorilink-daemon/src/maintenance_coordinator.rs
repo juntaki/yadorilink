@@ -127,7 +127,6 @@ pub(crate) fn start(state: &Arc<DaemonState>) -> Arc<RecoveryJob> {
     // `run_once`'s own synchronous call path (`list_links`,
     // `backfill_missing_change_history`,
     // `dag_reconcile_compatibility_applied_flag_for_group`,
-    // `retire_unjustified_ephemeral_conflict_copies`,
     // `list_materialization_repair_candidates`, `get_files_by_paths`,
     // `file_info_for_record` -- none of which run inside the per-record
     // `tokio::spawn` in `rematerialize_local_records` that already

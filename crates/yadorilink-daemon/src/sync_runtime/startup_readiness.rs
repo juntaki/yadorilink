@@ -193,8 +193,9 @@ impl StartupReadinessRegistry {
     /// gate, nothing in flight) and for one that has settled either way
     /// (`Ready` or `Failed`).
     ///
-    /// This is deliberately NOT a second way to gate peer apply -- that stays
-    /// on `wait_group_ready`, which must park rather than skip. It exists for
+    /// Peer apply gates on `wait_group_ready` (polled once by
+    /// `startup_admits_peer_apply`, so it defers rather than parks). This
+    /// exists for
     /// periodic background repair passes, which have no useful notion of
     /// waiting: a repair that fires while startup is still building the index
     /// is not merely early, it races the one-shot work startup is in the

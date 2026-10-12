@@ -324,8 +324,8 @@ fn register_non_ignored_directories_skips_a_reserved_directory() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let reserved_dir = root.join(
-        yadorilink_root_authority::reserved_namespace::artefact_component_name(
-            yadorilink_root_authority::reserved_namespace::ArtefactKind::Retained,
+        yadorilink_fs_platform::reserved_namespace::artefact_component_name(
+            yadorilink_fs_platform::reserved_namespace::ArtefactKind::Retained,
             "deadbeef",
         )
         .unwrap(),

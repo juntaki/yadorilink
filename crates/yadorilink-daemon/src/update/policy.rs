@@ -10,8 +10,7 @@
 //! Living in its own file (not bolted onto `device_config::DeviceConfig`)
 //! means an existing install with no `update_policy.json` at all — every
 //! device that existed before this update-policy feature shipped —
-//! loads the documented safe default (checks/installs enabled, `Idle`
-//! state, nothing downloaded) with no migration step, the same
+//! loads the documented safe default (checks enabled, `Idle` state) with no migration step, the same
 //! "version-safe defaulting for existing installs" property
 //! `GovernanceConfigStore`'s own doc comment calls out.
 
@@ -36,12 +35,7 @@ pub enum UpdateState {
     Available,
     HeldBack,
     KillSwitched,
-    Downloading,
-    Downloaded,
-    Verified,
-    Installing,
     Failed,
-    Deferred,
     UpToDate,
 }
 
@@ -53,46 +47,32 @@ impl UpdateState {
             UpdateState::Available => "available",
             UpdateState::HeldBack => "held_back",
             UpdateState::KillSwitched => "kill_switched",
-            UpdateState::Downloading => "downloading",
-            UpdateState::Downloaded => "downloaded",
-            UpdateState::Verified => "verified",
-            UpdateState::Installing => "installing",
             UpdateState::Failed => "failed",
-            UpdateState::Deferred => "deferred",
             UpdateState::UpToDate => "up_to_date",
         }
     }
 }
 
-/// Automatic install is enabled by default only once
-/// rollback/interrupted-update tests pass, "for beta builds"
-/// specifically. This code doesn't know at compile time whether it's a
-/// beta or production build, and shipping "automatic install on by
-/// default" as this crate's own hardcoded default before that gate is
-/// a policy decision that belongs in release configuration, not here.
-/// `Manual` is therefore the safe, conservative default an unset
-/// config file resolves to; `main.rs`/packaging is expected to write
-/// an explicit `automatic` policy file for a beta build once that gate
-/// is satisfied.
+/// v1 ships manual updates, so `Manual` is the only mode. The old
+/// persisted value `"automatic"` is still accepted when loading an
+/// existing policy file and reads as `Manual`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoInstallMode {
-    Automatic,
     #[default]
+    #[serde(alias = "automatic")]
     Manual,
 }
 
 impl AutoInstallMode {
     pub fn as_str(&self) -> &'static str {
         match self {
-            AutoInstallMode::Automatic => "automatic",
             AutoInstallMode::Manual => "manual",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "automatic" => Some(AutoInstallMode::Automatic),
             "manual" => Some(AutoInstallMode::Manual),
             _ => None,
         }
@@ -119,14 +99,6 @@ pub struct UpdatePolicy {
     pub available_release_notes_url: Option<String>,
     pub mandatory: bool,
     pub holdback_reason: Option<String>,
-    /// Set once a downloaded artifact has passed *both* checksum and
-    /// platform-signature verification (`verify::verify_artifact`) —
-    /// `manager::recover_on_startup` treats an artifact whose path is set
-    /// here but this flag is `false` as untrusted and discards it,
-    /// regardless of why the daemon didn't get to update this flag last
-    /// time (crash, kill -9, power loss).
-    pub downloaded_artifact_path: Option<PathBuf>,
-    pub downloaded_artifact_verified: bool,
     /// A stable value in `0..100`, generated once and persisted forever
     /// (never re-rolled), used only locally to decide staged-rollout
     /// eligibility (`manifest::LocalContext::rollout_bucket`) — never
@@ -193,8 +165,6 @@ impl Default for UpdatePolicy {
             available_release_notes_url: None,
             mandatory: false,
             holdback_reason: None,
-            downloaded_artifact_path: None,
-            downloaded_artifact_verified: false,
             rollout_bucket: 0,
             beta_cohort: None,
         }

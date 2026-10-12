@@ -18,7 +18,7 @@ use crate::error::DatabaseError;
 /// Bump this whenever the created shape changes at all, since the previous
 /// shape becomes unopenable by this binary and unopenable is the intended
 /// outcome.
-pub const SCHEMA_VERSION: i32 = 113;
+pub const SCHEMA_VERSION: i32 = 117;
 
 /// Reads `PRAGMA user_version` and refuses anything that is not exactly
 /// this binary's [`SCHEMA_VERSION`], in either direction: a newer stamp is
@@ -103,17 +103,6 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
               sequences it"
 )]
 fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseError> {
-    // Which model authorizes a group's rows. Absent means no authority is
-    // recorded; a group is `native` only through the transaction that adopts
-    // it under native authority with no indexed rows, and it does not change
-    // within an epoch. The authoring gate below reads it, so the trigger and the
-    // unauthored-row query share one predicate.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS group_authority (
-            group_id  TEXT PRIMARY KEY,
-            authority TEXT NOT NULL CHECK (authority IN ('dcf', 'native'))
-        );",
-    )?;
     // Widening `files`' primary key
     // from `(group_id, path)` to `(group_id, path, version_seq)` is not
     // expressible as an `ALTER TABLE... ADD COLUMN` — SQLite has no
@@ -212,7 +201,15 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
             -- additive (indexes what it finds, emits no deletions) so the
             -- departed root's paths survive and can hydrate from a peer.
             -- Cleared after one clean full scan.
-            suppress_tombstones_until_scan INTEGER NOT NULL DEFAULT 0
+            suppress_tombstones_until_scan INTEGER NOT NULL DEFAULT 0,
+            -- The volume (unix `st_dev`, Windows volume serial) the link root was
+            -- on when its index was last proven consistent with it. A tombstone
+            -- is authored only while the root is still on this volume: an
+            -- unmounted nested mount or a swapped root volume leaves an empty
+            -- directory that must not read as a mass deletion. NULL on rows
+            -- created before this column existed (and on provider links):
+            -- adopted by the first safe full scan, which emits no deletes.
+            capture_volume_identity TEXT
         );
 
         CREATE TABLE IF NOT EXISTS duplicate_recovery_paths (
@@ -425,12 +422,37 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
         -- the previous intent via `INSERT ... ON CONFLICT`. A new additive
         -- table, so a bare `CREATE TABLE IF NOT EXISTS` is the whole
         -- migration, like `local_dirty_paths`/`restore_operations` above.
+        --
+        -- `kind` says which obligation the row is. `write` (the default) is the
+        -- materialization above. `structural_mkdir` is the first phase of a
+        -- `mkdir` the materializer makes only to hold descendants: it carries the
+        -- path's mutation fence as the intent bumped it in `mutation_generation`
+        -- (completion is refused once anything else has moved the fence), an
+        -- empty `target_version_hash`, and is resolved by the writer on every
+        -- exit, or at startup and link start when the process died. A path can
+        -- carry one row of each kind at once.
         CREATE TABLE IF NOT EXISTS materialization_intents (
             group_id              TEXT NOT NULL,
             path                  TEXT NOT NULL,
+            kind                  TEXT NOT NULL DEFAULT 'write',
             target_version_hash   BLOB NOT NULL,
             created_at_unix_nanos INTEGER NOT NULL,
-            PRIMARY KEY (group_id, path)
+            mutation_generation   INTEGER,
+            PRIMARY KEY (group_id, path, kind)
+        );
+        -- The temp files writers are creating or have not yet renamed away or
+        -- removed. A row is written BEFORE its file is created and deleted
+        -- AFTER the file is gone, so the rows are exactly the temp files a
+        -- crash can have left behind; recovery removes the file each row
+        -- names and the row, and never looks at a file name to decide
+        -- anything. One row per temp file (not per path): a newer write of
+        -- the same path replaces the path's intent, but not the earlier
+        -- write's temp file. `tmp_path` is the absolute path as the link
+        -- table's root spelled it.
+        CREATE TABLE IF NOT EXISTS materialization_tmp_files (
+            group_id TEXT NOT NULL,
+            tmp_path TEXT NOT NULL,
+            PRIMARY KEY (group_id, tmp_path)
         );
         -- The content targets of earlier writes of a path that a newer
         -- write's intent replaced before they were proven. Such a write may
@@ -1089,21 +1111,6 @@ fn create_provider_namespace_tables(conn: &Connection) -> Result<(), DatabaseErr
             SELECT RAISE(ABORT, 'the namespace revision advances only with logged change events');
         END;
 
-        -- The displaced placements the provider projector wrote (a conflict copy, a relocation):
-        -- which physical path stands for which source path, so a plan that no longer holds one
-        -- can retire its row. Derived, group-scoped.
-        CREATE TABLE IF NOT EXISTS provider_placements (
-            group_id      TEXT NOT NULL,
-            physical_path TEXT NOT NULL,
-            source_path   TEXT NOT NULL,
-            -- The authoring identity of the head that holds the physical path: a row is retired
-            -- only while it still shows THIS identity (another head may own the path by now).
-            owner_identity BLOB NOT NULL,
-            PRIMARY KEY (group_id, physical_path)
-        ) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS provider_placements_source
-            ON provider_placements (group_id, source_path);
-
         -- The folders whose contents the OS has requested (the empty blob is the root
         -- container). A hint: losing it only costs extra signals.
         CREATE TABLE IF NOT EXISTS provider_enumerated_parents (
@@ -1278,14 +1285,6 @@ fn refuse_unverified_authoring_rows(
     Ok(())
 }
 
-/// Whether `row`'s group is authorized by native authoring (`group_authority`).
-fn native_group(row: &str) -> String {
-    format!(
-        "EXISTS(SELECT 1 FROM group_authority ga \
-                 WHERE ga.group_id = {row}.group_id AND ga.authority = 'native')"
-    )
-}
-
 /// The condition under which the `files` row `row` names no verified
 /// authoring identity.
 ///
@@ -1314,16 +1313,14 @@ pub fn authoring_evidence_missing(row: &str) -> String {
     )
 }
 
-/// The trigger condition: a current row, in a native-authority group that has
-/// native history, without a verified authoring identity. Before that a row may be unauthored
+/// The trigger condition: a current row, in a group that has native history,
+/// without a verified authoring identity. Before that a row may be unauthored
 /// (the initial scan writes rows before it authors them).
 fn unverified_authoring_identity(row: &str) -> String {
     format!(
         "{row}.state = 'current' AND {row}.version_seq > 0
-          AND {}
           AND EXISTS(SELECT 1 FROM native_authoring_witness WHERE group_id = {row}.group_id)
           AND {}",
-        native_group(row),
         authoring_evidence_missing(row)
     )
 }

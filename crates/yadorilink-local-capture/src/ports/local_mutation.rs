@@ -40,7 +40,7 @@ pub struct CapturedDirectory {
     pub op: yadorilink_replica_domain::local_op::Op,
     pub version: yadorilink_replica_domain::file::FileVersion,
     pub meta: LocalFileMetaColumns,
-    pub identity: Option<yadorilink_root_authority::fs_identity::FileIdentity>,
+    pub identity: Option<yadorilink_fs_platform::fs_identity::FileIdentity>,
 }
 
 /// The answer of [`LocalMutationStore::inspect_windows_placeholder`]: whether
@@ -108,9 +108,8 @@ pub trait LocalMutationStore: Send + Sync {
 
     /// [`native_capture_witness`](Self::native_capture_witness) for every
     /// path native knows in the group, from one read (for a whole-index
-    /// snapshot). A path missing from the result has no head and no
-    /// binding: use `yadorilink_sync_sqlite::native_projection_binding::
-    /// absent_native_witness`.
+    /// snapshot). A path missing from the result has no head: use
+    /// `yadorilink_sync_sqlite::native_capture::absent_native_witness`.
     fn native_capture_witnesses(
         &self,
         group_id: &str,
@@ -138,6 +137,21 @@ pub trait LocalMutationStore: Send + Sync {
         &self,
         group_id: &str,
     ) -> Result<HashMap<String, MaterializationState>, SyncSqliteError>;
+
+    /// The volume identity persisted for `group_id`'s live link: `None` when
+    /// the group has no link row, `Some(None)` for a link not yet adopted.
+    fn capture_volume_identity(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<Option<String>>, SyncSqliteError>;
+
+    /// Persists the volume identity of `group_id`'s live link (first adoption
+    /// only; a changed volume is never followed automatically).
+    fn adopt_capture_volume_identity(
+        &self,
+        group_id: &str,
+        identity: &str,
+    ) -> Result<(), SyncSqliteError>;
 
     fn get_materialization_state(
         &self,
@@ -320,7 +334,7 @@ pub trait LocalMutationStore: Send + Sync {
         &self,
         group_id: &str,
         path: &str,
-    ) -> Result<Option<yadorilink_root_authority::fs_identity::FileIdentity>, SyncSqliteError>;
+    ) -> Result<Option<yadorilink_fs_platform::fs_identity::FileIdentity>, SyncSqliteError>;
 
     /// The birth-time granularity of the volume holding `sync_root`, which
     /// decides whether an identity comparison of a directory against its
@@ -328,7 +342,7 @@ pub trait LocalMutationStore: Send + Sync {
     fn birth_time_granularity(
         &self,
         sync_root: &Path,
-    ) -> yadorilink_root_authority::fs_identity::TimestampGranularity;
+    ) -> yadorilink_fs_platform::fs_identity::TimestampGranularity;
 
     /// Whether the regular file at `out_path` is, untouched, what a usable
     /// proof says this device wrote at `path` -- whichever version the row
@@ -474,16 +488,6 @@ pub trait LocalMutationStore: Send + Sync {
     /// the index holds entries in a directory at `path`.
     fn has_live_descendant_row(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError>;
 
-    /// The entry a local delete or edit of `path` is an operation on, when
-    /// `path` is a copy name the namespace projection placed that entry's
-    /// File or Symlink under (never authored there itself). The capture
-    /// authors the op at the returned path; the row stays at `path`.
-    fn write_through_source(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Option<String>, SyncSqliteError>;
-
     /// Follows a structural directory a rename moved to `to_path`: when the
     /// ledger records the object `identity` names as structural under
     /// another path, its record (and those below it) moves to `to_path`,
@@ -494,8 +498,8 @@ pub trait LocalMutationStore: Send + Sync {
         &self,
         group_id: &str,
         to_path: &str,
-        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
-        birth_time_granularity: yadorilink_root_authority::fs_identity::TimestampGranularity,
+        identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
+        birth_time_granularity: yadorilink_fs_platform::fs_identity::TimestampGranularity,
     ) -> Result<Option<String>, SyncSqliteError>;
 
     /// Batch upsert for an initial folder scan, one transaction per chunk —
@@ -530,28 +534,6 @@ pub trait LocalMutationStore: Send + Sync {
         path: &str,
         device_id: &str,
         observed_at_unix_nanos: i64,
-        permit: &RootCommitPermit<'_>,
-    ) -> Result<(), SyncSqliteError>;
-
-    /// Commits a local deletion of the copy name `copy_path` as
-    /// `Delete(source)`, the entry [`Self::write_through_source`] named for
-    /// it: the copy's row is tombstoned, only the head it held is
-    /// superseded, and an `Absent` proof for `copy_path` is committed with
-    /// it (the caller revalidated the path gone under its lock).
-    /// `native_witness` is what native showed at the copy when the deletion
-    /// was captured.
-    // One argument per fact the deletion needs, as for
-    // `mark_deleted_emitting_change`.
-    #[allow(clippy::too_many_arguments)]
-    fn commit_write_through_deletion(
-        &self,
-        group_id: &str,
-        copy_path: &str,
-        source: &str,
-        native_witness: Option<yadorilink_replica_domain::native_state::NativeCaptureWitness>,
-        device_id: &str,
-        observed_at_unix_nanos: i64,
-        emitter: &LocalAuthorKey,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError>;
 

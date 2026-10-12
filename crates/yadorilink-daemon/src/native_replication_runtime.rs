@@ -88,6 +88,8 @@ pub struct NativeReplicationHub {
     reconcile_wake: ReconcileWake,
     /// Counts ingest activity; see [`Self::wake_when_ingest_goes_quiet`].
     ingest_seq: std::sync::atomic::AtomicU64,
+    /// Counts ingest activity for the contest-fork pass; see [`Self::fork_when_ingest_goes_quiet`].
+    fork_seq: std::sync::atomic::AtomicU64,
     /// Test-only: stops the rebootstrap machine at chosen points.
     #[cfg(any(test, feature = "test-support"))]
     rebootstrap_hook: Mutex<Option<crate::native_rebootstrap::Hook>>,
@@ -159,6 +161,29 @@ impl NativeReplicationHub {
                 if hub.ingest_seq.load(Ordering::SeqCst) == seq {
                     hub.wake_reconcile();
                 }
+            }
+        });
+    }
+
+    /// Runs the contest-fork pass once, `quiet` after the last call: a burst of ingested
+    /// batches costs one pass.
+    pub(crate) fn fork_when_ingest_goes_quiet(
+        self: &Arc<Self>,
+        quiet: Duration,
+        state: Weak<DaemonState>,
+    ) {
+        use std::sync::atomic::Ordering;
+        let seq = self.fork_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+        let hub = Arc::downgrade(self);
+        runtime.spawn(async move {
+            tokio::time::sleep(quiet).await;
+            let Some(hub) = hub.upgrade() else { return };
+            if hub.fork_seq.load(Ordering::SeqCst) != seq {
+                return;
+            }
+            if let Some(state) = state.upgrade() {
+                state.fork_contested_heads_everywhere().await;
             }
         });
     }
@@ -642,6 +667,9 @@ pub fn env_for_peer(state: &Arc<DaemonState>, device: &str) -> ReplicationEnv {
                 // only notices them on its next poll.
                 state.replica_coordinator.notify_materialization_wake();
                 state.native_replication.wake_when_ingest_goes_quiet(INGEST_QUIET);
+                state
+                    .native_replication
+                    .fork_when_ingest_goes_quiet(INGEST_QUIET, activity_state.clone());
             }
         }),
     }

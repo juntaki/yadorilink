@@ -259,6 +259,7 @@ fn new_device(
             .link_repository()
             .add_link(&root.path().to_string_lossy(), group)
             .unwrap();
+        support::mark_group_started(&state, group);
         roots.push(root);
     }
     Device {

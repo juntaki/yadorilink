@@ -60,9 +60,9 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "create_dir": 2,
         "create_dir_all": 1,
     },
-    # The block store's own directories.
-    C + "yadorilink-local-storage/src/segment_store/coordinator.rs": {"create_dir_all": 1},
-    C + "yadorilink-local-storage/src/segment_store/mod.rs": {"create_dir_all": 1},
+    # The block store's own directories (`create_dir_all_durably`: the store
+    # root and its `segments/` directory, never inside a sync root).
+    C + "yadorilink-local-storage/src/fs_ops.rs": {"create_dir_all": 2},
     # The case-sensitivity probe: the root itself, and a probe directory in
     # the root's reserved namespace, removed again at once.
     C + "yadorilink-peer-session/src/hazard.rs": {"create_dir": 1, "create_dir_all": 2},
@@ -77,7 +77,6 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     C + "yadorilink-daemon/src/reporting/counters.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/resource_lock.rs": {"create_dir_all": 2},
     C + "yadorilink-daemon/src/shell_ipc.rs": {"create_dir_all": 1},
-    C + "yadorilink-daemon/src/update/manager.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/update/policy.rs": {"create_dir_all": 1},
     C + "yadorilink-desktop-app/src/account.rs": {"create_dir_all": 1},
     C + "yadorilink-desktop-app/src/actions.rs": {"create_dir_all": 1},
@@ -94,6 +93,16 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # The send inbox and its received files' directories: not a sync root.
     C + "yadorilink-send/src/session.rs": {"create_dir_all": 4},
     C + "yadorilink-transport/src/key_secret_store.rs": {"create_dir_all": 1},
+    # Provider/native-recovery private state and the durability probe's scratch
+    # directory: app-owned directories (0700), not content inside a sync root.
+    C + "yadorilink-client-core/src/ops/provider_pending.rs": {"create_dir_all": 1},
+    C + "yadorilink-daemon/src/provider_handoff.rs": {"DirBuilder::new": 1, "create_dir_all": 1},
+    C + "yadorilink-daemon/src/provider_writer.rs": {"DirBuilder::new": 1},
+    # `DurableNamespace`: the Stage-directory mkdir, the methods named after it
+    # and the probe's own scratch directory.
+    C + "yadorilink-fs-platform/src/durable_dir.rs": {"create_dir": 2},
+    C + "yadorilink-fs-platform/src/durable_dir/probe.rs": {"create_dir": 2},
+    C + "yadorilink-sync-sqlite/src/native_rebootstrap_recovery.rs": {"DirBuilder::new": 3, "create_dir_all": 1},
 }
 
 

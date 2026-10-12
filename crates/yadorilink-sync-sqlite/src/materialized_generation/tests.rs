@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use yadorilink_root_authority::fs_identity::{
+use yadorilink_fs_platform::fs_identity::{
     ObjectKind, PlatformObjectId, Timestamp, VolumeIdentity,
 };
 
@@ -54,7 +54,7 @@ fn revalidate_confirms_a_still_absent_path() {
         revalidate_identity_against_disk(
             &basis,
             &missing,
-            yadorilink_root_authority::fs_identity::TimestampGranularity::Fine,
+            yadorilink_fs_platform::fs_identity::TimestampGranularity::Fine,
         ),
         IdentityRevalidation::Confirmed
     );
@@ -74,7 +74,7 @@ fn revalidate_rejects_an_absent_basis_whose_path_now_exists() {
         revalidate_identity_against_disk(
             &basis,
             &now_present,
-            yadorilink_root_authority::fs_identity::TimestampGranularity::Fine,
+            yadorilink_fs_platform::fs_identity::TimestampGranularity::Fine,
         ),
         IdentityRevalidation::NotAMatch
     );
@@ -93,7 +93,7 @@ fn revalidate_confirms_a_matching_real_object_identity() {
         revalidate_identity_against_disk(
             &basis,
             &path,
-            yadorilink_root_authority::fs_identity::TimestampGranularity::Fine,
+            yadorilink_fs_platform::fs_identity::TimestampGranularity::Fine,
         ),
         IdentityRevalidation::Confirmed
     );
@@ -113,7 +113,7 @@ fn revalidate_rejects_when_the_observed_identity_no_longer_matches() {
         revalidate_identity_against_disk(
             &basis,
             &path,
-            yadorilink_root_authority::fs_identity::TimestampGranularity::Fine,
+            yadorilink_fs_platform::fs_identity::TimestampGranularity::Fine,
         ),
         IdentityRevalidation::NotAMatch
     );
@@ -132,7 +132,7 @@ fn revalidate_rejects_a_non_absent_basis_with_no_recorded_identity() {
         revalidate_identity_against_disk(
             &basis,
             &path,
-            yadorilink_root_authority::fs_identity::TimestampGranularity::Fine,
+            yadorilink_fs_platform::fs_identity::TimestampGranularity::Fine,
         ),
         IdentityRevalidation::NotAMatch
     );
@@ -603,7 +603,7 @@ fn directory_generation_revalidates_after_child_added() {
             revalidate_identity_against_disk(
                 &basis,
                 &dir,
-                yadorilink_root_authority::fs_identity::TimestampGranularity::Fine,
+                yadorilink_fs_platform::fs_identity::TimestampGranularity::Fine,
             ),
             IdentityRevalidation::Confirmed,
             "{kind:?}"
@@ -622,7 +622,7 @@ fn absent_basis_over_structural_directory_confirms() {
     std::fs::create_dir(&dir).unwrap();
     std::fs::write(dir.join("x"), b"live descendant").unwrap();
     let basis = sample_basis(MaterializedObjectKind::Absent, None);
-    let granularity = yadorilink_root_authority::fs_identity::TimestampGranularity::Fine;
+    let granularity = yadorilink_fs_platform::fs_identity::TimestampGranularity::Fine;
     assert_eq!(
         revalidate_identity_against_projected_disk(
             &basis,
@@ -673,7 +673,7 @@ fn a_symlink_to_a_directory_is_not_a_structural_container() {
         revalidate_identity_against_projected_disk(
             &sample_basis(MaterializedObjectKind::Absent, None),
             &link,
-            yadorilink_root_authority::fs_identity::TimestampGranularity::Fine,
+            yadorilink_fs_platform::fs_identity::TimestampGranularity::Fine,
             ProjectedAtPath::StructuralDirectory,
         ),
         IdentityRevalidation::NotAMatch

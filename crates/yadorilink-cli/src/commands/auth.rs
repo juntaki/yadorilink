@@ -25,7 +25,12 @@ pub async fn login(device: bool) -> Result<(), CliError> {
 /// Sign out: revoke this installation's authority, confirm it, and only then
 /// destroy the local credential. A revocation that cannot be confirmed keeps
 /// the credential and fails, rather than deleting it and claiming success.
-pub async fn logout() -> Result<(), CliError> {
+pub async fn logout(yes: bool) -> Result<(), CliError> {
+    super::confirm_destructive(
+        "Sign out and revoke this computer's access? This cannot be undone. Files already on \
+         this computer stay on disk.",
+        yes,
+    )?;
     let kind = ops::sign_out().await?;
     println!("{}", sign_out_line(&kind));
     Ok(())

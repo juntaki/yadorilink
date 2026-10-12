@@ -13,3 +13,8 @@ pub const IGNORE_FILE_NAME: &str = ".yadorilinkignore";
 /// never spawn a conflicted copy: each device mints its own token, so a
 /// synced marker would overwrite a peer's identity with ours.
 pub const ROOT_MARKER_FILE_NAME: &str = ".yadorilink-root";
+
+/// The lock file placed at the top level of a sync root while a process owns
+/// it. Excluded from sync like the marker: it is never indexed, never
+/// transmitted, and never a conflicted-copy candidate.
+pub const SYNC_ROOT_LOCK_FILE_NAME: &str = ".yadorilink-root.lock";

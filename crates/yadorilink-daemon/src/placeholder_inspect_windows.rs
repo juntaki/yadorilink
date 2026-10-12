@@ -72,7 +72,11 @@ fn decode_generation_identity(bytes: &[u8]) -> Option<u64> {
 }
 
 fn to_wide(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    yadorilink_fs_platform::long_path::for_win32(path)
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// Opens `path` for a read-only placeholder-metadata query: `FILE_READ_

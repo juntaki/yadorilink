@@ -33,10 +33,16 @@ pub async fn check_for_updates() -> Result<UpdateCheckResponse, CoreError> {
     Ok(check)
 }
 
-/// Installs a previously checked update. The daemon's own pipeline decides
-/// whether and when it actually applies (mandatory, holdback and safe-point
-/// gating).
-pub async fn install_update() -> Result<UpdateInstallResponse, CoreError> {
+/// Official page to download new versions from. v1 ships manual updates:
+/// the daemon checks and reports, the user downloads and installs. Matches
+/// the daemon's `update::install_source::DOWNLOAD_PAGE_URL`.
+pub const DOWNLOAD_PAGE_URL: &str = "https://github.com/juntaki/yadorilink/releases";
+
+/// Asks the daemon how to get the new version (v1 ships manual updates;
+/// nothing is installed automatically). The reply's `guidance` is the text
+/// to show: the download page, or the package-manager command for a
+/// package-managed install.
+pub async fn download_guidance() -> Result<UpdateInstallResponse, CoreError> {
     let resp = control::send(ReqPayload::UpdateInstall(UpdateInstallRequest {})).await?;
     let Some(RespPayload::UpdateInstall(install)) = resp.payload else {
         return Err(unexpected());
@@ -44,8 +50,8 @@ pub async fn install_update() -> Result<UpdateInstallResponse, CoreError> {
     Ok(install)
 }
 
-/// Configures automatic update checks and/or the automatic install mode
-/// (`automatic` or `manual`). `None` leaves that setting unchanged.
+/// Configures automatic update checks and/or the install mode (only
+/// `manual` is supported in v1). `None` leaves that setting unchanged.
 pub async fn set_update_config(
     automatic_checks_enabled: Option<bool>,
     automatic_install_mode: Option<String>,

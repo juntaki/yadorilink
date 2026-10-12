@@ -206,7 +206,7 @@ pub fn disk_matches_expected_object(
             // against, and the same one `bytes_to_target` inverts to write
             // the link. Comparing through anything else here would be a
             // second, independently-lossy encoding of one thing.
-            Ok(if yadorilink_root_authority::fs_identity::target_to_bytes(&actual) == target {
+            Ok(if yadorilink_fs_platform::fs_identity::target_to_bytes(&actual) == target {
                 DiskContentComparison::Matched
             } else {
                 DiskContentComparison::PresentButDifferent

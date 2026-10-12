@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use yadorilink_fs_platform::durable_dir::trace;
 use yadorilink_replica_domain::history_truncation::{HistoryTruncations, RetainedSummary};
 use yadorilink_replica_domain::native_checkpoint_seal::NativeSealPolicy;
 use yadorilink_replica_domain::signed_delta::RecursivePart;
@@ -823,13 +824,16 @@ fn a_crash_after_preserved_resumes_from_the_manifest() {
     );
     // A leftover temporary from an interrupted write does not matter.
     let dir = recovery_dirs_of(area.path()).remove(0);
-    fs::write(dir.join(".tmp-0123456789abcdef"), b"partial").unwrap();
+    fs::write(dir.join(".yadorilink-v1-stage.0123456789abcdef"), b"partial").unwrap();
 
     let restart = recover_after_restart(&w.b, area.path(), &group()).unwrap();
 
     let RestartOutcome::Preserved(preserved) = restart else { panic!("{restart:?}") };
     assert_eq!(preserved.dir, dir);
-    assert!(!dir.join(".tmp-0123456789abcdef").exists(), "temporaries are removed on resume");
+    assert!(
+        !dir.join(".yadorilink-v1-stage.0123456789abcdef").exists(),
+        "temporaries are removed on resume"
+    );
     assert_eq!(preserved.manifest_sha256, sha256(&fs::read(dir.join("manifest.json")).unwrap()));
 }
 
@@ -1053,24 +1057,25 @@ fn the_manifest_is_canonical_versioned_and_self_hashed() {
 
 // --- durability is checked, not assumed ------------------------------------------------------------
 
-/// Every file is fsynced before its name is published and its directory after.
+/// Every file is fsynced exactly once, before its name is published, and every
+/// file's name is published by a durable move.
 #[test]
-fn every_file_is_fsynced_and_so_is_its_directory() {
-    use crate::native_rebootstrap_recovery::test_hooks::{DIR_SYNCS, FILE_SYNCS};
+fn every_file_is_fsynced_and_published_by_a_durable_move() {
+    use crate::native_rebootstrap_recovery::test_hooks::FILE_SYNCS;
     let w = scenario(|b1, h1| vec![put_op("x", 2, vec![rem(b1, 1, h1)])]);
     let area = private_tempdir();
     FILE_SYNCS.with(|n| n.set(0));
-    DIR_SYNCS.with(|dirs| dirs.borrow_mut().clear());
+    trace::take();
 
     begin_with(&w.b, built(&w.sealer), area.path(), &mut no_hook).unwrap();
 
     let files = files_below(area.path()).iter().filter(|p| p.is_file()).count();
     assert!(files >= 7, "bundle, digest, material, record, version, delta and manifest: {files}");
     assert_eq!(FILE_SYNCS.with(|n| n.get()), files, "a file was not fsynced exactly once");
-    assert!(
-        DIR_SYNCS.with(|dirs| dirs.borrow().len()) >= files,
-        "a directory was not fsynced after a rename"
-    );
+    let moves = published(&trace::take());
+    for file in files_below(area.path()).iter().filter(|p| p.is_file()) {
+        assert!(moves.contains(file), "{} was not published by a durable move", file.display());
+    }
 }
 
 /// A copy that does not read back as written is found, not trusted: the machine is
@@ -1092,44 +1097,38 @@ fn a_copy_that_does_not_read_back_blocks_the_barrier() {
     }
 }
 
-/// Every name that leads to the area is flushed: the directories created for the
-/// recovery root, the root, the group and the area itself, and the chain is
-/// flushed once more last, after the manifest and before the barrier is declared.
+/// Every name that leads to the area is published by a durable move, and the
+/// manifest is the last thing moved: the barrier is declared only over an area
+/// whose directories (the recovery root, the group, the area, its sub-directories
+/// and the ancestors created for the root) are all on disk.
 #[test]
-fn the_chain_of_directories_to_the_area_is_fsynced_before_the_barrier() {
-    use crate::native_rebootstrap_recovery::test_hooks::DIR_SYNCS;
+fn every_name_that_leads_to_the_area_is_published_before_the_manifest() {
     let w = scenario(|b1, h1| vec![put_op("x", 2, vec![rem(b1, 1, h1)])]);
     let base = private_tempdir();
     let root = base.path().join("a").join("b").join("recovery");
-    DIR_SYNCS.with(|dirs| dirs.borrow_mut().clear());
+    trace::take();
 
     let preserved = begin_with(&w.b, built(&w.sealer), &root, &mut no_hook).unwrap();
 
-    let synced = DIR_SYNCS.with(|dirs| dirs.borrow().clone());
+    let moves = published(&trace::take());
     let group_dir = preserved.dir.parent().unwrap().to_path_buf();
+    let manifest = preserved.dir.join("manifest.json");
     for created in [
-        base.path().to_path_buf(),
         base.path().join("a"),
         base.path().join("a").join("b"),
         root.clone(),
-        group_dir.clone(),
+        group_dir,
         preserved.dir.clone(),
         preserved.dir.join("versions"),
         preserved.dir.join("deltas"),
         preserved.dir.join("verification-material"),
     ] {
-        assert!(
-            synced.contains(&created),
-            "{} was never fsynced; synced {synced:?}",
-            created.display()
-        );
+        let at = moves.iter().position(|to| *to == created);
+        let at =
+            at.unwrap_or_else(|| panic!("{} was never published; {moves:?}", created.display()));
+        assert!(at < moves.len() - 1, "{} was published after the manifest", created.display());
     }
-    let tail = &synced[synced.len() - 4..];
-    assert_eq!(
-        tail,
-        [preserved.dir.clone(), group_dir, root.clone(), root.parent().unwrap().to_path_buf()],
-        "the whole chain must be flushed last, from the area up"
-    );
+    assert_eq!(moves.last(), Some(&manifest), "the manifest is the last thing published");
 }
 
 /// An fsync that fails is an error, not a count: the file is not trusted, the
@@ -1170,7 +1169,7 @@ fn temporaries_left_by_an_interrupted_write_are_removed_on_resume() {
     let (preserved, _) = preserved_area(&w, root.path());
     let leftovers: Vec<PathBuf> = ["", "versions", "deltas", "verification-material"]
         .iter()
-        .map(|sub| preserved.dir.join(sub).join(".tmp-0123456789abcdef"))
+        .map(|sub| preserved.dir.join(sub).join(".yadorilink-v1-stage.0123456789abcdef"))
         .collect();
     for leftover in &leftovers {
         fs::write(leftover, b"half a file").unwrap();
@@ -1257,32 +1256,40 @@ fn a_manifest_with_dangling_references_is_refused() {
     }
 }
 
-/// Creating the area flushes the entry of every directory it creates in that
-/// directory's parent, ancestors of the recovery root included.
+/// Creating the area publishes every directory it creates, ancestors of the
+/// recovery root included.
 #[test]
-fn creating_the_area_flushes_each_created_directory_in_its_parent() {
-    use crate::native_rebootstrap_recovery::test_hooks::DIR_SYNCS;
+fn creating_the_area_publishes_each_created_directory() {
     let base = private_tempdir();
     let root = base.path().join("a").join("b").join("recovery");
-    DIR_SYNCS.with(|dirs| dirs.borrow_mut().clear());
+    trace::take();
 
     let area = RecoveryArea::create(&root, &group(), &new_recovery_id(), &[]).unwrap();
 
-    let synced = DIR_SYNCS.with(|dirs| dirs.borrow().clone());
-    let group_dir = area.dir().parent().unwrap().to_path_buf();
-    for parent in [
-        base.path().to_path_buf(),
+    let moves = published(&trace::take());
+    for created in [
         base.path().join("a"),
         base.path().join("a").join("b"),
         root.clone(),
-        group_dir,
+        area.dir().parent().unwrap().to_path_buf(),
+        area.dir().to_path_buf(),
     ] {
-        assert!(
-            synced.contains(&parent),
-            "{} gained an entry that was never flushed",
-            parent.display()
-        );
+        assert!(moves.contains(&created), "{} was never published", created.display());
     }
+}
+
+/// The targets of the durable moves in `trace`, in order.
+fn published(
+    trace: &[yadorilink_fs_platform::durable_dir::trace::Event],
+) -> Vec<std::path::PathBuf> {
+    use yadorilink_fs_platform::durable_dir::trace::Event;
+    trace
+        .iter()
+        .filter_map(|event| match event {
+            Event::Move { to, .. } => Some(to.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 // --- the area is the one the journal recorded ---------------------------------------------------------
@@ -1746,20 +1753,46 @@ fn a_platform_without_directory_durability_starts_nothing() {
 }
 
 #[test]
-fn the_windows_gate_stays_closed_until_validated_on_a_windows_host() {
-    // Flipping this requires validating directory durability on a real Windows host.
-    const { assert!(!crate::native_rebootstrap_recovery::WINDOWS_DIRECTORY_DURABILITY_VALIDATED) };
+fn a_durable_write_flushes_a_stage_file_then_publishes_it_by_a_durable_move() {
+    use crate::native_rebootstrap_recovery::test_hooks::FILE_SYNCS;
+    use crate::native_rebootstrap_recovery::write_durable;
+    use yadorilink_fs_platform::durable_dir::trace::Event;
+    let dir = private_tempdir();
+    FILE_SYNCS.with(|n| n.set(0));
+    trace::take();
+    write_durable(dir.path(), "final", b"bytes").unwrap();
+    let steps = trace::take();
+    let [Event::Move { from: stage, to, .. }, ..] = steps.as_slice() else {
+        panic!("unexpected steps {steps:?}")
+    };
+    assert_eq!(to, &dir.path().join("final"));
+    let name = stage.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        matches!(
+            yadorilink_fs_platform::reserved_namespace::parse_artefact_component(&name),
+            Some((yadorilink_fs_platform::reserved_namespace::ArtefactKind::Stage, _))
+        ),
+        "{name}"
+    );
+    assert_eq!(FILE_SYNCS.with(|n| n.get()), 1, "the content is flushed before it is published");
+    assert_eq!(fs::read(dir.path().join("final")).unwrap(), b"bytes");
 }
 
 #[test]
-fn a_durable_write_renames_then_flushes_the_directory_that_holds_the_new_name() {
-    use crate::native_rebootstrap_recovery::{test_hooks::ORDER, write_durable};
-    let dir = private_tempdir();
-    ORDER.with(|o| o.borrow_mut().clear());
-    write_durable(dir.path(), "final", b"bytes").unwrap();
-    let order = ORDER.with(|o| o.borrow().clone());
-    assert_eq!(order.len(), 2, "{order:?}");
-    assert!(order[0].starts_with("rename:.tmp-") && order[0].ends_with("->final"), "{order:?}");
-    assert_eq!(order[1], format!("syncdir:{}", dir.path().display()));
-    assert_eq!(fs::read(dir.path().join("final")).unwrap(), b"bytes");
+fn removing_an_area_commits_by_a_durable_move_and_leaves_nothing() {
+    let base = private_tempdir();
+    let root = base.path().join("recovery");
+    let area = RecoveryArea::create(&root, &group(), &new_recovery_id(), &[]).unwrap();
+    area.write_target_bundle(b"bundle").unwrap();
+    let id = area.dir().file_name().unwrap().to_string_lossy().into_owned();
+    trace::take();
+
+    RecoveryArea::remove(&root, &group(), &id).unwrap();
+
+    assert!(!area.dir().exists());
+    assert!(files_below(&root).iter().all(|p| p.is_dir()), "{:?}", files_below(&root));
+    let moves = published(&trace::take());
+    assert_eq!(moves.len(), 1, "only the area itself moves: {moves:?}");
+    assert_eq!(moves[0].parent(), area.dir().parent());
+    RecoveryArea::remove(&root, &group(), &id).unwrap();
 }

@@ -81,6 +81,10 @@ impl MaterializationPolicy {
 pub enum ProviderKind {
     None,
     MacFileProvider,
+    /// The Windows Cloud Files (CfAPI) sync root. Like `MacFileProvider` it is an OS adapter
+    /// kind, not a sync-model kind: the root is served through the same provider model (root id,
+    /// item ids, readiness, publication, fetch gate).
+    WindowsCfapi,
 }
 
 impl ProviderKind {
@@ -88,6 +92,19 @@ impl ProviderKind {
         match self {
             Self::None => "none",
             Self::MacFileProvider => "mac_file_provider",
+            Self::WindowsCfapi => "windows_cfapi",
+        }
+    }
+
+    /// The provider kind this build's operating system serves, or `None` where the OS has no
+    /// provider adapter (such a platform refuses provider links).
+    pub const fn for_host_platform() -> Option<Self> {
+        if cfg!(target_os = "macos") {
+            Some(Self::MacFileProvider)
+        } else if cfg!(windows) {
+            Some(Self::WindowsCfapi)
+        } else {
+            None
         }
     }
 
@@ -95,6 +112,7 @@ impl ProviderKind {
         match value {
             "none" => Self::None,
             "mac_file_provider" => Self::MacFileProvider,
+            "windows_cfapi" => Self::WindowsCfapi,
             other => unknown_persisted_enum("provider kind", other),
         }
     }

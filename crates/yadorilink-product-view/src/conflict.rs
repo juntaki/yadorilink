@@ -74,6 +74,10 @@ pub enum ConflictReason {
     FolderAtPath,
 }
 
+/// Status line for a kept conflict copy whose durability is not yet confirmed
+/// by another device. Shared wording for any UI.
+pub const WAITING_FOR_CONFIRMATION: &str = "Both versions were kept. This PC is waiting for another device to confirm the copy before updating the file.";
+
 impl ConflictReason {
     fn from_wire(reason: WireConflictReason) -> Self {
         match reason {
@@ -88,9 +92,7 @@ impl ConflictReason {
     pub fn explanation(self) -> &'static str {
         match self {
             Self::ConcurrentEdit => {
-                "Two devices edited this file at the same time. The other edit lost the \
-                 tie-break (older effective timestamp, or the same timestamp broken by device \
-                 id) and was kept here as a separate file instead of being overwritten."
+                "Edited on two devices; both versions were kept. This is the other version."
             }
             Self::FolderAtPath => {
                 "Its name is a folder now: one device made a folder there while another had a \

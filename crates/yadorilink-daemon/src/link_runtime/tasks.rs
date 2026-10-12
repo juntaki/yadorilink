@@ -26,10 +26,8 @@ use std::sync::Arc;
 
 use tokio::task::JoinHandle;
 use yadorilink_filesystem_sync::debounce::{self, DebounceFlush};
+use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
 use yadorilink_local_capture::LocalChangeProcessor;
-use yadorilink_root_authority::ignore_patterns::{
-    is_ignore_file_relative_path, EffectiveIgnoreSet,
-};
 use yadorilink_root_authority::root_identity::RootVerificationStatePort;
 
 use crate::link_runtime::dependencies::LinkRuntimeDependencies;

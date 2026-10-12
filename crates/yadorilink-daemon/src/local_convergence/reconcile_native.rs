@@ -6,12 +6,12 @@
 //! What a pass over a seed set does:
 //!
 //! 1. Plans the levels the seeds and their ancestors live on.
-//! 2. Orders the work: at each depth the copies and relocated entries first
-//!    (a leaf leaves its name for a directory only once its content stands at
-//!    a copy name), then the directories, then the entries at their own names;
-//!    deletions last, deepest first.
+//! 2. Orders the work: at each depth the directories, then the entries;
+//!    deletions last, deepest first. A path that gives up content another path
+//!    still holds waits until that path has it (the displacement guard).
 //! 3. Gives each node the shape the plan requires, and projects entries
-//!    through [`Election::Native`], which re-plans under the path lock.
+//!    through [`Election::Native`], which re-plans under the path lock. A
+//!    contested path, and everything below it, is left alone.
 //! 4. Deletes a path only when the plan holds nothing for it *and* the row at
 //!    it was produced under native authority (it names a native head).
 //!    An empty native state never deletes.
@@ -28,7 +28,6 @@ use yadorilink_peer_session::peer_session::*;
 use yadorilink_peer_session::PeerSessionError;
 use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_replica_domain::ids::SyncPath;
-use yadorilink_replica_domain::native_materialize::Placement;
 use yadorilink_replica_domain::native_plan::{NativeLevelPlan, NativePlannedNode};
 use yadorilink_replica_domain::session_state::LinkGate;
 
@@ -42,21 +41,16 @@ enum Work {
     Absent,
 }
 
-/// Position in a pass: shallow first; copies and relocations, then
-/// directories, then own-name entries; deletions after everything, deep first.
+/// Position in a pass: shallow first; directories, then entries; deletions
+/// after everything, deep first.
 fn rank(path: &str, work: &Work) -> (u8, usize, u8) {
     let depth = path.matches('/').count();
     match work {
         Work::Absent => (1, usize::MAX - depth, 0),
-        Work::Node(NativePlannedNode::Entry { placement, .. })
-            if *placement != Placement::AtPath =>
-        {
-            (0, depth, 0)
-        }
         Work::Node(
             NativePlannedNode::StructuralDirectory | NativePlannedNode::ExplicitDirectory { .. },
-        ) => (0, depth, 1),
-        Work::Node(NativePlannedNode::Entry { .. }) => (0, depth, 2),
+        ) => (0, depth, 0),
+        Work::Node(NativePlannedNode::Entry { .. }) => (0, depth, 1),
     }
 }
 
@@ -72,7 +66,7 @@ enum Gate {
 
 /// A file or symlink the plan puts at its own path.
 fn is_plain_entry(node: &NativePlannedNode) -> bool {
-    matches!(node, NativePlannedNode::Entry { placement: Placement::AtPath, .. })
+    matches!(node, NativePlannedNode::Entry { .. })
 }
 
 /// The claim `path`'s write may close. A path whose conflict copy failed
@@ -100,7 +94,7 @@ fn claim_for<'a>(
 /// read only that path's state. What the serial order gave beyond that is kept
 /// by construction:
 ///
-/// * directories, copies and relocations (ranked ahead at every depth), absent
+/// * directories (ranked ahead at every depth), absent
 ///   paths (ranked last) and anything declined are barriers: the run gathered
 ///   so far finishes before the barrier item starts, and the next run starts
 ///   after it;
@@ -139,8 +133,8 @@ struct RunIndependence {
 
 impl RunIndependence {
     fn conflicts_with_run(&self, path: &str) -> bool {
+        use yadorilink_fs_platform::canonical_fold::canonical_fold;
         use yadorilink_replica_domain::conflict::is_conflict_copy_of;
-        use yadorilink_root_authority::canonical_fold::canonical_fold;
         let own = canonical_fold(path);
         // An entry that folds onto the directory another entry lives in, or the
         // reverse, is the same kind of collision.
@@ -154,7 +148,7 @@ impl RunIndependence {
     }
 
     fn admit(&mut self, path: &str) {
-        use yadorilink_root_authority::canonical_fold::canonical_fold;
+        use yadorilink_fs_platform::canonical_fold::canonical_fold;
         self.names.insert(canonical_fold(path));
         self.ancestors.extend(proper_ancestors(path).map(canonical_fold));
         self.paths.push(path.to_owned());
@@ -251,16 +245,6 @@ impl super::LocalConvergenceExecutor {
     ) -> Result<ProjectionAttempt, PeerSessionError> {
         let call_started = std::time::Instant::now();
         let plan_started = crate::receive_diag::clock();
-        // A copy is reconciled with its source: when a head of the source goes,
-        // the copy of it that is on disk is not named by any delta.
-        let mut seed_paths = seed_paths;
-        let mut copies = BTreeSet::new();
-        for path in &seed_paths {
-            copies.extend(self.state.native_placed_names_of(group_id, path).map_err(|error| {
-                PeerSessionError::from(crate::sync_error::SyncError::from(error))
-            })?);
-        }
-        seed_paths.extend(copies);
         let LinkGate::Live { policy, .. } = self.state.link_gate_for_group(group_id)? else {
             return Ok(ProjectionAttempt { settled: Default::default(), retry: seed_paths });
         };
@@ -311,26 +295,30 @@ impl super::LocalConvergenceExecutor {
             call_timer.add_dag_resolution(started.elapsed());
         }
 
+        // A contested path is not planned: it and everything below it wait for
+        // the loser's author to rename its head. Nothing is created, replaced
+        // or removed at or below it.
+        let contested: BTreeSet<String> = plans
+            .values()
+            .flat_map(|plan| plan.contested.iter().map(|path| path.as_str().to_owned()))
+            .collect();
+
         // The work: every node of a planned level that a seed (or the
-        // ancestor of one) is or stands for, and every seed the plan holds
-        // nothing for.
+        // ancestor of one) is, and every seed the plan holds nothing for.
         let mut work: BTreeMap<String, Work> = BTreeMap::new();
-        for (level, plan) in &plans {
-            for (physical, node) in &plan.nodes {
-                let source_is_interesting = match node {
-                    NativePlannedNode::Entry { head, .. } => {
-                        interesting.contains(head.source_path.as_str())
-                    }
-                    _ => false,
-                };
-                if interesting.contains(physical.as_str()) || source_is_interesting {
-                    work.insert(physical.as_str().to_owned(), Work::Node(node.clone()));
+        for plan in plans.values() {
+            for (path, node) in &plan.nodes {
+                if interesting.contains(path.as_str()) {
+                    work.insert(path.as_str().to_owned(), Work::Node(node.clone()));
                 }
             }
-            let _ = level;
         }
         for path in &seed_paths {
             if work.contains_key(path) {
+                continue;
+            }
+            if contested.contains(path) {
+                retry.insert(path.clone());
                 continue;
             }
             if unplannable.contains(parent_of(path)) {
@@ -348,7 +336,7 @@ impl super::LocalConvergenceExecutor {
         }
         let settle_started = crate::receive_diag::clock();
         let frozen = self.group_frozen(group_id)?;
-        let mut unshaped: BTreeSet<String> = BTreeSet::new();
+        let mut unshaped: BTreeSet<String> = contested.clone();
         let limit = self.receive_write_concurrency();
         let mut run: Vec<RunEntry<'_>> = Vec::new();
         let mut independence = RunIndependence::default();
@@ -412,10 +400,7 @@ impl super::LocalConvergenceExecutor {
                 }
                 Work::Node(node) => {
                     let claim = claim_for(claims, path, &retry);
-                    self.native_settle_node(
-                        group_id, path, node, &work, &settled, policy, prefetched, claim,
-                    )
-                    .await
+                    self.native_settle_node(group_id, path, node, policy, prefetched, claim).await
                 }
             };
             self.record_native_outcome(
@@ -661,7 +646,6 @@ impl super::LocalConvergenceExecutor {
             )
         });
         let mut outcomes = {
-            let settled_view: &BTreeMap<String, SettlementEvidence> = settled;
             // Built in a loop, not through a closure: a closure returning a borrowing
             // future makes the pass's future unprovably `Send`.
             let mut pending = Vec::with_capacity(run.len());
@@ -672,8 +656,6 @@ impl super::LocalConvergenceExecutor {
                     entry,
                     &budget,
                     window.as_ref(),
-                    work,
-                    settled_view,
                     policy,
                     prefetched,
                 ));
@@ -706,8 +688,6 @@ impl super::LocalConvergenceExecutor {
         entry: &RunEntry<'_>,
         budget: &tokio::sync::Semaphore,
         window: Option<&Arc<super::completion_window::CompletionWindow>>,
-        work: &BTreeMap<String, Work>,
-        settled: &BTreeMap<String, SettlementEvidence>,
         policy: yadorilink_replica_domain::session_state::MaterializationPolicy,
         prefetched: &HashMap<String, BlockRequirement>,
     ) -> (usize, Result<MaterializeResult, PeerSessionError>) {
@@ -722,8 +702,6 @@ impl super::LocalConvergenceExecutor {
             group_id,
             entry.path,
             entry.node,
-            work,
-            settled,
             policy,
             prefetched,
             entry.claim,
@@ -738,10 +716,9 @@ impl super::LocalConvergenceExecutor {
     }
 
     /// The zero-work pre-check under native authority: `path` is confirmed
-    /// current only when native's plan makes it a plain entry at its own name
-    /// (no copy or relocation recorded for the same source) and the recorded proof
-    /// equals what native requires there. A removal, a directory, a contested
-    /// path, or a path native cannot plan yet does the real work.
+    /// current only when native's plan makes it a plain entry and the recorded
+    /// proof equals what native requires there. A removal, a directory, a
+    /// contested path, or a path native cannot plan yet does the real work.
     pub(crate) fn native_zero_work_settlement(
         &self,
         group_id: &str,
@@ -756,30 +733,8 @@ impl super::LocalConvergenceExecutor {
             Err(yadorilink_sync_sqlite::SyncSqliteError::NotFound(_)) => return Ok(None),
             Err(error) => return Err(crate::sync_error::SyncError::from(error).into()),
         };
-        // A copy or relocation recorded for this source is reconciled with
-        // it: when the copy's head is gone the plan no longer names it, but
-        // its row is still on disk, and only a pass over the source seeds it.
-        // Closing the source with no work would leave the copy behind.
-        let placed = self
-            .state
-            .native_placed_names_of(group_id, path)
-            .map_err(|error| PeerSessionError::from(crate::sync_error::SyncError::from(error)))?;
-        if !placed.is_empty() {
-            return Ok(None);
-        }
         let own = SyncPath(path.to_owned());
-        if !matches!(
-            plan.nodes.get(&own),
-            Some(NativePlannedNode::Entry { placement: Placement::AtPath, .. })
-        ) {
-            return Ok(None);
-        }
-        let placed_elsewhere = plan.nodes.iter().any(|(physical, node)| {
-            *physical != own
-                && matches!(node, NativePlannedNode::Entry { head, .. }
-                    if head.source_path.as_str() == path)
-        });
-        if placed_elsewhere {
+        if !matches!(plan.nodes.get(&own), Some(NativePlannedNode::Entry { .. })) {
             return Ok(None);
         }
         Ok(self.state.dag_zero_work_settlement_if_already_current(group_id, path)?.map(
@@ -789,6 +744,54 @@ impl super::LocalConvergenceExecutor {
         ))
     }
 
+    /// Whether `path` may give up the content its row shows, to show `planned`
+    /// (`None` for a directory or nothing): a version that is live at another
+    /// path as well is first on disk there, and on a platform that can make
+    /// that durable.
+    pub(crate) fn displacement_allowed(
+        &self,
+        group_id: &str,
+        path: &str,
+        planned: Option<&yadorilink_replica_domain::ids::VersionHash>,
+    ) -> Result<bool, PeerSessionError> {
+        use yadorilink_sync_sqlite::displacement_guard::DisplacementGuard;
+        let verdict = self
+            .state
+            .displacement_guard(group_id, path, planned)
+            .map_err(crate::sync_error::SyncError::from)?;
+        Ok(match verdict {
+            DisplacementGuard::Clear => true,
+            DisplacementGuard::Wait => false,
+            DisplacementGuard::Guarded(holders) => {
+                // The rows are the index's belief; the disk must show it.
+                for holder in &holders {
+                    let on_disk = matches!(
+                        self.zero_work_settlement_for_path(group_id, holder)?,
+                        Some(SettlementEvidence::ExactObject { .. })
+                    );
+                    if !on_disk {
+                        return Ok(false);
+                    }
+                }
+                let durable = match self.sync_root(group_id) {
+                    Ok(root) => {
+                        yadorilink_sync_sqlite::displacement_guard::destructive_step_durable(&root)
+                    }
+                    Err(_) => false,
+                };
+                if !durable {
+                    tracing::warn!(
+                        group_id,
+                        path,
+                        "the conflict is resolved, but this platform cannot yet make the file \
+                         update durable; the local file is left as it is"
+                    );
+                }
+                durable
+            }
+        })
+    }
+
     /// Gives `path` the shape `node` requires and projects it.
     #[allow(clippy::too_many_arguments)]
     async fn native_settle_node(
@@ -796,20 +799,39 @@ impl super::LocalConvergenceExecutor {
         group_id: &str,
         path: &str,
         node: &NativePlannedNode,
-        work: &BTreeMap<String, Work>,
-        settled: &BTreeMap<String, SettlementEvidence>,
         policy: yadorilink_replica_domain::session_state::MaterializationPolicy,
         prefetched: &HashMap<String, BlockRequirement>,
         claim: Option<super::obligation_claims::PathClaim<'_>>,
     ) -> Result<MaterializeResult, PeerSessionError> {
+        let planned = match node {
+            NativePlannedNode::Entry { head, .. } => Some(head.version()),
+            _ => None,
+        };
+        if !self.displacement_allowed(group_id, path, planned.as_ref())? {
+            return Ok(MaterializeResult::RetryRequired);
+        }
+        // A copy of content already on this device (a fork's copy of a hydrated
+        // loser) is written, not left a placeholder: the guard at the original
+        // path waits for it to stand on disk.
+        let policy = match (&planned, policy) {
+            (
+                Some(version),
+                yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
+            ) if self
+                .state
+                .version_present_elsewhere(group_id, path, version)
+                .map_err(crate::sync_error::SyncError::from)? =>
+            {
+                yadorilink_replica_domain::session_state::MaterializationPolicy::Eager
+            }
+            _ => policy,
+        };
         match node {
             NativePlannedNode::StructuralDirectory => {
-                let placed = self.native_leaf_placed_elsewhere(path, work, settled);
-                self.settle_structural_container(group_id, path, placed).await
+                self.settle_structural_container(group_id, path).await
             }
             NativePlannedNode::ExplicitDirectory { .. } => {
-                let placed = self.native_leaf_placed_elsewhere(path, work, settled);
-                if !self.displace_leaf_for_directory(group_id, path, placed).await? {
+                if !self.displace_leaf_for_directory(group_id, path).await? {
                     return Ok(MaterializeResult::RetryRequired);
                 }
                 self.materialize_native_entry(
@@ -822,29 +844,20 @@ impl super::LocalConvergenceExecutor {
                 )
                 .await
             }
-            NativePlannedNode::Entry { head, placement, .. } => {
-                if *placement == Placement::AtPath {
-                    // A directory that holds this name under another spelling
-                    // cannot be displaced by an entry. A *leaf* that folds to
-                    // it is the name collision the materializer holds the
-                    // record for, so it is not declined here.
-                    if self.folded_directory_holds_name(group_id, path)? {
-                        return Ok(MaterializeResult::RetryRequired);
-                    }
-                    match self.settle_directory_in_the_way(group_id, path).await? {
-                        DirectoryVerdict::Clear => {}
-                        DirectoryVerdict::Retry => return Ok(MaterializeResult::RetryRequired),
-                        DirectoryVerdict::Kept { reason } => {
-                            // The directory stays: the entry lives at a name
-                            // of its own, recorded as a hold so the next plan
-                            // keeps it there.
-                            return self
-                                .native_hold_entry_beside_directory(
-                                    group_id, path, head, policy, reason,
-                                )
-                                .await;
-                        }
-                    }
+            NativePlannedNode::Entry { .. } => {
+                // A directory that holds this name under another spelling
+                // cannot be displaced by an entry. A *leaf* that folds to
+                // it is the name collision the materializer holds the
+                // record for, so it is not declined here.
+                if self.folded_directory_holds_name(group_id, path)? {
+                    return Ok(MaterializeResult::RetryRequired);
+                }
+                match self.settle_directory_in_the_way(group_id, path).await? {
+                    DirectoryVerdict::Clear => {}
+                    DirectoryVerdict::Retry => return Ok(MaterializeResult::RetryRequired),
+                    // The directory stays and the entry waits: the obstacle is
+                    // this device's own, never a replicated name.
+                    DirectoryVerdict::Kept => return Ok(MaterializeResult::RetryRequired),
                 }
                 self.materialize_native_entry(
                     group_id,
@@ -857,65 +870,6 @@ impl super::LocalConvergenceExecutor {
                 .await
             }
         }
-    }
-
-    /// Whether the leaf this device holds at `path` also stands, with its
-    /// content on disk, at a copy or relocated name written earlier in this
-    /// pass; only then may it leave `path` for a directory.
-    fn native_leaf_placed_elsewhere(
-        &self,
-        path: &str,
-        work: &BTreeMap<String, Work>,
-        settled: &BTreeMap<String, SettlementEvidence>,
-    ) -> bool {
-        work.iter().any(|(physical, item)| {
-            physical != path
-                && matches!(item, Work::Node(NativePlannedNode::Entry { head, .. })
-                    if head.source_path.as_str() == path)
-                && settled.get(physical).is_some_and(super::namespace_steps::content_on_disk)
-        })
-    }
-
-    /// Keeps a directory that may not be removed at `path` and writes the
-    /// entry at the first free numbered name of its source, recorded as a
-    /// reconciliation hold.
-    async fn native_hold_entry_beside_directory(
-        &self,
-        group_id: &str,
-        path: &str,
-        head: &yadorilink_replica_domain::native_plan::NativeLocatedHead,
-        policy: yadorilink_replica_domain::session_state::MaterializationPolicy,
-        reason: &str,
-    ) -> Result<MaterializeResult, PeerSessionError> {
-        let mut attempt = 1u32;
-        let name = loop {
-            let candidate = yadorilink_replica_domain::native_resolver::numbered_copy_name(
-                head.source_path.as_str(),
-                head.version().0,
-                attempt,
-            );
-            let taken = std::fs::symlink_metadata(self.local_file_path(group_id, &candidate)?)
-                .is_ok()
-                || self.state.get_file(group_id, &candidate)?.is_some_and(|row| !row.deleted);
-            if !taken {
-                break candidate;
-            }
-            attempt += 1;
-        };
-        let placed = match self.materialize_native_hold(group_id, &name, head, policy).await? {
-            MaterializeResult::Settled(_) => true,
-            MaterializeResult::RetryRequired => false,
-        };
-        if placed {
-            self.state.record_reconciliation_hold(group_id, &name, path).map_err(|error| {
-                PeerSessionError::from(crate::sync_error::SyncError::from(error))
-            })?;
-        }
-        Ok(if placed {
-            MaterializeResult::Settled(SettlementEvidence::Retained { reason: reason.to_owned() })
-        } else {
-            MaterializeResult::RetryRequired
-        })
     }
 
     /// The plan holds nothing for `path`. It is removed only when the row at
@@ -970,6 +924,11 @@ impl super::LocalConvergenceExecutor {
             return Ok(MaterializeResult::Settled(SettlementEvidence::ExactAbsent {
                 mutation_generation,
             }));
+        }
+        // Under the path lock: the content this removal drops lives on at
+        // another path (a fork) and is on disk there, or the path waits.
+        if !self.displacement_allowed(group_id, path, None)? {
+            return Ok(MaterializeResult::RetryRequired);
         }
         if self.state.row_authoring(group_id, path)?.is_none() {
             // Not known to be produced under native authority: revalidate

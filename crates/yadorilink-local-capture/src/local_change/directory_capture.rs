@@ -22,7 +22,10 @@ use std::path::Path;
 
 use crate::error::LocalCaptureError;
 use crate::ports::CapturedDirectory;
-use yadorilink_local_storage::{read_replicated_xattrs, unix_mode_from_metadata};
+use yadorilink_fs_platform::fs_identity::{
+    disk_race_fingerprint, FileIdentity, IdentityComparison,
+};
+use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
 use yadorilink_replica_domain::file::{FileRecord, FileVersion, RecordKind};
 use yadorilink_replica_domain::ids::SyncPath;
 use yadorilink_replica_domain::local_op::Op;
@@ -30,12 +33,6 @@ use yadorilink_replica_domain::native_state::NativeCaptureWitness;
 use yadorilink_replica_domain::recursive_operation::is_ancestor_or_self;
 use yadorilink_replica_domain::session_state::{
     LocalFileMetaColumns, MaterializationState, PreparedLocalMutation,
-};
-use yadorilink_root_authority::fs_identity::{
-    disk_race_fingerprint, FileIdentity, IdentityComparison,
-};
-use yadorilink_root_authority::ignore_patterns::{
-    is_ignore_file_relative_path, EffectiveIgnoreSet,
 };
 use yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence;
 use yadorilink_sync_sqlite::structural_origin::{
@@ -53,7 +50,7 @@ use super::path_policy::{
 };
 use super::record_builder::metadata_columns_for;
 use super::semantic_delete::Removal;
-use super::{now_unix_nanos, LocalChangeOutcome, LocalChangeProcessor};
+use super::{LocalChangeOutcome, LocalChangeProcessor};
 
 /// What capture does with a directory it finds on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +93,7 @@ pub(super) fn directory_entry(
 /// one recorded as `recorded` had.
 #[cfg(unix)]
 fn permission_bits_changed(recorded: &FileIdentity, lstat: &std::fs::Metadata) -> bool {
-    yadorilink_root_authority::fs_identity::directory_permission_bits_changed(recorded, lstat)
+    yadorilink_fs_platform::fs_identity::directory_permission_bits_changed(recorded, lstat)
 }
 
 #[cfg(not(unix))]
@@ -198,8 +195,13 @@ impl LocalChangeProcessor {
         {
             return Ok(DirectoryVerdict::Nothing);
         }
-        let unix_mode = unix_mode_from_metadata(lstat);
         let row = self.state.canonical_current_row(group_id, rel_path)?;
+        let unix_mode = self.captured_unix_mode(
+            lstat,
+            &super::Predecessor::of_row(
+                row.as_ref().filter(|row| row.snapshot.record_kind == RecordKind::Directory),
+            ),
+        );
         // Only a leaf that was on disk here can have been replaced: a peer's
         // entry still being written, admitted but not yet projected, or
         // held off disk by a name hazard never stood at the path, so the
@@ -218,7 +220,7 @@ impl LocalChangeProcessor {
             // directory got here is not a change to it.
             if row.snapshot.record_kind != RecordKind::Directory
                 || row.snapshot.unix_mode.is_none()
-                || row.snapshot.unix_mode == unix_mode
+                || unix_mode == row.snapshot.unix_mode
                 || self.state.has_materialization_intent(group_id, rel_path)?
             {
                 return Ok(DirectoryVerdict::Nothing);
@@ -343,33 +345,13 @@ impl LocalChangeProcessor {
         else {
             return Ok(LocalChangeOutcome::None);
         };
-        // The leaf this directory replaced sat under a copy name the
-        // namespace placed another entry's File or Symlink at: removing it
-        // was deleting that entry, authored at the entry itself (see
-        // `LocalMutationStore::write_through_source`). The directory is
-        // then a new entry at the name it was made under.
-        if let Some(emitter) = self.change_emitter.as_deref() {
-            if let Some(source) = self.state.write_through_source(group_id, rel_path)? {
-                let native_witness = self.state.native_capture_witness(group_id, rel_path)?;
-                self.state.commit_write_through_deletion(
-                    group_id,
-                    rel_path,
-                    &source,
-                    Some(native_witness),
-                    &self.device_id,
-                    now_unix_nanos(),
-                    emitter,
-                    &self.begin_operation()?.permit(),
-                )?;
-            }
-        }
         let (record, op, version, meta) = directory_entry(rel_path, unix_mode);
         // The proof names the directory only if it is still the directory
         // the verdict was taken on, with the mode being authored.
         let identity = FileIdentity::observe_path(event_path).ok().filter(|identity| {
-            identity.object_kind == yadorilink_root_authority::fs_identity::ObjectKind::Directory
+            identity.object_kind == yadorilink_fs_platform::fs_identity::ObjectKind::Directory
                 && std::fs::symlink_metadata(event_path)
-                    .is_ok_and(|now| now.is_dir() && unix_mode_from_metadata(&now) == unix_mode)
+                    .is_ok_and(|now| now.is_dir() && self.mode_unchanged_since(&now, unix_mode))
         });
         let directory = CapturedDirectory { record, op, version, meta, identity };
         self.state.commit_captured_directory(
@@ -449,9 +431,9 @@ impl LocalChangeProcessor {
         match rename_to {
             None => {
                 // The caller holds this one.
-                let held = yadorilink_root_authority::canonical_fold::canonical_fold(rel_path);
+                let held = yadorilink_fs_platform::canonical_fold::canonical_fold(rel_path);
                 to_lock.retain(|path| {
-                    yadorilink_root_authority::canonical_fold::canonical_fold(path) != held
+                    yadorilink_fs_platform::canonical_fold::canonical_fold(path) != held
                 });
             }
             Some(to) => {
@@ -689,15 +671,16 @@ impl LocalChangeProcessor {
             if !lstat.is_dir() || !exact_leaf_exists_as_directory(root, dest) {
                 return Ok(None);
             }
-            let unix_mode = unix_mode_from_metadata(&lstat);
+            let unix_mode =
+                self.captured_unix_mode(&lstat, &super::Predecessor::of_row(Some(moved)));
             let (record, op, version, meta) = directory_entry(dest, unix_mode);
             let proof = FileIdentity::observe_path(&dest_abs)
                 .ok()
                 .filter(|identity| {
                     identity.object_kind
-                        == yadorilink_root_authority::fs_identity::ObjectKind::Directory
+                        == yadorilink_fs_platform::fs_identity::ObjectKind::Directory
                         && std::fs::symlink_metadata(&dest_abs).is_ok_and(|now| {
-                            now.is_dir() && unix_mode_from_metadata(&now) == unix_mode
+                            now.is_dir() && self.mode_unchanged_since(&now, unix_mode)
                         })
                 })
                 .map(|filesystem_identity| LocalCaptureActualStateEvidence::Present {
@@ -733,10 +716,16 @@ impl LocalChangeProcessor {
             None,
         )?;
         let LocalChangeOutcome::FileChanged(record) = outcome else { return Ok(None) };
+        // The moved entry's predecessor is the row it moved from, for the mode
+        // as for the attributes: the destination has no row of its own.
+        let unix_mode = match (&classification, std::fs::metadata(&dest_abs)) {
+            (None, Ok(now)) => {
+                Some(self.captured_unix_mode(&now, &super::Predecessor::of_row(Some(moved))))
+            }
+            _ => unix_mode,
+        };
         let xattrs = if classification.is_none() {
-            std::fs::File::open(&dest_abs)
-                .map(|file| read_replicated_xattrs(&file))
-                .unwrap_or_default()
+            self.captured_xattrs(&dest_abs, &super::Predecessor::of_row(Some(moved)))
         } else {
             Vec::new()
         };

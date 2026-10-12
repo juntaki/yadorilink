@@ -944,7 +944,7 @@ async fn signing_out_revokes_the_installation_on_the_server() {
         .expect("reading the credential")
         .expect("an enrolled installation has a credential");
 
-    yadorilink_cli::commands::auth::logout().await.expect("signing out should succeed");
+    yadorilink_cli::commands::auth::logout(true).await.expect("signing out should succeed");
 
     match account::deletion_status().await {
         Err(CoreError::NotLoggedIn) => {}
@@ -1011,7 +1011,7 @@ async fn forgetting_local_credentials_does_not_revoke_anything() {
         .expect("forgetting local credentials must not have revoked the installation");
 
     // Leave nothing live behind.
-    yadorilink_cli::commands::auth::logout().await.expect("signing out at the end");
+    yadorilink_cli::commands::auth::logout(true).await.expect("signing out at the end");
 }
 
 // --- 4. the FAPI 2.0 negatives, against this deployment ----------------------

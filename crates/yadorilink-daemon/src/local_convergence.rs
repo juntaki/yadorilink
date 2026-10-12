@@ -1,9 +1,7 @@
 //! Convergence work that has no peer in it.
 //!
-//! Some of what a device owes a folder is decided entirely by its own state.
-//! Whether an ephemeral conflict copy is still justified by the current
-//! frontier is a question about this device's native state, its file index and its
-//! disk; no peer is consulted, and none can answer it.
+//! Some of what a device owes a folder is decided entirely by its own state:
+//! projecting its native state onto its disk, which no peer is consulted for.
 //!
 //! That work lived on `PeerSyncSession`, which had two consequences. A device
 //! with no peer connected — solo, newly linked, offline — could not do it at
@@ -38,11 +36,9 @@ use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_replica_domain::session_state::LinkGate;
 use yadorilink_root_authority::root_commit::{RootCommitPermit, RootLease};
 
+use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
 use yadorilink_peer_session::hazard;
 use yadorilink_peer_session::peer_session::RootCommitAuthorityProvider;
-use yadorilink_root_authority::ignore_patterns::{
-    is_ignore_file_relative_path, EffectiveIgnoreSet,
-};
 
 /// The local half of convergence: everything decided from this device alone.
 pub struct LocalConvergenceExecutor {
@@ -88,6 +84,11 @@ pub struct LocalConvergenceExecutor {
     /// a test can land a local write in exactly that window.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) between_assemble_and_persist_hook: StdMutex<Option<AssembleHook>>,
+    /// Test-only, one-shot: runs after an eager write's bytes and metadata
+    /// are on disk and before the proof observes the object, so a test can
+    /// land a local write in the window the proof would otherwise absorb.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) after_write_before_proof_hook: StdMutex<Option<AssembleHook>>,
     /// Test-only: pins how many own-name entries a pass settles at once
     /// (`0` leaves the configured value in force).
     #[cfg(any(test, feature = "test-support"))]
@@ -290,11 +291,13 @@ mod rebootstrap_freeze_tests;
 #[cfg(test)]
 mod namespace_capture_tests;
 
+/// A contested path keeps the disk until forked; the displacement guard and
+/// the durability gate stand between a winner and the loser's only copy.
 #[cfg(test)]
-mod projection_attempt_tests;
+mod contest_displacement_tests;
 
 #[cfg(test)]
-mod retirement_audit_guard_tests;
+mod projection_attempt_tests;
 
 /// `materialize_symlink_at` and
 /// `try_apply_metadata_only_update`, exercised directly against a
@@ -351,9 +354,6 @@ mod hazard_index_equivalence_tests;
 #[cfg(test)]
 mod require_physical_kind_matches_tests;
 
-#[cfg(test)]
-mod frontier_freshness_tests;
-
 /// Liveness regression for `ignore_sets`'s bounded-staleness reload: a
 /// `.yadorilinkignore` edit must eventually take effect for incoming records
 /// on a peer session that never gets reconstructed, not stay frozen for the
@@ -401,10 +401,6 @@ pub(crate) enum Election<'a> {
     /// kind, placement and the source it stands for); any difference declines,
     /// and the next pass plans afresh.
     Native { expected: &'a yadorilink_replica_domain::native_plan::NativePlannedNode },
-    /// `head` written at a name the reconciler chose because its own name is
-    /// held by a directory that stays. Fresh while the plan still puts exactly
-    /// this head at its source path.
-    NativeHold { head: &'a yadorilink_replica_domain::native_plan::NativeLocatedHead },
 }
 
 /// Whether a materialization applies the recapture rule to an
@@ -496,6 +492,8 @@ impl LocalConvergenceExecutor {
             block_write_activity_provider,
             #[cfg(any(test, feature = "test-support"))]
             between_assemble_and_persist_hook: StdMutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            after_write_before_proof_hook: StdMutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             receive_write_concurrency_override: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
@@ -629,12 +627,13 @@ impl LocalConvergenceExecutor {
         &self,
         group_id: &str,
         path: &str,
+        volume: types::VolumeFolding,
     ) -> Result<bool, PeerSessionError> {
         if self.observably_absent_on_disk(group_id, path)? {
             return Ok(true);
         }
         let root = self.sync_root(group_id)?;
-        Ok(hazard::observably_absent_by_exact_name(&root, path))
+        Ok(hazard::observably_absent_by_exact_name(&root, path, volume.normalization_insensitive))
     }
 
     /// Whether the regular file at `out_path` holds bytes this device has
@@ -699,7 +698,7 @@ impl LocalConvergenceExecutor {
             disk_content_comparison(out_path, blocks)
                 .map(|found| found == DiskContentComparison::PresentButDifferent)
         };
-        let state = self.state.get_materialization_state(group_id, rel_path).ok().flatten();
+        let state = self.state.get_materialization_state(group_id, rel_path)?;
         if !matches!(state, Some(MaterializationState::Present | MaterializationState::Remote)) {
             return Ok(false);
         }
@@ -710,6 +709,10 @@ impl LocalConvergenceExecutor {
         {
             return Ok(false);
         }
+        // Bytes are not the whole of a local edit: a chmod or xattr change
+        // moves neither, yet the scanner captures it as one. Ask the scanner's
+        // own question (disk mode and xattrs against the row's, exactly).
+        let metadata_edited = self.disk_metadata_differs_from_row(group_id, rel_path, out_path)?;
         if state == Some(MaterializationState::Present)
             && self.state.dag_has_usable_materialized_generation(group_id, rel_path)?
         {
@@ -718,16 +721,19 @@ impl LocalConvergenceExecutor {
             // daemon's own write, untouched since, is not an edit whichever
             // version it holds (an older version's bytes under a newer row);
             // anything that moved off the proof must still equal the row.
-            if self.state.dag_disk_is_untouched_proven_write(group_id, rel_path, out_path)? {
+            if self.state.disk_is_untouched_proven_write_at(group_id, rel_path, out_path)? {
                 return Ok(false);
             }
-            return Ok(differs_from(&local_row.blocks)?);
+            return Ok(metadata_edited || differs_from(&local_row.blocks)?);
         }
         // An object no proof vouches for (`Remote` over bytes, or `Present`
         // without evidence): a capture whose own disk observation raced
         // leaves exactly this, naming what it read while disk moved on. Real
         // bytes that match neither the row's version nor `incoming` are an
         // uncaptured edit.
+        if metadata_edited {
+            return Ok(true);
+        }
         if !differs_from(&local_row.blocks)? {
             return Ok(false);
         }
@@ -735,6 +741,27 @@ impl LocalConvergenceExecutor {
             Some(incoming) => Ok(differs_from(incoming)?),
             None => Ok(true),
         }
+    }
+
+    /// Whether the mode or replicated xattrs on disk differ from the row's,
+    /// compared as the scanner does (`on_disk != indexed`, a row without a
+    /// mode included).
+    fn disk_metadata_differs_from_row(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+        out_path: &Path,
+    ) -> Result<bool, PeerSessionError> {
+        let Some(row) = self.state.current_row_snapshot(group_id, rel_path)? else {
+            return Ok(false);
+        };
+        let meta = row.to_file_version().meta;
+        let Ok(file) = std::fs::File::open(out_path) else { return Ok(false) };
+        // Off Unix a disk has no mode to compare.
+        let mode_differs = cfg!(unix)
+            && file.metadata().map(|m| yadorilink_local_storage::unix_mode_from_metadata(&m))?
+                != meta.unix_mode;
+        Ok(mode_differs || yadorilink_local_storage::read_replicated_xattrs(&file) != meta.xattrs)
     }
 
     /// Whether removing `rel_path` on a projected removal would destroy
@@ -895,7 +922,9 @@ impl LocalConvergenceExecutor {
         let file_type = lstat.file_type();
         let moved_on = match kind {
             RecordKind::Directory if file_type.is_dir() => {
-                version.meta.unix_mode.is_some()
+                // Off Unix a disk has no mode to compare.
+                cfg!(unix)
+                    && version.meta.unix_mode.is_some()
                     && yadorilink_local_storage::unix_mode_from_metadata(&lstat)
                         != version.meta.unix_mode
             }
@@ -905,7 +934,7 @@ impl LocalConvergenceExecutor {
                     .map_err(yadorilink_local_storage::StorageError::Io)?;
                 version.meta.symlink_target.as_deref()
                     != Some(
-                        yadorilink_root_authority::fs_identity::target_to_bytes(&target).as_slice(),
+                        yadorilink_fs_platform::fs_identity::target_to_bytes(&target).as_slice(),
                     )
             }
             RecordKind::Symlink => file_type.is_file(),
@@ -1103,7 +1132,14 @@ impl LocalConvergenceExecutor {
                     // from the row: see `observably_absent_on_disk`. By
                     // exact name, because this name collides with a live
                     // sibling that a plain lookup resolves to instead.
-                    if !self.observably_absent_by_exact_name(group_id, &record.path)? {
+                    let root = self.sync_root(group_id)?;
+                    let volume = types::VolumeFolding {
+                        case_insensitive: hazard::is_case_insensitive_filesystem(&root),
+                        normalization_insensitive: hazard::is_normalization_insensitive_filesystem(
+                            &root,
+                        ),
+                    };
+                    if !self.observably_absent_by_exact_name(group_id, &record.path, volume)? {
                         return Ok(MaterializeResult::RetryRequired);
                     }
                     // No disk mutation occurred here
@@ -1131,7 +1167,7 @@ impl LocalConvergenceExecutor {
         // just as final for bytes this device never captured. A local edit
         // still on disk here is retried, not removed -- once captured, it
         // meets this tombstone as a concurrent edit instead of vanishing.
-        if self.disk_holds_uncaptured_local_bytes(group_id, &record.path, &out_path, None)? {
+        if self.removal_would_destroy_unrecorded_state(group_id, &record.path, &out_path)? {
             tracing::info!(
                 group_id,
                 path = %record.path,
@@ -1214,7 +1250,7 @@ impl LocalConvergenceExecutor {
             )?;
         } else {
             // The path carries no native head: it is a pure local artifact
-            // (an ephemeral conflict copy of the projection fixpoint) that no
+            // (a displaced leaf that no admitted delta touched) that no
             // admitted delta ever touched, and
             // `persist_row_under_fresh_operation` would upsert a 'current'
             // row via `upsert_file_with_origin`, which the schema's
@@ -1290,11 +1326,12 @@ impl LocalConvergenceExecutor {
                 return Ok(removal);
             }
         }
-        match std::fs::remove_file(out_path) {
-            Ok(()) => Ok(TombstoneRemoval::Removed),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TombstoneRemoval::Removed),
-            Err(e) => Err(PeerSessionError::from(e)),
-        }
+        // The caller records the path as absent next, so the removal is durable
+        // when this returns (a failed flush is an error: nothing is recorded).
+        yadorilink_local_storage::remove_durably(out_path, &self.state.temp_ledger(group_id))?;
+        #[cfg(test)]
+        removal_ordering_probe::fire(out_path);
+        Ok(TombstoneRemoval::Removed)
     }
 
     /// Whether the directory at `out_path` is the object this device
@@ -1310,7 +1347,7 @@ impl LocalConvergenceExecutor {
         out_path: &Path,
     ) -> Result<bool, PeerSessionError> {
         let Ok(observed) =
-            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(out_path)
+            yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(out_path)
         else {
             return Ok(false);
         };
@@ -1351,27 +1388,39 @@ impl LocalConvergenceExecutor {
         out_path: &Path,
     ) -> Result<Option<TombstoneRemoval>, PeerSessionError> {
         use yadorilink_local_storage::EmptyDirectoryRemoval;
-        Ok(match yadorilink_local_storage::remove_empty_dir(out_path)? {
-            EmptyDirectoryRemoval::Removed => {
-                self.state
-                    .forget_removed_directory(group_id, rel_path)
-                    .map_err(crate::sync_error::SyncError::from)?;
-                Some(TombstoneRemoval::Removed)
-            }
-            EmptyDirectoryRemoval::Absent => Some(TombstoneRemoval::Removed),
-            // The directory this delete aimed at: bound to its identity,
-            // so a later pass removes this object once it is empty, and
-            // never a different directory made at the same path.
-            EmptyDirectoryRemoval::NotEmpty => Some(TombstoneRemoval::Retained {
-                reason: self.retained_directory_reason_for(group_id, rel_path)?,
-                removable: yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
-                    out_path,
-                )
-                .ok()
-                .map(Box::new),
-            }),
-            EmptyDirectoryRemoval::NotADirectory => None,
-        })
+        Ok(
+            match yadorilink_local_storage::remove_empty_dir_in(
+                out_path,
+                &self.state.temp_ledger(group_id),
+            )? {
+                EmptyDirectoryRemoval::Removed => {
+                    self.state
+                        .forget_removed_directory(group_id, rel_path)
+                        .map_err(crate::sync_error::SyncError::from)?;
+                    Some(TombstoneRemoval::Removed)
+                }
+                EmptyDirectoryRemoval::Absent => Some(TombstoneRemoval::Removed),
+                // The directory this delete aimed at: bound to its identity,
+                // so a later pass removes this object once it is empty, and
+                // never a different directory made at the same path.
+                EmptyDirectoryRemoval::NotEmpty => Some(TombstoneRemoval::Retained {
+                    reason: self.retained_directory_reason_for(group_id, rel_path)?,
+                    removable: yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(
+                        out_path,
+                    )
+                    .ok()
+                    .map(Box::new),
+                }),
+                // A child appeared while the directory was being removed and its name
+                // was taken meanwhile: nothing was deleted, and what stands at the
+                // name now is not this delete's to touch.
+                EmptyDirectoryRemoval::Stranded(_) => Some(TombstoneRemoval::Retained {
+                    reason: self.retained_directory_reason_for(group_id, rel_path)?,
+                    removable: None,
+                }),
+                EmptyDirectoryRemoval::NotADirectory => None,
+            },
+        )
     }
 
     /// Records the directory a delete aimed at and found not empty as
@@ -1385,7 +1434,7 @@ impl LocalConvergenceExecutor {
         group_id: &str,
         rel_path: &str,
         reason: &str,
-        removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+        removable: Option<&yadorilink_fs_platform::fs_identity::FileIdentity>,
     ) -> Result<(), PeerSessionError> {
         self.state
             .keep_retained_directory(group_id, rel_path, reason, removable)
@@ -1433,7 +1482,7 @@ impl LocalConvergenceExecutor {
     ) -> Result<Option<SettlementEvidence>, PeerSessionError> {
         let out_path = self.local_file_path(group_id, rel_path)?;
         let Ok(observed) =
-            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path)
+            yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path)
         else {
             return Ok(None);
         };
@@ -1577,374 +1626,6 @@ impl LocalConvergenceExecutor {
         }
     }
 
-    /// Standalone entry point for the retirement step alone -- see
-    /// `retire_unjustified_ephemeral_conflict_copies`'s own doc comment for
-    /// what it does and why. `engine_wrapper.rs`'s event-driven retirement
-    /// loop calls this directly instead of the full `reconcile_local_
-    /// materialization_audit` below, which also re-drives unapplied-change
-    /// reprojection and materialization-repair candidates -- heavier work
-    /// a frontier-changed/job-completed retirement trigger has no bearing
-    /// on. Single-flights per group through its OWN `RetirementAuditGuard`
-    /// key -- a SEPARATE key space from `reconcile_local_materialization_
-    /// audit`/`reconcile_paths_directly`'s `MaterializationAuditGuard`, so
-    /// a full audit already in flight for a group no longer makes THIS
-    /// call report `RetirementAttempt::Busy`; only two retirement passes
-    /// for the same group ever contend with each other. See
-    /// `RetirementAuditGuard`'s own doc comment for why that coarser
-    /// group-wide sharing was never actually load-bearing for correctness,
-    /// and `RetirementAttempt`'s own doc comment for what each variant
-    /// means for a generation-tracked caller.
-    ///
-    /// Whole-pass frontier freshness: `frontier_before` is this device's
-    /// own admitted native heads for `group_id`, read right after the
-    /// `RetirementAuditGuard` is acquired (before any copy is examined);
-    /// `frontier_after` is the same read again right after the retirement
-    /// pass returns (after every mutation it made is durable). If they
-    /// differ, some OTHER admission (a peer's change arriving, or a local
-    /// edit) landed while this pass was evaluating justification against
-    /// whatever frontier was current when it started -- every individual
-    /// decision inside the pass was locally consistent with SOME real
-    /// frontier, but not provably the one current when the pass returns,
-    /// so the whole pass reports `RetirementAttempt::FrontierChanged`
-    /// instead of its own inner outcome, even if that inner outcome was
-    /// `Settled`. This deliberately does not attempt a per-copy freshness
-    /// recheck immediately before each delete (Commit 5's own scope is the
-    /// whole-pass guard only) -- see `retire_unjustified_ephemeral_
-    /// conflict_copies`'s own doc comment for why a copy this pass
-    /// mutated is never left in a worse state than before, only
-    /// potentially stale, and a caller that does not complete the
-    /// generation on `FrontierChanged` gets exactly the re-evaluation
-    /// against the CURRENT frontier that closes the gap.
-    pub async fn retire_conflict_copies_only(
-        &self,
-        group_id: &str,
-    ) -> Result<RetirementAttempt, PeerSessionError> {
-        if !matches!(
-            self.state.directory_link_gate_for_group(group_id)?,
-            Some(LinkGate::Live { .. })
-        ) {
-            return Ok(RetirementAttempt::Settled { retired: 0 });
-        }
-        let Some(_guard) = RetirementAuditGuard::try_acquire(&self.state, group_id) else {
-            return Ok(RetirementAttempt::Busy);
-        };
-        let frontier_before = self.state.native_author_frontier(group_id)?;
-        let audit_attempt_id = next_audit_attempt_id();
-        let (outcome, retired_generations) =
-            self.retire_unjustified_ephemeral_conflict_copies(group_id, audit_attempt_id).await?;
-        let frontier_after = self.state.native_author_frontier(group_id)?;
-        if frontier_changed_during_pass(&frontier_before, &frontier_after) {
-            // The deletions already happened and are not undone, but
-            // `frontier_before` is no longer provably this group's causal
-            // basis, so none of `retired_generations` is published here --
-            // each path's own pre-delete fence bump already made its
-            // prior proof non-usable, which is all the invariant requires
-            // in this case.
-            return Ok(RetirementAttempt::FrontierChanged);
-        }
-        // Publish regardless of whether `outcome` itself is `Settled` or
-        // `RetryRequired` -- `RetryRequired` means some OTHER copy was
-        // never re-verified this pass, which says nothing about the
-        // copies this pass genuinely did delete. Each publication is its
-        // own per-path CAS on the fence value that path's own pre-delete
-        // bump produced; a CAS failure for one path never blocks
-        // another's.
-        // Held across the publications, not merely across the deletes:
-        // the proof is what says this path is exactly absent, and it is
-        // published after the delete that made it so. A root swapped in
-        // between would make that claim about a root this device no
-        // longer owns.
-        let root_commit_authority = self.root_lease_for(group_id)?;
-        let root_commit_authority_op = root_commit_authority.begin_operation()?;
-        let root_commit_permit = root_commit_authority_op.permit();
-        self.state.publish_retired_copy_absence(
-            group_id,
-            &retired_generations,
-            &root_commit_permit,
-        );
-        Ok(outcome)
-    }
-
-    /// The live rows of `group_id` whose filename carries the conflict-copy
-    /// marker. Reads only the rows the marker index selects, so the cost
-    /// follows the number of copies and not the size of the group.
-    pub(crate) fn live_conflict_copy_shaped(
-        &self,
-        group_id: &str,
-    ) -> Result<Vec<FileRecord>, PeerSessionError> {
-        Ok(self
-            .state
-            .list_live_conflict_copy_candidates(group_id)?
-            .into_iter()
-            .filter(|r| {
-                !r.deleted && yadorilink_replica_domain::conflict::is_conflict_copy_path(&r.path)
-            })
-            .collect())
-    }
-
-    /// The whole-group read this pass used to make: every row decoded, then
-    /// filtered, with the group's native head paths read up front. Kept as
-    /// the oracle the indexed read is compared against.
-    #[cfg(test)]
-    pub(crate) fn live_conflict_copy_shaped_by_full_scan(
-        &self,
-        group_id: &str,
-    ) -> Result<(Vec<FileRecord>, std::collections::HashSet<String>), PeerSessionError> {
-        let copy_shaped = self
-            .state
-            .list_files(group_id)?
-            .into_iter()
-            .filter(|r| {
-                !r.deleted && yadorilink_replica_domain::conflict::is_conflict_copy_path(&r.path)
-            })
-            .collect();
-        Ok((copy_shaped, self.state.native_head_paths(group_id)?))
-    }
-
-    /// Removes locally-materialized conflict copies that are pure artifacts
-    /// of a *transient* frontier: (a) no admitted change carries the copy
-    /// path (it exists only because this device's projection fixpoint
-    /// happened to run at a moment when its losing head was live), and (b)
-    /// the CURRENT frontier's resolution of the base path no longer derives
-    /// it (the loser has since been superseded — typically by its own
-    /// author's next edit, which closes the conflict window without any
-    /// cross-branch merge and therefore without any carrier obligation).
-    ///
-    /// This closes a confirmed, reproduced convergence divergence (seed
-    /// `1254137095109609298` under contention, and ~1-in-3 locally with the
-    /// repair sweep active from t=0): devices reconcile at whatever
-    /// intermediate frontiers their arrival order produces, so a device
-    /// that passed through the transient concurrent moment materializes and
-    /// indexes the copy while a device that first reconciled after the
-    /// window closed never derives it — four identical DAGs, identical
-    /// resolutions, permanently different file sets, and nothing on either
-    /// side ever changes its mind. Retiring the unjustified copy makes
-    /// every device converge on the durable-plus-currently-justified copy
-    /// set: a copy for a loser that is STILL live stays (condition (b))
-    /// until the retroactive repair loop makes it durable, and a copy any
-    /// change carries stays permanently (condition (a)).
-    ///
-    /// Safety: a user file that merely mimics the copy naming is protected
-    /// by (a) — its own creation/edit emits a change carrying the path
-    /// (the same argument that lets `backfill_missing_history` skip
-    /// copy-shaped paths). Before deleting, any same-path local edit still
-    /// sitting in the debounce accumulator is flushed and history re-read
-    /// (the flushed change then protects it), a path still in the dirty
-    /// journal is skipped outright (its pending change is not yet
-    /// re-driven), and the whole check-then-delete runs under the path
-    /// lock, mirroring `reconcile_group_paths`' Absent-branch discipline.
-    ///
-    /// Returns `RetirementAttempt::Settled` only if every copy-shaped file
-    /// this pass examined was either justified or successfully retired.
-    /// One copy's tombstone `materialize` returning `MaterializeResult::
-    /// RetryRequired` (transient block/disk condition) makes the WHOLE
-    /// pass `RetirementAttempt::RetryRequired`, even if every other copy
-    /// settled cleanly: the caller uses this to decide whether it may
-    /// consider the frontier generation it targeted fully verified, and a
-    /// pass that skipped even one copy's re-evaluation has not verified
-    /// it. The operation is idempotent regardless -- a copy already
-    /// retired by an earlier pass this same call just does not appear in
-    /// `copy_shaped` on the next one.
-    /// Returns the pass's `RetirementAttempt` status ALONGSIDE the set of
-    /// paths it physically deleted, each mapped to the mutation-fence value
-    /// (`E`) its own pre-delete bump produced -- a pass's status and the
-    /// paths it mutated are independent facts, and only
-    /// `retire_conflict_copies_only` (the caller with its
-    /// own frontier-freshness proof) may use this map to publish.
-    pub(crate) async fn retire_unjustified_ephemeral_conflict_copies(
-        &self,
-        group_id: &str,
-        audit_attempt_id: u64,
-    ) -> Result<(RetirementAttempt, std::collections::BTreeMap<String, i64>), PeerSessionError>
-    {
-        let mut retired_generations = std::collections::BTreeMap::new();
-        let root_commit_authority = self.root_lease_for(group_id)?;
-        let root_commit_authority_op = root_commit_authority.begin_operation()?;
-        let root_commit_permit = root_commit_authority_op.permit();
-        let Some(LinkGate::Live { .. }) = self.state.directory_link_gate_for_group(group_id)?
-        else {
-            return Ok((RetirementAttempt::Settled { retired: 0 }, retired_generations));
-        };
-        let copy_shaped = self.live_conflict_copy_shaped(group_id)?;
-        if copy_shaped.is_empty() {
-            return Ok((RetirementAttempt::Settled { retired: 0 }, retired_generations));
-        }
-        let mut retired = 0usize;
-        let mut retry_required = false;
-        for record in copy_shaped {
-            if self.state.native_path_has_heads(group_id, &record.path)? {
-                continue;
-            }
-            if self.state.is_path_dirty(group_id, &record.path)? {
-                continue;
-            }
-            if yadorilink_replica_domain::conflict::conflict_copy_stem_was_truncated(&record.path) {
-                // The copy's name was shortened to fit the filesystem's
-                // per-component limit, so it no longer spells its source
-                // path in full. Resolving the prefix would find nothing
-                // and make a perfectly justified copy look unjustified,
-                // and this audit deletes what it finds unjustified. An
-                // inversion that cannot be trusted is not evidence.
-                continue;
-            }
-            let base = yadorilink_replica_domain::conflict::conflict_copy_source_path(&record.path);
-            // NativeState decides which copies exist: a copy is justified
-            // while its plan puts an entry of the source at that name, and
-            // a level that cannot be planned yet is never evidence that a
-            // copy may go.
-            // The copy's own name and its source are planned together: the placements a copy
-            // needs are recorded around its source, not around the copy's name.
-            let planned = self.state.native_plan_nodes(
-                group_id,
-                namespace_steps::parent_of(&record.path),
-                &std::collections::BTreeSet::from([record.path.clone(), base.to_owned()]),
-            );
-            let justified = match planned {
-                Ok(plan) => plan.nodes.get(&yadorilink_replica_domain::ids::SyncPath(record.path.clone())).is_some_and(|node| {
-                    matches!(node, yadorilink_replica_domain::native_plan::NativePlannedNode::Entry { head, .. }
-                        if head.source_path.as_str() == base)
-                }),
-                Err(error) => {
-                    // Keeping the copy is the safe answer, but a planner
-                    // failure that never clears would otherwise read as
-                    // a copy that is simply still justified.
-                    tracing::warn!(
-                        group_id,
-                        path = %record.path,
-                        %error,
-                        "native plan unavailable; keeping the conflict copy"
-                    );
-                    true
-                }
-            };
-            if justified {
-                continue;
-            }
-            // This device's own debounce accumulator, flushed before the
-            // path is reconciled against anything.
-            tracing::debug!(
-                group_id,
-                path = %record.path,
-                "checking this link's debounce accumulator for a pending local change"
-            );
-            if self
-                .pending_local_change_flush
-                .flush_pending_local_change(group_id, &record.path)
-                .await
-                == yadorilink_peer_session::peer_session::PendingLocalFlushOutcome::RetryRequired
-            {
-                // A local edit to this copy could not be captured; it is
-                // not this audit's to delete. A later audit re-examines it.
-                continue;
-            }
-            if !self
-                .state
-                .database()
-                .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
-                    yadorilink_sync_sqlite::native_store::native_heads_at(
-                        conn,
-                        &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned()),
-                        &yadorilink_replica_domain::ids::SyncPath(record.path.clone()),
-                    )
-                })
-                .map_err(crate::sync_error::SyncError::from)
-                .map_err(PeerSessionError::from)?
-                .is_empty()
-            {
-                // The flush just made a real local edit of this path durable
-                // -- it is user content now, not an ephemeral artifact.
-                continue;
-            }
-            let path_lock = self.state.path_lock(group_id, &record.path);
-            let _guard = crate::receive_diag::lock_path(&path_lock).await;
-            let still_live =
-                self.state.get_file(group_id, &record.path)?.map(|r| !r.deleted).unwrap_or(false);
-            if !still_live {
-                continue;
-            }
-            let tombstone = FileRecord {
-                path: record.path.clone(),
-                size: 0,
-                mtime_unix_nanos: 0,
-                blocks: Vec::new(),
-                deleted: true,
-            };
-            // The origin is this device. A retirement is decided from local
-            // state alone, so attributing its tombstone to whichever peer
-            // happened to own the session that ran it was never right — it
-            // only ever looked right because the synthetic session used this
-            // device's own id as its peer's.
-            match self
-                .materialize_tombstone(
-                    group_id,
-                    &tombstone,
-                    &self.local_device_id,
-                    &root_commit_permit,
-                )
-                .await
-            {
-                Ok(MaterializeResult::Settled(evidence)) => {
-                    retired += 1;
-                    // A tombstone `materialize` call only ever settles as
-                    // `ExactAbsent` -- the hazardous-tombstone sub-branch
-                    // reports `RetryRequired` instead (see `materialize`'s
-                    // own doc comment on the `if record.deleted` branch).
-                    // Recorded defensively rather than assumed: only a
-                    // real, fence-carrying `ExactAbsent` is ever eligible
-                    // for `retire_conflict_copies_only`'s own publication.
-                    if let SettlementEvidence::ExactAbsent { mutation_generation } = evidence {
-                        retired_generations.insert(record.path.clone(), mutation_generation);
-                    }
-                    tracing::info!(
-                        group_id,
-                        path = %record.path,
-                        audit_attempt_id,
-                        "retired an ephemeral conflict copy no longer justified by the current frontier"
-                    )
-                }
-                // `RetryRequired` is not a retirement -- the copy is still
-                // live, so the next audit re-evaluates it -- but it also
-                // means THIS pass never verified this copy's justification
-                // against the frontier it targeted, so the whole pass must
-                // report `RetryRequired`, not `Settled`: a caller that
-                // completed its target generation on a pass that silently
-                // skipped a copy's re-evaluation would never re-examine it
-                // again unless some unrelated future event happened to
-                // re-mark the group dirty.
-                Ok(MaterializeResult::RetryRequired) => {
-                    retry_required = true;
-                    tracing::debug!(
-                        group_id,
-                        path = %record.path,
-                        audit_attempt_id,
-                        "deferred retiring an ephemeral conflict copy; will re-evaluate next audit"
-                    )
-                }
-                // Same reasoning as `RetryRequired` above: a transient
-                // per-copy failure must not let the pass as a whole report
-                // `Settled` for a generation whose frontier this copy was
-                // never actually re-verified against.
-                Err(e) => {
-                    retry_required = true;
-                    tracing::warn!(
-                        group_id,
-                        path = %record.path,
-                        error = %e,
-                        "failed to retire an unjustified ephemeral conflict copy; will retry next audit"
-                    )
-                }
-            }
-        }
-        Ok((
-            if retry_required {
-                RetirementAttempt::RetryRequired
-            } else {
-                RetirementAttempt::Settled { retired }
-            },
-            retired_generations,
-        ))
-    }
-
     /// This session's currently-effective ignore set for `group_id` --
     /// see `ignore_sets`'s own doc comment for the bounded-staleness
     /// reasoning. Reloads from the group's current live root (`self.
@@ -2069,5 +1750,29 @@ impl LocalConvergenceExecutor {
                  or no provider injected)"
             ))
         })
+    }
+}
+
+/// Test probe: runs a closure at the moment a removal has returned durable and
+/// the caller has not recorded it yet, so a test can observe what the index
+/// holds at that point.
+#[cfg(test)]
+pub(crate) mod removal_ordering_probe {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    type Probe = Arc<dyn Fn() + Send + Sync>;
+    static PROBES: Mutex<Option<HashMap<PathBuf, Probe>>> = Mutex::new(None);
+
+    pub(crate) fn arm(removed: PathBuf, probe: impl Fn() + Send + Sync + 'static) {
+        PROBES.lock().unwrap().get_or_insert_with(HashMap::new).insert(removed, Arc::new(probe));
+    }
+
+    pub(super) fn fire(removed: &Path) {
+        let probe = PROBES.lock().unwrap().as_ref().and_then(|m| m.get(removed).cloned());
+        if let Some(probe) = probe {
+            probe();
+        }
     }
 }

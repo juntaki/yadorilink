@@ -30,10 +30,10 @@ use crate::materialization_execution::{
 /// race this same fingerprint also closes, eviction's outcome on a false
 /// match is more destructive: removing the object below destroys the
 /// user's just-edited bytes, not merely stale remote content.
-type DiskIdentity = Option<yadorilink_root_authority::fs_identity::DiskRaceFingerprint>;
+type DiskIdentity = Option<yadorilink_fs_platform::fs_identity::DiskRaceFingerprint>;
 
 fn disk_identity(path: &Path) -> Result<DiskIdentity, MaterializationExecutionError> {
-    Ok(yadorilink_root_authority::fs_identity::disk_race_fingerprint(path))
+    Ok(yadorilink_fs_platform::fs_identity::disk_race_fingerprint(path))
 }
 
 /// A point between eviction's last check of the object and its removal, at
@@ -78,8 +78,8 @@ pub fn eviction_quarantine_path(
 ) -> Result<std::path::PathBuf, MaterializationExecutionError> {
     use sha2::{Digest, Sha256};
     let id = hex::encode(Sha256::digest(format!("evict\0{rel_path}").as_bytes()));
-    let name = yadorilink_root_authority::reserved_namespace::artefact_component_name(
-        yadorilink_root_authority::reserved_namespace::ArtefactKind::Preimage,
+    let name = yadorilink_fs_platform::reserved_namespace::artefact_component_name(
+        yadorilink_fs_platform::reserved_namespace::ArtefactKind::Preimage,
         &id,
     )
     .map_err(|e| MaterializationExecutionError::CorruptState(e.to_string()))?;
@@ -367,7 +367,6 @@ impl<'a> ApprovedObject<'a> {
     }
 
     #[cfg(windows)]
-    #[allow(dead_code)]
     fn matches(&self, _detached: &Path) -> bool {
         true
     }
@@ -498,33 +497,11 @@ pub fn evict_file(
     )?;
     let initial_disk_identity = disk_identity(&out_path)?;
     let approved_object = ApprovedObject::observe(&out_path, &record.blocks);
-    // `#[cfg(test)]` alone would only select this crate's OWN test build --
-    // a downstream crate's tests (one that constructs a confirming custody
-    // double and expects eviction to reach physical block deletion) link
-    // this crate as an ordinary dependency, compiled without `--cfg test`,
-    // so `cfg(test)` here would silently fall through to the production
-    // verifier for every downstream caller's
-    // tests. `feature = "evict-custody-test-bypass"` is what actually
-    // crosses the crate boundary for the handful of callers that
-    // deliberately want to exercise the confirmed-custody deletion path in
-    // their own tests.
-    //
-    // This is a DIFFERENT feature than this crate's general `test-support`
-    // (which gates unrelated test doubles like `set_test_on_demand_allowed`/
-    // `FakeCommitAdapter`): `yadorilink-daemon` and `yadorilink-cli` both
-    // need `test-support` for those, but their own test
-    // (`eviction_without_remote_lease_never_reaches_physical_reclaim`)
-    // specifically asserts that an instantaneous custody confirmation
-    // *without* a durable remote lease must NOT authorize physical block
-    // deletion -- i.e. it needs the real, fails-closed
-    // `verify_reclaim_custody`, not the bypass. Folding this into the
-    // shared `test-support` feature previously made every consumer of that
-    // feature (not just the ones that opt into
-    // `evict-custody-test-bypass`) silently skip the durable-lease gate,
-    // which is exactly the regression that test caught.
+    // Only this crate's own unit tests use the custody bypass; downstream
+    // crates always get the real fails-closed verifier.
     let verified_custody = (!is_full_replica)
         .then(|| {
-            #[cfg(any(test, feature = "evict-custody-test-bypass"))]
+            #[cfg(test)]
             {
                 yadorilink_replica_engine::custody::verify_reclaim_custody_for_test(
                     custody,
@@ -534,7 +511,7 @@ pub fn evict_file(
                     &evicting_version.blocks,
                 )
             }
-            #[cfg(not(any(test, feature = "evict-custody-test-bypass")))]
+            #[cfg(not(test))]
             {
                 yadorilink_replica_engine::custody::verify_reclaim_custody(
                     custody,
@@ -701,8 +678,7 @@ pub fn evict_file(
                 && disk_bytes_match_indexed_blocks(&out_path, &record.blocks).unwrap_or(false);
             let abandoned = match intact
                 .then(|| {
-                    yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path)
-                        .ok()
+                    yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path).ok()
                 })
                 .flatten()
             {

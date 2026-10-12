@@ -272,6 +272,10 @@ message ProviderEvictRequest {
   bytes item_id = 2;
   bytes request_id = 3;
   bytes target_version_hash = 4;   // the version being published (trace only; not a version proof)
+  // When set (a 32-byte version hash): drop the copy only if the app currently shows the item at exactly this
+  // version, otherwise answer NOT_MATERIALIZED and drop nothing. A request that arrives late must not act on
+  // content the daemon never confirmed. Empty: the publication's unconditional eviction.
+  bytes require_shown_version = 5;
 }
 
 // app -> daemon. A wire reply only: the daemon never persists the result.

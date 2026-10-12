@@ -267,7 +267,7 @@ async fn an_unobservable_write_leaves_the_path_retryable_not_stuck() {
     let observed_path = observed.path().join("doc.txt");
     std::fs::write(&observed_path, b"").unwrap();
     let identity =
-        yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&observed_path).unwrap();
+        yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&observed_path).unwrap();
     // A present object's proof has to carry the version the row names,
     // or it matches no desired resolution and closes nothing.
     let current_version_hash = current_version_hash_for(&sync_state, "group-1", "doc.txt");
@@ -2517,7 +2517,7 @@ async fn a_newer_version_over_old_bytes_leaves_the_row_present_and_the_bytes_pro
     );
     assert!(!coordinator.sqlite().dag_usable_proof_names_current_version(GROUP, PATH).unwrap());
     let on_disk = root.path().join(PATH);
-    assert!(coordinator.dag_disk_is_untouched_proven_write(GROUP, PATH, &on_disk).unwrap());
+    assert!(coordinator.disk_is_untouched_proven_write_at(GROUP, PATH, &on_disk).unwrap());
 
     // Local capture: the older bytes are not an edit.
     let processor = yadorilink_local_capture::LocalChangeProcessor::new(
@@ -2555,7 +2555,7 @@ async fn a_newer_version_over_old_bytes_leaves_the_row_present_and_the_bytes_pro
 
     // Once the bytes are touched they are no longer the daemon's own write.
     std::fs::write(&on_disk, b"an edit").unwrap();
-    assert!(!coordinator.dag_disk_is_untouched_proven_write(GROUP, PATH, &on_disk).unwrap());
+    assert!(!coordinator.disk_is_untouched_proven_write_at(GROUP, PATH, &on_disk).unwrap());
     let authored = processor.scan_existing_files(GROUP, &canonical_root).unwrap();
     assert!(authored.iter().any(|record| record.path == PATH), "an edit must be captured");
 }
@@ -2999,7 +2999,7 @@ async fn restoring_a_symlink_version_recreates_a_real_symlink_not_an_empty_regul
         .set_symlink_target(
             GROUP,
             PATH,
-            Some(&yadorilink_root_authority::fs_identity::target_to_bytes(std::path::Path::new(
+            Some(&yadorilink_fs_platform::fs_identity::target_to_bytes(std::path::Path::new(
                 "v1-target",
             ))),
         )
@@ -3042,7 +3042,7 @@ async fn restoring_a_symlink_version_recreates_a_real_symlink_not_an_empty_regul
     );
     assert_eq!(
         state.replica_coordinator.file_index_repository().get_symlink_target(GROUP, PATH).unwrap(),
-        Some(yadorilink_root_authority::fs_identity::target_to_bytes(std::path::Path::new(
+        Some(yadorilink_fs_platform::fs_identity::target_to_bytes(std::path::Path::new(
             "v1-target"
         ))),
         "the current row's symlink_target must be updated to match the restored version"
@@ -3186,7 +3186,7 @@ async fn hydrate_after_a_symlink_restore_does_not_destroy_it() {
         .set_symlink_target(
             GROUP,
             PATH,
-            Some(&yadorilink_root_authority::fs_identity::target_to_bytes(std::path::Path::new(
+            Some(&yadorilink_fs_platform::fs_identity::target_to_bytes(std::path::Path::new(
                 "v1-target",
             ))),
         )
@@ -4300,5 +4300,108 @@ async fn a_failure_after_the_placement_keeps_the_write_intent_open() {
             .has_materialization_intent("group-1", "doc.txt")
             .unwrap(),
         "the write intent was cleared after the bytes were placed"
+    );
+}
+
+/// An editor's atomic save -- new bytes written to a sibling, the original
+/// mtime restored, the sibling renamed over the file -- that lands on the
+/// exact size of the indexed bytes is invisible to a size+mtime comparison
+/// and leaves no dirty marker if the watcher has not seen it yet. Eviction
+/// must still notice that the bytes on disk are no longer the indexed
+/// version's, keep the file untouched and not report it freed.
+#[cfg(unix)]
+#[tokio::test]
+async fn eviction_keeps_a_same_size_same_mtime_atomic_replace_of_a_hydrated_file() {
+    use yadorilink_filesystem_sync::materialization_eviction::{
+        evict_file, MaterializationContext,
+    };
+
+    let (state, _store_dir) = test_state();
+    let root = tempfile::tempdir().unwrap();
+    let local_path = root.path().to_string_lossy().to_string();
+    state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
+    state.install_test_root_commit_authority(GROUP);
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(
+        root.path(),
+        GROUP,
+        state.replica_coordinator.as_ref(),
+    )
+    .unwrap();
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+
+    let original = b"AAAAAAAAAAAAAAAAAAAA";
+    let local_edit = b"BBBBBBBBBBBBBBBBBBBB";
+    assert_eq!(original.len(), local_edit.len());
+    let block = put_block(&state, GROUP, original);
+    state
+        .replica_coordinator
+        .file_index_repository()
+        .upsert_file_with_origin(
+            GROUP,
+            &record_with_blocks(PATH, vec![block], original.len() as u64),
+            "device-seed",
+            &permit,
+        )
+        .unwrap();
+    let out_path = root.path().join(PATH);
+    std::fs::write(&out_path, original).unwrap();
+    let fixed_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let set_mtime = |path: &std::path::Path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(fixed_mtime))
+            .unwrap();
+    };
+    set_mtime(&out_path);
+    crate::test_support::seed_prior_cycle_proof(
+        &state.replica_coordinator,
+        GROUP,
+        PATH,
+        &out_path,
+        &permit,
+    );
+
+    // The atomic save, with no watcher running to journal it.
+    let tmp_path = root.path().join("big.bin.tmp");
+    std::fs::write(&tmp_path, local_edit).unwrap();
+    set_mtime(&tmp_path);
+    std::fs::rename(&tmp_path, &out_path).unwrap();
+
+    let block_reclamation =
+        crate::adapters::block_store_ports::BlockStorePortsAdapter::new(state.block_store.clone());
+    let root_path = root.path().canonicalize().unwrap();
+    let outcome = evict_file(
+        MaterializationContext {
+            state: state.replica_coordinator.as_ref(),
+            liveness_gate: state.block_liveness_gate(),
+            store: &block_reclamation,
+            root: &root_path,
+            permit: &permit,
+        },
+        GROUP,
+        PATH,
+        false,
+        state.as_ref(),
+    );
+
+    assert_eq!(
+        std::fs::read(&out_path).unwrap(),
+        local_edit,
+        "an externally replaced file must survive eviction untouched ({outcome:?})"
+    );
+    assert!(
+        !matches!(outcome, Ok(ref o) if o.dehydrated),
+        "eviction must not report a file it left materialized as freed"
+    );
+    assert_eq!(
+        state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, PATH)
+            .unwrap(),
+        Some(MaterializationState::Present),
+        "an undetected on-disk replacement must not be committed to a placeholder"
     );
 }

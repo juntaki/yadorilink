@@ -369,8 +369,6 @@ pub(crate) fn author_delta_with_version(
                 path: SyncPath(path.into()),
                 removes: Vec::new(),
                 put: Some(DeltaPut { version: version.version_hash }),
-                keeps: Vec::new(),
-                keep_put: false,
             }],
             signature: [0; 64],
         };
@@ -676,8 +674,6 @@ fn author_two_put_delta(c: &SyncDatabase) -> [yadorilink_replica_domain::file::F
             path: SyncPath((*path).into()),
             removes: Vec::new(),
             put: Some(DeltaPut { version: version.version_hash }),
-            keeps: Vec::new(),
-            keep_put: false,
         })
         .collect();
     c.write(|conn| {
@@ -802,8 +798,6 @@ fn bulk_delta(ops: usize) -> yadorilink_replica_domain::signed_delta::NativeDelt
                 path: SyncPath(format!("photos/2026/holiday/IMG_{i:06}.jpg")),
                 removes: Vec::new(),
                 put: Some(DeltaPut { version: VersionHash([i as u8; 32]) }),
-                keeps: Vec::new(),
-                keep_put: false,
             })
             .collect(),
         signature: [0; 64],
@@ -850,7 +844,7 @@ fn a_full_bulk_delta_replicates_within_the_message_limits() {
 
 /// The largest delta authoring can sign: a bulk run is cut at the byte budget,
 /// then the op that crosses it is added, each op naming a full class of
-/// removals and a full cohort of kept heads by the longest device ids. It is
+/// removals by the longest device ids. It is
 /// within the per-item budget and `delta_batches` sends it, never drops it.
 #[test]
 fn the_largest_authorable_delta_is_sent_not_dropped() {
@@ -858,7 +852,7 @@ fn the_largest_authorable_delta_is_sent_not_dropped() {
     use yadorilink_replica_domain::ids::{AuthorSeq, DeviceId, SyncPath, VersionHash};
     use yadorilink_replica_domain::native_state::{DeltaHash, Dot};
     use yadorilink_replica_domain::signed_delta::{
-        DeltaOp, DeltaPut, HeadRef, NativeDelta, MAX_KEEPS_PER_OP, MAX_REMOVES_PER_OP,
+        DeltaOp, DeltaPut, HeadRef, NativeDelta, MAX_REMOVES_PER_OP,
     };
     let named = |i: usize| Dot {
         author: AuthorId {
@@ -875,10 +869,6 @@ fn the_largest_authorable_delta_is_sent_not_dropped() {
             .map(|i| HeadRef { dot: named(i), provenance: DeltaHash([i as u8; 32]) })
             .collect(),
         put: Some(DeltaPut { version: VersionHash([9; 32]) }),
-        keeps: (0..MAX_KEEPS_PER_OP)
-            .map(|i| HeadRef { dot: named(1000 + i), provenance: DeltaHash([i as u8; 32]) })
-            .collect(),
-        keep_put: true,
     };
     let budget = yadorilink_sync_sqlite::native_authoring::BULK_DELTA_MAX_BYTES;
     let mut ops = Vec::new();

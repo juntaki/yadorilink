@@ -262,28 +262,7 @@ mod tests {
             let put = rng
                 .chance(70)
                 .then(|| DeltaPut { version: VersionHash([1 + rng.below(4) as u8; 32]) });
-            // Kept heads: live heads (mostly with their true provenance, some
-            // with a wrong one) that this op does not remove, and a dot nobody
-            // has seen.
-            let mut keeps = Vec::new();
-            for head in state.heads_at(&sync) {
-                if rng.chance(15) && !removes.iter().any(|removal| removal.dot == head.dot) {
-                    let header = if rng.chance(85) {
-                        head.payload.provenance
-                    } else {
-                        DeltaHash([0xDD; 32])
-                    };
-                    keeps.push(HeadRef { dot: head.dot, provenance: header });
-                }
-            }
-            if rng.chance(4) {
-                keeps.push(HeadRef {
-                    dot: Dot { author: author_id(9), seq: AuthorSeq(4 + rng.below(3) as u64) },
-                    provenance: DeltaHash([0x78; 32]),
-                });
-            }
-            let keep_put = put.is_some() && rng.chance(15);
-            ops.push(DeltaOp { path: sync, removes, put, keeps, keep_put });
+            ops.push(DeltaOp { path: sync, removes, put });
         }
         let mut delta = NativeDelta {
             recursive_part: None,
@@ -308,7 +287,6 @@ mod tests {
             (0..4).map(|i| SigningKey::from_bytes(&[i as u8 + 11; 32])).collect();
         let mut verdicts: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
-        let mut kept_rows = 0i64;
         for seed in 0..1500u64 {
             let mut rng = Rng(seed);
             let incremental = conn();
@@ -341,14 +319,8 @@ mod tests {
                 if got.starts_with("ok Installed") {
                     earlier.push((delta, who));
                 }
-                kept_rows += incremental
-                    .query_row("SELECT COUNT(*) FROM native_head_keep", [], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                    .unwrap();
             }
         }
-        assert!(kept_rows > 500, "the generator kept heads too rarely: {kept_rows}");
         // The generator must actually reach every kind of verdict, or the
         // comparison above proves little.
         for kind in VERDICT_KINDS {

@@ -14,8 +14,8 @@ The eframe `yadorilink-status-app` is not part of the macOS installer;
 left (`YadoriLinkFinderSyncHost.app`, `yadorilink-status-app`), and
 `postinstall` removes the old `com.yadorilink.status-app` LaunchAgent.
 
-`build-pkg.sh` refuses to run while `YadoriLink.app` still runs on its
-fake client (see `platforms/macos/app/YadoriLinkApp/App/ClientFactory.swift`).
+`build-pkg.sh` refuses to run while the Release `YadoriLink.app` would not use the
+live client (see `platforms/macos/app/YadoriLinkApp/App/ClientFactory.swift`).
 
 The coordination service is a separate server-side deployment and is
 **not** part of this installer.
@@ -30,7 +30,10 @@ packages are signed with a Developer ID, notarized and stapled, so
 double-clicking works. Verify the checksum with
 `shasum -a 256 -c yadorilink-macos.pkg.sha256`, then install.
 
-First run, in Terminal:
+First run: open `YadoriLink.app` and follow the steps (Welcome, sign in with
+Google in your browser, choose a folder, then "Link Folder").
+
+Advanced / command line: the same setup from Terminal:
 
 ```bash
 yadorilink login
@@ -191,4 +194,5 @@ of the above; see its header comment.
 - `Distribution.xml` — `productbuild` distribution definition (product
   title, single component choice)
 - `scripts/preinstall`, `scripts/postinstall` — component pkg scripts
-- `uninstall.sh` — companion uninstaller (run manually, with `sudo`)
+- `uninstall.sh` — companion uninstaller (run manually, with `sudo`); the pkg
+  installs it at `/usr/local/share/yadorilink/uninstall.sh`

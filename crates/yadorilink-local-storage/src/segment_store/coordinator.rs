@@ -748,20 +748,44 @@ impl DurabilityCoordinator {
         }
         let segment_id = writer.next_segment_id;
         writer.next_segment_id += 1;
-        let segment = SegmentWriter::create(&self.root, segment_id)?;
-        if let Some(error) = self.check_fault(CommitPoint::AfterSegmentCreateBeforeDirSync) {
-            return Err(error);
-        }
-        // A file whose directory entry is not durable is not reachable
-        // after a crash, however well fsynced its own contents are. One
-        // barrier per segment created, not per group and not per block.
-        io_diag::time(Op::SegmentDirFsync, 0, || {
-            crate::fs_ops::sync_directory(&self.root.join(SEGMENTS_DIR))
-        })?;
-        if let Some(error) = self.check_fault(CommitPoint::AfterSegmentDirSync) {
-            return Err(error);
-        }
+        let segment = self.create_segment(segment_id)?;
         Ok(OpenBatch::created(segment))
+    }
+
+    /// A brand-new segment, published under its name with its header on disk.
+    ///
+    /// Where the volume offers durable moves the file is staged under a
+    /// reserved name beside its final one, its header flushed, and published
+    /// by a durable move, so the name never refers to a file without a whole
+    /// header and is on disk when this returns. Elsewhere it is created in
+    /// place and the directory is synced. A file whose directory entry is not
+    /// durable is not reachable after a crash, however well fsynced its own
+    /// contents are; one such barrier per segment created, not per group and
+    /// not per block.
+    fn create_segment(&self, segment_id: u64) -> Result<SegmentWriter, StorageError> {
+        let path = segment_path(&self.root, segment_id);
+        let Some(ns) = crate::fs_ops::durable_namespace_beside(&path) else {
+            let segment = SegmentWriter::create(&self.root, segment_id)?;
+            if let Some(error) = self.check_fault(CommitPoint::AfterSegmentStaged) {
+                return Err(error);
+            }
+            io_diag::time(Op::SegmentDirFsync, 0, || {
+                crate::fs_ops::sync_directory(&self.root.join(SEGMENTS_DIR))
+            })?;
+            if let Some(error) = self.check_fault(CommitPoint::AfterSegmentPublished) {
+                return Err(error);
+            }
+            return Ok(segment);
+        };
+        let staged = SegmentWriter::stage(&self.root, segment_id)?;
+        if let Some(error) = self.check_fault(CommitPoint::AfterSegmentStaged) {
+            return Err(error);
+        }
+        let segment = io_diag::time(Op::SegmentDirFsync, 0, || staged.publish(&ns))?;
+        if let Some(error) = self.check_fault(CommitPoint::AfterSegmentPublished) {
+            return Err(error);
+        }
+        Ok(segment)
     }
 
     /// Appends relocated copies of `blocks` and swaps every mapping onto
@@ -949,7 +973,7 @@ fn unix_nanos_now() -> i64 {
 pub(crate) fn ensure_segments_directory(root: &Path) -> Result<(), StorageError> {
     let segments = root.join(SEGMENTS_DIR);
     if !segments.exists() {
-        std::fs::create_dir_all(&segments)?;
+        crate::fs_ops::create_dir_all_durably(&segments)?;
         crate::fs_ops::sync_directory(root)?;
     }
     Ok(())

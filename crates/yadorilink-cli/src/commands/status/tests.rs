@@ -14,6 +14,8 @@ fn base_link() -> LinkStatus {
         group_id: "group-1".into(),
         paused: false,
         conflict_count: 0,
+        conflicts_pending: 0,
+        conflict_note: String::new(),
         materialization_policy: "eager".into(),
         hydrated_count: 0,
         placeholder_count: 0,
@@ -35,6 +37,7 @@ fn base_link() -> LinkStatus {
         policy_stale: false,
         ambiguous: false,
         ambiguous_local_paths: Vec::new(),
+        capture_volume_changed: false,
         local_storage_state: LocalStorageState::FullCopy as i32,
         fetch_availability: FetchAvailability::AvailableNow as i32,
         full_replica_device_ids: Vec::new(),
@@ -47,7 +50,7 @@ fn base_link() -> LinkStatus {
 fn no_held_files_renders_no_new_output() {
     let link = base_link();
     assert_eq!(held_summary_suffix(&link), "");
-    assert!(held_file_detail_lines(&link).is_empty());
+    assert!(held_file_detail_lines(&link, false).is_empty());
 }
 
 /// No full-replica peers configured renders no "Complete
@@ -55,7 +58,7 @@ fn no_held_files_renders_no_new_output() {
 #[test]
 fn no_full_replica_peers_renders_no_complete_copies_lines() {
     let link = base_link();
-    assert!(complete_copies_detail_lines(&link, &[]).is_empty());
+    assert!(complete_copies_detail_lines(&link, &[], false).is_empty());
 }
 
 /// the label says "configured
@@ -71,7 +74,7 @@ fn complete_copies_lines_report_available_for_a_connected_device() {
     peer.device_id = "nas-1".into();
     peer.reachability = PeerReachability::Connected as i32;
 
-    let lines = complete_copies_detail_lines(&link, &[peer]);
+    let lines = complete_copies_detail_lines(&link, &[peer], false);
     assert_eq!(lines, vec!["    configured full copy: nas-1  (available)".to_string()]);
 }
 
@@ -85,8 +88,8 @@ fn unseen_device_reads_unknown_not_offline() {
     let mut link = base_link();
     link.full_replica_device_ids = vec!["unseen-device".into()];
 
-    let lines = complete_copies_detail_lines(&link, &[]);
-    assert_eq!(lines, vec!["    configured full copy: unseen-device  (unknown)".to_string()]);
+    let lines = complete_copies_detail_lines(&link, &[], false);
+    assert_eq!(lines, vec!["    configured full copy: unseen-d...  (unknown)".to_string()]);
 }
 
 /// `Connecting`/`Unspecified` are ALSO not
@@ -100,7 +103,7 @@ fn indeterminate_reachability_states_read_unknown() {
         let mut peer = base_peer();
         peer.device_id = "nas-1".into();
         peer.reachability = state as i32;
-        let lines = complete_copies_detail_lines(&link, &[peer]);
+        let lines = complete_copies_detail_lines(&link, &[peer], false);
         assert_eq!(
             lines,
             vec!["    configured full copy: nas-1  (unknown)".to_string()],
@@ -120,7 +123,7 @@ fn complete_copies_line_reports_offline_for_a_known_unreachable_device() {
     peer.device_id = "nas-1".into();
     peer.reachability = PeerReachability::Unreachable as i32;
 
-    let lines = complete_copies_detail_lines(&link, &[peer]);
+    let lines = complete_copies_detail_lines(&link, &[peer], false);
     assert_eq!(lines, vec!["    configured full copy: nas-1  (offline)".to_string()]);
 }
 
@@ -144,12 +147,12 @@ fn held_files_render_count_and_per_file_reason() {
     ];
 
     assert_eq!(held_summary_suffix(&link), "  held=2");
-    let lines = held_file_detail_lines(&link);
+    let lines = held_file_detail_lines(&link, false);
     assert_eq!(lines.len(), 2);
     assert!(lines[0].contains("photo.jpg"));
-    assert!(lines[0].contains("case_collision"));
+    assert!(lines[0].contains("upper/lower case"));
     assert!(lines[1].contains("CON.txt"));
-    assert!(lines[1].contains("invalid_name"));
+    assert!(lines[1].contains("not allowed on this device"));
 }
 
 /// A healthy (non-degraded) link renders no degraded-related output,
@@ -406,14 +409,14 @@ fn update_failure_is_surfaced_with_a_pointer_to_update_status() {
 /// no new output at all.
 #[test]
 fn empty_overall_state_renders_no_new_output() {
-    assert_eq!(overall_state_line(&base_status()), None);
+    assert!(overall_state_lines(&base_status(), false).is_empty());
 }
 
 #[test]
 fn healthy_overall_state_renders_with_no_reasons() {
     let mut status = base_status();
     status.overall_state = "healthy".into();
-    assert_eq!(overall_state_line(&status), Some("Overall: healthy".to_string()));
+    assert_eq!(overall_state_lines(&status, false), vec!["Overall: healthy".to_string()]);
 }
 
 #[test]
@@ -421,10 +424,19 @@ fn attention_overall_state_renders_its_reasons() {
     let mut status = base_status();
     status.overall_state = "attention".into();
     status.attention_reasons = vec!["conflict:group-1".into(), "low_disk:/data".into()];
+    status.links = vec![base_link()];
     assert_eq!(
-        overall_state_line(&status),
-        Some("Overall: attention  (conflict:group-1, low_disk:/data)".to_string())
+        overall_state_lines(&status, false),
+        vec![
+            "Overall: attention".to_string(),
+            "  - Some files have conflicting copies. [/tmp/photos] Next: yadorilink conflicts list"
+                .to_string(),
+            "  - The disk is running low on space. [/data] Next: yadorilink gc --dry-run"
+                .to_string(),
+        ]
     );
+    let verbose = overall_state_lines(&status, true);
+    assert!(verbose[1].ends_with("(code: conflict:group-1)"), "{verbose:?}");
 }
 
 /// the limits summary line reports both configured and
@@ -671,7 +683,7 @@ fn a_healthy_link_renders_no_ambiguity_suffix() {
 #[test]
 fn status_lines_for_an_empty_daemon_are_pinned_verbatim() {
     assert_eq!(
-        status_lines(&base_status()),
+        status_lines(&base_status(), false),
         vec![
             "No linked folders.",
             "",
@@ -693,9 +705,9 @@ fn status_lines_for_a_busy_daemon_are_pinned_verbatim() {
         .recent_errors
         .push(RecentSyncError { category: "disk_full".into(), ..Default::default() });
     assert_eq!(
-        status_lines(&status),
+        status_lines(&status, false),
         vec![
-            "/tmp/photos  group=group-1  syncing  conflicts=0",
+            "/tmp/photos  syncing  conflicts=0",
             "",
             "Peers:",
             "  peer-1  unknown",
@@ -706,7 +718,7 @@ fn status_lines_for_a_busy_daemon_are_pinned_verbatim() {
             "Update: 0.2.0 (available)",
             "",
             "Recent errors:",
-            "  disk_full  ()  0",
+            "  disk_full  ()  unknown time",
         ]
     );
 }
@@ -743,18 +755,18 @@ fn preserved_data_renders_one_line_and_warns_above_the_threshold() {
 fn a_rebootstrapping_group_is_named() {
     let mut status = base_status();
     status.rebootstrapping_groups = vec!["g1".into()];
-    let lines = status_lines(&status);
-    assert!(lines.iter().any(|line| line.contains("group=g1") && line.contains("rebootstrap")));
+    let lines = status_lines(&status, false);
+    assert!(lines.iter().any(|line| line.contains("g1") && line.contains("rebootstrap")));
 }
 
 /// Retained uploads of undecided operations are on the status, with the age of the oldest; none, no line.
 #[test]
 fn undecided_uploads_are_reported_with_their_age() {
     let mut status = base_status();
-    assert!(!status_lines(&status).iter().any(|l| l.contains("undecided uploads")));
+    assert!(!status_lines(&status, false).iter().any(|l| l.contains("undecided uploads")));
     status.undecided_uploads = 3;
     status.undecided_uploads_oldest_ms = 5 * 3_600_000;
-    let lines = status_lines(&status);
+    let lines = status_lines(&status, false);
     assert!(lines.iter().any(|l| l == "undecided uploads: 3, oldest: 5h"), "{lines:?}");
 }
 
@@ -781,15 +793,15 @@ fn provider_roots_are_explained() {
         unconfirmed_publications: 1,
         unconfirmed_oldest_ms: 5 * 3_600_000,
     }];
-    let lines = status_lines(&status);
+    let lines = status_lines(&status, false);
     let has = |needle: &str| lines.iter().any(|l| l.contains(needle));
-    assert!(has("provider folder Photos (abcdef01): enable File Provider"), "{lines:?}");
+    assert!(has("provider folder Photos: enable File Provider"), "{lines:?}");
     assert!(has("downloading: running, 40 file(s) on this Mac, 7 to fetch, 2 in progress"));
     assert!(has("stuck: a/b.bin (5 failed attempt(s))"));
     assert!(has("edits kept beside the file: 3, oldest: 3h"));
     assert!(has("file in use or release pending): 2, oldest: 90s"), "{lines:?}");
     assert!(has("released but not yet confirmed by the OS: 1, oldest: 5h"));
-    assert!(!status_lines(&base_status()).iter().any(|l| l.contains("provider folder")));
+    assert!(!status_lines(&base_status(), false).iter().any(|l| l.contains("provider folder")));
 }
 
 /// A provider folder is named, never shown by its identity key; a removal says where the
@@ -817,14 +829,94 @@ fn provider_folders_removals_and_orphans_are_rendered_without_a_path() {
         },
     ];
     status.orphan_domains = vec!["cccccccc".into()];
-    let lines = status_lines(&status);
+    let lines = status_lines(&status, false);
     let has = |needle: &str| lines.iter().any(|l| l.contains(needle));
-    assert!(has("provider folder 'Photos'  group=group-1"), "{lines:?}");
+    assert!(has("provider folder 'Photos'  syncing"), "{lines:?}");
     assert!(!has("provider://"), "the identity key leaked into the output: {lines:?}");
     assert!(has("removed; the downloaded files are kept at /Users/u/kept"), "{lines:?}");
-    assert!(has("Going (bbbbbbbb): removing"), "{lines:?}");
+    assert!(has("Going: removing"), "{lines:?}");
     assert!(
         has("domain cccccccc belongs to no folder this database knows; it is kept"),
         "{lines:?}"
     );
+}
+
+/// Every code the daemon can emit (`overall_status` in the daemon's control socket and the held-file
+/// reasons) maps to a sentence and a next step; none leaks its raw code outside verbose mode.
+#[test]
+fn every_known_reason_code_has_a_sentence_and_a_next_step() {
+    let attention = [
+        "degraded:g",
+        "ambiguous:g",
+        "durability_at_risk:g",
+        "durability_unknown:g",
+        "fetch_unavailable:g",
+        "fetch_availability_unknown:g",
+        "conflict:g",
+        "held:g",
+        "provider_not_ready:r",
+        "provider_stuck:r",
+        "kept_edits:r",
+        "provider_orphan_domain:d",
+        "low_disk_critical:/p",
+        "low_disk:/p",
+        "peer_disconnected:dev",
+        "recent_error:cat",
+        "update_failed:cat",
+    ];
+    let held = [
+        "case_collision: collides with 'A'",
+        "invalid_name: bad",
+        "normalization_collision",
+        "case_and_normalization_collision",
+        "metadata_unprovable: unreadable",
+    ];
+    for raw in attention.iter().chain(held.iter()) {
+        let text = reasons::explain(raw, "", false);
+        assert!(text.contains(" Next: "), "{raw}: {text}");
+        assert!(!text.contains("Needs attention"), "{raw}: {text}");
+        assert!(!text.contains(raw), "{raw} leaked: {text}");
+        assert!(reasons::explain(raw, "", true).contains(&format!("(code: {raw})")));
+    }
+}
+
+#[test]
+fn an_unknown_reason_falls_back_and_shows_the_code_only_when_verbose() {
+    assert_eq!(
+        reasons::explain("brand_new:x", "", false),
+        "Needs attention Next: yadorilink status --details"
+    );
+    assert_eq!(reasons::explain("brand_new:x", "", true), "Needs attention (code: brand_new:x)");
+}
+
+#[test]
+fn durability_unknown_names_the_folder_not_the_group_id() {
+    let mut status = base_status();
+    status.overall_state = "attention".into();
+    status.attention_reasons = vec!["durability_unknown:group-1".into()];
+    status.links = vec![base_link()];
+    let lines = overall_state_lines(&status, false);
+    assert!(lines[1].starts_with("  - This folder cannot confirm it is safely stored on disk yet."));
+    assert!(lines[1].contains("/tmp/photos") && !lines[1].contains("group-1"), "{lines:?}");
+}
+
+#[test]
+fn held_files_get_a_plain_sentence() {
+    let mut link = base_link();
+    link.held_files = vec![HeldFile {
+        path: "a.txt".into(),
+        reason: "metadata_unprovable: x".into(),
+        ..Default::default()
+    }];
+    let lines = held_file_detail_lines(&link, false);
+    assert!(
+        lines[0].contains("cannot be read by you") && !lines[0].contains("metadata_unprovable")
+    );
+}
+
+#[test]
+fn timestamps_render_as_readable_times() {
+    let text = format_local_time(1_750_000_000);
+    assert!(text.starts_with("2025-06-1"), "{text}");
+    assert_eq!(format_local_time(0), "unknown time");
 }

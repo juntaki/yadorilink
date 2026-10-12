@@ -6,9 +6,10 @@ license.workspace = true
 
 # See yadorilink-local-storage/Cargo.toml's identical section for why.
 [features]
-test-support = []
+test-support = ["yadorilink-fs-platform/test-support"]
 
 [dependencies]
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
 thiserror.workspace = true
 sha2.workspace = true
@@ -20,9 +21,6 @@ serde_json = "1"
 rand = "0.10.2"
 hex = "0.4"
 fs2 = "0.4"
-# `canonical_fold`'s NFC/case-fold combined equivalence key.
-unicode-normalization = "0.1"
-caseless = "0.2.2"
 tokio.workspace = true
 
 [dev-dependencies]

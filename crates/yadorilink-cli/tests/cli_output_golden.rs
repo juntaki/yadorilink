@@ -171,7 +171,7 @@ const DAEMON_NOT_RUNNING: &str =
 // ---- no daemon, not signed in --------------------------------------------
 
 #[test]
-fn coordination_commands_report_not_logged_in_with_exit_code_2() {
+fn coordination_commands_report_not_logged_in_with_exit_code_10() {
     let env = Env::new();
     for args in [
         &["share", "members", "photos"][..],
@@ -181,13 +181,13 @@ fn coordination_commands_report_not_logged_in_with_exit_code_2() {
         &["share", "pending"],
         &["share", "approve", "photos", "device-1"],
         &["share", "deny", "photos", "device-1"],
-        &["share", "revoke", "photos", "device-1"],
+        &["share", "revoke", "photos", "device-1", "--yes"],
         &["share", "invite", "photos"],
         &["share", "cancel-invite", "invite-1"],
         &["share", "change-role", "photos", "device-1", "--role", "viewer"],
         &["share", "set-storage-mode", "photos", "--mode", "eager"],
         &["share", "grant", "photos", "device-1"],
-        &["share", "delete", "photos"],
+        &["share", "delete", "photos", "--yes"],
         &["device", "list"],
         &["device", "register", "--name", "laptop"],
         &["account", "delete", "status"],
@@ -195,10 +195,10 @@ fn coordination_commands_report_not_logged_in_with_exit_code_2() {
         &["account", "delete", "cancel"],
         &["account", "delete", "confirm", "token"],
         &["account", "export"],
-        &["logout"],
+        &["logout", "--yes"],
         &["forget-local-credentials"],
     ] {
-        assert_eq!(env.run_blocking(args), Run::new(2, "", NOT_LOGGED_IN), "yadorilink {args:?}");
+        assert_eq!(env.run_blocking(args), Run::new(10, "", NOT_LOGGED_IN), "yadorilink {args:?}");
     }
 }
 
@@ -224,8 +224,8 @@ fn daemon_commands_report_daemon_not_running_with_exit_code_4() {
         &["materialization-status", "/nowhere"],
         &["update", "status"],
         &["update", "check"],
-        &["device", "remove", "device-1"],
-        &["share", "revoke", "edge-1"],
+        &["device", "remove", "device-1", "--yes"],
+        &["share", "revoke", "edge-1", "--yes"],
     ] {
         assert_eq!(
             env.run_blocking(args),
@@ -379,4 +379,38 @@ async fn link_dry_run_prints_the_preflight_report() {
         "{lines:?}"
     );
     assert_eq!(*lines.last().unwrap(), "dry run: no link registered (risky conditions found)");
+}
+
+#[test]
+fn destructive_commands_refuse_without_yes_when_stdin_is_not_a_terminal() {
+    let env = Env::new();
+    for args in [
+        &["logout"][..],
+        &["device", "remove", "device-1"],
+        &["share", "delete", "photos"],
+        &["share", "revoke", "photos", "device-1"],
+        &["share", "revoke", "edge-1"],
+    ] {
+        let run = env.run_blocking(args);
+        assert_eq!(run.code, 1, "yadorilink {args:?}: {run:?}");
+        assert_eq!(run.stdout, "", "yadorilink {args:?}");
+        assert!(run.stderr.contains("Re-run with --yes to confirm."), "{args:?}: {run:?}");
+    }
+}
+
+#[test]
+fn a_missing_backup_file_names_the_path_not_the_daemon() {
+    let env = Env::new();
+    let run = env.run_blocking(&["backup", "import", "missing.json"]);
+    assert_eq!(run.code, 1, "{run:?}");
+    assert!(run.stderr.contains("cannot read missing.json"), "{run:?}");
+    assert!(!run.stderr.contains("daemon"), "{run:?}");
+}
+
+#[test]
+fn help_lists_the_exit_codes() {
+    let env = Env::new();
+    let run = env.run_blocking(&["--help"]);
+    assert!(run.stdout.contains("Exit codes:"), "{run:?}");
+    assert!(run.stdout.contains("10  not logged in"), "{run:?}");
 }

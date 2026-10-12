@@ -79,14 +79,14 @@ human-gated.
   marker: `yadorilink.iss`'s `GetPackageManagerParam`/`CurStepChanged`
   reads this flag and writes `InstallSource=winget` to
   `HKLM\Software\yadorilink`, which
-  `install_windows::detect_package_manager_marker` reads so the daemon's
+  `install_source::detect_package_manager_marker` reads so the daemon's
   built-in updater defers to `winget upgrade` instead of running its own
   installer over a WinGet-managed install — see `manager::dispatch_install`
   in `crates/yadorilink-daemon/src/update/manager.rs` for the full dispatch
   logic. **This mechanism is unverified against a real WinGet install**
   (no Windows machine in this environment) — matching this repo's
   existing honesty convention for Windows-only code paths (see
-  `install_windows.rs`'s own header comment).
+  `install_source.rs`'s own header comment).
 
 ## Submission
 

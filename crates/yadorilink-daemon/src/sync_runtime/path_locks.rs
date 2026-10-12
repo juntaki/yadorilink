@@ -21,7 +21,7 @@ type PathLockMap = HashMap<PathLockKey, Weak<tokio::sync::Mutex<()>>>;
 /// function computes and the combined-axis hazard check it must be atomic
 /// with can never drift apart from each other by construction.
 fn path_lock_fold_key(path: &str) -> String {
-    yadorilink_root_authority::canonical_fold::canonical_fold(path)
+    yadorilink_fs_platform::canonical_fold::canonical_fold(path)
 }
 
 /// per-`(group_id, path)` locks serializing local-change

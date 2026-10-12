@@ -710,7 +710,15 @@ async fn dropping_a_run_mid_assembly_leaves_no_temp_files() {
         let (store, out) = (store.clone(), dir.path().join(format!("f{i}")));
         running.push(tokio::spawn(async move {
             let block = BlockInfo { hash: vec![i; 32], offset: 0, size: 1024 };
-            super::types::reconstruct_file_to_temp_off_runtime(store, &out, &[block], 1, None).await
+            super::types::reconstruct_file_to_temp_off_runtime(
+                store,
+                &out,
+                &[block],
+                1,
+                None,
+                no_ledger(),
+            )
+            .await
         }));
     }
     let waited = std::time::Instant::now();
@@ -781,8 +789,15 @@ async fn an_abandoned_assembly_keeps_its_space_reserved_until_it_finishes() {
         let (store, out, held) = (store.clone(), dir.path().join("f"), reservation.clone());
         tokio::spawn(async move {
             let block = BlockInfo { hash: vec![1; 32], offset: 0, size: 1024 };
-            super::types::reconstruct_file_to_temp_off_runtime(store, &out, &[block], 1, Some(held))
-                .await
+            super::types::reconstruct_file_to_temp_off_runtime(
+                store,
+                &out,
+                &[block],
+                1,
+                Some(held),
+                no_ledger(),
+            )
+            .await
         })
     };
     until("the assembly did not start", || store.entered.load(Ordering::SeqCst) == 1).await;
@@ -813,6 +828,7 @@ async fn a_panicking_assembly_leaves_no_temp_and_frees_its_space() {
         &[block],
         1,
         Some(held.clone()),
+        no_ledger(),
     )
     .await;
     drop(held);
@@ -926,6 +942,7 @@ async fn an_abandoned_hydration_keeps_its_space_reserved_until_its_write_finishe
                 &blocks,
                 mtime,
                 Some(headroom),
+                no_ledger(),
             )
             .await
         })
@@ -984,4 +1001,8 @@ async fn a_hung_free_space_query_on_one_volume_does_not_block_another() {
 
     assert!(other.join().unwrap());
     assert!(hung.join().unwrap());
+}
+
+fn no_ledger() -> Arc<dyn yadorilink_local_storage::TempFileLedger> {
+    Arc::new(yadorilink_local_storage::NoTempLedger)
 }

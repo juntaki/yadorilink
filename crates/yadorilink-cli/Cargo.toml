@@ -14,10 +14,13 @@ path = "src/main.rs"
 yadorilink-client-core = { path = "../yadorilink-client-core" }
 yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
 yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
 yadorilink-reporting = { path = "../yadorilink-reporting" }
 tokio.workspace = true
+# Local-time rendering of timestamps in `status` (`localtime_r`).
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 thiserror.workspace = true
 # Audit-trail logging for the `--force` durability-gate override on
@@ -36,6 +39,10 @@ serde_json = "1"
 # module-matrix + built-in char-based string renderer is needed, so no
 # image-decoding dependency tree comes along for the ride.
 qrcode = { version = "0.14", default-features = false }
+
+# Local-time rendering of conflict mtimes (`localtime_r` offset).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # The wire-contract harness decodes JWT-shaped values and parses redirect

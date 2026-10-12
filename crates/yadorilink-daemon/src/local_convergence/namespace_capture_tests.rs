@@ -16,7 +16,6 @@ use super::growing_file_projection_tests::{Harness, GROUP, LOCAL_DEVICE};
 use super::*;
 use std::collections::BTreeSet;
 use yadorilink_local_capture::LocalChangeOutcome;
-use yadorilink_replica_domain::conflict::{conflict_copy_source_path, is_conflict_copy_path};
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::ids::{SyncPath, VersionHash};
 use yadorilink_replica_domain::local_op::Op;
@@ -66,23 +65,6 @@ fn own_deltas(
     h.all_deltas().into_iter().filter(|(_, delta)| delta.author.device.0 == LOCAL_DEVICE).collect()
 }
 
-/// The native summary roots: what a peer would compare to learn whether this
-/// replica's state changed.
-fn native_state_root(h: &Harness) -> String {
-    format!(
-        "{:?}",
-        h.state
-            .database()
-            .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
-                yadorilink_sync_sqlite::native_replication::summary_roots(
-                    conn,
-                    &yadorilink_replica_domain::ids::FolderGroupId(GROUP.to_owned()),
-                )
-            })
-            .unwrap()
-    )
-}
-
 fn own_change_count(h: &Harness) -> usize {
     own_deltas(h).len()
 }
@@ -107,16 +89,6 @@ async fn settle(h: &Harness, paths: &[&str]) {
     panic!("{paths:?} did not settle");
 }
 
-fn copies_of_root_level(h: &Harness, source: &str) -> Vec<String> {
-    let mut out: Vec<String> = std::fs::read_dir(h.path(""))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| is_conflict_copy_path(name) && conflict_copy_source_path(name) == source)
-        .collect();
-    out.sort();
-    out
-}
-
 /// Every name capture could be told about, then a full scan: none of it
 /// may author anything.
 async fn capture_everything(h: &Harness, names: &[&str]) {
@@ -124,35 +96,6 @@ async fn capture_everything(h: &Harness, names: &[&str]) {
         h.capture(name).await;
     }
     h.scan();
-}
-
-/// This device's own File `a` is displaced by a peer's `a/x`, and later
-/// returns when the peer deletes it. Neither move is captured.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn structural_relocation_of_local_file_authors_no_change() {
-    let h = Harness::new(true);
-    std::fs::write(h.path("a"), b"this device's file a").unwrap();
-    assert!(matches!(h.capture("a").await, LocalChangeOutcome::FileChanged(_)));
-    let x = stored_version(&h, "scratch-x", b"the peer's a/x").await;
-    let before = own_change_count(&h);
-
-    remote_change(&h, vec![put("a/x", x)], &[]);
-    settle(&h, &["a/x"]).await;
-
-    assert!(std::fs::symlink_metadata(h.path("a")).unwrap().is_dir());
-    assert_eq!(std::fs::read(h.path("a/x")).unwrap(), b"the peer's a/x");
-    let copies = copies_of_root_level(&h, "a");
-    assert_eq!(copies.len(), 1, "{copies:?}");
-    assert_eq!(std::fs::read(h.path(&copies[0])).unwrap(), b"this device's file a");
-    capture_everything(&h, &["a", &copies[0], "a/x"]).await;
-    assert_eq!(own_change_count(&h), before, "the relocation was captured as a change");
-
-    remote_change(&h, vec![delete("a/x")], &[]);
-    settle(&h, &["a/x"]).await;
-
-    assert_eq!(std::fs::read(h.path("a")).unwrap(), b"this device's file a");
-    capture_everything(&h, &["a", &copies[0], "a/x"]).await;
-    assert_eq!(own_change_count(&h), before, "the move back was captured as a change");
 }
 
 /// A peer deletes explicit directory `d` while `d/f` lives: `d` stays as
@@ -174,11 +117,11 @@ async fn remotely_deleted_explicit_dir_with_live_child_is_not_reauthored_by_full
     assert_eq!(std::fs::read(h.path("d/f")).unwrap(), b"a child that outlives its directory");
     let origin = h.state.sqlite().dag_structural_directory_origin(GROUP, "d").unwrap();
     let observed =
-        yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&h.path("d")).ok();
+        yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&h.path("d")).ok();
     assert_eq!(
         origin.status(
             observed.as_ref(),
-            yadorilink_root_authority::fs_identity::TimestampGranularity::Fine
+            yadorilink_fs_platform::fs_identity::TimestampGranularity::Fine
         ),
         StructuralOriginStatus::Structural,
         "the kept directory must be adopted as structural"
@@ -194,365 +137,41 @@ async fn remotely_deleted_explicit_dir_with_live_child_is_not_reauthored_by_full
 // on the source entry: `Delete(a)` / `Put(a)`, never an op at the copy
 // name.
 
-fn own_change_hashes(h: &Harness) -> BTreeSet<[u8; 32]> {
-    own_deltas(h).into_iter().map(|(hash, _)| hash).collect()
+/// A symlink on disk where the index has a captured File, which the flush
+/// did not capture, is local state displacement must not unlink.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn displacing_a_leaf_keeps_a_symlink_the_flush_did_not_capture() {
+    let h = Harness::new(false);
+    std::fs::write(h.path("a"), b"captured").unwrap();
+    assert!(matches!(h.capture("a").await, LocalChangeOutcome::FileChanged(_)));
+    std::fs::remove_file(h.path("a")).unwrap();
+    std::os::unix::fs::symlink("elsewhere", h.path("a")).unwrap();
+
+    let cleared = h.convergence.displace_leaf_for_directory(GROUP, "a").await.unwrap();
+
+    assert!(!cleared, "an uncaptured symlink must not be displaced");
+    assert!(std::fs::symlink_metadata(h.path("a")).unwrap().file_type().is_symlink());
 }
 
-/// The ops of every delta this device authored after `before`, as the puts and
-/// deletes at each path they name (a rename is a delete plus a put).
-fn own_ops_since(h: &Harness, before: &BTreeSet<[u8; 32]>) -> Vec<Op> {
-    let mut deltas: Vec<_> =
-        own_deltas(h).into_iter().filter(|(hash, _)| !before.contains(hash)).collect();
-    deltas.sort_by_key(|(_, delta)| delta.seq);
-    deltas
-        .into_iter()
-        .flat_map(|(_, delta)| {
-            delta
-                .ops
-                .into_iter()
-                .filter_map(|op| match op.put {
-                    Some(put) => Some(Op::Put { path: op.path, version: put.version }),
-                    None if !op.removes.is_empty() => Some(Op::Delete { path: op.path }),
-                    None => None,
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
-fn op_paths(ops: &[Op]) -> Vec<String> {
-    ops.iter()
-        .map(|op| match op {
-            Op::Put { path, .. } | Op::Delete { path } => path.as_str().to_string(),
-            Op::Move { from, to, .. } => format!("{}->{}", from.as_str(), to.as_str()),
-        })
-        .collect()
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Leaf {
-    File,
-    Symlink,
-}
-
-fn write_leaf(h: &Harness, rel: &str, leaf: Leaf, body: &str) {
-    let path = h.path(rel);
-    let _ = std::fs::remove_file(&path);
-    match leaf {
-        Leaf::File => std::fs::write(&path, body).unwrap(),
-        #[cfg(unix)]
-        Leaf::Symlink => std::os::unix::fs::symlink(body, &path).unwrap(),
-        #[cfg(windows)]
-        Leaf::Symlink => std::os::windows::fs::symlink_file(body, &path).unwrap(),
+/// Displacing a captured leaf makes the unlink durable before the row is erased.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn displacing_a_leaf_is_durable_before_the_index_row_is_erased() {
+    let h = Harness::new(true);
+    std::fs::write(h.path("a"), b"captured").unwrap();
+    assert!(matches!(h.capture("a").await, LocalChangeOutcome::FileChanged(_)));
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let (state, observed, path) = (h.state.clone(), observed.clone(), h.path("a"));
+        super::removal_ordering_probe::arm(h.path("a"), move || {
+            let live = state.get_file(GROUP, "a").unwrap().is_some_and(|row| !row.deleted);
+            observed.lock().unwrap().push((live, std::fs::symlink_metadata(&path).is_err()));
+        });
     }
-}
 
-fn read_leaf(h: &Harness, rel: &str, leaf: Leaf) -> String {
-    match leaf {
-        Leaf::File => String::from_utf8(std::fs::read(h.path(rel)).unwrap()).unwrap(),
-        Leaf::Symlink => std::fs::read_link(h.path(rel)).unwrap().to_string_lossy().into_owned(),
-    }
-}
+    let cleared = h.convergence.displace_leaf_for_directory(GROUP, "a").await.unwrap();
 
-/// This device's own `a` (a File or Symlink), displaced to its copy name
-/// by a peer's `a/x`. Returns the copy name.
-async fn relocated_own_leaf(h: &Harness, leaf: Leaf) -> String {
-    write_leaf(h, "a", leaf, "this device's a");
-    assert!(matches!(h.capture("a").await, LocalChangeOutcome::FileChanged(_)));
-    let x = stored_version(h, "scratch-x", b"the peer's a/x").await;
-    remote_change(h, vec![put("a/x", x)], &[]);
-    settle(h, &["a/x"]).await;
-    assert!(std::fs::symlink_metadata(h.path("a")).unwrap().is_dir());
-    let copies = copies_of_root_level(h, "a");
-    assert_eq!(copies.len(), 1, "{copies:?}");
-    assert_eq!(read_leaf(h, &copies[0], leaf), "this device's a");
-    copies[0].clone()
-}
-
-async fn retire(h: &Harness) {
-    let attempt = h.convergence.retire_conflict_copies_only(GROUP).await.unwrap();
-    assert!(
-        matches!(attempt, RetirementAttempt::Settled { .. }),
-        "the retirement pass must settle: {attempt:?}"
-    );
-}
-
-fn desired(h: &Harness, path: &str) -> yadorilink_sync_sqlite::desired_state::DesiredPathState {
-    h.state.desired_path_state(GROUP, path).unwrap()
-}
-
-async fn deleting_relocated_copy_deletes_original_entry_for(leaf: Leaf) {
-    let h = Harness::new(true);
-    let copy = relocated_own_leaf(&h, leaf).await;
-    let before = own_change_hashes(&h);
-
-    std::fs::remove_file(h.path(&copy)).unwrap();
-    h.capture(&copy).await;
-
-    let ops = own_ops_since(&h, &before);
-    assert_eq!(op_paths(&ops), vec!["a".to_string()], "{leaf:?}: {ops:?}");
-    assert!(matches!(ops[0], Op::Delete { .. }), "{leaf:?}: {ops:?}");
-    assert_eq!(
-        desired(&h, "a"),
-        yadorilink_sync_sqlite::desired_state::DesiredPathState::StructuralDirectory,
-        "{leaf:?}: a keeps only its descendant's directory"
-    );
-    let before = own_change_hashes(&h);
-    settle(&h, &["a", "a/x"]).await;
-    assert!(copies_of_root_level(&h, "a").is_empty(), "{leaf:?}");
-    assert_eq!(std::fs::read(h.path("a/x")).unwrap(), b"the peer's a/x");
-    capture_everything(&h, &["a", &copy, "a/x"]).await;
-    assert_eq!(own_ops_since(&h, &before), Vec::<Op>::new(), "{leaf:?}");
-}
-
-/// Deleting the copy a relocated File sits under deletes
-/// the File's own entry, `a`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deleting_relocated_copy_deletes_original_entry() {
-    deleting_relocated_copy_deletes_original_entry_for(Leaf::File).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deleting_relocated_symlink_copy_deletes_original_entry() {
-    deleting_relocated_copy_deletes_original_entry_for(Leaf::Symlink).await;
-}
-
-/// A peer's explicit Directory `a`, concurrent with this device's
-/// own File or Symlink `a`, keeps its path and the leaf sits at its copy
-/// name. Deleting the copy deletes the leaf's entry and only it: the
-/// Directory stays explicit.
-async fn deleting_leaf_beside_explicit_directory_keeps_the_directory_for(leaf: Leaf) {
-    let h = Harness::new(true);
-    let x = stored_version(&h, "scratch-x", b"the peer's a/x").await;
-    write_leaf(&h, "a", leaf, "this device's a");
-    assert!(matches!(h.capture("a").await, LocalChangeOutcome::FileChanged(_)));
-    let directory = FileVersion::directory(None);
-    h.state
-        .database()
-        .write(|conn| yadorilink_sync_sqlite::dag_store::put_file_version(conn, GROUP, &directory))
-        .unwrap();
-    crate::test_support::remote_admission_fixture::admit_remote_ops(
-        &h.state,
-        GROUP,
-        "device-remote",
-        &[put("a", directory.version_hash), put("a/x", x)],
-        crate::test_support::remote_admission_fixture::Basis::Nothing,
-    );
-    settle(&h, &["a", "a/x"]).await;
-    assert!(std::fs::symlink_metadata(h.path("a")).unwrap().is_dir(), "{leaf:?}");
-    let copies = copies_of_root_level(&h, "a");
-    assert_eq!(copies.len(), 1, "{leaf:?}: {copies:?}");
-    let copy = copies[0].clone();
-    assert!(
-        h.native_heads(&copy).is_empty(),
-        "{leaf:?}: sanity: the copy name is the projection's, not an authored entry"
-    );
-    let before = own_change_hashes(&h);
-
-    std::fs::remove_file(h.path(&copy)).unwrap();
-    h.capture(&copy).await;
-
-    let ops = own_ops_since(&h, &before);
-    assert_eq!(op_paths(&ops), vec!["a".to_string()], "{leaf:?}: {ops:?}");
-    assert!(matches!(ops[0], Op::Delete { .. }), "{leaf:?}: {ops:?}");
-    assert_eq!(
-        desired(&h, "a"),
-        yadorilink_sync_sqlite::desired_state::DesiredPathState::ExplicitDirectory {
-            version: directory.version_hash
-        },
-        "{leaf:?}: the Directory keeps its path and its entry"
-    );
-    settle(&h, &["a", "a/x"]).await;
-    assert!(copies_of_root_level(&h, "a").is_empty(), "{leaf:?}");
-    assert!(std::fs::symlink_metadata(h.path("a")).unwrap().is_dir(), "{leaf:?}");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deleting_file_beside_explicit_directory_keeps_the_directory() {
-    deleting_leaf_beside_explicit_directory_keeps_the_directory_for(Leaf::File).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deleting_symlink_beside_explicit_directory_keeps_the_directory() {
-    deleting_leaf_beside_explicit_directory_keeps_the_directory_for(Leaf::Symlink).await;
-}
-
-/// Editing the leaf beside an explicit Directory writes the
-/// leaf's entry, concurrent with the Directory, which keeps its path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn editing_file_beside_explicit_directory_keeps_the_directory() {
-    let h = Harness::new(true);
-    let x = stored_version(&h, "scratch-x", b"the peer's a/x").await;
-    std::fs::write(h.path("a"), b"this device's a").unwrap();
-    assert!(matches!(h.capture("a").await, LocalChangeOutcome::FileChanged(_)));
-    let directory = FileVersion::directory(None);
-    h.state
-        .database()
-        .write(|conn| yadorilink_sync_sqlite::dag_store::put_file_version(conn, GROUP, &directory))
-        .unwrap();
-    crate::test_support::remote_admission_fixture::admit_remote_ops(
-        &h.state,
-        GROUP,
-        "device-remote",
-        &[put("a", directory.version_hash), put("a/x", x)],
-        crate::test_support::remote_admission_fixture::Basis::Nothing,
-    );
-    settle(&h, &["a", "a/x"]).await;
-    let copies = copies_of_root_level(&h, "a");
-    assert_eq!(copies.len(), 1, "{copies:?}");
-    let before = own_change_hashes(&h);
-
-    std::fs::write(h.path(&copies[0]), b"edited beside the directory").unwrap();
-    h.capture(&copies[0]).await;
-
-    let ops = own_ops_since(&h, &before);
-    assert_eq!(op_paths(&ops), vec!["a".to_string()], "{ops:?}");
-    assert!(matches!(ops[0], Op::Put { .. }), "{ops:?}");
-    assert_eq!(
-        desired(&h, "a"),
-        yadorilink_sync_sqlite::desired_state::DesiredPathState::ExplicitDirectory {
-            version: directory.version_hash
-        }
-    );
-    settle(&h, &["a", "a/x"]).await;
-    retire(&h).await;
-    let copies = copies_of_root_level(&h, "a");
-    assert_eq!(copies.len(), 1, "{copies:?}");
-    assert_eq!(std::fs::read(h.path(&copies[0])).unwrap(), b"edited beside the directory");
-    assert!(std::fs::symlink_metadata(h.path("a")).unwrap().is_dir());
-}
-
-/// The distinction: a copy some change authored as an entry of its own is
-/// that entry. Deleting it deletes it, at its own name; `a` is untouched.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deleting_an_authored_conflict_copy_deletes_the_copy_itself() {
-    let h = Harness::new(true);
-    let copy = relocated_own_leaf(&h, Leaf::File).await;
-    let authored = yadorilink_replica_engine::conflict::conflict_copy_path_for_losing_change(
-        "a",
-        "device-remote",
-        0,
-        &[0xAB; 32],
-    );
-    assert_ne!(authored, copy);
-    let body = stored_version(&h, "scratch-authored", b"an authored conflict copy").await;
-    remote_change(&h, vec![put(&authored, body)], &[]);
-    settle(&h, &[&authored]).await;
-    assert_eq!(std::fs::read(h.path(&authored)).unwrap(), b"an authored conflict copy");
-    let before = own_change_hashes(&h);
-
-    std::fs::remove_file(h.path(&authored)).unwrap();
-    h.capture(&authored).await;
-
-    let ops = own_ops_since(&h, &before);
-    assert_eq!(op_paths(&ops), vec![authored.clone()], "{ops:?}");
-    assert!(matches!(ops[0], Op::Delete { .. }), "{ops:?}");
-    assert_eq!(read_leaf(&h, &copy, Leaf::File), "this device's a", "the relocated leaf stays");
-    assert!(!h.native_heads("a").is_empty(), "a's entry is untouched");
-}
-
-/// The batched route (one debounced flush) writes through exactly as the
-/// immediate one does, for a delete and for an edit.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_flushed_batch_writes_relocated_copy_operations_through() {
-    let h = Harness::new(true);
-    let copy = relocated_own_leaf(&h, Leaf::File).await;
-    let before = own_change_hashes(&h);
-    std::fs::write(h.path(&copy), b"edited through the copy, batched").unwrap();
-    h.capture_flush(&[&copy]).await;
-    let ops = own_ops_since(&h, &before);
-    assert_eq!(op_paths(&ops), vec!["a".to_string()], "{ops:?}");
-    assert!(matches!(ops[0], Op::Put { .. }), "{ops:?}");
-
-    let before = own_change_hashes(&h);
-    std::fs::remove_file(h.path(&copy)).unwrap();
-    h.capture_flush(&[&copy]).await;
-    let ops = own_ops_since(&h, &before);
-    assert_eq!(op_paths(&ops), vec!["a".to_string()], "{ops:?}");
-    assert!(matches!(ops[0], Op::Delete { .. }), "{ops:?}");
-}
-
-/// A full scan that finds the relocated copy gone or changed does not
-/// author the copy name either.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_full_scan_writes_relocated_copy_operations_through() {
-    let h = Harness::new(true);
-    let copy = relocated_own_leaf(&h, Leaf::File).await;
-    let before = own_change_hashes(&h);
-    std::fs::write(h.path(&copy), b"edited while nothing watched").unwrap();
-    h.scan();
-    let ops = own_ops_since(&h, &before);
-    assert!(!op_paths(&ops).contains(&copy), "the scan authored the copy name: {ops:?}");
-    // The scan journals the copy dirty; the re-drive authors it, at `a`.
-    h.redrive().await;
-    let ops = own_ops_since(&h, &before);
-    assert_eq!(op_paths(&ops), vec!["a".to_string()], "{ops:?}");
-    assert!(matches!(ops[0], Op::Put { .. }), "{ops:?}");
-
-    let before = own_change_hashes(&h);
-    std::fs::remove_file(h.path(&copy)).unwrap();
-    h.scan();
-    let ops = own_ops_since(&h, &before);
-    assert!(!op_paths(&ops).contains(&copy), "the scan authored the copy name: {ops:?}");
-    h.redrive().await;
-    let ops = own_ops_since(&h, &before);
-    assert_eq!(op_paths(&ops), vec!["a".to_string()], "{ops:?}");
-    assert!(matches!(ops[0], Op::Delete { .. }), "{ops:?}");
-}
-
-/// The copy is replaced by a directory of the same name: the file's
-/// removal deletes the entry it was, `a`, and the directory is a new entry.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_directory_replacing_a_relocated_copy_deletes_its_entry() {
-    let h = Harness::new(true);
-    let copy = relocated_own_leaf(&h, Leaf::File).await;
-    let before = own_change_hashes(&h);
-
-    std::fs::remove_file(h.path(&copy)).unwrap();
-    std::fs::create_dir(h.path(&copy)).unwrap();
-    h.capture(&copy).await;
-
-    let ops = own_ops_since(&h, &before);
-    assert!(
-        ops.iter().any(|op| matches!(op, Op::Delete { path } if path.as_str() == "a")),
-        "the replaced file's entry must be deleted: {ops:?}"
-    );
-    assert_eq!(
-        desired(&h, "a"),
-        yadorilink_sync_sqlite::desired_state::DesiredPathState::StructuralDirectory,
-        "a keeps only its descendant's directory"
-    );
-}
-
-/// A peer's later write of `a`, descending from the one the copy shows, is
-/// admitted before the reconcile moves the copy. The head the copy shows is
-/// already superseded, so deleting the copy has nothing live to remove: no
-/// delta is owed, and the peer's write, which the copy never showed, stays.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deleting_a_copy_the_reconcile_has_not_caught_up_with_writes_through() {
-    let h = Harness::new(true);
-    let copy = relocated_own_leaf(&h, Leaf::File).await;
-    let newer = stored_version(&h, "scratch-newer", b"the peer's newer a").await;
-    remote_change(&h, vec![put("a", newer)], &[]);
-    let before = own_change_hashes(&h);
-    let root_before = native_state_root(&h);
-
-    std::fs::remove_file(h.path(&copy)).unwrap();
-    h.capture(&copy).await;
-
-    let ops = own_ops_since(&h, &before);
-    assert!(ops.is_empty(), "nothing live is left to remove: {ops:?}");
-    // No delta means no change of native state for any peer to receive, and
-    // no projection owed for the path the (non-)write named.
-    assert_eq!(
-        native_state_root(&h),
-        root_before,
-        "the no-op delete leaves native state as it was"
-    );
-    assert_eq!(own_change_hashes(&h), before, "the no-op delete authored no delta of its own");
-    let heads = h.native_heads("a");
-    assert!(
-        heads.iter().any(|head| head.payload.version == newer),
-        "the peer's write, which the copy never showed, stays live: {heads:?}"
-    );
+    assert!(cleared, "sanity: the captured leaf is displaced");
+    assert_eq!(*observed.lock().unwrap(), vec![(true, true)]);
 }

@@ -234,6 +234,14 @@ async fn a_restore_racing_a_concurrent_edit_converges_deterministically() {
     wait_for_current_version(&a, group_id, "doc.txt", 1).await;
     std::fs::write(a.root.path().join("doc.txt"), "version two").unwrap();
     wait_for_current_version(&a, group_id, "doc.txt", 2).await;
+    // Everything below needs B to receive A's second write over its existing
+    // file, then a winner replacing a loser's original: both need durable
+    // namespace changes.
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "B receiving A's second write and the conflict winner replacing the original",
+    ) {
+        return;
+    }
     wait_until_with_context(
         || {
             std::fs::read_to_string(b.root.path().join("doc.txt")).unwrap_or_default()

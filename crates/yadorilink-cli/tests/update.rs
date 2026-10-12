@@ -177,13 +177,13 @@ async fn update_config_persists_and_is_reflected_by_status() {
     let _guard = TEST_MUTEX.lock().await;
     let (_dir, state) = start_daemon().await;
 
-    yadorilink_cli::commands::update::config(Some("off".into()), Some("automatic".into()))
+    yadorilink_cli::commands::update::config(Some("off".into()), Some("manual".into()))
         .await
         .unwrap();
 
     let policy = state.update_manager.policy.load().unwrap();
     assert!(!policy.automatic_checks_enabled);
-    assert_eq!(policy.automatic_install_mode, AutoInstallMode::Automatic);
+    assert_eq!(policy.automatic_install_mode, AutoInstallMode::Manual);
 
     let resp = yadorilink_client_core::daemon::control::send(ReqPayload::UpdateStatus(
         UpdateStatusRequest {},
@@ -194,29 +194,25 @@ async fn update_config_persists_and_is_reflected_by_status() {
         panic!("expected an UpdateStatus response");
     };
     assert!(!status.automatic_checks_enabled);
-    assert_eq!(status.automatic_install_mode, "automatic");
+    assert_eq!(status.automatic_install_mode, "manual");
 }
 
-/// case with nothing verified yet: `update install`
-/// against a fresh daemon (no verified artifact) surfaces a clear error
-/// rather than hanging or silently no-op'ing.
+/// v1 ships manual updates: `update download` round-trips to the daemon
+/// and succeeds, printing where to get the new version.
 #[tokio::test]
-async fn update_install_without_a_verified_artifact_is_a_clear_error() {
+async fn update_download_prints_guidance_without_installing() {
     let _guard = TEST_MUTEX.lock().await;
-    let (_dir, _state) = start_daemon().await;
+    let (_dir, state) = start_daemon().await;
 
-    let result = yadorilink_cli::commands::update::install().await;
-    assert!(result.is_err(), "expected update install to fail without a verified artifact");
+    let before = state.update_manager.policy.load_or_default().state;
+    yadorilink_cli::commands::update::download().await.unwrap();
+
+    let resp = yadorilink_client_core::ops::updates::download_guidance().await.unwrap();
+    assert_eq!(resp.outcome, "manual_download");
+    assert!(resp.guidance.contains("github.com/juntaki/yadorilink/releases"), "{}", resp.guidance);
+    assert_eq!(
+        state.update_manager.policy.load_or_default().state,
+        before,
+        "the download request must not change update state"
+    );
 }
-
-// Deliberately no test here that drives a verified artifact through to a
-// real `install_macos::install`/`install_windows::install` call: that
-// would actually shell out to `open`/launch a real installer process
-// (GUI side effects on a real macOS machine, or an elevation prompt on
-// Windows) from an automated test run, which `update::verify::tests` and
-// `update::install_macos::tests`/`update::install_windows::tests`
-// deliberately avoid via `CommandRunner` mocking instead. The
-// `install`-without-a-verified-artifact case above already exercises this
-// CLI command's IPC round-trip and error surfacing end-to-end; the
-// platform-dispatch logic itself is covered by those lower-level mocked
-// unit tests.

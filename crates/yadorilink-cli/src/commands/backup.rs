@@ -141,7 +141,8 @@ fn write_output(path: &std::path::Path, contents: &str, yes: bool) -> Result<(),
 /// saved link metadata is printed as a re-link checklist rather than
 /// re-registered automatically.
 pub async fn import(input_path: PathBuf, yes: bool) -> Result<(), CliError> {
-    let contents = std::fs::read_to_string(&input_path)?;
+    let contents = std::fs::read_to_string(&input_path)
+        .map_err(|e| CliError::Other(format!("cannot read {}: {e}", input_path.display())))?;
     let backup: NonSensitiveBackup = serde_json::from_str(&contents)
         .map_err(|e| CliError::Other(format!("not a valid backup document: {e}")))?;
 

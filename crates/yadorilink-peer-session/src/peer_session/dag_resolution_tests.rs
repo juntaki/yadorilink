@@ -40,9 +40,8 @@ fn single_tombstone_leaves_the_path_absent() {
 }
 
 #[test]
-fn concurrent_content_keeps_higher_lamport_and_conflicts_the_loser() {
-    // head 0 lamport 5, head 1 lamport 7 -> head 1 wins, head 0 is the
-    // conflict copy.
+fn concurrent_content_keeps_higher_version_and_conflicts_the_loser() {
+    // The higher version (head 1) keeps the name; head 0 stands at its copy path.
     let heads = [content_head(1, 5, "device-a", 100), content_head(2, 7, "device-b", 200)];
     match resolve_path_heads("report.docx", &heads) {
         PathResolution::Present { winner, conflict_copies } => {
@@ -50,7 +49,14 @@ fn concurrent_content_keeps_higher_lamport_and_conflicts_the_loser() {
             assert_eq!(conflict_copies.len(), 1);
             assert_eq!(conflict_copies[0].head, 0);
             assert!(conflict_copies[0].path.starts_with("report (conflicted copy"));
-            assert!(conflict_copies[0].path.contains("device-a"));
+            assert_eq!(
+                conflict_copies[0].path,
+                yadorilink_replica_domain::native_fork::copy_path(
+                    "report.docx",
+                    &yadorilink_replica_domain::ids::VersionHash([1; 32])
+                ),
+                "the copy is named by the path and the losing version alone"
+            );
             assert!(conflict_copies[0].path.ends_with(".docx"));
         }
         other => panic!("expected Present, got {other:?}"),

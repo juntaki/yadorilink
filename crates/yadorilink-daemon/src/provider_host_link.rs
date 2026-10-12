@@ -195,6 +195,50 @@ impl ProviderHostLink {
     }
 }
 
+impl ProviderHostLink {
+    /// Asks the host to drop its copy of `item` only while it shows exactly the version `target`: a request that is
+    /// answered late then cannot drop content that arrived after the version was confirmed.
+    pub(crate) fn evict_shown_version<'a>(
+        &'a self,
+        root_id: &'a str,
+        item: ItemId,
+        target: [u8; 32],
+    ) -> BoxFuture<'a, EvictOutcome> {
+        self.send_evict(root_id, item, target, true)
+    }
+
+    fn send_evict<'a>(
+        &'a self,
+        root_id: &'a str,
+        item: ItemId,
+        target: [u8; 32],
+        require_shown: bool,
+    ) -> BoxFuture<'a, EvictOutcome> {
+        Box::pin(async move {
+            let request_id: [u8; 16] = rand::random();
+            let rx = self.wait_for(request_id.to_vec());
+            let sent = self.send(Payload::ProviderEvictRequest(ProviderEvictRequest {
+                root_id: hex::decode(root_id).unwrap_or_default(),
+                item_id: item.to_vec(),
+                request_id: request_id.to_vec(),
+                target_version_hash: target.to_vec(),
+                require_shown_version: if require_shown { target.to_vec() } else { Vec::new() },
+            }));
+            if !sent {
+                self.forget(&request_id);
+                return EvictOutcome::NotConnected;
+            }
+            match tokio::time::timeout(ACK_TIMEOUT, rx).await {
+                Ok(Ok(Reply::Evict(outcome))) => outcome,
+                _ => {
+                    self.forget(&request_id);
+                    EvictOutcome::Error("the host did not answer the eviction request".into())
+                }
+            }
+        })
+    }
+}
+
 impl ProviderHost for ProviderHostLink {
     fn revoke_unconsumed_handoffs(&self, root_id: &str, item: &ItemId) -> bool {
         let slot = self.handoff.lock().unwrap_or_else(|p| p.into_inner()).clone();
@@ -223,27 +267,7 @@ impl ProviderHost for ProviderHostLink {
         item: ItemId,
         target: [u8; 32],
     ) -> BoxFuture<'a, EvictOutcome> {
-        Box::pin(async move {
-            let request_id: [u8; 16] = rand::random();
-            let rx = self.wait_for(request_id.to_vec());
-            let sent = self.send(Payload::ProviderEvictRequest(ProviderEvictRequest {
-                root_id: hex::decode(root_id).unwrap_or_default(),
-                item_id: item.to_vec(),
-                request_id: request_id.to_vec(),
-                target_version_hash: target.to_vec(),
-            }));
-            if !sent {
-                self.forget(&request_id);
-                return EvictOutcome::NotConnected;
-            }
-            match tokio::time::timeout(ACK_TIMEOUT, rx).await {
-                Ok(Ok(Reply::Evict(outcome))) => outcome,
-                _ => {
-                    self.forget(&request_id);
-                    EvictOutcome::Error("the host did not answer the eviction request".into())
-                }
-            }
-        })
+        self.send_evict(root_id, item, target, false)
     }
 
     fn signal<'a>(

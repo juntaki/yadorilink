@@ -9,6 +9,8 @@ license.workspace = true
 test-support = []
 
 [dependencies]
+# The durable publish of the database creation marker (`durable_dir::publish_durably`).
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 thiserror.workspace = true
 tracing.workspace = true
 rusqlite = { version = "0.31", features = ["bundled"] }

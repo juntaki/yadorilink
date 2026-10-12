@@ -74,7 +74,7 @@ fn witness(c: &Connection, group: &str, delta_hash: &[u8], suffix: u8, version: 
 fn head(c: &Connection, group: &str, path: &str, provenance: &[u8], version: &FileVersion) {
     c.execute(
         "INSERT INTO native_heads (group_id, path, author, incarnation, seq, version, provenance) \
-         VALUES (?1, ?2, 'a', X'00', 1, ?3, ?4)",
+         VALUES (?1, ?2, 'a', X'00000000000000000000000000000000', 1, ?3, ?4)",
         params![group, path, &version.version_hash.0[..], provenance],
     )
     .unwrap();

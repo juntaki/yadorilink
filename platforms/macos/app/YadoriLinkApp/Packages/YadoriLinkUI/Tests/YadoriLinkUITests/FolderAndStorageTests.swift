@@ -94,6 +94,7 @@ struct FolderDetailTests {
         let edited = try #require(model.conflicts.first { $0.reason == .concurrentEdit })
         #expect(edited.relation.hasPrefix("the other version is "))
         #expect(model.conflicts.allSatisfy { !$0.subtitle.contains("Why") })
+        #expect(model.conflictFilePath(edited) == (docs.localPath as NSString).appendingPathComponent(edited.path))
     }
 
     @Test func fileToolsShowOnlyApplicableActionsAndResultAtWindowLevel() async throws {

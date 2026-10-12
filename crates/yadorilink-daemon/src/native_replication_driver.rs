@@ -205,9 +205,20 @@ impl RecoveryState {
         true
     }
 
+    /// A serve that failed sealed nothing for this peer, so its retry is not a repeat.
+    fn forget_serve(&self, group: &FolderGroupId) {
+        self.served.lock().unwrap_or_else(|p| p.into_inner()).remove(&group.0);
+    }
+
     /// Forgets a request that will not be answered.
+    /// The ask that never reached an answer does not count against the cooldown: the next
+    /// reconcile round may ask again at once.
     fn abandon(&self, request_id: protocol5::RequestId) {
-        self.outstanding.lock().unwrap_or_else(|p| p.into_inner()).remove(&request_id.0);
+        let issued =
+            self.outstanding.lock().unwrap_or_else(|p| p.into_inner()).remove(&request_id.0);
+        if let Some(issued) = issued {
+            self.asked.lock().unwrap_or_else(|p| p.into_inner()).remove(&issued.group);
+        }
         self.assembling
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -314,6 +325,10 @@ async fn serve_stream(
             (env.activity)();
         }
     }
+    if let Some(request_id) = answer.recovery_refused {
+        env.recovery_state.abandon(request_id);
+        return;
+    }
     if let Some(chunk) = answer.recovery_chunk {
         if let Some((group, bundle)) = env.recovery_state.add(chunk) {
             let (port, group_owned) = (env.recovery.clone(), group.clone());
@@ -377,6 +392,13 @@ async fn serve_recovery(
         Ok(bundle) => bundle,
         Err(reason) => {
             tracing::debug!(group = %group.0, ?reason, "native recovery: could not serve a peer");
+            env.recovery_state.forget_serve(group);
+            // The request was accepted, so the peer is waiting for a bundle: say it will not
+            // come, instead of leaving the peer to wait out its ask cooldown.
+            if let Ok(refusal) = protocol5::encode_message(&Message::Refused { request_id, reason })
+            {
+                push_message(connection, &refusal).await;
+            }
             return;
         }
     };

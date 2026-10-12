@@ -936,3 +936,57 @@ fn a_viewer_or_a_later_revoked_device_is_judged_at_the_pinned_point() {
     assert!(policy.writer_at_policy_point("anyone", &fp, 0, &ZERO_HASH));
     assert!(!policy.writer_at_policy_point("anyone", &fp, 0, &h1));
 }
+
+/// The Writer fallback for a losing head is decided from the verified policy
+/// chain alone. Two replicas folding the same chain agree; a replica whose
+/// verified chain stops before the revocation answers "not yet", which only
+/// delays the fallback; a replica that has seen the revocation answers yes.
+#[test]
+fn fallback_fork_eligibility_follows_the_verified_policy_point() {
+    use yadorilink_replica_domain::native_fork::fallback_may_fork;
+
+    let key = service_key();
+    let group_id = "group";
+    let a =
+        grant_record(&key, group_id, 1, ZERO_HASH, "device-a", [9u8; HASH_LEN], WriterRole::Editor);
+    let a_hash = hash_of(&a);
+    let b =
+        grant_record(&key, group_id, 2, a_hash, "device-b", [7u8; HASH_LEN], WriterRole::Editor);
+    let b_hash = hash_of(&b);
+    let revoke = revoke_record(&key, group_id, 3, b_hash, "device-a");
+    let revoke_hash = hash_of(&revoke);
+    let verify = |records: Vec<_>, head: [u8; HASH_LEN], epoch: u64| {
+        let log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: records.len() as u64,
+            current_epoch: epoch,
+            policy_head: head.to_vec(),
+            records,
+        };
+        verify_group_policy_log(&key.verifying_key().to_bytes(), &log).unwrap()
+    };
+    let lagging = verify(vec![a.clone(), b.clone()], b_hash, 0);
+    let advanced = verify(vec![a.clone(), b.clone(), revoke.clone()], revoke_hash, 1);
+    let advanced_again = verify(vec![a, b, revoke], revoke_hash, 1);
+
+    let is_writer = |policy: &GroupPolicyState, device: &str| {
+        policy.current_writers().iter().any(|w| w.device_id == device)
+    };
+    // Same chain, same answer, whoever folds it.
+    for seq in 0..=3 {
+        assert_eq!(advanced.writers_at(seq), advanced_again.writers_at(seq));
+    }
+    // The lagging replica's whole history is a prefix of the advanced one's.
+    assert_eq!(lagging.current_writers(), advanced.writers_at(2).unwrap());
+
+    // An open author that is still a writer is forked by its own device only.
+    assert!(!fallback_may_fork(false, is_writer(&lagging, "device-a")));
+    // After the revocation any Writer may; the lagging replica merely waits.
+    assert!(fallback_may_fork(false, is_writer(&advanced, "device-a")));
+    // A closed author is eligible at every policy point.
+    assert!(fallback_may_fork(true, is_writer(&lagging, "device-a")));
+    assert!(fallback_may_fork(true, is_writer(&advanced, "device-a")));
+    // The signing Writer itself is a writer at both points, so a lagging
+    // replica admits its fork delta as an ordinary writer delta.
+    assert!(is_writer(&lagging, "device-b") && is_writer(&advanced, "device-b"));
+}

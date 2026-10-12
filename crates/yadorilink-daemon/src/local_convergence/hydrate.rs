@@ -84,6 +84,10 @@ impl super::LocalConvergenceExecutor {
         // the "constructed once per call and threaded by reference through
         // every function that call touches" property this module's own doc
         // comment already claims.
+        // Deferred before fetching or planning anything for a group still starting up.
+        if !self.startup_admits_peer_apply(group_id) {
+            return Ok(None);
+        }
         let window = crate::receive_diag::window_begin(group_id);
         let path_count = paths.len();
         let fetch_started = crate::receive_diag::clock();
@@ -1287,13 +1291,17 @@ impl super::LocalConvergenceExecutor {
         ) {
             return Ok(true);
         }
+        // Repair re-materializes files, so it waits for startup capture too.
+        if !self.startup_admits_peer_apply(group_id) {
+            return Ok(false);
+        }
         // Ordinary desired-state projection has exactly one scheduling
         // source (`projection_obligations`) and one driver (the
         // Convergence Engine's own claim/reconcile loop) -- this periodic
         // audit no longer independently re-projects unprojected history.
         // What remains here are the genuinely distinct maintenance
-        // responsibilities: conflict-copy retirement and explicit
-        // repair-candidate re-materialization. Held for the whole
+        // responsibility: explicit repair-candidate
+        // re-materialization. Held for the whole
         // remainder of this audit -- unlike the old reproject-backstop
         // era, nothing here runs an unbounded number of
         // `reconcile_group_paths` calls, so there is no reason to release
@@ -1301,16 +1309,6 @@ impl super::LocalConvergenceExecutor {
         let Some(_guard) = MaterializationAuditGuard::try_acquire(&self.state, group_id) else {
             return Ok(false);
         };
-
-        if let Err(e) =
-            self.retire_unjustified_ephemeral_conflict_copies(group_id, audit_attempt_id).await
-        {
-            tracing::warn!(
-                group_id,
-                error = %e,
-                "failed to retire unjustified ephemeral conflict copies during audit"
-            );
-        }
 
         let paths = self.state.list_materialization_repair_candidates(group_id)?;
         // Names every candidate

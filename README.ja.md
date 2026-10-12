@@ -38,11 +38,12 @@ macOS、Windows、Linux で動作します。
 
 **Windows:** インストーラーは現時点でコード署名されていないため、Windows
 SmartScreen が「発行元不明」の警告を表示します。「実行」を選ぶ前に、ダウンロード
-したファイルの SHA-256 を公開されている `.sha256` と照合してください。また、
-長期間オフラインだったために同期履歴の再構築が必要になった Windows
-デバイスは、まだサポートされていません。デーモンは
-`the rebootstrap is blocked: DurabilityUnsupported` と報告して再構築を拒否し、
-フォルダには手を加えません。
+したファイルの SHA-256 を公開されている `.sha256` と照合してください。
+
+**Windows の長期オフラインのデバイス:** 長期間オフラインだったために追いつけなくなり、
+同期履歴の再構築が必要になった Windows デバイスは、まだサポートされていません。
+YadoriLink は再構築の開始を拒否し（ログに "rebootstrap is blocked" と出ます）、
+フォルダには手を加えません。同期が保たれているデバイスには影響しません。
 
 リリース版は自動的に YadoriLink の調整サービス（`https://control.yadori.link`）
 に接続します。別の調整サービスを使うには、`yadorilink` コマンドやデーモンを実行する
@@ -51,8 +52,19 @@ SmartScreen が「発行元不明」の警告を表示します。「実行」�
 
 ## はじめて使う
 
-インストール後、デーモンを起動します（macOS と Windows ではインストーラーが起動
-します。Linux では `systemctl --user enable --now yadorilink-daemon`）。その後:
+1. YadoriLink をインストールして開きます。macOS では `YadoriLink.app` を開き、
+   Windows ではインストーラー最後のページで「Set up YadoriLink now」にチェックを
+   入れたままにします。
+2. ブラウザで Google アカウントにサインインします。
+3. 同期するフォルダを選びます。macOS では内容を確認して「Link Folder」を押します。
+
+Linux にはまだデスクトップアプリがないため、下記のコマンドラインを使ってください。
+
+## 上級者向け / コマンドライン
+
+同じセットアップをターミナルからも行えます。macOS と Windows ではインストーラーが
+デーモンを起動します。Linux では `systemctl --user enable --now
+yadorilink-daemon` を実行してから:
 
 ```bash
 yadorilink login
@@ -62,9 +74,10 @@ yadorilink status
 ```
 
 `yadorilink status` と `yadorilink doctor` でデーモンの状態を確認できます。
-フォルダグループがリセットされて退避された項目がある場合は、
-`yadorilink preserved list` で一覧でき、`preserved restore`、`retry`、
-`discard` で扱えます。
+共有フォルダの履歴が再構築されたとき、引き継げなかった版や手元の変更は削除されず
+「退避（preserved）」されます。`yadorilink preserved list` で一覧でき、
+`preserved restore <item-id>` は退避された版を新しい変更として書き戻し、`retry <item-id>`
+は自分の変更を再投入し、`discard <item-id>` はその項目を削除します。
 
 自分の別のデバイスを追加する:
 

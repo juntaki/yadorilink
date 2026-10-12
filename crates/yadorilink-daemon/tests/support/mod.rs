@@ -396,7 +396,7 @@ pub fn real_entry_names(dir: &std::path::Path) -> Vec<String> {
             entries
                 .filter_map(|e| e.ok())
                 .filter(|e| {
-                    !yadorilink_root_authority::reserved_namespace::is_reserved_component(
+                    !yadorilink_fs_platform::reserved_namespace::is_reserved_component(
                         e.file_name().as_os_str(),
                     )
                 })
@@ -1285,6 +1285,15 @@ fn install_bootstrap_policies(state: &DaemonState, group_ids: &[String], service
         policies.insert(group_id.clone(), policy);
     }
     state.authority.replace_group_policy_states(policies);
+}
+
+/// Marks `group`'s startup as finished on a test device that links the group
+/// without running the link runtime: peer apply waits for a Ready startup gate
+/// (`startup_admits_peer_apply`), and a device that never registers one defers it forever.
+#[allow(dead_code)]
+pub fn mark_group_started(state: &Arc<DaemonState>, group: &str) {
+    let generation = state.replica_coordinator.startup_readiness().begin_group_startup(group);
+    state.replica_coordinator.startup_readiness().mark_group_ready(group, generation);
 }
 
 /// Ensures `state` has a change-signing key (generating one if absent) and

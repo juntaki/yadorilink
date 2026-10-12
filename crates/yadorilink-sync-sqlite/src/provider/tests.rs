@@ -1329,6 +1329,20 @@ fn create_provider_link(
     })
 }
 
+/// A provider link has no folder to scan, so it never owes a startup scan; a folder link does.
+#[test]
+fn only_a_folder_link_owes_a_startup_scan() {
+    let db = open_db();
+    let links = crate::link::LinkRepository::new(db.clone());
+    create_provider_link(&db, "provider://t2", "g-provider", &spec("P", false)).unwrap();
+    db.write_immediate::<_, SyncSqliteError>(|tx| {
+        crate::link::LinkRepository::insert_link_row(tx, "/some/folder", "g-folder")
+    })
+    .unwrap();
+    assert!(!links.has_live_link_for_group("g-provider").unwrap());
+    assert!(links.has_live_link_for_group("g-folder").unwrap());
+}
+
 /// The link, its root, its token digest and its install marker commit together; an owner-created
 /// empty group is installed at once, a joined group is installed only if its native base already is
 /// (the install finished before the link existed); a failure leaves nothing behind.
@@ -1564,59 +1578,4 @@ fn a_root_is_installed_by_the_in_sync_mark_only_and_idempotently() {
     assert!(repo.install_done_for_tests(&joined));
     assert!(!repo.mark_installed_when_in_sync("g-join").unwrap(), "idempotent");
     assert!(repo.install_done_for_tests(&joined));
-}
-
-/// A provider link is native from the moment it is created: rows that replication brings in later
-/// must not turn the first local write into "state from before native authority".
-#[test]
-fn a_provider_link_records_native_authority_before_any_row_arrives() {
-    let db = open_db();
-    create_provider_link(&db, "provider://j", "g-join", &spec("Joined", false)).unwrap();
-    db.write_immediate::<_, SyncSqliteError>(|tx| {
-        tx.execute(
-            "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, version_seq) \
-             VALUES ('g-join', 'a', 0, 0, '[]', 1)",
-            [],
-        )?;
-        Ok(())
-    })
-    .unwrap();
-    let native = db
-        .read::<_, SyncSqliteError>(|conn| {
-            crate::group_authority::adopt_native_if_fresh(conn, "g-join")
-        })
-        .unwrap();
-    assert!(native, "the authority recorded at creation survives the arriving rows");
-}
-
-/// A group that was removed and joined again on the same device keeps its replicated index
-/// rows, and is still native: the first local write after the rejoin must not be refused as state
-/// from before native authority.
-#[test]
-fn a_rejoin_after_a_removal_is_still_native_with_the_old_rows_in_place() {
-    let db = open_db();
-    let repo = ProviderRepository::new(db.clone());
-    let links = crate::link::LinkRepository::new(db.clone());
-    let root =
-        create_provider_link(&db, "provider://first", "g-rejoin", &spec("Docs", false)).unwrap();
-    db.write_immediate::<_, SyncSqliteError>(|tx| {
-        tx.execute(
-            "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, version_seq) \
-             VALUES ('g-rejoin', 'a', 0, 0, '[]', 1)",
-            [],
-        )?;
-        Ok(())
-    })
-    .unwrap();
-
-    assert!(links.remove_link("provider://first").unwrap());
-    assert!(repo.domain_removed(&root, "/kept").unwrap());
-    create_provider_link(&db, "provider://second", "g-rejoin", &spec("Docs", false)).unwrap();
-
-    let native = db
-        .read::<_, SyncSqliteError>(|conn| {
-            crate::group_authority::adopt_native_if_fresh(conn, "g-rejoin")
-        })
-        .unwrap();
-    assert!(native, "the rows that outlived the removal made the group non-native");
 }

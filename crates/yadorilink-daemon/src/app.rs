@@ -463,23 +463,11 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Run before any link watcher starts or any new write happens, so
-    // nothing new can be mistaken for one of last run's orphaned temp
-    // files. Per-link interrupted-materialization/restore-operation repair
-    // used to run here too, before any `SyncRootLock` existed for any
-    // link -- it now runs inside the daemon's own `LinkRuntimeController::start_inner`,
-    // immediately after that specific link's `SyncRootLock` is acquired,
-    // so repair goes through the same `RootLease` every other mutation for
-    // that link uses instead of a startup-only stand-in with no real
-    // exclusion (see that function's own doc comment).
-    let stale_block_store_tmp =
-        yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files(&block_store_root);
-    if !stale_block_store_tmp.is_empty() {
-        tracing::info!(
-            count = stale_block_store_tmp.len(),
-            "removed stale temp files from block store on startup"
-        );
-    }
+    // Per-link interrupted-materialization/restore-operation repair and the
+    // removal of the temp files a crash left run inside the daemon's own
+    // `LinkRuntimeController::start_inner`, immediately after that specific
+    // link's `SyncRootLock` is acquired, so they go through the same
+    // `RootLease` every other mutation for that link uses.
     // Enumerate the links ONCE, for both `start_link_watch_gating_
     // tombstones` below and the watcher resume loop further down, and fail
     // startup if the table cannot be read. Collapsing this error into
@@ -1438,7 +1426,6 @@ mod startup_config_validation_tests {
     struct StartupAttempt {
         error: String,
         sync_db_path: PathBuf,
-        stale_temp_file: PathBuf,
         _config_dir: tempfile::TempDir,
     }
 
@@ -1452,13 +1439,7 @@ mod startup_config_validation_tests {
     }
 
     /// Runs daemon startup against a config directory holding exactly
-    /// `device_json`, and seeds the block-store root with a file named to the
-    /// `.yadorilink-tmp.<pid>.<counter>` scheme that
-    /// `yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files`
-    /// deletes on sight, with no
-    /// age threshold. That file surviving is the observable proof that
-    /// startup stopped before the sweep-and-repair pass rather than merely
-    /// returning the right error at the end of it.
+    /// `device_json`.
     async fn start_daemon_with_device_json(device_json: &str) -> StartupAttempt {
         start_daemon_with_device_json_and_keys(device_json, false).await
     }
@@ -1488,8 +1469,6 @@ mod startup_config_validation_tests {
             .unwrap();
         }
         std::fs::create_dir_all(&block_store_root).unwrap();
-        let stale_temp_file = block_store_root.join("block.yadorilink-tmp.1.0");
-        std::fs::write(&stale_temp_file, b"leftover").unwrap();
 
         let error = run(DaemonConfig::from_env())
             .await
@@ -1500,7 +1479,7 @@ mod startup_config_validation_tests {
         std::env::remove_var("YADORILINK_BLOCK_STORE");
         std::env::remove_var("YADORILINK_SYNC_DB");
 
-        StartupAttempt { error, sync_db_path, stale_temp_file, _config_dir: config_dir }
+        StartupAttempt { error, sync_db_path, _config_dir: config_dir }
     }
 
     fn current_device_json() -> String {
@@ -1521,10 +1500,6 @@ mod startup_config_validation_tests {
         assert!(
             !attempt.sync_db_path.exists(),
             "a missing device key must abort before SQLite creation"
-        );
-        assert!(
-            attempt.stale_temp_file.exists(),
-            "a missing device key must abort before startup repair"
         );
     }
 
@@ -1588,12 +1563,6 @@ mod startup_config_validation_tests {
             "the sync database must not be created or migrated before device.json is validated, \
              but {} exists after a refused startup",
             attempt.sync_db_path.display()
-        );
-        assert!(
-            attempt.stale_temp_file.exists(),
-            "no startup temp-file sweep or materialization repair may run before device.json is \
-             validated, but {} was already swept",
-            attempt.stale_temp_file.display()
         );
     }
 

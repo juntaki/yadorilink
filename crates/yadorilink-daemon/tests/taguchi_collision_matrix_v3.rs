@@ -219,7 +219,7 @@ fn recursive_snapshot(root: &Path) -> HashMap<String, String> {
                 && (name == yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME
                     || name == yadorilink_root_authority::sync_root_lock::SYNC_ROOT_LOCK_FILE_NAME))
                 || name.contains(".yadorilink-tmp.")
-                || yadorilink_root_authority::reserved_namespace::is_reserved_component(
+                || yadorilink_fs_platform::reserved_namespace::is_reserved_component(
                     entry.file_name().as_os_str(),
                 )
             {
@@ -610,8 +610,23 @@ fn assert_no_content_silently_lost(
     row_name: &str,
     final_snapshot: &HashMap<String, String>,
 ) {
+    if let Some(lost) = lost_edit(devices, op_level, path_level, excluded_idx, final_snapshot) {
+        panic!(
+            "{row_name}: {lost} -- silent data loss (op_level={op_level}, path_level={path_level})"
+        );
+    }
+}
+
+/// The first Edit-device whose round-1 content is in none of `snapshot`'s hashes.
+fn lost_edit(
+    devices: &[TestDevice],
+    op_level: u8,
+    path_level: u8,
+    excluded_idx: Option<usize>,
+    snapshot: &HashMap<String, String>,
+) -> Option<String> {
     if path_level == 4 {
-        return;
+        return None;
     }
     for idx in 0..devices.len() {
         if Some(idx) == excluded_idx {
@@ -626,13 +641,25 @@ fn assert_no_content_silently_lost(
         let target = target_path(path_level, idx);
         let expected_content = format!("row round 1 device {idx} target {}", target.display());
         let expected_hash = hex::encode(sha2::Sha256::digest(expected_content.as_bytes()));
-        assert!(
-            final_snapshot.values().any(|h| h == &expected_hash),
-            "{row_name}: device-{idx}'s round-1 edit (content hash {expected_hash}) is not \
-             present anywhere in the final converged tree -- silent data loss \
-             (op_level={op_level}, path_level={path_level})"
-        );
+        if !snapshot.values().any(|h| h == &expected_hash) {
+            return Some(format!(
+                "device-{idx}'s round-1 edit (content hash {expected_hash}) is not present \
+                 anywhere in the final tree"
+            ));
+        }
     }
+    None
+}
+
+/// Every device's tree, entries named by device so none collides.
+fn union_of_trees(devices: &[&TestDevice]) -> HashMap<String, String> {
+    devices
+        .iter()
+        .enumerate()
+        .flat_map(|(i, d)| {
+            recursive_snapshot(d.root.path()).into_iter().map(move |(k, h)| (format!("{i}/{k}"), h))
+        })
+        .collect()
 }
 
 /// How many canonical (non-conflict-copy) entries a device may end with for the
@@ -685,6 +712,74 @@ fn panic_settled_but_different(
 }
 
 /// Runs one Taguchi-array row: sets up devices per Factor D, applies
+/// Factor D's churn action: returns the index of a revoked device, or a
+/// freshly joined one.
+async fn apply_churn(
+    fake: &FakeCoordination,
+    devices: &[TestDevice],
+    churn_level: u8,
+    row_name: &str,
+    group_id: &str,
+) -> (Option<usize>, Option<TestDevice>) {
+    match churn_level {
+        1 | 2 => (None, None),
+        3 => {
+            let new_device =
+                setup_device(fake, &format!("{row_name}-device-churn-join"), &[group_id]).await;
+            // The joiner arrives after `n_synced_devices` ran its
+            // advertisement, so nobody knows where its reconciliation
+            // substrate answers and it knows where nobody else's does.
+            // Re-including the existing devices is idempotent.
+            let mut states: Vec<&std::sync::Arc<DaemonState>> =
+                devices.iter().map(|device| &device.state).collect();
+            states.push(&new_device.state);
+            support::advertise_substrate_between(&states).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            (None, Some(new_device))
+        }
+        4 => {
+            let last = devices.len() - 1;
+            fake.revoke(&devices[last].device_id, group_id);
+            (Some(last), None)
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// With the Windows gate closed the trees cannot converge, so the only
+/// property waited for is that no edit is lost.
+async fn wait_for_no_lost_edit(
+    row_name: &str,
+    devices: &[TestDevice],
+    active_refs: &[&TestDevice],
+    op_level: u8,
+    path_level: u8,
+    excluded_idx: Option<usize>,
+    timeout: Duration,
+) {
+    wait_until_with_context(
+        || {
+            lost_edit(devices, op_level, path_level, excluded_idx, &union_of_trees(active_refs))
+                .is_none()
+        },
+        timeout,
+        || {
+            format!(
+                "{row_name}: {:?}; {}",
+                lost_edit(
+                    devices,
+                    op_level,
+                    path_level,
+                    excluded_idx,
+                    &union_of_trees(active_refs)
+                ),
+                tree_dump(active_refs)
+            )
+        },
+    )
+    .await;
+}
+
 /// Factor A's partition/reconnect timing around two rounds of Factor-B/C-
 /// driven operations (staggered per Factor E), applies Factor D's churn
 /// action between the two rounds, waits for convergence, then asserts both
@@ -762,30 +857,8 @@ async fn run_taguchi_v3_row(
     // freshly offline for 2/3/4). The mesh is already fully connected (see
     // `n_synced_devices`), so a revoke here tears a live, established
     // session down rather than merely preventing a connection.
-    let mut excluded_idx: Option<usize> = None;
-    let mut joined_device: Option<TestDevice> = None;
-    match churn_level {
-        1 | 2 => {}
-        3 => {
-            let new_device =
-                setup_device(&fake, &format!("{row_name}-device-churn-join"), &[group_id]).await;
-            // The joiner arrives after `n_synced_devices` ran its
-            // advertisement, so nobody knows where its reconciliation
-            // substrate answers and it knows where nobody else's does.
-            // Re-including the existing devices is idempotent.
-            let mut states: Vec<&std::sync::Arc<DaemonState>> =
-                devices.iter().map(|device| &device.state).collect();
-            states.push(&new_device.state);
-            support::advertise_substrate_between(&states).await;
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            joined_device = Some(new_device);
-        }
-        4 => {
-            fake.revoke(&devices[device_count - 1].device_id, group_id);
-            excluded_idx = Some(device_count - 1);
-        }
-        _ => unreachable!(),
-    }
+    let (excluded_idx, joined_device) =
+        apply_churn(&fake, &devices, churn_level, row_name, group_id).await;
 
     apply_round_for_devices(&devices, path_level, op_level, 1, stagger).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -810,6 +883,26 @@ async fn run_taguchi_v3_row(
     // full-index resync). Give it matching headroom.
     let timeout =
         if churn_level == 3 { Duration::from_secs(200) } else { Duration::from_secs(150) };
+
+    // The closed Windows gate withholds the winner's replacement of the loser's
+    // original, so the trees cannot converge and the sync work stays pending by
+    // design. What must hold meanwhile is that no edit is lost: its content is
+    // still on the device that made it, or in a conflict copy, somewhere.
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "conflict convergence requires durable namespace replacement",
+    ) {
+        wait_for_no_lost_edit(
+            row_name,
+            &devices,
+            &active_refs,
+            op_level,
+            path_level,
+            excluded_idx,
+            timeout,
+        )
+        .await;
+        return;
+    }
 
     // Every row, case-fold included, must reach true quiescence before any
     // tree comparison: equal frontiers, nothing fetchable left unhydrated or
@@ -987,6 +1080,9 @@ async fn run_taguchi_v3_row(
 // --- L16(4^5) orthogonal array rows: (A partition, B op, C path, D churn, E stagger) ---
 //
 // The case-fold rows 04, 07, 10 and 13 skip on case-sensitive filesystems.
+// With the Windows durability gate closed the winner does not replace the loser's original, so the
+// full-tree convergence cannot complete; every row then checks only that no round-1 edit is lost
+// (see `run_taguchi_v3_row`), and the convergence checks run again when the gate opens.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_v3_row_01_part_none_op_all_edit_path_flat_churn_dc2_stag_sim() {

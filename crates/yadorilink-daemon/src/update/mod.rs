@@ -1,19 +1,13 @@
-//! Signed update discovery, verification, download, install
-//! orchestration, and rollback/recovery for desktop builds. See each
-//! submodule's doc comment for its slice of the design:
+//! Signed update discovery for desktop builds (v1 ships manual updates:
+//! the daemon checks and reports a new version, the user downloads and
+//! installs it). See each submodule's doc comment:
 //!  - `manifest`: the signed update manifest.
-//!  - `verify`: downloaded-artifact checksum/publisher-signature checks.
 //!  - `policy`: persisted daemon update policy/state.
-//!  - `manager`: check/download/verify/install orchestration, background
-//!    scheduling, and interrupted-update recovery.
-//!  - `install_macos` / `install_windows`: platform install handoff.
-//!  - `install_linux`: install-source detection only — Linux has no
-//!    self-update installer handoff yet (see that module's doc comment).
+//!  - `manager`: check orchestration and background scheduling.
+//!  - `install_source`: how this copy was installed (apt, Homebrew,
+//!    Microsoft Store, WinGet, standalone).
 
-pub mod install_linux;
-pub mod install_macos;
-pub mod install_windows;
+pub mod install_source;
 pub mod manager;
 pub mod manifest;
 pub mod policy;
-pub mod verify;

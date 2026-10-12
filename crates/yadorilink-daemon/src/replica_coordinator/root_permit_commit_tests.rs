@@ -250,7 +250,7 @@ fn a_hydrated_proof_heal_publishes_nothing_once_the_root_it_was_admitted_against
     let observed = root.path().join("observed");
     std::fs::write(&observed, b"").unwrap();
     let identity =
-        yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&observed).unwrap();
+        yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&observed).unwrap();
     let operation = lease.begin_operation().unwrap();
     assert!(operation.permit().verify().is_ok(), "fixture check: the permit must start out good");
 
@@ -294,7 +294,7 @@ fn a_hydrated_proof_heal_under_a_live_root_still_publishes() {
     let observed = root.path().join("observed");
     std::fs::write(&observed, b"").unwrap();
     let identity =
-        yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&observed).unwrap();
+        yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&observed).unwrap();
     let operation = lease.begin_operation().unwrap();
 
     let published = coordinator

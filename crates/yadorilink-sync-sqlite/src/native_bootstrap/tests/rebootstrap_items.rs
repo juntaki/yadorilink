@@ -442,6 +442,42 @@ fn restoring_an_item_authors_one_ordinary_put_with_a_new_dot_and_keeps_the_item(
     assert_eq!(items_of(&o.b), saved, "restoring removed the item");
 }
 
+/// #63 item 5: the restore saw nothing at the path, so it never supersedes a head
+/// another author has live there; it lands beside it.
+#[test]
+fn restoring_never_supersedes_a_live_head_of_another_author() {
+    let (o, area, _) = finished();
+    let saved = items_of(&o.b);
+    let author = crate::author_incarnation::current_author(&o.b).unwrap();
+    let key = device_key(2);
+    let local = LocalAuthor { author: author.clone(), signing_key: &key, capture: None };
+    let others_before: Vec<_> = crate::native_store::load_state(&o.b, &group())
+        .unwrap()
+        .heads
+        .get(&SyncPath("x".into()))
+        .into_iter()
+        .flatten()
+        .filter(|(dot, _)| dot.author != author)
+        .map(|(dot, payload)| (dot.clone(), payload.clone()))
+        .collect();
+
+    restore_recovery_item(
+        &o.b,
+        &items_root_of(area.path()),
+        &group(),
+        &saved[0].item_id,
+        &local,
+        &mut |_, _| Ok(()),
+    )
+    .unwrap();
+
+    let state = crate::native_store::load_state(&o.b, &group()).unwrap();
+    let heads = &state.heads[&SyncPath("x".into())];
+    for (dot, payload) in &others_before {
+        assert_eq!(heads.get(dot), Some(payload), "another author's live head was superseded");
+    }
+}
+
 #[test]
 fn restoring_is_refused_while_the_group_is_frozen() {
     let o = one_remote_only_head();
@@ -576,8 +612,6 @@ fn three_block_head() -> Offline {
         path: SyncPath("x".into()),
         removes: Vec::new(),
         put: Some(DeltaPut { version: version.version_hash }),
-        keeps: Vec::new(),
-        keep_put: false,
     };
     let a1 = signed(&a, 1, None, vec![op]);
     let a1_hash = a1.delta_hash();

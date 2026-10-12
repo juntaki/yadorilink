@@ -936,9 +936,7 @@ fn check_destination(
     new_path: &str,
     moving: Option<&str>,
 ) -> Result<(), ApplyError> {
-    if yadorilink_root_authority::reserved_namespace::wire_path_admission_refusal(new_path)
-        .is_some()
-    {
+    if yadorilink_fs_platform::reserved_namespace::wire_path_admission_refusal(new_path).is_some() {
         return Err(ApplyError::InvalidName("a reserved or non-portable name".into()));
     }
     let inside_moving = |path: &str| {
@@ -999,11 +997,10 @@ fn clean_xattrs(xattrs: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
 
 fn witness(path: &str, shown: Option<VersionHash>) -> NativeCaptureWitness {
     NativeCaptureWitness {
-        physical_path: SyncPath(path.to_owned()),
-        logical_source_path: SyncPath(path.to_owned()),
-        shown_head: None,
+        path: SyncPath(path.to_owned()),
         shown_class: Vec::new(),
         shown_version: shown,
+        row_version: shown,
     }
 }
 

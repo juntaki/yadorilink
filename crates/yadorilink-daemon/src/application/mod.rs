@@ -20,8 +20,8 @@ pub(crate) use enrollment_service::{
 pub(crate) use link_lifecycle_service::LinkLifecycleService;
 #[allow(unused_imports)]
 pub(crate) use ports::{
-    ConsentCommand, InstallOutcome, LastErrorReport, LinkCommand, LinkOutcome,
-    PendingEnrollmentLinkCommand, UpdateConfigCommand, UpdatePolicyView,
+    ConsentCommand, LastErrorReport, LinkCommand, LinkOutcome, PendingEnrollmentLinkCommand,
+    UpdateConfigCommand, UpdatePolicyView,
 };
 #[allow(unused_imports)]
 pub(crate) use replica_membership_service::{

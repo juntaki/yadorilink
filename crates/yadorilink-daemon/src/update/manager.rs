@@ -1,28 +1,17 @@
-//! Orchestrates manifest checks, artifact download/verification, and
-//! install dispatch on top of `manifest`, `verify`, and `policy`; also
-//! owns interrupted-update recovery on daemon startup.
+//! Orchestrates the update check on top of `manifest` and `policy`.
 //!
-//! Nothing in this module ever installs or trusts an artifact except
-//! through the exact sequence: fetch manifest -> `manifest::verify_and_parse`
-//! (signature) -> `manifest::select_applicable` (applicability/downgrade/
-//! rollout/kill-switch) -> download -> `verify::verify_checksum` +
-//! `verify::verify_*_signature` (both must pass) -> only then is
-//! `policy.downloaded_artifact_verified` ever set to `true`, and only a
-//! `true` there is ever handed to a platform installer.
+//! v1 ships manual updates: the daemon only discovers (signed manifest ->
+//! `manifest::verify_and_parse` -> `manifest::select_applicable`) and
+//! reports that a newer version exists; the user downloads and installs
+//! it from the official download page. Nothing is downloaded or installed
+//! by the daemon.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
-use super::manifest::{self, Applicability, LocalContext, ReleaseEntry};
+use super::install_source;
+use super::manifest::{self, Applicability, LocalContext};
 use super::policy::{AutoInstallMode, UpdatePolicy, UpdatePolicyStore, UpdateState};
-use super::verify::{self, CommandRunner, SystemCommandRunner};
-use super::{install_macos, install_windows};
-// `install_linux` is reached only from the `#[cfg(target_os = "linux")]`
-// `detect_install_source` below. `install_macos`/`install_windows` need no such
-// gate: `dispatch_install` selects between them on a runtime platform string, so
-// both compile on every target.
-#[cfg(target_os = "linux")]
-use super::install_linux;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum UpdateError {
@@ -30,16 +19,6 @@ pub enum UpdateError {
     Fetch(String),
     #[error("update manifest rejected: {0}")]
     Manifest(#[from] manifest::ManifestError),
-    #[error("failed to download update artifact: {0}")]
-    Download(String),
-    #[error("update artifact verification failed: {0}")]
-    Verify(#[from] verify::VerifyError),
-    #[error("no verified update is ready to install")]
-    NoVerifiedUpdate,
-    #[error("install failed: {0}")]
-    Install(String),
-    #[error("unsupported platform for automatic updates")]
-    UnsupportedPlatform,
     #[error("failed to persist update policy: {0}")]
     Policy(String),
 }
@@ -58,11 +37,6 @@ impl UpdateError {
         match self {
             UpdateError::Fetch(_) => "update_manifest_fetch_failed",
             UpdateError::Manifest(_) => "update_manifest_invalid",
-            UpdateError::Download(_) => "update_artifact_download_failed",
-            UpdateError::Verify(_) => "update_artifact_verification_failed",
-            UpdateError::NoVerifiedUpdate => "update_no_verified_artifact",
-            UpdateError::Install(_) => "update_install_failed",
-            UpdateError::UnsupportedPlatform => "update_unsupported_platform",
             UpdateError::Policy(_) => "update_policy_persist_failed",
         }
     }
@@ -70,7 +44,7 @@ impl UpdateError {
 
 /// This install's coarse platform identity — never anything more
 /// identifying (device id, account id) — 's `LocalContext` plus the
-/// Windows install-source distinction from `install_windows`.
+/// install-source distinction from `install_source`.
 #[derive(Debug, Clone)]
 pub struct PlatformInfo {
     pub platform: String,
@@ -97,30 +71,30 @@ impl PlatformInfo {
 #[cfg(windows)]
 fn detect_install_source() -> String {
     let exe = std::env::current_exe().unwrap_or_default();
-    match install_windows::detect_install_source(&exe) {
-        install_windows::InstallSource::MicrosoftStore => {
-            install_windows::InstallSource::MicrosoftStore.as_str().to_string()
+    match install_source::detect_windows_install_source(&exe) {
+        install_source::InstallSource::MicrosoftStore => {
+            install_source::InstallSource::MicrosoftStore.as_str().to_string()
         }
         // The Store's MSIX path is a structural signal checked first and
         // takes precedence; only a non-Store install can also be a WinGet
-        // one (see `install_windows::detect_package_manager_marker`'s doc
+        // one (see `install_source::detect_package_manager_marker`'s doc
         // comment on why WinGet needs its own installer-written marker).
-        install_windows::InstallSource::Standalone => {
-            install_windows::detect_package_manager_marker()
-                .unwrap_or_else(|| install_windows::InstallSource::Standalone.as_str().to_string())
+        install_source::InstallSource::Standalone => {
+            install_source::detect_package_manager_marker()
+                .unwrap_or_else(|| install_source::InstallSource::Standalone.as_str().to_string())
         }
     }
 }
 
 #[cfg(target_os = "macos")]
 fn detect_install_source() -> String {
-    install_macos::detect_install_source()
+    install_source::detect_macos_install_source()
 }
 
 #[cfg(target_os = "linux")]
 fn detect_install_source() -> String {
     let exe = std::env::current_exe().unwrap_or_default();
-    install_linux::detect_install_source(&SystemCommandRunner, &exe)
+    install_source::detect_linux_install_source(&install_source::SystemCommandRunner, &exe)
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -128,19 +102,15 @@ fn detect_install_source() -> String {
     "standalone".to_string()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InstallDispatchOutcome {
-    Deferred,
-    StoreManaged { guidance: String },
-    HandoffLaunched,
-    Installed,
-}
+/// A manifest fetch follows at most this many redirects, and only to an
+/// `https` URL -- see the `redirect::Policy::custom` closure in
+/// `UpdateManager::new`.
+const MAX_DOWNLOAD_REDIRECTS: usize = 5;
 
 pub struct UpdateManager {
     pub policy: UpdatePolicyStore,
     http: reqwest::Client,
     manifest_url: String,
-    updates_dir: PathBuf,
     current_version: semver::Version,
     platform_info: PlatformInfo,
     /// Substitutes the pinned production `manifest::TRUSTED_KEYS` trust
@@ -156,23 +126,6 @@ pub struct UpdateManager {
     #[cfg(test)]
     trusted_keys_override: Option<Vec<manifest::TrustedKey>>,
 }
-
-/// A download follows at most this many redirects, and only to an
-/// `https` URL -- see the `redirect::Policy::custom` closure in
-/// `UpdateManager::new`.
-const MAX_DOWNLOAD_REDIRECTS: usize = 5;
-
-/// Channels a manifest entry may still ship on without a pinned
-/// `artifact_publisher_identity` (SEC #7). Currently only `beta`, since
-/// this crate has no separate internal-dev channel string of its own
-/// yet and every real release channel today is either `beta` or
-/// production-equivalent. Deliberately an allow-list, not a
-/// production-channel deny-list: any channel not explicitly named here
-/// -- including a future channel this code doesn't know about yet --
-/// is treated as production and requires a pinned identity, so an
-/// unrecognized channel fails closed rather than silently inheriting
-/// the permissive beta behavior.
-const CHANNELS_ALLOWING_UNPINNED_PUBLISHER: &[&str] = &["beta"];
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -222,7 +175,6 @@ impl UpdateManager {
             policy: UpdatePolicyStore::new(config_dir.as_ref()),
             http,
             manifest_url,
-            updates_dir: config_dir.as_ref().join("updates"),
             current_version,
             platform_info: PlatformInfo::detect(),
             #[cfg(test)]
@@ -373,370 +325,6 @@ impl UpdateManager {
         })?;
         Ok(())
     }
-
-    /// Downloads `entry`'s artifact to a `.partial` path,
-    /// verifies checksum + platform publisher signature, and only on
-    /// full success renames it into place and marks the policy verified.
-    /// Any failure at any step deletes the partial artifact and records
-    /// a `Failed` state — this is the fail-closed core the spec's
-    /// "Artifact checksum mismatch"/"Artifact publisher signature
-    /// mismatch" scenarios describe.
-    pub async fn download_and_verify(&self, entry: &ReleaseEntry) -> Result<PathBuf, UpdateError> {
-        let result = self.download_and_verify_inner(entry).await;
-        if let Err(e) = &result {
-            let _ = self.policy.update(|p| {
-                p.state = UpdateState::Failed;
-                p.last_error_category = Some(e.category().to_string());
-                p.last_error_message = Some(e.to_string());
-                p.downloaded_artifact_path = None;
-                p.downloaded_artifact_verified = false;
-            });
-        }
-        result
-    }
-
-    async fn download_and_verify_inner(
-        &self,
-        entry: &ReleaseEntry,
-    ) -> Result<PathBuf, UpdateError> {
-        self.policy.update(|p| p.state = UpdateState::Downloading)?;
-        std::fs::create_dir_all(&self.updates_dir)
-            .map_err(|e| UpdateError::Download(e.to_string()))?;
-        let filename = artifact_filename(entry, &self.platform_info)?;
-        let partial_path = self.updates_dir.join(format!("{filename}.partial"));
-        let final_path = self.updates_dir.join(&filename);
-
-        self.stream_download(&entry.artifact_url, &partial_path, entry.artifact_size).await?;
-        self.policy.update(|p| p.state = UpdateState::Downloaded)?;
-
-        // Checksum first (cheap, local) before shelling out to a
-        // platform tool for the signature check.
-        verify::verify_checksum(&partial_path, &entry.artifact_sha256).inspect_err(|_| {
-            let _ = std::fs::remove_file(&partial_path);
-        })?;
-
-        let runner = SystemCommandRunner;
-        self.verify_platform_signature(&runner, &partial_path, entry).inspect_err(|_| {
-            let _ = std::fs::remove_file(&partial_path);
-        })?;
-
-        std::fs::rename(&partial_path, &final_path)
-            .map_err(|e| UpdateError::Download(e.to_string()))?;
-        self.policy.update(|p| {
-            p.state = UpdateState::Verified;
-            p.downloaded_artifact_path = Some(final_path.clone());
-            p.downloaded_artifact_verified = true;
-        })?;
-        Ok(final_path)
-    }
-
-    /// Streams `url`'s body to `dest`, bounded by `cap` -- the signed
-    /// manifest entry's `artifact_size`. Enforced twice: against the
-    /// `Content-Length` header before a byte is written, and against the
-    /// running total while the body streams, since a server can lie about
-    /// or omit `Content-Length` and only the streaming check actually
-    /// bounds the download.
-    async fn stream_download(&self, url: &str, dest: &Path, cap: u64) -> Result<(), UpdateError> {
-        use futures_util::StreamExt;
-        use tokio::io::AsyncWriteExt;
-
-        let response =
-            self.http.get(url).send().await.map_err(|e| UpdateError::Download(e.to_string()))?;
-        let response =
-            response.error_for_status().map_err(|e| UpdateError::Download(e.to_string()))?;
-
-        if let Some(len) = response.content_length() {
-            if len > cap {
-                return Err(UpdateError::Download(format!(
-                    "Content-Length {len} exceeds the expected artifact size of {cap} bytes"
-                )));
-            }
-        }
-
-        // Never follow or append to whatever might already be at `dest`
-        // (a leftover partial file from an earlier attempt in this same
-        // run, or -- in the worst case -- a symlink planted by another
-        // local process): remove it first, then open in create-new mode
-        // so this download always starts from a genuinely fresh file.
-        let _ = std::fs::remove_file(dest);
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(dest)
-            .await
-            .map_err(|e| UpdateError::Download(e.to_string()))?;
-
-        let mut stream = response.bytes_stream();
-        let mut total: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| UpdateError::Download(e.to_string()))?;
-            total += chunk.len() as u64;
-            if total > cap {
-                drop(file);
-                let _ = tokio::fs::remove_file(dest).await;
-                return Err(UpdateError::Download(format!(
-                    "artifact download exceeded the expected size of {cap} bytes; aborted"
-                )));
-            }
-            file.write_all(&chunk).await.map_err(|e| UpdateError::Download(e.to_string()))?;
-        }
-        file.flush().await.map_err(|e| UpdateError::Download(e.to_string()))?;
-        Ok(())
-    }
-
-    fn verify_platform_signature(
-        &self,
-        runner: &dyn CommandRunner,
-        path: &Path,
-        entry: &ReleaseEntry,
-    ) -> Result<(), UpdateError> {
-        if entry.artifact_publisher_identity.trim().is_empty()
-            && !CHANNELS_ALLOWING_UNPINNED_PUBLISHER.contains(&entry.channel.as_str())
-        {
-            // SEC #7: an empty `artifact_publisher_identity` only weakens
-            // this to "any validly OS-signed artifact", which is a real
-            // defense-in-depth loss on a production channel if the
-            // manifest signing key is ever compromised -- fail closed
-            // rather than silently accepting an unpinned identity there.
-            // Non-production channels (beta today) keep the previous,
-            // more permissive behavior since a pin isn't always
-            // available yet for every in-development build.
-            return Err(UpdateError::Verify(verify::VerifyError::SignatureCheck(format!(
-                "channel {:?} manifest entry has no pinned artifact_publisher_identity; \
-                 refusing to verify with an unpinned publisher identity outside the \
-                 channels explicitly allowed to omit one",
-                entry.channel
-            ))));
-        }
-        match self.platform_info.platform.as_str() {
-            "macos" => Ok(verify::verify_macos_signature(
-                runner,
-                path,
-                &entry.artifact_publisher_identity,
-            )?),
-            "windows" => Ok(verify::verify_windows_signature(
-                runner,
-                path,
-                &entry.artifact_publisher_identity,
-            )?),
-            _ => Err(UpdateError::UnsupportedPlatform),
-        }
-    }
-
-    /// Dispatches installation of an already-verified
-    /// artifact, gated on `safe_point` (the caller — `daemon_state`'s
-    /// safe-point check — decides whether sync-critical writes are in
-    /// progress; this function never guesses). Fails closed if the
-    /// current policy doesn't actually have a verified artifact,
-    /// regardless of what state the caller thinks it's in.
-    pub async fn install_now(
-        &self,
-        safe_point: bool,
-    ) -> Result<InstallDispatchOutcome, UpdateError> {
-        let policy = self.policy.load_or_default();
-        let Some(artifact_path) = policy.downloaded_artifact_path.clone() else {
-            return Err(UpdateError::NoVerifiedUpdate);
-        };
-        if !policy.downloaded_artifact_verified || policy.state != UpdateState::Verified {
-            return Err(UpdateError::NoVerifiedUpdate);
-        }
-        if !safe_point {
-            self.policy.update(|p| p.state = UpdateState::Deferred)?;
-            return Ok(InstallDispatchOutcome::Deferred);
-        }
-
-        self.policy.update(|p| p.state = UpdateState::Installing)?;
-        let runner = SystemCommandRunner;
-        let outcome = self.dispatch_install(&runner, &artifact_path);
-        match &outcome {
-            Ok(_) => {
-                // The handoff succeeded; the actual replacement now
-                // happens outside this process (Installer.app / the
-                // Windows installer). Reset to `Idle` rather than
-                // claiming `UpToDate` — the daemon doesn't get to
-                // observe the OS-level install completing.
-                self.policy.update(|p| p.state = UpdateState::Idle)?;
-            }
-            Err(e) => {
-                self.policy.update(|p| {
-                    p.state = UpdateState::Failed;
-                    p.last_error_category = Some(e.category().to_string());
-                    p.last_error_message = Some(e.to_string());
-                })?;
-            }
-        }
-        outcome
-    }
-
-    fn dispatch_install(
-        &self,
-        runner: &dyn CommandRunner,
-        artifact_path: &Path,
-    ) -> Result<InstallDispatchOutcome, UpdateError> {
-        match self.platform_info.platform.as_str() {
-            "macos" => {
-                // Package-manager ownership: a Homebrew Cask install (see
-                // `install_macos::HOMEBREW_MARKER_PATH`) must defer to
-                // `brew upgrade`, exactly like a Microsoft Store install
-                // defers below — launching Installer.app over a
-                // brew-tracked install would leave Homebrew's own Caskroom
-                // bookkeeping pointing at a version that no longer matches
-                // what's actually on disk.
-                if self.platform_info.install_source == "homebrew" {
-                    return Ok(InstallDispatchOutcome::StoreManaged {
-                        guidance: "this install is managed by Homebrew; run `brew upgrade --cask yadorilink` instead"
-                            .to_string(),
-                    });
-                }
-                install_macos::install(runner, artifact_path)
-                    .map(|_| InstallDispatchOutcome::HandoffLaunched)
-                    .map_err(|e| UpdateError::Install(e.to_string()))
-            }
-            "windows" => {
-                let source = if self.platform_info.install_source == "microsoft_store" {
-                    install_windows::InstallSource::MicrosoftStore
-                } else {
-                    install_windows::InstallSource::Standalone
-                };
-                if source == install_windows::InstallSource::MicrosoftStore {
-                    return Ok(InstallDispatchOutcome::StoreManaged {
-                        guidance:
-                            "this install is managed by the Microsoft Store; open Store > Library > Updates to install"
-                                .to_string(),
-                    });
-                }
-                // Package-manager ownership, WinGet case: same principle as
-                // the Store branch above, gated on the installer-written
-                // registry marker (`install_windows::detect_package_manager_marker`)
-                // since a WinGet install runs this same standalone installer.
-                if self.platform_info.install_source == "winget" {
-                    return Ok(InstallDispatchOutcome::StoreManaged {
-                        guidance: "this install is managed by WinGet; run `winget upgrade yadorilink` instead"
-                            .to_string(),
-                    });
-                }
-                install_windows::install(runner, source, artifact_path)
-                    .map(|_| InstallDispatchOutcome::Installed)
-                    .map_err(|e| UpdateError::Install(e.to_string()))
-            }
-            "linux" => {
-                // No self-update installer exists for Linux at all yet
-                // (see `install_linux`'s module doc) -- an apt-managed
-                // install already can't be silently overwritten as a
-                // result, but this still reports the precise, actionable
-                // reason instead of a generic "unsupported platform".
-                if self.platform_info.install_source == "apt" {
-                    return Ok(InstallDispatchOutcome::StoreManaged {
-                        guidance: "this install is managed by apt; run `sudo apt update && sudo apt install --only-upgrade yadorilink` instead"
-                            .to_string(),
-                    });
-                }
-                Err(UpdateError::UnsupportedPlatform)
-            }
-            _ => Err(UpdateError::UnsupportedPlatform),
-        }
-    }
-
-    /// interrupted-update recovery, run once at daemon startup
-    /// (before the periodic scheduler starts). Any artifact that hadn't
-    /// completed verification when the daemon last stopped — whatever
-    /// the reason (crash, kill -9, power loss) — is discarded rather than
-    /// trusted; an `Installing` state left over from a prior run is
-    /// recorded as failed (unknown outcome) rather than assumed
-    /// successful, since this process cannot know whether the platform
-    /// installer it handed off to actually completed.
-    pub fn recover_on_startup(&self) {
-        // Defense in depth, independent of what the policy file claims:
-        // any stray `*.partial` file is by definition never-verified and
-        // is removed unconditionally.
-        if let Ok(entries) = std::fs::read_dir(&self.updates_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("partial")
-                    && std::fs::remove_file(&path).is_ok()
-                {
-                    tracing::info!(path = %path.display(), "removed stray unverified update artifact on startup");
-                }
-            }
-        }
-
-        let policy = self.policy.load_or_default();
-        match policy.state {
-            UpdateState::Downloading | UpdateState::Downloaded => {
-                if let Some(path) = &policy.downloaded_artifact_path {
-                    let _ = std::fs::remove_file(path);
-                }
-                let _ = self.policy.update(|p| {
-                    p.state = UpdateState::Failed;
-                    p.downloaded_artifact_path = None;
-                    p.downloaded_artifact_verified = false;
-                    p.last_error_category = Some("update_interrupted_download".into());
-                    p.last_error_message = Some(
-                        "daemon restarted before the previous update artifact finished verification; discarded".into(),
-                    );
-                });
-                tracing::warn!(
-                    "discarded an unverified update artifact left over from a previous run"
-                );
-            }
-            UpdateState::Verified if !policy.downloaded_artifact_verified => {
-                // Should be unreachable (the two are always set
-                // together) but handled explicitly anyway: fail closed,
-                // never trust an artifact this flag doesn't vouch for.
-                if let Some(path) = &policy.downloaded_artifact_path {
-                    let _ = std::fs::remove_file(path);
-                }
-                let _ = self.policy.update(|p| {
-                    p.state = UpdateState::Failed;
-                    p.downloaded_artifact_path = None;
-                    p.downloaded_artifact_verified = false;
-                });
-            }
-            UpdateState::Installing => {
-                let _ = self.policy.update(|p| {
-                    p.state = UpdateState::Failed;
-                    p.last_error_category = Some("update_interrupted_install".into());
-                    p.last_error_message = Some(
-                        "daemon restarted during an install handoff; outcome is unknown -- check platform installer status manually".into(),
-                    );
-                });
-                tracing::warn!("daemon restarted mid-install; recorded as failed for diagnostics (current version remains in use)");
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Derives the local filename an artifact is downloaded/verified under
-/// -- deliberately never derived from `entry.artifact_url` (SEC #8: a
-/// hostile or compromised URL could otherwise smuggle a path-traversal
-/// segment, a query string, a Windows reserved device name, or control
-/// characters into a path under `updates_dir`). `version` is re-parsed
-/// and re-rendered as semver (never used as a raw string) and
-/// `platform`/`arch` come from this process's own already-detected
-/// `PlatformInfo`, not from the manifest at all -- so nothing here is
-/// ever built from untrusted input, and the manifest can only select
-/// *which* fixed extension this process already expects for its own
-/// platform.
-fn artifact_filename(
-    entry: &ReleaseEntry,
-    platform_info: &PlatformInfo,
-) -> Result<String, UpdateError> {
-    let version = manifest::parse_semver(&entry.version)
-        .map_err(|e| UpdateError::Download(format!("unparseable release version: {e}")))?;
-    let extension = match platform_info.platform.as_str() {
-        "macos" => "pkg",
-        "windows" => "exe",
-        // Never actually reachable today (no other platform has an
-        // install dispatch path -- see `dispatch_install`), but a
-        // filename generator fails closed on an unknown platform rather
-        // than guessing.
-        _ => return Err(UpdateError::UnsupportedPlatform),
-    };
-    Ok(format!(
-        "yadorilink-{version}-{}-{}.{extension}",
-        platform_info.platform, platform_info.arch
-    ))
 }
 
 /// applies a `yadorilink update config` change, leaving any

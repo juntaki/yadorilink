@@ -21,9 +21,11 @@
 //!   current-user-only DACL on Windows), with the mode given at creation;
 //! * nothing is reached through a symlink or reparse point, and a root that is
 //!   one is refused;
-//! * a file is written under a temporary name, fsynced, renamed to its final
-//!   name, and the parent directory is fsynced, so a crash leaves either no
-//!   file or a whole one;
+//! * a file is written under a reserved Stage name beside its final name,
+//!   fsynced, and published by a durable move (`durable_dir`), so a crash
+//!   leaves either no file or a whole one; a directory is the same with an
+//!   empty Stage directory, so every name that leads to the area is published
+//!   before the manifest that makes the area count;
 //! * every name in the area is a fixed name or a hex digest. A manifest path is
 //!   a validated relative sync-root path used as data only: it is never joined
 //!   to a directory here, so a hostile manifest cannot name anything outside the
@@ -37,6 +39,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use yadorilink_fs_platform::durable_dir::{
+    DiscardOutcome, DurableNamespace, NoLedger, NsError, Replace,
+};
+use yadorilink_fs_platform::reserved_namespace::{parse_artefact_component, ArtefactKind};
 
 use yadorilink_replica_domain::author::{AuthorId, IncarnationId};
 use yadorilink_replica_domain::file::FileVersion;
@@ -179,34 +185,23 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
 }
 
 /// Makes `path` a private directory that is not a link: created `0700` if it
-/// is absent, otherwise checked to be exactly that. Returns whether it was
-/// created here, in which case its parent's entry still has to be flushed.
-fn ensure_private_dir(path: &Path) -> Result<bool, AreaError> {
-    let mut created = false;
+/// is absent (an empty Stage directory with that mode, published by a durable
+/// move), otherwise checked to be exactly that.
+pub(crate) fn ensure_private_dir_durably(path: &Path) -> Result<(), AreaError> {
     if lstat_no_link(path)?.is_none() {
-        match create_private_dir(path) {
-            Ok(()) => created = true,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
+        let ns = namespace_for(path)?;
+        let stage = ns.stage_path(path).map_err(ns_error)?;
+        create_private_dir(&stage)?;
+        match ns.publish(&stage, path, Replace::No, &NoLedger) {
+            Ok(()) | Err(NsError::AlreadyExists) => {}
+            Err(error) => return Err(ns_error(error)),
         }
     }
     let meta = lstat_no_link(path)?.ok_or_else(|| unavailable("the directory vanished"))?;
     if !meta.is_dir() {
         return Err(unavailable(format!("{} is not a directory", path.display())));
     }
-    require_private(&meta, 0o700, path)?;
-    Ok(created)
-}
-
-/// Creates `path` as `ensure_private_dir` does and flushes the entry it added
-/// to its parent.
-pub(crate) fn ensure_private_dir_durably(path: &Path) -> Result<(), AreaError> {
-    if ensure_private_dir(path)? {
-        if let Some(parent) = path.parent() {
-            sync_dir(parent)?;
-        }
-    }
-    Ok(())
+    require_private(&meta, 0o700, path)
 }
 
 fn open_no_follow(options: &mut fs::OpenOptions) -> &mut fs::OpenOptions {
@@ -249,15 +244,9 @@ pub(crate) mod test_hooks {
             const { RefCell::new(None) };
         /// Files whose fsync succeeded.
         pub static FILE_SYNCS: Cell<usize> = const { Cell::new(0) };
-        /// Directories whose fsync succeeded, in order.
-        pub static DIR_SYNCS: RefCell<Vec<std::path::PathBuf>> =
-            const { RefCell::new(Vec::new()) };
         /// An fsync of a file under a path containing this text fails once.
         pub static FAIL_FILE_SYNC_CONTAINING: RefCell<Option<String>> =
             const { RefCell::new(None) };
-        /// Every durable rename and directory flush, in the order asked for:
-        /// `rename:<from file name>-><to file name>` and `syncdir:<path>`.
-        pub static ORDER: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// Stands in for a platform without directory-entry durability.
         pub static NO_DIRECTORY_DURABILITY: Cell<bool> = const { Cell::new(false) };
     }
@@ -304,175 +293,65 @@ fn fsync_file(file: &fs::File, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// The one-line flip for Windows. While `false`, a Windows build contains the
-/// directory-durability implementation below (`durable_rename` with
-/// `MOVEFILE_WRITE_THROUGH`, plus a directory-handle `FlushFileBuffers`) but
-/// still refuses a rebootstrap with `Blocked(DurabilityUnsupported)`. Set it to
-/// `true` ONLY after the write-through rename and directory-handle flush have
-/// been validated end to end (including crash recovery) on a real Windows host.
-pub const WINDOWS_DIRECTORY_DURABILITY_VALIDATED: bool = false;
-
 /// Whether this platform can make a directory-entry change (a create or a
-/// rename) durable, which the preserved barrier depends on.
-///
-/// Unix: `fsync` on a directory descriptor does so. Windows: implemented (see
-/// `durable_rename`, `sync_dir`) but fail-closed until
-/// [`WINDOWS_DIRECTORY_DURABILITY_VALIDATED`] is flipped after validation on a
-/// Windows host. Any other platform has nothing and refuses.
+/// rename) durable at all, which the preserved barrier depends on: Unix
+/// always, Windows once its gate is open.
 pub const fn platform_supports_directory_durability() -> bool {
-    cfg!(unix) || (cfg!(windows) && WINDOWS_DIRECTORY_DURABILITY_VALIDATED)
+    yadorilink_fs_platform::durable_dir::platform_offers_durable_namespace()
 }
 
-/// [`platform_supports_directory_durability`], with a test seam to stand in for
-/// a platform that lacks it.
-pub(crate) fn directory_durability_available() -> bool {
+/// [`platform_supports_directory_durability`] for the recovery root `root`, with
+/// a test seam to stand in for a platform that lacks it. The volume holding
+/// `root` must be one `DurableNamespace::open` trusts: on Windows only a volume
+/// on which the shapes were seen to work, whatever its file system is called.
+pub(crate) fn directory_durability_available(root: &Path) -> bool {
     // Under test the rebootstrap logic is exercised on every platform, so
-    // Windows runs it too; whether a platform really can flush a directory
-    // entry is asserted separately by `only_a_unix_platform_claims_directory_durability`
+    // Windows runs it too; whether a platform really offers durable namespace
+    // changes is asserted separately by `only_a_unix_platform_claims_directory_durability`
     // and the refusal by `a_platform_without_directory_durability_starts_nothing`.
     #[cfg(test)]
-    return !test_hooks::NO_DIRECTORY_DURABILITY.with(std::cell::Cell::get);
+    {
+        let _ = root;
+        !test_hooks::NO_DIRECTORY_DURABILITY.with(std::cell::Cell::get)
+    }
     #[cfg(not(test))]
-    platform_supports_directory_durability()
+    {
+        existing_ancestor(root).is_some_and(|dir| DurableNamespace::open(dir).is_ok())
+    }
 }
 
-/// Flushes the directory entry changes of `dir`.
-///
-/// Unix: `fsync` of the directory. Windows: `FlushFileBuffers` on a directory
-/// handle (`FILE_FLAG_BACKUP_SEMANTICS`). Microsoft does not document that this
-/// flushes directory entries, so on Windows it is best effort for a create and
-/// is never the only thing a rename relies on (see [`durable_rename`]).
-pub(crate) fn sync_dir(dir: &Path) -> Result<(), AreaError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-            .open(dir)?
-            .sync_all()?;
-    }
-    #[cfg(windows)]
-    windows_dir::flush_directory_handle(dir)?;
-    #[cfg(not(any(unix, windows)))]
-    let _ = dir;
+/// The nearest ancestor of `path` (itself included) that exists: the root may
+/// not exist yet, and its volume is that of that ancestor.
+#[cfg(not(test))]
+fn existing_ancestor(path: &Path) -> Option<&Path> {
+    path.ancestors().find(|dir| dir.is_dir())
+}
+
+/// The handle for durable namespace changes under `path`, whose nearest
+/// existing ancestor decides the volume.
+fn namespace_for(path: &Path) -> Result<DurableNamespace, AreaError> {
     #[cfg(test)]
     {
-        test_hooks::DIR_SYNCS.with(|dirs| dirs.borrow_mut().push(dir.to_path_buf()));
-        test_hooks::ORDER
-            .with(|order| order.borrow_mut().push(format!("syncdir:{}", dir.display())));
+        let _ = path;
+        Ok(DurableNamespace::unchecked_for_tests())
     }
-    Ok(())
-}
-
-/// Renames `from` over `to` (same directory) and makes the new entry durable
-/// before returning.
-///
-/// Unix: `rename`, then `fsync` of the directory (unchanged). Windows:
-/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`, then the
-/// directory-handle flush. The caller has already fsynced the file's contents.
-pub(crate) fn durable_rename(from: &Path, to: &Path) -> Result<(), AreaError> {
-    #[cfg(test)]
-    test_hooks::ORDER.with(|order| {
-        let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
-        order.borrow_mut().push(format!(
-            "rename:{}->{}",
-            name(from).unwrap_or_default(),
-            name(to).unwrap_or_default()
-        ));
-    });
-    #[cfg(windows)]
-    windows_dir::move_write_through(from, to)?;
-    #[cfg(not(windows))]
-    fs::rename(from, to)?;
-    match to.parent() {
-        Some(parent) => sync_dir(parent),
-        None => Ok(()),
+    #[cfg(not(test))]
+    {
+        let dir = existing_ancestor(path).ok_or_else(|| unavailable("no existing ancestor"))?;
+        DurableNamespace::open(dir)
+            .map_err(|e| unavailable(format!("durable namespace changes are unavailable: {e}")))
     }
 }
 
-#[cfg(windows)]
-mod windows_dir {
-    //! Never executed in this repository's CI or on the development hosts: it
-    //! is compiled for Windows and awaits validation on a real Windows host.
-    use std::fs;
-    use std::io;
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::path::Path;
-
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    const GENERIC_WRITE: u32 = 0x4000_0000;
-    const SHARE_ALL: u32 = 0x7; // READ | WRITE | DELETE
-
-    fn wide(path: &Path) -> io::Result<Vec<u16>> {
-        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        if wide.contains(&0) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"));
-        }
-        Ok(wide.into_iter().chain(Some(0)).collect())
-    }
-
-    pub(super) fn move_write_through(from: &Path, to: &Path) -> io::Result<()> {
-        let (from, to) = (wide(from)?, wide(to)?);
-        // SAFETY: both buffers are NUL-terminated and outlive the call.
-        let ok = unsafe {
-            MoveFileExW(
-                from.as_ptr(),
-                to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    /// `FlushFileBuffers` needs write access; a directory handle needs
-    /// `FILE_FLAG_BACKUP_SEMANTICS`. A link is refused, as `O_NOFOLLOW` does on Unix.
-    pub(super) fn flush_directory_handle(dir: &Path) -> io::Result<()> {
-        if fs::symlink_metadata(dir)?.file_type().is_symlink() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "a link is not followed"));
-        }
-        fs::OpenOptions::new()
-            .access_mode(GENERIC_WRITE)
-            .share_mode(SHARE_ALL)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(dir)?
-            .sync_all()
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        // Compiles everywhere Windows builds; its pass/fail is only observable on a
-        // Windows host (part of the validation list in the design note).
-        #[test]
-        fn a_write_through_move_replaces_and_a_directory_handle_flushes() {
-            let dir = tempfile::tempdir().unwrap();
-            let (a, b) = (dir.path().join("a"), dir.path().join("b"));
-            fs::write(&a, b"new").unwrap();
-            fs::write(&b, b"old").unwrap();
-            move_write_through(&a, &b).unwrap();
-            assert_eq!(fs::read(&b).unwrap(), b"new");
-            assert!(!a.exists());
-            flush_directory_handle(dir.path()).unwrap();
-        }
+fn ns_error(error: NsError) -> AreaError {
+    match error {
+        NsError::Io(error) => AreaError::Io(error),
+        other => AreaError::Io(io::Error::other(other.to_string())),
     }
 }
 
 fn record_file_name(version: &VersionHash) -> String {
     format!("{}.record", hex::encode(version.0))
-}
-
-fn temp_name() -> String {
-    format!(".tmp-{}", hex::encode(rand::random::<[u8; 8]>()))
 }
 
 /// `dir` is a real directory, not a link: a write or read below it would
@@ -484,27 +363,31 @@ pub(crate) fn require_real_dir(dir: &Path) -> Result<(), AreaError> {
     }
 }
 
-/// Writes `bytes` as `dir/name`: temporary name, fsync, rename, fsync of `dir`.
+/// Writes `bytes` as `dir/name`: a Stage file beside it, fsynced, then published
+/// by a durable move that replaces any earlier file of that name.
 pub(crate) fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), AreaError> {
     require_real_dir(dir)?;
     #[cfg(test)]
     let owned = test_hooks::maybe_corrupt(&dir.join(name), bytes);
     #[cfg(test)]
     let bytes = owned.as_slice();
-    let temp = dir.join(temp_name());
-    let result = (|| -> Result<(), AreaError> {
-        let mut file = create_private_file(&temp)?;
+    let ns = namespace_for(dir)?;
+    let target = dir.join(name);
+    let stage = ns.stage_path(&target).map_err(ns_error)?;
+    let staged = (|| -> Result<(), AreaError> {
+        let mut file = create_private_file(&stage)?;
         file.write_all(bytes)?;
-        fsync_file(&file, &temp)?;
+        fsync_file(&file, &stage)?;
         drop(file);
         #[cfg(windows)]
-        windows_acl::restrict_to_current_user(&temp, false)?;
-        durable_rename(&temp, &dir.join(name))
+        windows_acl::restrict_to_current_user(&stage, false)?;
+        Ok(())
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
+    if let Err(error) = staged {
+        let _ = fs::remove_file(&stage);
+        return Err(error);
     }
-    result
+    ns.publish(&stage, &target, Replace::Yes, &NoLedger).map_err(ns_error)
 }
 
 /// The bytes of a regular file under the area, never through a link.
@@ -580,20 +463,6 @@ impl RecoveryArea {
         Ok(Self { dir })
     }
 
-    /// Flushes every directory entry that leads to the area: its own entries,
-    /// the group directory, the recovery root and the recovery root's parent. A
-    /// file is only as durable as the chain of names that reaches it, so this
-    /// runs once more before the barrier is declared.
-    pub fn sync_chain(&self) -> Result<(), AreaError> {
-        let mut level = Some(self.dir.as_path());
-        for _ in 0..4 {
-            let Some(dir) = level else { break };
-            sync_dir(dir)?;
-            level = dir.parent();
-        }
-        Ok(())
-    }
-
     /// The existing area of `recovery_id`.
     pub fn open_existing(
         recovery_root: &Path,
@@ -626,7 +495,8 @@ impl RecoveryArea {
         &self.dir
     }
 
-    /// Removes the area. Idempotent; nothing is followed out of it.
+    /// Removes the area. Idempotent; nothing is followed out of it. The area
+    /// leaves its parent by a durable move (see [`remove_private_tree`]).
     pub fn remove(
         recovery_root: &Path,
         group: &FolderGroupId,
@@ -638,13 +508,7 @@ impl RecoveryArea {
         let dir = recovery_root.join(group_dir_name(group)).join(recovery_id);
         match lstat_no_link(&dir)? {
             None => Ok(()),
-            Some(meta) if meta.is_dir() => {
-                fs::remove_dir_all(&dir)?;
-                if let Some(parent) = dir.parent() {
-                    sync_dir(parent)?;
-                }
-                Ok(())
-            }
+            Some(meta) if meta.is_dir() => remove_private_tree(&dir),
             Some(_) => Err(unavailable("the area is not a directory")),
         }
     }
@@ -679,7 +543,8 @@ impl RecoveryArea {
         matches!(lstat_no_link(&self.dir.join(MANIFEST_FILE)), Ok(Some(_)) | Err(_))
     }
 
-    /// Removes leftover temporary files from an interrupted write.
+    /// Removes the Stage files an interrupted write left. The area is a private
+    /// directory of this product, so a Stage name in it is ours by where it is.
     pub fn remove_temporaries(&self) -> Result<(), AreaError> {
         for dir in [
             self.dir.clone(),
@@ -694,7 +559,8 @@ impl RecoveryArea {
             }
             for entry in fs::read_dir(&dir)? {
                 let entry = entry?;
-                if entry.file_name().to_string_lossy().starts_with(".tmp-") {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if matches!(parse_artefact_component(&name), Some((ArtefactKind::Stage, _))) {
                     fs::remove_file(entry.path())?;
                 }
             }
@@ -800,26 +666,42 @@ impl RecoveryArea {
     }
 }
 
-/// Creates `path` and any missing ancestors, flushing each created entry in its
-/// parent.
+/// Creates `path` and any missing ancestors, each as its own published
+/// directory. The first ancestor that exists is trusted as it is.
 pub(crate) fn create_dirs_durably(path: &Path) -> Result<(), AreaError> {
-    let mut missing = Vec::new();
-    let mut level = Some(path);
-    while let Some(dir) = level {
-        if fs::symlink_metadata(dir).is_ok() {
-            break;
-        }
-        missing.push(dir);
-        level = dir.parent();
+    let ns = namespace_for(path)?;
+    match ns.create_dir_all(path, &NoLedger) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(ns_error(error)),
     }
-    for dir in missing.into_iter().rev() {
-        match fs::create_dir(dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        if let Some(parent) = dir.parent() {
-            sync_dir(parent)?;
+}
+
+/// Removes the private directory `dir` and everything below it, never
+/// recursively in one step: everything below is unlinked (a subdirectory only
+/// once it is empty), and `dir` itself, once empty, leaves its parent by a
+/// durable move to a Discard name. Its removal is what is committed; nothing
+/// below it is relied on after that.
+pub(crate) fn remove_private_tree(dir: &Path) -> Result<(), AreaError> {
+    empty_directory(dir)?;
+    let ns = namespace_for(dir)?;
+    let discarded = ns.discard(dir, &NoLedger).map_err(ns_error)?;
+    match discarded.finish(&ns, &NoLedger) {
+        DiscardOutcome::Removed => Ok(()),
+        other => Err(unavailable(format!("{} was not removed: {other:?}", dir.display()))),
+    }
+}
+
+/// Unlinks everything below `dir`, a link as a link and a subdirectory only
+/// once it is empty.
+fn empty_directory(dir: &Path) -> Result<(), AreaError> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            empty_directory(&path)?;
+            fs::remove_dir(&path)?;
+        } else {
+            fs::remove_file(&path)?;
         }
     }
     Ok(())
@@ -1531,7 +1413,11 @@ mod windows_acl {
         if ok == 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut wide: Vec<u16> = yadorilink_fs_platform::long_path::for_win32(path)
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         // SAFETY: `wide` is NUL terminated; `dacl` points into `descriptor`.
         let status = unsafe {
             SetNamedSecurityInfoW(

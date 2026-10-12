@@ -469,6 +469,46 @@ async fn run_taguchi_v2_row(
         .chain(joined_device.iter())
         .collect();
 
+    // Conflict convergence needs the winner to replace the loser's original,
+    // which the closed Windows gate withholds, so the devices cannot agree
+    // while it is closed. What must still hold is that no device's write is
+    // lost: its content stays on its own device or in a conflict copy beside it.
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "conflict convergence requires durable namespace replacement",
+    ) {
+        let expected: Vec<String> = (0..DEVICE_COUNT)
+            .filter(|idx| Some(*idx) != excluded_idx)
+            .map(|idx| {
+                hex::encode(sha2::Sha256::digest(generate_content(size_level, pattern_level, idx)))
+            })
+            .collect();
+        let present = || -> Vec<String> {
+            let mut hashes = Vec::new();
+            for device in &active_refs {
+                let target = device.root.path().join(&rel_path);
+                let dir = target.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                let dir =
+                    if dir.as_os_str().is_empty() { device.root.path().to_path_buf() } else { dir };
+                for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                    if entry.path().is_file() {
+                        hashes.extend(file_hash(&entry.path()));
+                    }
+                }
+            }
+            hashes
+        };
+        wait_until_with_context(
+            || {
+                let present = present();
+                expected.iter().all(|hash| present.contains(hash))
+            },
+            Duration::from_secs(60),
+            || format!("{row_name}: a device's write is in none of the trees ({expected:?})"),
+        )
+        .await;
+        return;
+    }
+
     wait_for_content_convergence(
         &active_refs,
         &rel_path,

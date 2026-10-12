@@ -57,8 +57,6 @@ pub(crate) fn author_delta(c: &SyncDatabase, incarnation: u8, path: &str) -> Nat
                 path: SyncPath(path.into()),
                 removes: Vec::new(),
                 put: Some(DeltaPut { version: VersionHash([path.len() as u8; 32]) }),
-                keeps: Vec::new(),
-                keep_put: false,
             }],
             signature: [0; 64],
         };

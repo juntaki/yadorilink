@@ -5,6 +5,8 @@ use yadorilink_ipc_proto::daemonctl::{
 
 use crate::error::CliError;
 
+mod reasons;
+
 /// The ` held=N` suffix appended to a link's summary line — empty
 /// (rendering no suffix at all) when the link has no held files, so an
 /// unaffected link's `status` output is byte-for-byte unchanged from
@@ -21,8 +23,84 @@ fn held_summary_suffix(link: &LinkStatus) -> String {
 /// One indented detail line per held file (path and reason), printed
 /// directly beneath a link's summary line. Empty when the link has no
 /// held files.
-fn held_file_detail_lines(link: &LinkStatus) -> Vec<String> {
-    link.held_files.iter().map(|h| format!("    held: {}  ({})", h.path, h.reason)).collect()
+fn held_file_detail_lines(link: &LinkStatus, verbose: bool) -> Vec<String> {
+    link.held_files
+        .iter()
+        .map(|h| {
+            let (code, _) = reasons::split_code(&h.reason);
+            let sentence = reasons::explain(code, "", false);
+            if verbose {
+                format!("    held: {}  {sentence}  (code: {})", h.path, h.reason)
+            } else {
+                format!("    held: {}  {sentence}", h.path)
+            }
+        })
+        .collect()
+}
+
+/// A device id for people: the first eight characters. The full id only under `--verbose`.
+fn device_label(device_id: &str, verbose: bool) -> String {
+    if verbose || device_id.chars().count() <= 8 {
+        device_id.to_string()
+    } else {
+        format!("{}...", device_id.chars().take(8).collect::<String>())
+    }
+}
+
+/// What a link is called: its provider folder name, else its directory.
+fn folder_label(link: &LinkStatus) -> String {
+    if link.provider_display_name.is_empty() {
+        link.local_path.clone()
+    } else {
+        format!("provider folder '{}'", link.provider_display_name)
+    }
+}
+
+/// The folder name for a group id, or the id itself when no linked folder carries it.
+fn group_label(status: &StatusResponse, group_id: &str) -> String {
+    status
+        .links
+        .iter()
+        .find(|l| l.group_id == group_id)
+        .map(folder_label)
+        .unwrap_or_else(|| group_id.to_string())
+}
+
+/// Local-time `YYYY-MM-DD HH:MM:SS` for unix seconds (UTC where the platform has no local zone).
+pub(crate) fn format_local_time(unix: i64) -> String {
+    if unix <= 0 {
+        return "unknown time".to_string();
+    }
+    #[cfg(unix)]
+    {
+        let t = unix as libc::time_t;
+        // SAFETY: `localtime_r` writes only into the zeroed `tm` we own.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if !unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+            return format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec
+            );
+        }
+    }
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    // Civil-from-days (Howard Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC", secs / 3600, secs % 3600 / 60, secs % 60)
 }
 
 /// One `    configured full copy: <device>  (available|offline|unknown)`
@@ -50,7 +128,11 @@ fn held_file_detail_lines(link: &LinkStatus) -> Vec<String> {
 /// `unknown`, since this daemon has no positive evidence either way for
 /// those (an earlier version
 /// conflated "never observed" with "known offline").
-fn complete_copies_detail_lines(link: &LinkStatus, peers: &[PeerStatus]) -> Vec<String> {
+fn complete_copies_detail_lines(
+    link: &LinkStatus,
+    peers: &[PeerStatus],
+    verbose: bool,
+) -> Vec<String> {
     link.full_replica_device_ids
         .iter()
         .map(|device_id| {
@@ -61,7 +143,7 @@ fn complete_copies_detail_lines(link: &LinkStatus, peers: &[PeerStatus]) -> Vec<
                 Some(PeerReachability::Unreachable) => "offline",
                 _ => "unknown",
             };
-            format!("    configured full copy: {device_id}  ({state})")
+            format!("    configured full copy: {}  ({state})", device_label(device_id, verbose))
         })
         .collect()
 }
@@ -208,18 +290,48 @@ pub(crate) fn format_rate_bytes_per_sec(bytes_per_sec: u64) -> String {
 /// `overall_state` an unset value renders nothing
 /// at all, matching this file's "absent = no new output" convention for
 /// every other additive field.
-fn overall_state_line(status: &StatusResponse) -> Option<String> {
+fn overall_state_lines(status: &StatusResponse, verbose: bool) -> Vec<String> {
     if status.overall_state.is_empty() {
-        return None;
+        return Vec::new();
     }
-    if status.attention_reasons.is_empty() {
-        Some(format!("Overall: {}", status.overall_state))
-    } else {
-        Some(format!(
-            "Overall: {}  ({})",
-            status.overall_state,
-            status.attention_reasons.join(", ")
-        ))
+    let mut lines = vec![format!("Overall: {}", status.overall_state)];
+    for raw in &status.attention_reasons {
+        let (code, arg) = reasons::split_code(raw);
+        let subject = reason_subject(status, code, arg, verbose);
+        lines.push(format!("  - {}", reasons::explain(raw, &subject, verbose)));
+    }
+    lines
+}
+
+/// The name a reason refers to: a folder or provider folder name, a short device id, a path or an
+/// error category. Raw ids appear only under `--verbose`.
+fn reason_subject(status: &StatusResponse, code: &str, arg: &str, verbose: bool) -> String {
+    match code {
+        "degraded"
+        | "ambiguous"
+        | "ownership_lost"
+        | "durability_at_risk"
+        | "durability_unknown"
+        | "fetch_unavailable"
+        | "fetch_availability_unknown"
+        | "conflict"
+        | "volume_changed"
+        | "held" => group_label(status, arg),
+        "provider_not_ready" | "provider_stuck" | "kept_edits" => status
+            .provider_roots
+            .iter()
+            .find(|r| r.root_id == arg)
+            .map(|r| format!("provider folder '{}'", r.display_name))
+            .unwrap_or_default(),
+        "peer_disconnected" => device_label(arg, verbose),
+        "provider_orphan_domain" => {
+            if verbose {
+                arg.to_string()
+            } else {
+                String::new()
+            }
+        }
+        _ => arg.to_string(),
     }
 }
 
@@ -227,12 +339,15 @@ fn overall_state_line(status: &StatusResponse) -> Option<String> {
 /// `discard` when the total is above the configured size.
 /// The provider roots: why one is not ready, its Eager progress and stuck files, and the edits kept
 /// beside a file instead of replacing it.
-fn provider_root_lines(status: &StatusResponse) -> Vec<String> {
+fn provider_root_lines(status: &StatusResponse, verbose: bool) -> Vec<String> {
+    let id = |root_id: &str| if verbose { format!(" ({root_id})") } else { String::new() };
     let mut lines = Vec::new();
     for root in &status.provider_roots {
         lines.push(format!(
-            "provider folder {} ({}): {}",
-            root.display_name, root.root_id, root.readiness
+            "provider folder {}{}: {}",
+            root.display_name,
+            id(&root.root_id),
+            root.readiness
         ));
         if root.eager {
             lines.push(format!(
@@ -272,19 +387,23 @@ fn provider_root_lines(status: &StatusResponse) -> Vec<String> {
         lines.push(if removal.removed {
             if removal.preserved_location.is_empty() {
                 format!(
-                    "provider folder {} ({}): removed; the downloaded files were kept by the operating system",
-                    removal.display_name, removal.root_id
+                    "provider folder {}{}: removed; the downloaded files were kept by the operating system",
+                    removal.display_name,
+                    id(&removal.root_id)
                 )
             } else {
                 format!(
-                    "provider folder {} ({}): removed; the downloaded files are kept at {}",
-                    removal.display_name, removal.root_id, removal.preserved_location
+                    "provider folder {}{}: removed; the downloaded files are kept at {}",
+                    removal.display_name,
+                    id(&removal.root_id),
+                    removal.preserved_location
                 )
             }
         } else {
             format!(
-                "provider folder {} ({}): removing (waiting for the app to remove the domain)",
-                removal.display_name, removal.root_id
+                "provider folder {}{}: removing (waiting for the app to remove the domain)",
+                removal.display_name,
+                id(&removal.root_id)
             )
         });
     }
@@ -492,7 +611,14 @@ fn recent_errors_summary_lines(status: &StatusResponse) -> Vec<String> {
     status
         .recent_errors
         .iter()
-        .map(|e| format!("  {}  ({})  {}", e.category, e.coarse_context, e.timestamp_unix))
+        .map(|e| {
+            format!(
+                "  {}  ({})  {}",
+                e.category,
+                e.coarse_context,
+                format_local_time(e.timestamp_unix)
+            )
+        })
         .collect()
 }
 
@@ -534,12 +660,12 @@ fn update_summary_lines(status: &StatusResponse) -> Vec<String> {
 /// than re-running the command by hand. A plain `yadorilink status`
 /// (`watch = false`) is byte-for-byte the same single-snapshot behavior
 /// as before this flag existed.
-pub async fn status(watch: bool) -> Result<(), CliError> {
+pub async fn status(watch: bool, verbose: bool) -> Result<(), CliError> {
     if !watch {
-        return render_status_once().await;
+        return render_status_once(verbose).await;
     }
     loop {
-        render_status_once().await?;
+        render_status_once(verbose).await?;
         println!();
         println!("--- refreshing every 2s (Ctrl-C to stop) ---");
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -547,43 +673,53 @@ pub async fn status(watch: bool) -> Result<(), CliError> {
 }
 
 /// `status --pending-items N`: the publications waiting on the OS, oldest first.
-pub async fn pending_items(limit: u32) -> Result<(), CliError> {
+pub async fn pending_items(limit: u32, verbose: bool) -> Result<(), CliError> {
     let items = yadorilink_client_core::ops::storage::list_provider_pending(limit).await?;
     if items.is_empty() {
-        println!("No publication is waiting on the OS.");
+        println!("Nothing is waiting on the operating system.");
     }
     for item in &items {
-        println!("  waiting: {} ({}): {}", item.path, item.root_id, age_text(item.age_ms));
+        if verbose {
+            println!("  waiting: {} ({}): {}", item.path, item.root_id, age_text(item.age_ms));
+        } else {
+            println!("  waiting: {}: {}", item.path, age_text(item.age_ms));
+        }
     }
     Ok(())
 }
 
-async fn render_status_once() -> Result<(), CliError> {
+async fn render_status_once(verbose: bool) -> Result<(), CliError> {
     let status = yadorilink_client_core::ops::folders::status().await?;
-    for line in status_lines(&status) {
+    for line in status_lines(&status, verbose) {
         println!("{line}");
     }
     Ok(())
 }
 
 /// Every line one `yadorilink status` rendering prints, in order.
-fn status_lines(status: &StatusResponse) -> Vec<String> {
+fn status_lines(status: &StatusResponse, verbose: bool) -> Vec<String> {
     let mut lines = Vec::new();
-    if let Some(line) = overall_state_line(status) {
-        lines.push(line);
+    let overall = overall_state_lines(status, verbose);
+    if !overall.is_empty() {
+        lines.extend(overall);
         lines.push(String::new());
     }
 
     for group in &status.rebootstrapping_groups {
+        let name = if verbose {
+            format!("{} (group={group})", group_label(status, group))
+        } else {
+            group_label(status, group)
+        };
         lines.push(format!(
-            "group={group}  replacing its state from a peer's sealed state (rebootstrap running); \
+            "{name}  replacing its state from a peer's sealed state (rebootstrap running); \
              its folder is paused until it ends"
         ));
     }
     if let Some(line) = preserved_line(status) {
         lines.push(line);
     }
-    lines.extend(provider_root_lines(status));
+    lines.extend(provider_root_lines(status, verbose));
     if status.undecided_uploads > 0 {
         lines.push(format!(
             "undecided uploads: {}, oldest: {}",
@@ -605,17 +741,22 @@ fn status_lines(status: &StatusResponse) -> Vec<String> {
         let fetch_availability = fetch_availability_suffix(link);
         let ambiguous = ambiguous_suffix(link);
         // A provider folder has no directory: it is named, never shown by its identity key.
-        let place = if link.provider_display_name.is_empty() {
-            link.local_path.clone()
+        let place = folder_label(link);
+        let group = if verbose { format!("  group={}", link.group_id) } else { String::new() };
+        let pending = if link.conflicts_pending > 0 {
+            format!("  conflicts_pending={}", link.conflicts_pending)
         } else {
-            format!("provider folder '{}'", link.provider_display_name)
+            String::new()
         };
         lines.push(format!(
-            "{place}  group={}  {state}  conflicts={}{materialization}{held}{degraded}{transfer}{durability}{fetch_availability}{ambiguous}",
-            link.group_id, link.conflict_count
+            "{place}{group}  {state}  conflicts={}{pending}{materialization}{held}{degraded}{transfer}{durability}{fetch_availability}{ambiguous}",
+            link.conflict_count
         ));
-        lines.extend(held_file_detail_lines(link));
-        lines.extend(complete_copies_detail_lines(link, &status.peers));
+        if !link.conflict_note.is_empty() {
+            lines.push(format!("  {}", link.conflict_note));
+        }
+        lines.extend(held_file_detail_lines(link, verbose));
+        lines.extend(complete_copies_detail_lines(link, &status.peers, verbose));
     }
 
     if !status.peers.is_empty() {
@@ -623,7 +764,7 @@ fn status_lines(status: &StatusResponse) -> Vec<String> {
         lines.push("Peers:".to_string());
         for peer in &status.peers {
             let connectivity = peer_connectivity_label(peer);
-            lines.push(format!("  {}  {connectivity}", peer.device_id));
+            lines.push(format!("  {}  {connectivity}", device_label(&peer.device_id, verbose)));
         }
     }
 

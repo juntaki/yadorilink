@@ -127,7 +127,7 @@ pub enum NativeAdmission {
     Unauthorized(DeltaProofVerificationError),
     /// A path this delta names (an op's own path) is one no replica may ever store — the same permanent,
     /// signed-bytes-only predicate
-    /// (`yadorilink_root_authority::reserved_namespace::
+    /// (`yadorilink_fs_platform::reserved_namespace::
     /// wire_path_admission_refusal`). Final, not a hold: re-delivering the
     /// identical delta can never produce another verdict, so there is
     /// nothing to wait for. Checked before any chain/context gate runs.
@@ -507,10 +507,10 @@ enum Step {
 /// The first path `delta` names that no replica may store, by the same
 /// signed-bytes-only predicate -- every op's own path.
 fn path_refusal(delta: &NativeDelta) -> Option<yadorilink_replica_domain::admission::PathRefusal> {
-    use yadorilink_replica_domain::admission::PathRefusal;
-    use yadorilink_root_authority::reserved_namespace::{
+    use yadorilink_fs_platform::reserved_namespace::{
         wire_path_admission_refusal, WirePathRefusal,
     };
+    use yadorilink_replica_domain::admission::PathRefusal;
     delta.ops.iter().find_map(|op| match wire_path_admission_refusal(op.path.as_str())? {
         WirePathRefusal::ReservedNamespace => {
             Some(PathRefusal::ReservedNamespaceCollision { path: op.path.as_str().to_owned() })
@@ -644,16 +644,9 @@ fn apply_or_hold(
     // must belong to an author this replica has observed at least that far. A
     // dot it has observed but that is no longer live is not this gate's
     // concern: for a removal that is `receive_verified`'s best-effort no-op
-    // case below, and a keep of a retired head records nothing. Holding a keep
-    // until its head is observed is what lets a kept copy exist only for a live
-    // head, with no record of retired heads to keep.
+    // case below.
     for op in &delta.ops {
-        for dot in op
-            .removes
-            .iter()
-            .map(|removal| &removal.dot)
-            .chain(op.keeps.iter().map(|keep| &keep.dot))
-        {
+        for dot in op.removes.iter().map(|removal| &removal.dot) {
             let observed = native_store::author_context_seq(conn, group_id, &dot.author)?;
             if observed.is_none_or(|seq| seq < dot.seq) {
                 // A dot above the cutoff of a closed incarnation is never
@@ -1054,30 +1047,11 @@ mod tests {
                 path: SyncPath(path.into()),
                 removes,
                 put: Some(DeltaPut { version: VersionHash([version; 32]) }),
-                keeps: Vec::new(),
-                keep_put: false,
             }],
             signature: [0u8; 64],
         };
         d.sign(key);
         d
-    }
-
-    /// Admits `order` one delta at a time. Each is admitted or held for an
-    /// earlier one; once all have arrived nothing may be left held.
-    fn deliver(
-        c: &Connection,
-        lookup: &impl Fn(&AuthorId) -> Option<VerifyingKey>,
-        order: &[&NativeDelta],
-    ) {
-        for delta in order {
-            let outcome = admit_native_delta(c, &group(), delta, lookup).unwrap();
-            assert!(
-                matches!(outcome, NativeAdmission::Admitted { .. } | NativeAdmission::Held { .. }),
-                "{outcome:?}"
-            );
-        }
-        assert_eq!(held_count(c, None), 0, "every delta was admitted in the end");
     }
 
     fn held_count(c: &Connection, who: Option<&AuthorId>) -> i64 {
@@ -1390,7 +1364,7 @@ mod tests {
         let a = author("a");
         let key_a = key(1);
         // The wire-path predicate
-        // (`yadorilink_root_authority::reserved_namespace::
+        // (`yadorilink_fs_platform::reserved_namespace::
         // wire_path_admission_refusal`), exercised here through native's
         // own admission path rather than a re-implementation of it.
         let d = delta(&a, 1, None, ".yadorilink-root.lock", 1, vec![], &key_a);
@@ -2063,313 +2037,5 @@ mod tests {
             assert!(matches!(retried, NativeAdmission::Admitted { .. }));
             assert!(native_publication::is_published(&c, &d.delta_hash()).unwrap());
         }
-    }
-
-    /// The survivor of a cascade is the version that lost first: two held
-    /// deltas (a competing put, then the removal of the winner) are released
-    /// by one arrival, and nothing resolves in between.
-    #[test]
-    fn a_loser_left_alone_by_a_released_winner_removal_keeps_its_copy_name() {
-        fn run(remove_dot_of: &str) -> Vec<(String, u8)> {
-            let c = Connection::open_in_memory().unwrap();
-            crate::replica_tables::init(&c).unwrap();
-            init_admission_tables(&c).unwrap();
-            let (a, b) = (author("a"), author("b"));
-            let (key_a, key_b) = (key(1), key(2));
-            let lookup = keys(vec![(a.clone(), key_a.clone()), (b.clone(), key_b.clone())]);
-            let a1 = delta(&a, 1, None, "x", 1, vec![], &key_a);
-            let b1 = delta(&b, 1, None, "d", 9, vec![], &key_b);
-            let b2 = delta(&b, 2, Some(b1.delta_hash()), "x", 2, vec![], &key_b);
-            let victim = if remove_dot_of == "a" { &a } else { &b };
-            let victim_dot = Dot {
-                author: victim.clone(),
-                seq: AuthorSeq(if remove_dot_of == "a" { 1 } else { 2 }),
-            };
-            let mut b3 = delta(&b, 3, Some(b2.delta_hash()), "x", 3, vec![], &key_b);
-            b3.ops[0].put = None;
-            let header = if remove_dot_of == "a" { a1.delta_hash() } else { b2.delta_hash() };
-            b3.ops[0].removes = vec![HeadRef { dot: victim_dot.clone(), provenance: header }];
-            // The author of the removal saw the contest: when it removes the
-            // winner, the delta declares the loser a kept copy. That
-            // declaration, not the order the deltas arrive in, is what keeps
-            // the loser's name.
-            let live = |dot: Dot, seq_delta: &NativeDelta, version: u8| {
-                yadorilink_replica_domain::native_state::LiveHead {
-                    dot,
-                    payload: yadorilink_replica_domain::native_state::HeadPayload {
-                        version: VersionHash([version; 32]),
-                        provenance: seq_delta.delta_hash(),
-                    },
-                }
-            };
-            let heads = [live(a1.dot(), &a1, 1), live(b2.dot(), &b2, 2)];
-            let winner = yadorilink_replica_domain::native_state::resolve_winner(heads.iter())
-                .expect("two heads")
-                .dot
-                .clone();
-            if victim_dot == winner {
-                let survivor = if remove_dot_of == "a" { &b2 } else { &a1 };
-                b3.ops[0].keeps =
-                    vec![HeadRef { dot: survivor.dot(), provenance: survivor.delta_hash() }];
-            }
-            b3.sign(&key_b);
-
-            assert!(matches!(
-                admit_native_delta(&c, &group(), &a1, &lookup).unwrap(),
-                NativeAdmission::Admitted { .. }
-            ));
-            assert!(matches!(
-                admit_native_delta(&c, &group(), &b2, &lookup).unwrap(),
-                NativeAdmission::Held { .. }
-            ));
-            assert!(matches!(
-                admit_native_delta(&c, &group(), &b3, &lookup).unwrap(),
-                NativeAdmission::Held { .. }
-            ));
-            // One arrival releases both, with no resolve in between.
-            let NativeAdmission::Admitted { released, .. } =
-                admit_native_delta(&c, &group(), &b1, &lookup).unwrap()
-            else {
-                panic!("b1 must be admitted")
-            };
-            assert_eq!(released.len(), 2, "both held deltas are released");
-
-            let survivor: Vec<u8> =
-                native_store::native_heads_at(&c, &group(), &SyncPath("x".into()))
-                    .unwrap()
-                    .iter()
-                    .map(|head| head.payload.version.0[0])
-                    .collect();
-            assert_eq!(survivor.len(), 1, "one head of x survives: {survivor:?}");
-            crate::stable_projection_binding::native_placements(&c, "g1")
-                .unwrap()
-                .into_iter()
-                .map(|p| (p.physical_path, p.version[0]))
-                .chain(std::iter::once((String::new(), survivor[0])))
-                .collect()
-        }
-        // Whichever of the two versions wins the contested "x", one run
-        // removes the winner and the other the loser. Removing the loser
-        // leaves the winner at the real name and no copy. Removing the winner
-        // leaves the other version alone at the copy name it lost to.
-        let mut recorded_copies: Vec<usize> = ["a", "b"]
-            .iter()
-            .map(|owner| {
-                let rows = run(owner);
-                let (survivor_version, copies): (u8, Vec<_>) = {
-                    let survivor = rows.last().unwrap().1;
-                    (survivor, rows[..rows.len() - 1].to_vec())
-                };
-                assert!(
-                    copies.iter().all(|(_, version)| *version == survivor_version),
-                    "{copies:?}"
-                );
-                copies.len()
-            })
-            .collect();
-        recorded_copies.sort_unstable();
-        assert_eq!(recorded_copies, vec![0, 1], "exactly the removed-winner run keeps a copy name");
-    }
-
-    /// A replica that admits the loser only after the winner's removal
-    /// derives the same durable copy name as one that lived through the
-    /// contest, because the removal's signed `keeps` names the loser.
-    #[test]
-    fn a_kept_copy_is_placed_whatever_order_the_deltas_arrive_in() {
-        let (a, b) = (author("a"), author("b"));
-        let (key_a, key_b) = (key(1), key(2));
-        let lookup = keys(vec![(a.clone(), key_a.clone()), (b.clone(), key_b.clone())]);
-        // `a` puts version 2 (the winner), `b` puts version 1 concurrently (the
-        // loser). `a` then removes its own head, having seen the loser as a copy.
-        let a1 = delta(&a, 1, None, "x", 2, vec![], &key_a);
-        let b1 = delta(&b, 1, None, "x", 1, vec![], &key_b);
-        let mut a2 = delta(&a, 2, Some(a1.delta_hash()), "x", 1, vec![], &key_a);
-        a2.ops[0].put = None;
-        a2.ops[0].removes = vec![HeadRef { dot: a1.dot(), provenance: a1.delta_hash() }];
-        a2.ops[0].keeps = vec![HeadRef { dot: b1.dot(), provenance: b1.delta_hash() }];
-        a2.sign(&key_a);
-
-        let placements_after = |order: &[&NativeDelta]| {
-            let c = conn();
-            deliver(&c, &lookup, order);
-            let mut rows: Vec<(String, u8)> =
-                crate::stable_projection_binding::native_placements(&c, "g1")
-                    .unwrap()
-                    .into_iter()
-                    .map(|p| (p.physical_path, p.version[0]))
-                    .collect();
-            rows.sort();
-            rows
-        };
-        let lived_through = placements_after(&[&a1, &b1, &a2]);
-        let late_clone = placements_after(&[&a1, &a2, &b1]);
-        assert_eq!(lived_through.len(), 1, "the loser keeps a copy name: {lived_through:?}");
-        assert_eq!(late_clone, lived_through);
-    }
-
-    /// A keep covers the head it names and nothing else: the same content put
-    /// at the path again, by an author that declared nothing, is promoted on
-    /// every replica, whether the declaring delta arrived before the declared
-    /// head, while it was live, or after it was gone. Nothing records a keep
-    /// for a retired head, so a replica that admitted the declaring delta late
-    /// cannot disagree with one that lived through it.
-    #[test]
-    fn a_later_head_with_a_kept_versions_content_is_not_kept() {
-        let (a, b, c3) = (author("a"), author("b"), author("c"));
-        let (key_a, key_b, key_c) = (key(1), key(2), key(3));
-        let lookup = keys(vec![
-            (a.clone(), key_a.clone()),
-            (b.clone(), key_b.clone()),
-            (c3.clone(), key_c.clone()),
-        ]);
-        let a1 = delta(&a, 1, None, "x", 2, vec![], &key_a);
-        let b1 = delta(&b, 1, None, "x", 1, vec![], &key_b);
-        let mut a2 = delta(&a, 2, Some(a1.delta_hash()), "x", 1, vec![], &key_a);
-        a2.ops[0].put = None;
-        a2.ops[0].removes = vec![HeadRef { dot: a1.dot(), provenance: a1.delta_hash() }];
-        a2.ops[0].keeps = vec![HeadRef { dot: b1.dot(), provenance: b1.delta_hash() }];
-        a2.sign(&key_a);
-        let mut b2 = delta(&b, 2, Some(b1.delta_hash()), "x", 2, vec![], &key_b);
-        b2.ops[0].put = None;
-        b2.ops[0].removes = vec![HeadRef { dot: b1.dot(), provenance: b1.delta_hash() }];
-        b2.sign(&key_b);
-        // The same content as the kept copy, from an author that declares
-        // nothing.
-        let c1 = delta(&c3, 1, None, "x", 1, vec![], &key_c);
-
-        let state_after = |order: &[&NativeDelta]| {
-            let c = conn();
-            deliver(&c, &lookup, order);
-            let placements: Vec<(String, u8)> =
-                crate::stable_projection_binding::native_placements(&c, "g1")
-                    .unwrap()
-                    .into_iter()
-                    .map(|p| (p.physical_path, p.version[0]))
-                    .collect();
-            let kept =
-                crate::stable_projection_binding::native_kept_heads_of_group(&c, "g1").unwrap();
-            (placements, kept)
-        };
-        let declared_while_live = state_after(&[&a1, &b1, &a2, &b2, &c1]);
-        let declared_before_head = state_after(&[&a1, &a2, &b1, &b2, &c1]);
-        let declared_after_head_gone = state_after(&[&a1, &b1, &b2, &a2, &c1]);
-        assert!(
-            declared_while_live.0.is_empty() && declared_while_live.1.is_empty(),
-            "the re-put takes the real name and is kept nowhere: {declared_while_live:?}"
-        );
-        assert_eq!(declared_before_head, declared_while_live);
-        assert_eq!(declared_after_head_gone, declared_while_live);
-    }
-
-    /// A keep naming a head this replica has not observed holds the delta, like
-    /// a removal does, and releases with the head's own arrival.
-    #[test]
-    fn a_keep_naming_an_unobserved_head_holds_the_delta_until_the_head_arrives() {
-        let (a, b) = (author("a"), author("b"));
-        let (key_a, key_b) = (key(1), key(2));
-        let lookup = keys(vec![(a.clone(), key_a.clone()), (b.clone(), key_b.clone())]);
-        let a1 = delta(&a, 1, None, "x", 1, vec![], &key_a);
-        let b1 = delta(&b, 1, None, "x", 2, vec![], &key_b);
-        let mut a2 = delta(&a, 2, Some(a1.delta_hash()), "x", 1, vec![], &key_a);
-        a2.ops[0].put = None;
-        a2.ops[0].keeps = vec![HeadRef { dot: b1.dot(), provenance: b1.delta_hash() }];
-        a2.sign(&key_a);
-
-        let c = conn();
-        assert!(matches!(
-            admit_native_delta(&c, &group(), &a1, &lookup).unwrap(),
-            NativeAdmission::Admitted { .. }
-        ));
-        let held = admit_native_delta(&c, &group(), &a2, &lookup).unwrap();
-        let NativeAdmission::Held { waiting_on } = held else { panic!("expected Held: {held:?}") };
-        assert_eq!(waiting_on, b1.dot());
-        assert!(crate::stable_projection_binding::native_kept_heads_of_group(&c, "g1")
-            .unwrap()
-            .is_empty());
-
-        let NativeAdmission::Admitted { released, .. } =
-            admit_native_delta(&c, &group(), &b1, &lookup).unwrap()
-        else {
-            panic!("b1 must be admitted")
-        };
-        assert_eq!(released.len(), 1, "the keep is released by the head's arrival");
-        let kept = crate::stable_projection_binding::native_kept_heads_of_group(&c, "g1").unwrap();
-        assert_eq!(kept.len(), 1);
-        assert_eq!((kept[0].author.as_str(), kept[0].seq), ("b", 1));
-    }
-
-    /// Retiring a head removes its keep and a keep arriving after the retirement
-    /// records nothing: a kept copy never outlives its head and is never
-    /// revived by a late delta.
-    #[test]
-    fn a_keep_goes_with_its_head_and_a_late_keep_of_a_retired_head_is_dropped() {
-        let (a, b) = (author("a"), author("b"));
-        let (key_a, key_b) = (key(1), key(2));
-        let lookup = keys(vec![(a.clone(), key_a.clone()), (b.clone(), key_b.clone())]);
-        let b1 = delta(&b, 1, None, "x", 2, vec![], &key_b);
-        let mut a1 = delta(&a, 1, None, "x", 1, vec![], &key_a);
-        a1.ops[0].put = None;
-        a1.ops[0].keeps = vec![HeadRef { dot: b1.dot(), provenance: b1.delta_hash() }];
-        a1.sign(&key_a);
-        let mut b2 = delta(&b, 2, Some(b1.delta_hash()), "x", 2, vec![], &key_b);
-        b2.ops[0].put = None;
-        b2.ops[0].removes = vec![HeadRef { dot: b1.dot(), provenance: b1.delta_hash() }];
-        b2.sign(&key_b);
-
-        // Keep first, then retire: the row goes with the head.
-        let c = conn();
-        deliver(&c, &lookup, &[&b1, &a1]);
-        assert_eq!(
-            crate::stable_projection_binding::native_kept_heads_of_group(&c, "g1").unwrap().len(),
-            1
-        );
-        deliver(&c, &lookup, &[&b2]);
-        assert!(crate::stable_projection_binding::native_kept_heads_of_group(&c, "g1")
-            .unwrap()
-            .is_empty());
-
-        // Retire first, then the keep: nothing is recorded.
-        let late = conn();
-        deliver(&late, &lookup, &[&b1, &b2, &a1]);
-        assert!(crate::stable_projection_binding::native_kept_heads_of_group(&late, "g1")
-            .unwrap()
-            .is_empty());
-    }
-
-    /// A keep names the head's provenance as well as its dot: a keep whose header is
-    /// not the live head's records nothing.
-    #[test]
-    fn a_keep_with_another_provenance_than_the_live_head_records_nothing() {
-        let (a, b) = (author("a"), author("b"));
-        let (key_a, key_b) = (key(1), key(2));
-        let lookup = keys(vec![(a.clone(), key_a.clone()), (b.clone(), key_b.clone())]);
-        let b1 = delta(&b, 1, None, "x", 2, vec![], &key_b);
-        let mut a1 = delta(&a, 1, None, "x", 1, vec![], &key_a);
-        a1.ops[0].put = None;
-        a1.ops[0].keeps = vec![HeadRef { dot: b1.dot(), provenance: DeltaHash([0xEE; 32]) }];
-        a1.sign(&key_a);
-        let c = conn();
-        deliver(&c, &lookup, &[&b1, &a1]);
-        assert!(crate::stable_projection_binding::native_kept_heads_of_group(&c, "g1")
-            .unwrap()
-            .is_empty());
-    }
-
-    /// The head an op puts is kept when the op says so, and only that head.
-    #[test]
-    fn a_keep_put_keeps_exactly_the_head_the_op_puts() {
-        let a = author("a");
-        let key_a = key(1);
-        let lookup = keys(vec![(a.clone(), key_a.clone())]);
-        let mut a1 = delta(&a, 1, None, "x", 1, vec![], &key_a);
-        a1.ops[0].keep_put = true;
-        a1.sign(&key_a);
-        let a2 = delta(&a, 2, Some(a1.delta_hash()), "y", 1, vec![], &key_a);
-        let c = conn();
-        deliver(&c, &lookup, &[&a1, &a2]);
-        let kept = crate::stable_projection_binding::native_kept_heads_of_group(&c, "g1").unwrap();
-        assert_eq!(kept.len(), 1);
-        assert_eq!((kept[0].source_path.as_str(), kept[0].seq), ("x", 1));
-        assert_eq!(kept[0].provenance, a1.delta_hash().0);
     }
 }

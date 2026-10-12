@@ -257,7 +257,13 @@ fn revoke_line(announcement: RevokeAnnouncement, device_id: &str, group_name: &s
 /// durability readiness gate runs before any coordination-plane write;
 /// `--force` bypasses a refusal with a data-loss warning and an audit log
 /// line.
-pub async fn revoke(group_name: String, device_id: String, force: bool) -> Result<(), CliError> {
+pub async fn revoke(
+    group_name: String,
+    device_id: String,
+    force: bool,
+    yes: bool,
+) -> Result<(), CliError> {
+    confirm_revoke(&format!("device {device_id} to '{group_name}'"), yes)?;
     revoke_announcing(group_name, device_id, force, RevokeAnnouncement::Revoked).await
 }
 
@@ -268,7 +274,20 @@ pub async fn revoke(group_name: String, device_id: String, force: bool) -> Resul
 /// forced: the readiness gate does not apply to a device that was never
 /// admitted.
 pub async fn deny(group_name: String, device_id: String) -> Result<(), CliError> {
-    revoke_announcing(group_name, device_id, false, RevokeAnnouncement::Denied).await
+    use yadorilink_client_core::error::CoreError;
+    let group_id = ops::resolve_group_name(&group_name).await?;
+    let outcome = match ops::deny_checked(group_id, device_id.clone()).await? {
+        ops::DenyAttempt::Refused(refusal) => {
+            return Err(CoreError::InvalidInput(refusal.reason().to_owned()).into());
+        }
+        ops::DenyAttempt::Attempted(ops::RevokeAttempt::Committed(outcome)) => outcome,
+        ops::DenyAttempt::Attempted(ops::RevokeAttempt::NotDurable { message, group_ids }) => {
+            return Err(CoreError::DurabilityBlocked { message, group_ids }.into());
+        }
+    };
+    crate::commands::membership_render::render_membership_outcome("revoke", &outcome);
+    println!("{}", revoke_line(RevokeAnnouncement::Denied, &device_id, &group_name));
+    Ok(())
 }
 
 async fn revoke_announcing(
@@ -283,9 +302,20 @@ async fn revoke_announcing(
     Ok(())
 }
 
+fn confirm_revoke(what: &str, yes: bool) -> Result<(), CliError> {
+    super::confirm_destructive(
+        &format!(
+            "Revoke access for {what}? It will no longer sync this folder. Files already on \
+             that device stay on its disk."
+        ),
+        yes,
+    )
+}
+
 /// `yadorilink share revoke <edge-id> [--force]`. An edge that no longer
 /// exists is treated as already revoked.
-pub async fn revoke_edge(edge_id: String, force: bool) -> Result<(), CliError> {
+pub async fn revoke_edge(edge_id: String, force: bool, yes: bool) -> Result<(), CliError> {
+    confirm_revoke(&format!("share {edge_id}"), yes)?;
     match ops::revoke_edge(&edge_id, force).await? {
         RevokeEdgeOutcome::Revoked(outcome) => {
             crate::commands::membership_render::render_membership_outcome("revoke", &outcome);
@@ -301,7 +331,15 @@ pub async fn revoke_edge(edge_id: String, force: bool) -> Result<(), CliError> {
 pub async fn delete_group(
     group_name: String,
     acknowledge_cross_account_members: bool,
+    yes: bool,
 ) -> Result<(), CliError> {
+    super::confirm_destructive(
+        &format!(
+            "Delete folder group '{group_name}' for every member? Their access is removed; \
+             files already on each device stay on its disk."
+        ),
+        yes,
+    )?;
     ops::delete_group(&group_name, acknowledge_cross_account_members).await?;
     println!("Deleted folder group: {group_name}");
     Ok(())

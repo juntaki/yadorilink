@@ -301,6 +301,11 @@ async fn wait_for_local_edit_indexed_past(
 /// conflict-marked copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partition_edit_edit_reconnect_keeps_both_copies_as_original_plus_conflict_copy() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     let (device_a, device_b, group_id) = two_synced_devices("partition-edit-edit").await;
 
     std::fs::write(device_a.root.path().join("shared.txt"), b"base").unwrap();
@@ -556,6 +561,11 @@ async fn partition_paused_device_rename_vs_online_device_edit_old_name_converges
 /// both sides converge," which the assertion below checks directly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partition_multi_op_backlog_flush_converges() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     let (device_a, device_b, group_id) = two_synced_devices("partition-multi-op-backlog").await;
 
     std::fs::write(device_a.root.path().join("y.txt"), b"y base").unwrap();
@@ -598,6 +608,11 @@ async fn partition_multi_op_backlog_flush_converges() {
 /// ordering is that both devices agree on the same final state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partition_both_devices_paused_simultaneously_resume_races_converges() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     let (device_a, device_b, group_id) =
         two_synced_devices("partition-both-paused-simultaneously").await;
 

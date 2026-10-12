@@ -99,8 +99,6 @@ pub fn admit_remote(
                         RemoteOp::Put { version, .. } => Some(DeltaPut { version: *version }),
                         RemoteOp::Delete { .. } => None,
                     },
-                    keeps: Vec::new(),
-                    keep_put: false,
                 });
             }
             let mut delta = NativeDelta {
@@ -121,19 +119,80 @@ pub fn admit_remote(
                 matches!(admission, NativeAdmission::Admitted { .. }),
                 "the fixture's delta is admitted: {admission:?}"
             );
-            // What admission of a peer's delta owes: every path it touched
-            // gets its placements settled.
-            for op in &delta.ops {
-                yadorilink_sync_sqlite::native_desired_state::ensure_path_placements(
-                    conn,
-                    group,
-                    op.path.as_str(),
-                );
-            }
             Ok(delta)
         })
         .unwrap();
     delta
+}
+
+/// The fork `device` makes of its own losing heads, admitted here the way a
+/// peer's delivery does: the deltas of
+/// [`yadorilink_replica_domain::native_fork::plan_own_forks`] over this
+/// replica's state, signed by `device`. The number of deltas admitted.
+pub fn admit_remote_forks(coordinator: &ReplicaCoordinator, group: &str, device: &str) -> usize {
+    use yadorilink_replica_domain::native_fork::{plan_own_forks, ForkLimits};
+    let author = fixtures::author(device, 1);
+    let key = fixtures::signing_key(&author.device);
+    let group_id = FolderGroupId(group.to_owned());
+    coordinator
+        .database()
+        .write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            let state = yadorilink_sync_sqlite::native_store::load_state(conn, &group_id)?;
+            let mut kinds = std::collections::HashMap::new();
+            for heads in state.heads.values() {
+                for payload in heads.values() {
+                    let kind = yadorilink_sync_sqlite::dag_store::get_file_version(
+                        conn,
+                        group,
+                        &payload.version,
+                    )?
+                    .map(|version| version.meta.record_kind);
+                    kinds.insert(payload.version, kind);
+                }
+            }
+            let plan = plan_own_forks(
+                &state,
+                &author,
+                |version| kinds.get(version).copied().flatten(),
+                ForkLimits { max_ops_per_delta: 64, max_bytes_per_delta: usize::MAX },
+            )
+            .expect("a fork plan");
+            let mut admitted = 0;
+            for planned in plan.deltas {
+                let entry = yadorilink_sync_sqlite::native_store::frontier_entry_get(
+                    conn, &group_id, &author,
+                )?;
+                let (seq, prev) = match &entry {
+                    None => (1, None),
+                    Some(entry) => (entry.seq.get() + 1, Some(entry.tip)),
+                };
+                let mut delta = NativeDelta {
+                    group_id: group_id.clone(),
+                    author: author.clone(),
+                    seq: yadorilink_replica_domain::ids::AuthorSeq(seq),
+                    prev,
+                    ops: planned
+                        .ops
+                        .into_iter()
+                        .map(|op| DeltaOp { path: op.path, removes: op.removes, put: op.put })
+                        .collect(),
+                    recursive_part: None,
+                    signature: [0; 64],
+                };
+                delta.sign(&key);
+                let verifying = key.verifying_key();
+                let admission = admit_native_delta(conn, &group_id, &delta, &|a| {
+                    (a == &author).then_some(verifying)
+                })?;
+                assert!(
+                    matches!(admission, NativeAdmission::Admitted { .. }),
+                    "the fork delta is admitted: {admission:?}"
+                );
+                admitted += 1;
+            }
+            Ok(admitted)
+        })
+        .unwrap()
 }
 
 /// [`admit_remote`] of one put of `version` at `path`, superseding nothing

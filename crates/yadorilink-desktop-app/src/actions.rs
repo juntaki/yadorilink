@@ -202,13 +202,11 @@ pub async fn check_for_updates() -> Result<(), IpcError> {
     Ok(())
 }
 
-/// "updates": install a previously-checked update — identical
-/// request `yadorilink update install` sends. The daemon's own update
-/// pipeline (mandatory/holdback/safe-point gating)
-/// is the sole authority for whether/when this actually applies, matching
-/// its "round-trip through daemon validation" rule.
-pub async fn install_update() -> Result<(), IpcError> {
-    updates::install_update().await?;
+/// "updates": v1 ships manual updates, so "download the new version" opens
+/// the official download page in the browser; nothing is installed by the
+/// daemon or this app.
+pub async fn download_update() -> Result<(), IpcError> {
+    let _ = opener::open(updates::DOWNLOAD_PAGE_URL);
     Ok(())
 }
 
@@ -525,8 +523,9 @@ pub async fn update_status() -> Result<UpdateStatusResponse, IpcError> {
     Ok(updates::update_status().await?)
 }
 
-/// Configures automatic update checks and/or automatic install mode --
-/// identical request `yadorilink update config --checks --install` sends.
+/// Configures automatic update checks and/or the install mode (only
+/// `manual` is supported) -- identical request `yadorilink update config
+/// --checks --install` sends.
 /// `None` for either argument means "leave that setting unchanged" (same
 /// discipline the wire request itself documents).
 pub async fn set_update_config(

@@ -56,7 +56,9 @@ pub(crate) fn prepare_layout(root: &Path) -> std::io::Result<()> {
                     use std::os::unix::fs::DirBuilderExt;
                     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
                 }
-                #[cfg(not(unix))]
+                #[cfg(windows)]
+                crate::windows_fs_security::create_private_dir_all(&dir)?;
+                #[cfg(not(any(unix, windows)))]
                 std::fs::create_dir_all(&dir)?;
             }
             Err(error) => return Err(error),
@@ -84,6 +86,23 @@ pub(crate) fn prepare_layout(root: &Path) -> std::io::Result<()> {
             if metadata.permissions().mode() & 0o077 != 0 {
                 std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
             }
+        }
+        #[cfg(windows)]
+        {
+            // The same two rules as above: a directory owned by another account is refused, and
+            // anything looser than "the current user only" is tightened to a protected DACL.
+            use crate::windows_fs_security::{
+                directory_owned_by_current_user, restrict_to_current_user,
+            };
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(invalid("is a reparse point"));
+            }
+            if !directory_owned_by_current_user(&dir)? {
+                return Err(invalid("is owned by another user"));
+            }
+            restrict_to_current_user(&dir)?;
         }
     }
     Ok(())
@@ -198,7 +217,11 @@ fn is_own_directory(path: &Path) -> bool {
         // SAFETY: `geteuid` has no preconditions and cannot fail.
         meta.uid() == unsafe { libc::geteuid() }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::windows_fs_security::directory_owned_by_current_user(path).unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
     true
 }
 
@@ -289,7 +312,7 @@ impl HandoffRoot {
             let stale = entry
                 .metadata()
                 .ok()
-                .and_then(|m| handed_over_at(&m))
+                .and_then(|m| copied_at(&m))
                 .is_some_and(|at| older_than(at, limit));
             let sweepable =
                 if partial { true } else { keep.is_some_and(|keep| !keep.contains(&name)) };
@@ -471,6 +494,21 @@ fn handed_over_at(metadata: &std::fs::Metadata) -> Option<SystemTime> {
     {
         let _ = metadata;
         None
+    }
+}
+
+/// When a copy in `ingest/` was last written. Where the file system has a status-change time
+/// that is what ages the copy (as for a handoff file); Windows has none, and the copy's own
+/// modification time is the age: the host writes a copy once, under a name that starts with a dot
+/// until it is complete, and never touches it again.
+fn copied_at(metadata: &std::fs::Metadata) -> Option<SystemTime> {
+    #[cfg(windows)]
+    {
+        metadata.modified().ok()
+    }
+    #[cfg(not(windows))]
+    {
+        handed_over_at(metadata)
     }
 }
 

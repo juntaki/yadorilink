@@ -66,18 +66,17 @@ order = [
 
 [layer.contract]
 purpose = """
-Serialization and reporting contracts. Generated protobuf types and shared
-report shapes, with no policy, no I/O, and no workspace dependencies.
+Serialization contracts. Generated protobuf types, with no policy, no I/O,
+and no workspace dependencies.
 """
 crates = [
   "yadorilink-ipc-proto",
-  "yadorilink-reporting",
 ]
 
 [layer.domain]
 purpose = """
 Pure, synchronous model and policy. Identities, file and version records,
-the signed canonical change, root authority, the deterministic replica
+the signed canonical change, the deterministic replica
 policy engine, and the range-based set reconciliation algorithm. Nothing
 beneath these but the standard library and
 cryptography: no async runtime, no database, no wire framing, no filesystem
@@ -85,9 +84,7 @@ or network access.
 """
 crates = [
   "yadorilink-replica-domain",
-  "yadorilink-root-authority",
   "yadorilink-replica-engine",
-  "yadorilink-dcf-kernel",
   "yadorilink-namespace",
   "yadorilink-dcf-oracle",
 ]
@@ -99,7 +96,12 @@ shared SQLite connection pool and writer gate, the device signing key and
 its OS keyring storage (plus the QUIC endpoint kept for tests that need a
 reachability probe off the sync path), the iroh networking substrate that
 IS the peer transport, the peer wire codec, the HTTP request/response
-surface, and the OAuth (FAPI 2.0) credential client. Each of these owns
+surface, the OAuth (FAPI 2.0) credential client, the reporting crate
+(report shapes, the local consent and candidate files, the HTTPS submission
+client), the generic filesystem layer (durable namespace changes, capability
+probes, file identity, the reserved artefact namespace) and the root-authority
+capability (root lease, commit permit, sync-root lock and identity) built on
+it. Each of these owns
 one mechanism and must stay ignorant of the domain concepts layered above
 it.
 """
@@ -110,6 +112,9 @@ crates = [
   "yadorilink-http-api",
   "yadorilink-sync-substrate",
   "yadorilink-fapi-client",
+  "yadorilink-reporting",
+  "yadorilink-fs-platform",
+  "yadorilink-root-authority",
 ]
 
 [layer.storage]
@@ -201,7 +206,18 @@ reason = "The domain model sits at the bottom; it depends on no workspace crate.
 workspace_dependencies = []
 
 [crate."yadorilink-root-authority"]
-reason = "Root identity and leases, expressed only over the domain model."
+reason = """
+Root identity, leases, commit permits and the sync-root lock, expressed over
+the domain model and the generic filesystem layer.
+"""
+workspace_dependencies = ["yadorilink-fs-platform", "yadorilink-replica-domain"]
+
+[crate."yadorilink-fs-platform"]
+reason = """
+The generic filesystem layer. It must not depend on root authority, the
+SQLite adapter or any engine: leases and permits are built on it, never the
+reverse.
+"""
 workspace_dependencies = ["yadorilink-replica-domain"]
 
 [crate."yadorilink-replica-engine"]
@@ -211,15 +227,6 @@ deterministic conflict repair election. Pure policy over the domain model,
 so it can be reasoned about and tested without a runtime.
 """
 workspace_dependencies = ["yadorilink-replica-domain"]
-
-[crate."yadorilink-dcf-kernel"]
-reason = """
-Research asset: the transition, join and author-side rules of signed
-per-path bases, generic over the change type. Pure and dependency-free. No
-production crate depends on it; it is kept as the reference the native
-causal state was derived from.
-"""
-workspace_dependencies = []
 
 [crate."yadorilink-namespace"]
 reason = """
@@ -240,9 +247,11 @@ workspace_dependencies = []
 reason = """
 Owns exactly the connection pool, the in-process writer gate, connection
 PRAGMA setup, and the transaction helpers for the shared database file. It
-must know nothing about domain concepts, replica policy, or wire framing.
+must know nothing about domain concepts, replica policy, or wire framing. Its
+one workspace dependency is the generic filesystem layer's durable-publish
+primitive, used to write the creation marker durably.
 """
-workspace_dependencies = []
+workspace_dependencies = ["yadorilink-fs-platform"]
 
 [crate."yadorilink-sync-wire"]
 reason = """
@@ -299,6 +308,7 @@ adapter or on any crate above it; its wire encoding comes exclusively from
 the wire codec crate.
 """
 workspace_dependencies = [
+  "yadorilink-fs-platform",
   "yadorilink-local-storage",
   "yadorilink-replica-domain",
   "yadorilink-replica-engine",
@@ -314,6 +324,7 @@ not reach back into the peer session, the daemon, the transport, or the wire
 codec: persistence is driven by those, never the reverse.
 """
 workspace_dependencies = [
+  "yadorilink-fs-platform",
   "yadorilink-local-storage",
   "yadorilink-namespace",
   "yadorilink-replica-domain",
@@ -330,6 +341,7 @@ already-built value types -- it runs no watcher and no SQL of its own.
 """
 workspace_dependencies = [
   "yadorilink-filesystem-sync",
+  "yadorilink-fs-platform",
   "yadorilink-local-storage",
   "yadorilink-replica-domain",
   "yadorilink-root-authority",
@@ -348,6 +360,7 @@ list does not count.
 """
 workspace_dependencies = [
   "yadorilink-fapi-client",
+  "yadorilink-fs-platform",
   "yadorilink-ipc-proto",
   "yadorilink-local-storage",
   "yadorilink-product-view",
@@ -377,6 +390,7 @@ count.
 workspace_dependencies = [
   "yadorilink-client-core",
   "yadorilink-fapi-client",
+  "yadorilink-fs-platform",
   "yadorilink-ipc-proto",
   "yadorilink-local-storage",
   "yadorilink-replica-domain",

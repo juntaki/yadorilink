@@ -12,6 +12,7 @@
 //! for the unchanged content, even though the wire protocol has no
 //! dedicated "rename" message.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::LocalCaptureError;
@@ -91,6 +92,40 @@ pub enum LocalChangeOutcome {
     RetryLater,
 }
 
+/// The mode and replicated attributes a path's current row records, and
+/// whether that row is live: what [`LocalChangeProcessor::captured_unix_mode`]
+/// inherits where the platform cannot observe them.
+pub(super) struct Predecessor {
+    pub(super) unix_mode: Option<u32>,
+    pub(super) xattrs: Vec<(String, Vec<u8>)>,
+    live: bool,
+}
+
+impl Predecessor {
+    pub(super) fn of_row(row: Option<&yadorilink_sync_sqlite::CanonicalCurrentRow>) -> Self {
+        match row {
+            Some(row) => Self {
+                unix_mode: row.snapshot.unix_mode,
+                xattrs: row.snapshot.xattrs.clone(),
+                live: !row.snapshot.deleted,
+            },
+            None => Self { unix_mode: None, xattrs: Vec::new(), live: false },
+        }
+    }
+
+    fn inherited_unix_mode(&self) -> Option<u32> {
+        self.live.then_some(self.unix_mode).flatten()
+    }
+
+    fn inherited_xattrs(&self) -> Vec<(String, Vec<u8>)> {
+        if self.live {
+            self.xattrs.clone()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 pub struct LocalChangeProcessor {
     state: Arc<dyn crate::ports::LocalMutationStore>,
     store: Arc<dyn crate::ports::BlockContentStore>,
@@ -127,6 +162,10 @@ pub struct LocalChangeProcessor {
     /// their path lock frees (see `journal_uncaptured_once_unlocked`): one
     /// waiter per path, however many scans find the path busy meanwhile.
     deferred_journal_waiters: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
+    /// Test-only: makes every disk observation report no unix mode, as a
+    /// platform without permission bits (Windows) always does.
+    #[cfg(test)]
+    modes_unobservable: std::sync::atomic::AtomicBool,
 }
 
 impl LocalChangeProcessor {
@@ -145,7 +184,86 @@ impl LocalChangeProcessor {
             reconcile_gate: ReconcileGate::default(),
             deferred_journal_waiters: Arc::default(),
             directory_capture: true,
+            #[cfg(test)]
+            modes_unobservable: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// The unix mode a disk object reports: none on a platform with no
+    /// permission bits.
+    fn observed_unix_mode(&self, metadata: &std::fs::Metadata) -> Option<u32> {
+        #[cfg(test)]
+        if self.modes_unobservable.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        yadorilink_local_storage::unix_mode_from_metadata(metadata)
+    }
+
+    /// Whether this platform reports a file's unix mode at all.
+    fn mode_observable(&self) -> bool {
+        #[cfg(test)]
+        if self.modes_unobservable.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        cfg!(unix)
+    }
+
+    /// Whether a disk object's mode is still the one captured: always, where
+    /// the platform cannot report it.
+    pub(super) fn mode_unchanged_since(
+        &self,
+        now: &std::fs::Metadata,
+        captured: Option<u32>,
+    ) -> bool {
+        !self.mode_observable() || self.observed_unix_mode(now) == captured
+    }
+
+    /// Whether this platform reports the replicated extended attributes at all.
+    fn xattrs_observable(&self) -> bool {
+        #[cfg(test)]
+        if self.modes_unobservable.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        cfg!(target_os = "linux")
+    }
+
+    /// THE rule for metadata capture: a field the platform can observe is what
+    /// the disk shows; a field it cannot is inherited from the path's semantic
+    /// predecessor (a live row), and is absent when there is none. Capturing
+    /// "nothing observed" as "removed" would author a new version against the
+    /// very version the file was written from, and strip a POSIX-origin file's
+    /// mode and attributes on every edit made where they cannot be read.
+    pub(super) fn captured_unix_mode(
+        &self,
+        metadata: &std::fs::Metadata,
+        predecessor: &Predecessor,
+    ) -> Option<u32> {
+        if self.mode_observable() {
+            self.observed_unix_mode(metadata)
+        } else {
+            predecessor.inherited_unix_mode()
+        }
+    }
+
+    /// See [`Self::captured_unix_mode`].
+    pub(super) fn captured_xattrs(
+        &self,
+        path: &Path,
+        predecessor: &Predecessor,
+    ) -> Vec<(String, Vec<u8>)> {
+        if self.xattrs_observable() {
+            std::fs::File::open(path)
+                .map(|f| yadorilink_local_storage::read_replicated_xattrs(&f))
+                .unwrap_or_default()
+        } else {
+            predecessor.inherited_xattrs()
+        }
+    }
+
+    /// Test-only: from here on the disk reports no unix mode.
+    #[cfg(test)]
+    pub(crate) fn simulate_unobservable_modes(&self) {
+        self.modes_unobservable.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Turns off authoring directories as entries, for a link whose

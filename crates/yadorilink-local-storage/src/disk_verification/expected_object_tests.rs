@@ -19,7 +19,7 @@ fn a_correct_symlink_verifies_as_itself_not_as_its_target() {
     let link = dir.path().join("link");
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
-    let target_bytes = yadorilink_root_authority::fs_identity::target_to_bytes(target.as_path());
+    let target_bytes = yadorilink_fs_platform::fs_identity::target_to_bytes(target.as_path());
     assert_eq!(
         disk_matches_expected_object(
             &link,

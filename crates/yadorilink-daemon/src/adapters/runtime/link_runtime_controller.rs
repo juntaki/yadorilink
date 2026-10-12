@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use yadorilink_filesystem_sync::watcher::{FolderWatchSource, RealFolderWatchSource};
 #[cfg(test)]
-use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 
 use crate::daemon_state::DaemonState;
 use crate::error::DaemonError;
@@ -217,6 +217,7 @@ impl LinkRuntimeController {
                 // closure and held for the whole repair call, including the
                 // disk walk/reconstruct work that precedes its own DB commits,
                 // not just their `verify`.
+                let lease_to_latch = root_lease.clone();
                 let repair_result = tokio::task::spawn_blocking(move || {
                     crate::link_runtime::operations::repair_materialization::repair_interrupted_materializations(
                         &replica_coordinator,
@@ -236,6 +237,21 @@ impl LinkRuntimeController {
                         demoted_to_placeholder = report.demoted_to_placeholder.len(),
                         "periodic live repair found and fixed a materialization/disk divergence"
                     ),
+                    // Terminal: the sidecar is gone. No retry, no recreation; only relink or a
+                    // daemon restart acquires a fresh lock. This link's repair work ends here.
+                    Ok(Err(crate::sync_error::SyncError::OwnershipLost(msg))) => {
+                        // Latch: even if the sidecar becomes observable again, no operation is
+                        // admitted until a relink or restart builds a fresh lease.
+                        lease_to_latch.begin_stopping();
+                        if repair_state.mark_link_ownership_lost(&repair_root.to_string_lossy()) {
+                            tracing::error!(
+                                local_path = %repair_root.display(),
+                                reason = %msg,
+                                "sync-root ownership lost; this folder stops syncing until it is re-linked or the daemon restarts"
+                            );
+                        }
+                        break;
+                    }
                     Ok(Err(e)) => tracing::warn!(
                         error = %e,
                         local_path = %repair_root.display(),
@@ -321,6 +337,8 @@ impl LinkRuntimeController {
         // for why the slot was reserved as `Starting` back at this function's
         // very start rather than appearing from nothing right here.
         link_slot_guard.publish(Arc::new(runtime));
+        // A fresh start holds a fresh lock: a previous OwnershipLost no longer applies.
+        state.links.clear_ownership_lost(&local_path);
         // A rebootstrap the journal records is continued now that the folder is watched
         // again; for a group with none this reads the journal and returns.
         crate::native_rebootstrap::spawn_resume(state.clone(), group_id);

@@ -8,6 +8,7 @@ import YadoriLinkUI
 /// read one shared `AppContext`.
 @main
 struct YadoriLinkApp: App {
+    @NSApplicationDelegateAdaptor(InviteLinkDelegate.self) private var delegate
     @State private var context: AppContext
 
     init() {
@@ -22,7 +23,9 @@ struct YadoriLinkApp: App {
         // Open at login is on by default, independent of whether setup is
         // completed; setup's checkbox only turns it off again.
         loginItem.applyDefaultOnce()
-        _context = State(initialValue: AppContext(app: app, loginItem: loginItem))
+        let context = AppContext(app: app, loginItem: loginItem)
+        InviteLinkDelegate.deliver = { context.pendingInviteLink = $0 }
+        _context = State(initialValue: context)
     }
 
     var body: some Scene {
@@ -55,10 +58,18 @@ struct YadoriLinkApp: App {
         }
         .windowResizability(.contentSize)
 
+        Window("Join with Invite Link", id: WindowID.join) {
+            JoinInviteView(client: context.app.client, context: context) {
+                context.app.refresh()
+            }
+        }
+        .windowResizability(.contentSize)
+
         // Keyed by invite id; the link stays in memory (see AppContext).
         WindowGroup("Invite", id: WindowID.invite, for: String.self) { $inviteId in
             InviteQRView(url: inviteId.flatMap { context.inviteURL(forQRCode: $0) })
         }
+        .handlesExternalEvents(matching: [])
         .windowResizability(.contentSize)
     }
 
@@ -77,6 +88,23 @@ struct YadoriLinkApp: App {
     }
 }
 
+/// Receives `yadorilink://invite/<code>` links the system hands to the app
+/// (a link clicked anywhere, or opened with `open`). A link that arrives
+/// before the app has finished starting is held until it has.
+final class InviteLinkDelegate: NSObject, NSApplicationDelegate {
+    @MainActor static var deliver: ((String) -> Void)? {
+        didSet { if let held = heldLink, let deliver { heldLink = nil; deliver(held) } }
+    }
+    @MainActor private static var heldLink: String?
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let url = urls.first(where: { $0.scheme?.lowercased() == "yadorilink" }) else { return }
+        MainActor.assumeIsolated {
+            if let deliver = Self.deliver { deliver(url.absoluteString) } else { Self.heldLink = url.absoluteString }
+        }
+    }
+}
+
 /// The menu bar icon. It also opens the launch windows (setup until it has
 /// been completed, and the development arguments `LaunchPlan` describes),
 /// because the label is the one view that exists from launch.
@@ -89,9 +117,19 @@ struct MenuBarLabel: View {
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        Image(systemName: symbol)
-            .accessibilityLabel("YadoriLink: \(app.headline)")
+        // Fixture runs get a flask icon and a title so the menu bar item itself says the data is fake.
+        HStack(spacing: 3) {
+            Image(systemName: context.isFixture ? "testtube.2" : symbol)
+            if context.isFixture { Text("Fixture") }
+        }
+            .accessibilityLabel("YadoriLink\(context.isFixture ? " (Fixture)" : ""): \(app.headline)")
             .task { openLaunchWindows() }
+            .onChange(of: context.pendingInviteLink) { _, link in
+                // A clicked yadorilink://invite/ link: the Join window picks it up.
+                guard link != nil else { return }
+                openWindow(id: WindowID.join)
+                NSApp.activate()
+            }
     }
 
     private func openLaunchWindows() {

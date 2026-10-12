@@ -138,8 +138,6 @@ fn scenario_5_revoke_timing_sweep() {
                     path: SyncPath("x".into()),
                     removes: vec![],
                     put: Some(DeltaPut { version: VersionHash([1u8; 32]) }),
-                    keeps: Vec::new(),
-                    keep_put: false,
                 }],
                 signature: [0u8; 64],
             };

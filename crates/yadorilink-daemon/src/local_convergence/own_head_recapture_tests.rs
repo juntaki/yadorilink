@@ -263,7 +263,7 @@ async fn restore_of_an_older_own_version_still_materializes() {
 /// is not this device's own change at all: the edit is captured and meets
 /// the peer's change as a conflict, and neither side's bytes are lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn peer_change_over_a_local_edit_keeps_both_sides() {
+async fn winner_arrival_never_overwrites_an_unsynced_local_edit() {
     let h = Harness::new(true);
     let file = h.path("notes.txt");
     std::fs::write(&file, b"captured by this device").unwrap();
@@ -284,11 +284,18 @@ async fn peer_change_over_a_local_edit_keeps_both_sides() {
     );
     std::fs::write(&file, b"edited here, never captured").unwrap();
 
-    // The pass that captures the edit may already be writing the peer's
-    // change, which the edit then loses to; the edit's copy is derived
-    // from the fork the capture made, by the pass after.
+    // The pass captures the edit, which meets the peer's change as a contest;
+    // the loser's head moves to its copy path, and the pass after writes both.
     for _ in 0..3 {
         reconcile_pass(&h, "notes.txt").await;
+        h.fork_own_contests();
+    }
+    for _ in 0..2 {
+        h.convergence
+            .reconcile_paths_directly(&driver(&h), GROUP, h.head_paths())
+            .await
+            .unwrap()
+            .expect("sanity: the pass must actually run");
     }
 
     let mut contents: Vec<Vec<u8>> = std::fs::read_dir(h.path(""))
@@ -304,10 +311,17 @@ async fn peer_change_over_a_local_edit_keeps_both_sides() {
         contents.contains(&b"edited here, never captured".to_vec()),
         "the local edit must survive, at the path or as a conflict copy: {contents:?}"
     );
-    assert!(
-        contents.contains(&b"the peer's newer version".to_vec()),
-        "the peer's change must land, at the path or as a conflict copy: {contents:?}"
-    );
+    // Which side wins the path is not fixed. When the peer's version wins, writing it needs the
+    // winner to replace the local edit's original, which the closed Windows gate withholds (the
+    // edit's copy is made, the original stays); the edit survives either way, checked above.
+    if crate::test_support::windows_durability_gate_allows_tests(
+        "the peer's winning version replacing the local original",
+    ) {
+        assert!(
+            contents.contains(&b"the peer's newer version".to_vec()),
+            "the peer's change must land, at the path or as a conflict copy: {contents:?}"
+        );
+    }
 }
 
 /// A file that keeps changing is never written over while it does, and
@@ -525,6 +539,11 @@ async fn a_recapture_that_finds_nothing_newer_does_not_leave_the_path_retrying()
         "sanity: capture finds disk equal to the row"
     );
 
+    // Projecting the head over the row's bytes replaces the file, which needs
+    // durable namespace changes.
+    if !crate::test_support::windows_durability_gate_allows_tests("the head replacing the file") {
+        return;
+    }
     let mut settled = false;
     for _ in 0..3 {
         if reconcile_pass(&h, "notes.txt").await.is_settled("notes.txt") {

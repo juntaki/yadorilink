@@ -88,6 +88,8 @@ public protocol YadoriLinkClient: AnyObject, Sendable {
     func mintInvite(groupId: String, role: AssignableRole?, ttl: TimeInterval?, requireApproval: Bool) async throws -> InviteSummary
     func listInvites() async throws -> [PendingInviteSummary]
     func cancelInvite(inviteId: String) async throws
+    /// Validates a pasted or clicked invite link (or bare code) and returns its code. Throws `DesktopError.invalidInput` with a plain-language message.
+    func parseInviteLink(_ input: String) throws -> String
     func acceptInvite(codeOrUrl: String, localPath: String, mode: FolderMode, acknowledgeRisks: Bool) async throws -> AcceptInviteOutcome
 
     // linking

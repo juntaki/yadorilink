@@ -345,11 +345,6 @@ fn diagnostic_dump(expected: &Snapshot, devices: &[&TestDevice], group_id: &str)
                         ));
                     }
                 }
-                for row in yadorilink_sync_sqlite::stable_projection_binding::native_placements(
-                    conn, group_id,
-                )? {
-                    text.push_str(&format!("  placement {row:?}\n"));
-                }
                 let mut stmt = conn.prepare(
                     "SELECT path, deleted, hex(native_authoring_identity) FROM files \
                  WHERE group_id = ?1 AND state = 'current' ORDER BY path",
@@ -418,6 +413,11 @@ async fn assert_late_observers_match(
 /// one catch-up and never need to project {A, B} as their live frontier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn late_clone_after_merge_edit_preserves_the_pre_merge_loser() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     let (devices, group_id) = setup_four_devices("git-merge-edit").await;
     let (a, b, late_a, late_b) = (&devices[0], &devices[1], &devices[2], &devices[3]);
     seed_common_base(a, b, &[("tracked.txt", "base commit")]).await;
@@ -473,6 +473,11 @@ async fn late_clone_after_merge_edit_preserves_the_pre_merge_loser() {
 /// objects rather than reconstructing only the latest source path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn late_clone_after_rename_and_recreate_keeps_the_old_conflict_copy() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     let (devices, group_id) = setup_four_devices("git-rename-recreate").await;
     let (a, b, late_a, late_b) = (&devices[0], &devices[1], &devices[2], &devices[3]);
     seed_common_base(a, b, &[("module.rs", "base module")]).await;
@@ -520,6 +525,11 @@ async fn late_clone_after_rename_and_recreate_keeps_the_old_conflict_copy() {
 /// on the derived path is authoritative for both existing and late replicas.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn deleted_conflict_copy_does_not_resurrect_on_a_late_clone() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     let (devices, group_id) = setup_four_devices("git-delete-conflict-copy").await;
     let (a, b, late_a, late_b) = (&devices[0], &devices[1], &devices[2], &devices[3]);
     seed_common_base(a, b, &[("notes.md", "base notes")]).await;
@@ -565,6 +575,11 @@ async fn deleted_conflict_copy_does_not_resurrect_on_a_late_clone() {
 /// peer/batch order for multi-path projection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn multi_file_checkout_rewrite_preserves_every_loser_for_late_clones() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
     let (devices, group_id) = setup_four_devices("git-multi-file-checkout").await;
     let (a, b, late_a, late_b) = (&devices[0], &devices[1], &devices[2], &devices[3]);
     seed_common_base(

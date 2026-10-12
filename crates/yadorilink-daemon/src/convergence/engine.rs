@@ -697,12 +697,9 @@ async fn complete_one_obligation(
         });
         match closed {
             Ok(true) => {
-                // Wake retirement and hazard recheck: a copy this attempt
-                // just made durable could have superseded some OTHER,
-                // still-live ephemeral conflict copy's justification, or be
-                // exactly the sibling change that clears some held path's
-                // hazard.
-                state.replica_coordinator.retirement_wake().mark_dirty(group_id);
+                // Wake the hazard recheck: a copy this attempt just made durable
+                // could be exactly the sibling change that clears some held
+                // path's hazard.
                 state.replica_coordinator.hazard_recheck_wake().mark_dirty(group_id);
             }
             Ok(false) => {
@@ -744,7 +741,6 @@ async fn complete_one_obligation(
         });
         match closed {
             Ok(true) => {
-                state.replica_coordinator.retirement_wake().mark_dirty(group_id);
                 state.replica_coordinator.hazard_recheck_wake().mark_dirty(group_id);
             }
             Ok(false) => {

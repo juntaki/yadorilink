@@ -86,8 +86,11 @@ fn conflicted_file_line_renders_every_field() {
     };
     assert_eq!(
         conflicted_file_line(&f),
-        "/tmp/photos/vacation (conflicted copy, 2026-01-01-000000, device-b).jpg  size=1234  \
-         mtime=5678"
+        format!(
+            "/tmp/photos/vacation (conflicted copy, 2026-01-01-000000, device-b).jpg  size=1234  \
+             modified={}",
+            format_local_time(5678)
+        )
     );
 }
 
@@ -174,7 +177,27 @@ fn conflicted_file_line_names_a_folder_at_its_path() {
     };
     assert_eq!(
         conflicted_file_line(&f),
-        "/tmp/photos/album (conflicted copy, 2026-01-01-000000, device-b)  size=3  mtime=4  \
-         reason=folder_at_path"
+        format!(
+            "/tmp/photos/album (conflicted copy, 2026-01-01-000000, device-b)  size=3  \
+             modified={}  reason=folder_at_path",
+            format_local_time(4)
+        )
     );
+}
+
+#[test]
+fn local_time_formats_calendar_fields_for_an_offset() {
+    // 2026-03-01 12:34:56 UTC.
+    let secs = 1_772_368_496;
+    assert_eq!(format_with_offset(secs, 0), "2026-03-01 12:34:56");
+    assert_eq!(format_with_offset(secs, 9 * 3600), "2026-03-01 21:34:56");
+    assert_eq!(format_with_offset(secs, -13 * 3600), "2026-02-28 23:34:56");
+    assert_eq!(format_with_offset(0, 0), "1970-01-01 00:00:00");
+    // 2024-02-29 is a leap day.
+    assert_eq!(format_with_offset(1_709_164_800, 0), "2024-02-29 00:00:00");
+}
+
+#[test]
+fn conflict_hint_says_how_to_resolve() {
+    assert!(CONFLICT_RESOLVE_HINT.contains("delete the other copy"));
 }

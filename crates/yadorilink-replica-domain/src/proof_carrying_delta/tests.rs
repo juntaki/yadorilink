@@ -33,8 +33,6 @@ fn signed_delta(group: &str, device: &str) -> NativeDelta {
             path: SyncPath("a.txt".into()),
             removes: Vec::new(),
             put: Some(DeltaPut { version: VersionHash([1u8; 32]) }),
-            keeps: Vec::new(),
-            keep_put: false,
         }],
         signature: [0u8; 64],
     };

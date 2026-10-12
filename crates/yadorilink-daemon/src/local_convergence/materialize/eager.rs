@@ -8,7 +8,7 @@ use yadorilink_replica_domain::session_state::MaterializationState;
 
 use super::super::types::*;
 use super::MaterializationPlan;
-use yadorilink_root_authority::fs_identity::{disk_race_fingerprint, DiskRaceFingerprint};
+use yadorilink_fs_platform::fs_identity::{disk_race_fingerprint, DiskRaceFingerprint};
 
 // The eager lane is a pipeline. Each stage consumes the value the
 // previous one produced, so a stage can only run once everything before it
@@ -232,7 +232,7 @@ impl super::super::LocalConvergenceExecutor {
         // obligation untouched, so the work is re-driven.
         tracing::debug!("phase T_recv_hydrated_commit: Hydrated state-machine commit completed");
         let applied = self.apply_written_metadata(plan, written)?;
-        let Some(verified) = self.verify_written_object(plan, applied)? else {
+        let Some(verified) = self.verify_written_object(plan, applied).await? else {
             // The bytes landed, but the path has moved on to a version
             // they are not. There is no exact claim to make about
             // them, so re-drive rather than settle -- and leave the
@@ -554,7 +554,21 @@ impl super::super::LocalConvergenceExecutor {
         // `cfapi-host.exe`: nothing is on disk yet in that case, so the
         // intent must stay open -- this call returns `RetryRequired` below
         // regardless, so a later retry naturally re-examines this path.
-        if !provider_deferred {
+        //
+        // An older object standing under the newer row is not touched here
+        // (no fence bump, no write), so a proof it had stays valid and the
+        // untouched-proven exclusion keeps it out of repair's reach; the
+        // intent only guards the transient row commit above. An object with
+        // no standing proof keeps the intent, so repair recovers it rather
+        // than authoring it over the newer row.
+        if !provider_deferred
+            && (!object_present
+                || self.state.disk_is_untouched_proven_write_at(
+                    group_id,
+                    &record.path,
+                    &out_path,
+                )?)
+        {
             intent_guard.clear()?;
         }
         // Eager wanted real content but not every block was available --
@@ -793,9 +807,15 @@ impl super::super::LocalConvergenceExecutor {
                 "eager_reconstruct_failed_record",
             )?;
             // Clear the intent unless Windows deferred the object to
-            // `cfapi-host.exe`: nothing is on disk yet in that case, so the
-            // intent must stay open.
-            if !provider_deferred {
+            // `cfapi-host.exe` (nothing is on disk yet, so it must stay
+            // open), or an older object still sits under the newer row. In
+            // the latter case the fence bump at the start of this write
+            // already invalidated that object's proof, so startup could not
+            // tell "our untouched older version" from "an offline edit" and
+            // would author it over the peer's newer version. The open intent
+            // keeps it an interrupted write: repair quarantines the bytes
+            // and rebuilds the row's version from the local blocks.
+            if !provider_deferred && !object_present {
                 intent_guard.clear()?;
             }
             // Reconstruct never actually succeeded despite the blocks being
@@ -853,6 +873,7 @@ impl super::super::LocalConvergenceExecutor {
             &record.blocks,
             record.mtime_unix_nanos,
             Some(headroom.clone()),
+            Arc::new(self.state.temp_ledger(group_id)),
         )
         .await?;
         #[cfg(any(test, feature = "test-support"))]
@@ -875,7 +896,10 @@ impl super::super::LocalConvergenceExecutor {
         let moved = fingerprint != baseline.fingerprint
             || (!baseline.was_dirty && self.state.is_path_dirty(group_id, &record.path)?);
         if moved {
-            let _ = std::fs::remove_file(&tmp_path);
+            yadorilink_local_storage::discard_temp_file(
+                &tmp_path,
+                &self.state.temp_ledger(group_id),
+            );
             self.state.journal_uncaptured_local_edit(
                 group_id,
                 &record.path,
@@ -890,7 +914,12 @@ impl super::super::LocalConvergenceExecutor {
             );
             return Ok(AssembleOutcome::LocalEdit);
         }
-        persist_reconstructed_file_off_runtime(tmp_path, out_path).await?;
+        persist_reconstructed_file_off_runtime(
+            tmp_path,
+            out_path,
+            Arc::new(self.state.temp_ledger(group_id)),
+        )
+        .await?;
         Ok(AssembleOutcome::Written)
     }
 
@@ -925,22 +954,65 @@ impl super::super::LocalConvergenceExecutor {
 
     /// Stage 7: verify disk holds the exact object the payload names.
     /// `None` when the path has moved on to a version these bytes are not.
-    fn verify_written_object(
+    async fn verify_written_object(
         &self,
         plan: &MaterializationPlan<'_>,
         applied: AppliedObject,
     ) -> Result<Option<VerifiedObject>, PeerSessionError> {
         let AppliedObject { written, xattrs } = applied;
-        Ok(self
-            .exact_object_evidence_after_write(
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let hook = self
+                .after_write_before_proof_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(hook) = hook {
+                hook(&written.out_path);
+            }
+        }
+        let Some(evidence) = self.exact_object_evidence_after_write(
+            plan.group_id,
+            &plan.record.path,
+            RecordKind::File,
+            &written.written_version,
+            written.mutation_generation,
+            &xattrs,
+        )?
+        else {
+            return Ok(None);
+        };
+        // The evidence's identity is observed from whatever is on disk, so a
+        // user save that landed between the rename and that observation
+        // would be baked into it as if the daemon had written it, and the
+        // commit-time identity check would then pass. Bind the proof to the
+        // bytes written: they are compared AFTER the identity was taken, so
+        // anything later changes the identity and anything earlier fails
+        // here. A mismatch publishes nothing and journals the path, so
+        // capture authors the edit.
+        let (check_path, check_blocks) = (written.out_path.clone(), plan.record.blocks.clone());
+        let bytes_match = tokio::task::spawn_blocking(move || {
+            yadorilink_local_storage::disk_bytes_match_indexed_blocks(&check_path, &check_blocks)
+                .unwrap_or(false)
+        })
+        .await
+        .map_err(|e| PeerSessionError::CorruptState(format!("proof content check failed: {e}")))?;
+        if !bytes_match {
+            self.state.journal_uncaptured_local_edit(
                 plan.group_id,
                 &plan.record.path,
-                RecordKind::File,
-                &written.written_version,
-                written.mutation_generation,
-                &xattrs,
-            )?
-            .map(|evidence| VerifiedObject { written, evidence }))
+                true,
+                plan.permit,
+            )?;
+            tracing::info!(
+                group_id = plan.group_id,
+                path = %plan.record.path,
+                "the file changed on disk between the write and its proof; leaving the local \
+                 write in place and publishing nothing"
+            );
+            return Ok(None);
+        }
+        Ok(Some(VerifiedObject { written, evidence }))
     }
 
     /// Stage 8: commit the proof, the `Present` stamp, the intent clear and
@@ -1048,9 +1120,9 @@ fn disk_still_the_verified_object(
     path: &str,
     out_path: &std::path::Path,
     blocks: &[yadorilink_replica_domain::file::BlockInfo],
-    verified: Option<yadorilink_root_authority::fs_identity::FileIdentity>,
+    verified: Option<yadorilink_fs_platform::fs_identity::FileIdentity>,
 ) -> bool {
-    use yadorilink_root_authority::fs_identity::FileIdentity;
+    use yadorilink_fs_platform::fs_identity::FileIdentity;
     let identity_unchanged = verified.is_some()
         && super::super::types::require_physical_kind_matches(path, out_path, RecordKind::File)
             .is_ok()

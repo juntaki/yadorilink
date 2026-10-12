@@ -12,14 +12,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
+use yadorilink_fs_platform::fs_identity::disk_race_fingerprint;
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_local_storage::unix_mode_from_metadata;
 use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::ids::SyncPath;
 use yadorilink_replica_domain::local_op::Op;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_root_authority::fs_identity::disk_race_fingerprint;
-use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_sync_sqlite::SyncSqliteError;
 
 fn processor() -> (LocalChangeProcessor, Arc<TestReplica>, tempfile::TempDir, tempfile::TempDir) {
@@ -1090,7 +1090,7 @@ async fn no_proof_is_published_for_content_overwritten_in_place_before_chunk_com
         yadorilink_sync_sqlite::materialized_generation::revalidate_identity_against_disk(
             basis,
             &victim,
-            yadorilink_root_authority::fs_identity::TimestampGranularity::Fine,
+            yadorilink_fs_platform::fs_identity::TimestampGranularity::Fine,
         )
     });
     assert!(
@@ -1247,6 +1247,17 @@ fn canonical_root(root_dir: &tempfile::TempDir) -> std::path::PathBuf {
 /// assume but cannot otherwise express: the volume is mounted, and the file
 /// really is missing from a folder that really is this link's.
 fn adopt_root(state: &ReplicaCoordinator, group: &str, root: &std::path::Path) {
+    adopt_root_without_volume_identity(state, group, root);
+    let identity = yadorilink_filesystem_sync::device_boundary::root_volume_identity(root).unwrap();
+    state.link_repository().set_capture_volume_identity_for_group(group, &identity).unwrap();
+}
+
+/// A link as an older build left it: adopted root, no volume identity yet.
+fn adopt_root_without_volume_identity(
+    state: &ReplicaCoordinator,
+    group: &str,
+    root: &std::path::Path,
+) {
     // A real link row is required: `set_link_root_token_for_group` is an
     // `UPDATE ... WHERE group_id = ?` with no matching row otherwise, so
     // without this the token silently never persists and a later
@@ -2462,6 +2473,83 @@ async fn removed_file_is_marked_deleted_with_incremented_version() {
     assert_eq!(state.sqlite().dag_list_versions("group-1", "bye.txt").unwrap().len(), 2);
 }
 
+/// A case-only rename on a case-insensitive volume leaves the old name's
+/// lookup answering with the new spelling. The old exact name is gone, so
+/// it is an observed removal: the old name's row must be tombstoned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn case_only_rename_is_captured_as_a_delete_of_the_old_name() {
+    let (proc, state, _store_dir, root_dir) = processor();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    let old = root.join("Photo.jpg");
+    std::fs::write(&old, b"data").unwrap();
+    proc.process_event(
+        "group-1",
+        &root,
+        &FsChangeEvent { path: old.clone(), kind: FsChangeKind::CreatedOrModified },
+    )
+    .await
+    .unwrap();
+
+    std::fs::rename(&old, root.join("photo.jpg")).unwrap();
+    if old.symlink_metadata().is_err() {
+        eprintln!("skipped: this volume is case-sensitive, so the old name simply vanishes");
+        return;
+    }
+    let outcome = proc
+        .process_event(
+            "group-1",
+            &root,
+            &FsChangeEvent { path: old, kind: FsChangeKind::ObservedRemoval },
+        )
+        .await
+        .unwrap();
+
+    assert!(expect_file_changed(outcome).deleted);
+}
+
+/// A file whose parent cannot be listed is not shown absent by that failure:
+/// no delete is authored, and the path is looked at again later.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlistable_parent_is_not_read_as_a_removal() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (proc, state, _store_dir, root_dir) = processor();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    let dir = root.join("d");
+    std::fs::create_dir(&dir).unwrap();
+    let file = dir.join("f.txt");
+    std::fs::write(&file, b"data").unwrap();
+    proc.process_event(
+        "group-1",
+        &root,
+        &FsChangeEvent { path: file.clone(), kind: FsChangeKind::CreatedOrModified },
+    )
+    .await
+    .unwrap();
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o111)).unwrap();
+    let listable = std::fs::read_dir(&dir).is_ok();
+    let outcome = proc
+        .process_event(
+            "group-1",
+            &root,
+            &FsChangeEvent { path: file, kind: FsChangeKind::ObservedRemoval },
+        )
+        .await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if listable {
+        eprintln!("skipped: permissions do not stop this user from listing the directory");
+        return;
+    }
+
+    assert!(matches!(outcome.unwrap(), LocalChangeOutcome::RetryLater));
+    assert!(
+        !state.file_index_repository().get_file("group-1", "d/f.txt").unwrap().unwrap().deleted
+    );
+}
+
 /// A `Removed` event for a path that is already a tombstone authors
 /// nothing. More than one such event per deletion is ordinary: a
 /// program that recreates and removes the same scratch name (a lock
@@ -2732,6 +2820,31 @@ fn scan_existing_files_drops_newly_ignored_index_entries_without_tombstones() {
     assert!(state.file_index_repository().get_file("group-1", "ignored.txt").unwrap().is_none());
     assert_eq!(std::fs::read(root.join("ignored.txt")).unwrap(), b"still on disk");
     assert!(state.file_index_repository().get_file("group-1", "keep.txt").unwrap().is_some());
+}
+
+/// One file the scan cannot read must not abort the whole scan: the rest is
+/// still captured.
+#[cfg(unix)]
+#[test]
+fn scan_existing_files_continues_past_an_unreadable_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (proc, state, _store_dir, root_dir) = processor();
+    let root = canonical_root(&root_dir);
+    std::fs::write(root.join("good.txt"), b"readable").unwrap();
+    let bad = root.join("bad.txt");
+    std::fs::write(&bad, b"secret").unwrap();
+    std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&bad).is_ok() {
+        eprintln!("skipped: permissions do not stop this user from reading the file");
+        return;
+    }
+
+    let scan = proc.scan_existing_files("group-1", &root);
+
+    std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).unwrap();
+    scan.expect("an unreadable file must not abort the scan");
+    assert!(state.file_index_repository().get_file("group-1", "good.txt").unwrap().is_some());
+    assert!(state.file_index_repository().get_file("group-1", "bad.txt").unwrap().is_none());
 }
 
 #[test]
@@ -4224,6 +4337,66 @@ async fn a_local_create_over_a_placement_scaffold_is_not_a_descendant_of_the_pee
     let resolved = proc.flush_pending_batch(group, &mut pending).await.unwrap();
     assert_eq!(resolved.len(), 1, "the local create must commit, not be dropped");
     // The local write's head is the one at the path that is not the peer's.
+    let l_hash = yadorilink_replica_domain::ids::DeltaHash(
+        crate::test_support::native_path_head_provenances(&state, group, "new.txt")
+            .into_iter()
+            .find(|provenance| *provenance != r_hash.0)
+            .expect("the local create is a head beside the peer's"),
+    );
+
+    assert_concurrent_live_heads(&state, group, "new.txt", &r_hash, &l_hash);
+}
+
+/// The window between capture and emission. A local create of a path this
+/// device has never placed is captured; only then is a peer's create of the
+/// same path admitted; then the captured create is emitted. It has no recorded
+/// basis, so emission falls back to the current frontier, which now holds the
+/// peer's create. The local create must not claim it as its causal past:
+/// the peer's content would be superseded and no conflict copy derived.
+#[tokio::test]
+async fn a_peer_create_admitted_between_capture_and_emit_of_a_new_path_is_not_its_parent() {
+    use std::sync::atomic::Ordering;
+
+    let (proc, state, policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+    policy_healthy.store(true, Ordering::SeqCst);
+    state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(())));
+    let root = canonical_root(&root_dir);
+    let group = "group-1";
+    adopt_root(&state, group, &root);
+    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+
+    let path = root.join("new.txt");
+    std::fs::write(&path, b"created locally").unwrap();
+    state
+        .dirty_path_repository()
+        .record_dirty_path(
+            group,
+            "new.txt",
+            dirty_kind_str(FsChangeKind::CreatedOrModified),
+            0,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    let mut pending = Vec::new();
+    let outcome = proc
+        .process_event_with_ignore_at(
+            group,
+            &root,
+            &FsChangeEvent { path: path.clone(), kind: FsChangeKind::CreatedOrModified },
+            &ignore_set,
+            Some(0),
+            Some(&mut pending),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, EventOutcome::Deferred));
+    assert_eq!(pending.len(), 1, "the create must be captured but uncommitted");
+
+    // The peer's create is admitted after capture, before emission.
+    let r_hash = admit_peer_put_only_into_the_dag(&state, group, "new.txt", vec![], 0, 0);
+
+    let resolved = proc.flush_pending_batch(group, &mut pending).await.unwrap();
+    assert_eq!(resolved.len(), 1, "the local create must still commit, not be dropped");
     let l_hash = yadorilink_replica_domain::ids::DeltaHash(
         crate::test_support::native_path_head_provenances(&state, group, "new.txt")
             .into_iter()
@@ -8480,4 +8653,303 @@ mod scan_commit_lock {
         assert_eq!(journaled.len(), 1);
         assert_eq!(journaled[0].attempts, 1, "journaled once, not once per scan");
     }
+}
+
+/// A nested mount (simulated via the device-boundary test seam) is never
+/// indexed: the walk neither descends into it nor captures the mountpoint.
+#[test]
+fn the_scan_walk_does_not_descend_across_a_device_boundary() {
+    let (proc, state, _store_dir, root_dir) = processor();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    std::fs::create_dir_all(root.join("media")).unwrap();
+    std::fs::write(root.join("media/mounted.txt"), b"on another device").unwrap();
+    std::fs::write(root.join("local.txt"), b"ours").unwrap();
+    yadorilink_filesystem_sync::device_boundary::seam::mark_foreign(&root.join("media"));
+
+    let records = proc.scan_existing_files("group-1", &root).unwrap();
+
+    assert!(records.iter().any(|r| r.path == "local.txt"), "control: {records:?}");
+    assert!(
+        !records.iter().any(|r| r.path == "media" || r.path.starts_with("media/")),
+        "nothing across the device boundary may be indexed: {records:?}"
+    );
+}
+
+/// Rows indexed beneath a directory that is now on another device are not
+/// delete evidence (the walk no longer sees them), so the scan must not
+/// tombstone them. The control proves the same missing row IS tombstoned
+/// on the root's own device.
+#[test]
+fn rows_under_a_device_boundary_are_not_tombstoned() {
+    let (proc, state, _store_dir, root_dir) = processor();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    std::fs::create_dir_all(root.join("media")).unwrap();
+    std::fs::create_dir_all(root.join("plain")).unwrap();
+    index_hydrated_missing_file(&state, "group-1", "media/old.txt");
+    index_hydrated_missing_file(&state, "group-1", "plain/old.txt");
+    yadorilink_filesystem_sync::device_boundary::seam::mark_foreign(&root.join("media"));
+
+    let records = proc.scan_existing_files("group-1", &root).unwrap();
+
+    assert!(
+        records.iter().any(|r| r.path == "plain/old.txt" && r.deleted),
+        "control: a missing row on the root's device is still a real deletion: {records:?}"
+    );
+    assert!(
+        !records.iter().any(|r| r.path == "media/old.txt"),
+        "a row under a device boundary must not be tombstoned: {records:?}"
+    );
+    let row = state.file_index_repository().get_file("group-1", "media/old.txt").unwrap().unwrap();
+    assert!(!row.deleted);
+}
+
+/// Live events beneath a device boundary author nothing either.
+#[tokio::test]
+async fn live_events_under_a_device_boundary_are_ignored() {
+    let (proc, state, _store_dir, root_dir) = processor();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    std::fs::create_dir_all(root.join("mnt")).unwrap();
+    std::fs::write(root.join("mnt/f.txt"), b"x").unwrap();
+    yadorilink_filesystem_sync::device_boundary::seam::mark_foreign(&root.join("mnt"));
+
+    proc.process_event(
+        "group-1",
+        &root,
+        &FsChangeEvent { path: root.join("mnt/f.txt"), kind: FsChangeKind::CreatedOrModified },
+    )
+    .await
+    .unwrap();
+
+    assert!(state.file_index_repository().get_file("group-1", "mnt/f.txt").unwrap().is_none());
+}
+
+/// Rows an older build indexed under a path that has since been unmounted
+/// (an empty mountpoint on the root's device) cannot be told from a real
+/// deletion. A link with no recorded volume identity adopts the current one
+/// in its first safe full scan and authors no deletes in that scan; the next
+/// scan deletes normally.
+#[test]
+fn legacy_rows_adopt_the_volume_identity_without_deleting_anything() {
+    let (proc, state, _store_dir, root_dir) = processor();
+    let root = canonical_root(&root_dir);
+    adopt_root_without_volume_identity(&state, "group-1", &root);
+    std::fs::create_dir_all(root.join("media")).unwrap();
+    std::fs::create_dir_all(root.join("plain")).unwrap();
+    // Indexed while `media` was a mount; now unmounted, so it is empty.
+    index_hydrated_missing_file(&state, "group-1", "media/old.txt");
+    index_hydrated_missing_file(&state, "group-1", "plain/old.txt");
+    assert_eq!(
+        state.link_repository().capture_volume_identity_for_group("group-1").unwrap(),
+        Some(None)
+    );
+
+    let records = proc.scan_existing_files("group-1", &root).unwrap();
+
+    assert!(!records.iter().any(|r| r.deleted), "the adopting scan deletes nothing: {records:?}");
+    let adopted = state.link_repository().capture_volume_identity_for_group("group-1").unwrap();
+    assert_eq!(
+        adopted,
+        Some(yadorilink_filesystem_sync::device_boundary::root_volume_identity(&root))
+    );
+    for path in ["media/old.txt", "plain/old.txt"] {
+        assert!(!state.file_index_repository().get_file("group-1", path).unwrap().unwrap().deleted);
+    }
+
+    // Control: with the identity recorded, a real deletion is tombstoned.
+    let records = proc.scan_existing_files("group-1", &root).unwrap();
+    assert!(records.iter().any(|r| r.path == "plain/old.txt" && r.deleted), "{records:?}");
+}
+
+/// A root that is no longer on the recorded volume (swapped volume, or an
+/// unmounted root leaving an empty mountpoint) is never tombstoned under,
+/// by a scan or a live event, and is never re-adopted.
+#[tokio::test]
+async fn a_changed_root_volume_stops_all_tombstoning() {
+    let (proc, state, _store_dir, root_dir) = processor();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    let recorded = state.link_repository().capture_volume_identity_for_group("group-1").unwrap();
+    index_hydrated_missing_file(&state, "group-1", "docs/a.txt");
+    index_hydrated_missing_file(&state, "group-1", "docs/b.txt");
+    yadorilink_filesystem_sync::device_boundary::seam::set_root_identity(
+        &root,
+        Some("unix:424242"),
+    );
+
+    let records = proc.scan_existing_files("group-1", &root).unwrap();
+    proc.process_event(
+        "group-1",
+        &root,
+        &FsChangeEvent { path: root.join("docs/b.txt"), kind: FsChangeKind::ObservedRemoval },
+    )
+    .await
+    .unwrap();
+
+    yadorilink_filesystem_sync::device_boundary::seam::clear_root_identity(&root);
+    assert!(!records.iter().any(|r| r.deleted), "no tombstone on a changed volume: {records:?}");
+    for path in ["docs/a.txt", "docs/b.txt"] {
+        assert!(!state.file_index_repository().get_file("group-1", path).unwrap().unwrap().deleted);
+    }
+    assert_eq!(
+        state.link_repository().capture_volume_identity_for_group("group-1").unwrap(),
+        recorded,
+        "a mismatch must not be adopted as the new identity"
+    );
+
+    // Back on the recorded volume, the same absence is a real deletion.
+    let records = proc.scan_existing_files("group-1", &root).unwrap();
+    assert!(records.iter().any(|r| r.path == "docs/a.txt" && r.deleted), "{records:?}");
+}
+
+/// A platform that cannot observe a file's unix mode and replicated attributes
+/// (Windows; macOS for attributes) inherits them from the path's semantic
+/// predecessor and never captures their absence as a removal.
+const RECEIVED_MODE: u32 = 0o644;
+
+fn received_xattrs() -> Vec<(String, Vec<u8>)> {
+    vec![("user.origin".to_string(), b"linux".to_vec())]
+}
+
+/// A peer-materialized file whose row records `RECEIVED_MODE` and attributes
+/// the capturing platform cannot read.
+async fn received_file_on_a_platform_that_reads_no_metadata() -> (
+    LocalChangeProcessor,
+    Arc<TestReplica>,
+    std::path::PathBuf,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Arc<CountingBlockStore>,
+) {
+    let (proc, state, store, store_dir, root_dir) = processor_with_counting_store();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    let content = b"received bytes\n";
+    let scratch = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(scratch.path(), content).unwrap();
+    let blocks = yadorilink_local_storage::chunk_file(store.as_ref(), scratch.path()).unwrap();
+    let file_path = root.join("received.bin");
+    const PEER_AUTHORED_MTIME: i64 = 1_600_000_000_000_000_000;
+    yadorilink_local_storage::reconstruct_file(
+        store.as_ref(),
+        &file_path,
+        &blocks,
+        PEER_AUTHORED_MTIME,
+    )
+    .unwrap();
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    state
+        .file_index_repository()
+        .upsert_file(
+            "group-1",
+            &FileRecord {
+                path: "received.bin".to_string(),
+                size: content.len() as u64,
+                mtime_unix_nanos: PEER_AUTHORED_MTIME,
+                blocks,
+                deleted: false,
+            },
+            &permit,
+        )
+        .unwrap();
+    state
+        .file_index_repository()
+        .set_unix_mode("group-1", "received.bin", Some(RECEIVED_MODE), &permit)
+        .unwrap();
+    state
+        .file_index_repository()
+        .set_xattrs("group-1", "received.bin", &received_xattrs(), &permit)
+        .unwrap();
+    proc.simulate_unobservable_modes();
+    (proc, state, file_path, store_dir, root_dir, store)
+}
+
+#[tokio::test]
+async fn a_noop_capture_where_no_metadata_is_readable_keeps_the_recorded_mode_and_attributes() {
+    let (proc, state, file_path, _s, _r, _store) =
+        received_file_on_a_platform_that_reads_no_metadata().await;
+    let root = file_path.parent().unwrap().to_path_buf();
+    let versions = state.sqlite().dag_list_versions("group-1", "received.bin").unwrap().len();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let outcome = proc
+        .process_event(
+            "group-1",
+            &root,
+            &FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::CreatedOrModified },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, LocalChangeOutcome::None), "no metadata read is no edit");
+    proc.scan_existing_files("group-1", &root).unwrap();
+
+    assert_eq!(
+        state.sqlite().dag_list_versions("group-1", "received.bin").unwrap().len(),
+        versions
+    );
+    assert_eq!(
+        state.file_index_repository().get_unix_mode("group-1", "received.bin").unwrap(),
+        Some(RECEIVED_MODE)
+    );
+}
+
+#[tokio::test]
+async fn a_content_edit_where_no_metadata_is_readable_inherits_the_mode_and_attributes() {
+    let (proc, state, file_path, _s, _r, _store) =
+        received_file_on_a_platform_that_reads_no_metadata().await;
+    let root = file_path.parent().unwrap().to_path_buf();
+    std::fs::write(&file_path, b"edited here, where mode and attributes are unreadable\n").unwrap();
+    let outcome = proc
+        .process_event(
+            "group-1",
+            &root,
+            &FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::CreatedOrModified },
+        )
+        .await
+        .unwrap();
+    expect_file_changed(outcome);
+
+    assert_eq!(
+        state.file_index_repository().get_unix_mode("group-1", "received.bin").unwrap(),
+        Some(RECEIVED_MODE),
+        "the edited version must keep the predecessor's mode, not drop it"
+    );
+    assert_eq!(
+        state.file_index_repository().get_xattrs("group-1", "received.bin").unwrap(),
+        received_xattrs(),
+        "the edited version must keep the predecessor's attributes, not drop them"
+    );
+}
+
+#[tokio::test]
+async fn a_new_file_where_no_metadata_is_readable_has_no_mode_and_no_attributes() {
+    let (proc, state, file_path, _s, _r, _store) =
+        received_file_on_a_platform_that_reads_no_metadata().await;
+    let root = file_path.parent().unwrap().to_path_buf();
+    let fresh = root.join("made-here.bin");
+    std::fs::write(&fresh, b"made here\n").unwrap();
+    let outcome = proc
+        .process_event(
+            "group-1",
+            &root,
+            &FsChangeEvent { path: fresh.clone(), kind: FsChangeKind::CreatedOrModified },
+        )
+        .await
+        .unwrap();
+    expect_file_changed(outcome);
+
+    assert_eq!(
+        state.file_index_repository().get_unix_mode("group-1", "made-here.bin").unwrap(),
+        None
+    );
+    assert!(state
+        .file_index_repository()
+        .get_xattrs("group-1", "made-here.bin")
+        .unwrap()
+        .is_empty());
 }

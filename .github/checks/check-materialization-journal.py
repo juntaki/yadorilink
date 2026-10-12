@@ -92,10 +92,22 @@ PERSIST_TOKEN = "persist_reconstructed_file("
 RECONSTRUCT_FORWARDER_FILE = "crates/yadorilink-daemon/src/local_convergence/types.rs"
 RECONSTRUCT_FORWARDER = "reconstruct_file_off_runtime"
 PERSIST_FORWARDER = "persist_reconstructed_file_off_runtime"
-FORWARDER_OF = {RECONSTRUCT_TOKEN: RECONSTRUCT_FORWARDER, PERSIST_TOKEN: PERSIST_FORWARDER}
+# The writer and the publish take a temp-file ledger through their `_in`
+# variants, and production callers use those; the bare names above are only
+# thin `NoTempLedger` wrappers. Both spellings are content-write sites, or the
+# guard stops seeing the real call sites (it did, and counted 1 of 4).
+RECONSTRUCT_IN_TOKEN = "reconstruct_file_in("
+PERSIST_IN_TOKEN = "persist_reconstructed_file_in("
+FORWARDER_OF = {
+    RECONSTRUCT_TOKEN: RECONSTRUCT_FORWARDER,
+    PERSIST_TOKEN: PERSIST_FORWARDER,
+    PERSIST_IN_TOKEN: PERSIST_FORWARDER,
+}
 RECONSTRUCT_SITE_TOKENS = (
     RECONSTRUCT_TOKEN,
     PERSIST_TOKEN,
+    RECONSTRUCT_IN_TOKEN,
+    PERSIST_IN_TOKEN,
     RECONSTRUCT_FORWARDER + "(",
     PERSIST_FORWARDER + "(",
 )

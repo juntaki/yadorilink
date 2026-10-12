@@ -20,12 +20,12 @@ pub mod content_write_open;
 pub mod dag_store;
 pub mod desired_state;
 pub mod dirty_path;
+pub mod displacement_guard;
 pub mod enrollment;
 mod error;
 pub mod exact_materialized_commit;
 pub mod file_identity_codec;
 pub mod file_index;
-pub mod group_authority;
 pub mod handoff_lease;
 pub mod held_path;
 pub mod link;
@@ -42,27 +42,18 @@ pub mod native_bootstrap;
 pub mod native_bootstrap_codec;
 #[cfg(test)]
 mod native_bulk_authoring_tests;
+pub mod native_capture;
 #[cfg(test)]
 mod native_capture_profile_tests;
 pub mod native_checkpoint_authorization;
 pub mod native_checkpoint_frontier;
 pub mod native_checkpoint_install;
 pub mod native_closure;
-#[cfg(test)]
-mod native_conflict_name_independence;
+pub mod native_contest_candidates;
 pub mod native_desired_state;
 pub mod native_history_floor;
 #[cfg(test)]
-mod native_keep_tests;
-#[cfg(test)]
-mod native_path_planner_tests;
-#[cfg(test)]
-mod native_plan_read_first_tests;
-#[cfg(test)]
-mod native_planner_scaling_tests;
-#[cfg(test)]
 mod native_prepare_count_tests;
-pub mod native_projection_binding;
 pub mod native_publication;
 pub mod native_rebootstrap;
 pub mod native_rebootstrap_install;
@@ -72,7 +63,6 @@ pub mod native_rebootstrap_target;
 pub mod native_recovery_items;
 pub mod native_recursive_operation;
 pub mod native_replication;
-pub(crate) mod native_row_witness;
 #[cfg(test)]
 mod native_scaling_tests;
 pub mod native_store;
@@ -102,18 +92,20 @@ pub mod replica_tables;
 pub mod restore_operation;
 pub mod rewind_plan;
 pub mod role_loss_operation;
-pub mod stable_projection_binding;
 mod store;
 pub mod structural_origin;
 mod types;
-pub mod write_through;
+#[cfg(test)]
+mod windows_durability_harness;
 
 pub use dirty_path::DirtyPathRepository;
 pub use enrollment::EnrollmentRepository;
 pub use error::SyncSqliteError;
 pub use handoff_lease::HandoffLeaseRepository;
 pub use held_path::HeldPathRepository;
-pub use materialization_intent_repository::MaterializationIntentRepository;
+pub use materialization_intent_repository::{
+    MaterializationIntentRepository, MaterializationTempLedger, TempReleaseQueue,
+};
 pub use materialization_state::{
     ContentHash, MaterializationCounts, MaterializationStateRepository,
     RecordedPlaceholderGeneration,

@@ -270,7 +270,7 @@ fn author_local(
     sync_state
         .database()
         .write(|conn| {
-            yadorilink_sync_sqlite::native_authoring::author_op(conn, &group, &local, &op, &path)?;
+            yadorilink_sync_sqlite::native_authoring::author_op(conn, &group, &local, &op)?;
             let entry =
                 yadorilink_sync_sqlite::native_store::frontier_entry_get(conn, &group, &author)?
                     .expect("the authored delta advanced its author's frontier");

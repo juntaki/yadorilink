@@ -59,6 +59,22 @@ fn exact_materialized_state_from(
 }
 
 impl MaterializationExecutionPort for ReplicaCoordinator {
+    fn record_temp_file(
+        &self,
+        group_id: &str,
+        tmp_path: &Path,
+    ) -> Result<(), MaterializationExecutionError> {
+        use yadorilink_local_storage::TempFileLedger;
+        self.temp_ledger(group_id).record(tmp_path).map_err(|error| {
+            MaterializationExecutionError::from(SyncError::CorruptState(error.to_string()))
+        })
+    }
+
+    fn release_temp_file(&self, group_id: &str, tmp_path: &Path) {
+        use yadorilink_local_storage::TempFileLedger;
+        self.temp_ledger(group_id).release(tmp_path);
+    }
+
     fn get_file(
         &self,
         group_id: &str,
@@ -184,7 +200,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         path: &str,
         out_path: &Path,
     ) -> Result<bool, MaterializationExecutionError> {
-        Ok(ReplicaCoordinator::dag_disk_is_untouched_proven_write(self, group_id, path, out_path)
+        Ok(ReplicaCoordinator::disk_is_untouched_proven_write_at(self, group_id, path, out_path)
             .unwrap_or(false))
     }
 
@@ -309,23 +325,6 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .map_err(SyncError::from)?)
     }
 
-    fn relocate_held_entry_beside_directory(
-        &self,
-        group_id: &str,
-        path: &str,
-        generation: i64,
-        removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
-    ) -> Result<Option<String>, MaterializationExecutionError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
-        Ok(self
-            .held_path_repository()
-            .relocate_held_entry_beside_directory(group_id, path, generation, removable, now)
-            .map_err(SyncError::from)?)
-    }
-
     fn path_lock(&self, group_id: &str, path: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.path_lock_registry().path_lock(group_id, path)
     }
@@ -343,7 +342,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         &self,
         group_id: &str,
         path: &str,
-        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+        identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
     ) -> Result<(), MaterializationExecutionError> {
         Ok(ReplicaCoordinator::complete_structural_directory_origin(self, group_id, path, identity)
             .map_err(SyncError::from)?)
@@ -355,6 +354,15 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         path: &str,
     ) -> Result<(), MaterializationExecutionError> {
         Ok(ReplicaCoordinator::abandon_structural_directory_intent(self, group_id, path)
+            .map_err(SyncError::from)?)
+    }
+
+    fn resolve_interrupted_structural_intent(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<(), MaterializationExecutionError> {
+        Ok(ReplicaCoordinator::resolve_interrupted_structural_intent(self, group_id, path)
             .map_err(SyncError::from)?)
     }
 
@@ -374,7 +382,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         group_id: &str,
         path: &str,
         sync_root: &Path,
-        observed: &yadorilink_root_authority::fs_identity::FileIdentity,
+        observed: &yadorilink_fs_platform::fs_identity::FileIdentity,
     ) -> Result<bool, MaterializationExecutionError> {
         Ok(ReplicaCoordinator::structural_origin_status(
             self,
@@ -391,7 +399,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         &self,
         group_id: &str,
         path: &str,
-        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+        identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
     ) -> Result<(), MaterializationExecutionError> {
         Ok(ReplicaCoordinator::adopt_as_structural_directory(self, group_id, path, identity)
             .map_err(SyncError::from)?)
@@ -401,7 +409,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         &self,
         group_id: &str,
         path: &str,
-        removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+        removable: Option<&yadorilink_fs_platform::fs_identity::FileIdentity>,
     ) -> Result<(), MaterializationExecutionError> {
         Ok(ReplicaCoordinator::keep_retained_directory(
             self,
@@ -435,7 +443,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
     fn commit_restore_operation(
         &self,
         operation_id: &str,
-        identity: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+        identity: Option<&yadorilink_fs_platform::fs_identity::FileIdentity>,
         wrote_under_mutation_generation: Option<i64>,
         permit: &RootCommitPermit,
     ) -> Result<RestoreCommitOutcome, MaterializationExecutionError> {
@@ -895,7 +903,7 @@ impl ReplicaCoordinator {
         group_id: &str,
         path: &str,
         version: &yadorilink_replica_domain::ids::VersionHash,
-        identity: Option<yadorilink_root_authority::fs_identity::FileIdentity>,
+        identity: Option<yadorilink_fs_platform::fs_identity::FileIdentity>,
         permit: &RootCommitPermit,
     ) -> Result<bool, MaterializationExecutionError> {
         let in_flight = self

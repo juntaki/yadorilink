@@ -1,7 +1,7 @@
 //! Fault-injection DST scenario: simulates a process crash during
 //! materialization and verifies the real recovery path
 //! (`materialization::repair_interrupted_materializations` +
-//! `cleanup_stale_temp_files`) self-heals without data loss or leftover
+//! `remove_recorded_temp_files`) self-heals without data loss or leftover
 //! garbage.
 //!
 //! Scope note: unlike the watcher (`SimulatedFolderWatchSource`) and
@@ -9,7 +9,7 @@
 //! deliberately **not** built on a `MaterializeIo` trait abstraction or a
 //! simulated runtime. The materialization write path
 //! (`chunker::reconstruct_file`) and its recovery path
-//! (`repair_interrupted_materializations`, `cleanup_stale_temp_files`)
+//! (`repair_interrupted_materializations`, `remove_recorded_temp_files`)
 //! are both plain, synchronous functions with no `tokio`/async
 //! involvement at all -- there is no scheduling to simulate. Rather than
 //! intercepting `reconstruct_file`'s own I/O calls (which would mean
@@ -33,7 +33,6 @@ use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_filesystem_sync::materialization_repair::{
     repair_interrupted_materializations, RepairMode,
 };
-use yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files;
 use yadorilink_local_storage::{BlockStore, SegmentBlockStore};
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_replica_domain::session_state::MaterializationState;
@@ -119,16 +118,17 @@ fn run_scenario(seed: u64) -> Result<(), String> {
         .begin_materialization_intent(GROUP_ID, PATH, &[0u8; 32], &RootCommitPermit::for_tests())
         .map_err(|e| e.to_string())?;
 
-    // About half the seeds also leave a stale leftover temp file, the
-    // shape a crash *during* reconstruct_file's write (rather than
-    // before it started) leaves behind -- see
-    // chunker.rs::unique_tmp_path's naming convention, which
-    // `is_own_stale_temp_file_name` (materialization.rs) recognizes.
+    // About half the seeds also leave a temp file, the shape a crash *during*
+    // reconstruct_file's write (rather than before it started) leaves behind.
+    // The writer recorded it before creating it, which is what recovery uses.
     let left_stale_temp = rng.random_bool(0.5);
     if left_stale_temp {
         let tmp_name =
             format!("{PATH}.yadorilink-tmp.{}.{}", std::process::id(), rng.random::<u32>());
-        std::fs::write(root.join(&tmp_name), b"partial garbage from an interrupted write")
+        let tmp = root.join(&tmp_name);
+        yadorilink_local_storage::TempFileLedger::record(&state.temp_ledger(GROUP_ID), &tmp)
+            .map_err(|e| e.to_string())?;
+        std::fs::write(&tmp, b"partial garbage from an interrupted write")
             .map_err(|e| e.to_string())?;
     }
 
@@ -143,7 +143,8 @@ fn run_scenario(seed: u64) -> Result<(), String> {
         &RootCommitPermit::for_tests(),
     )
     .map_err(|e| format!("seed {seed}: repair_interrupted_materializations failed: {e}"))?;
-    let removed_temps = cleanup_stale_temp_files(&root);
+    let removed_temps =
+        state.remove_recorded_temp_files(GROUP_ID, &root).map_err(|e| e.to_string())?;
 
     let on_disk = std::fs::read(root.join(PATH)).map_err(|e| {
         format!("seed {seed}: not repaired (report: {report:?}, stale_temp_present={left_stale_temp}): {e}")
@@ -161,7 +162,7 @@ fn run_scenario(seed: u64) -> Result<(), String> {
         .collect();
     if !leftover.is_empty() {
         return Err(format!(
-            "seed {seed}: stale temp file(s) remained after cleanup_stale_temp_files: {leftover:?} \
+            "seed {seed}: stale temp file(s) remained after remove_recorded_temp_files: {leftover:?} \
              (it reported removing: {removed_temps:?})"
         ));
     }

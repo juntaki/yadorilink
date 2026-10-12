@@ -115,7 +115,7 @@ pub struct FinishedProjectedUpsert {
     /// The disk identity observed after this path's write. `None` when the
     /// observation failed -- the proof is still published, without an
     /// identity, since usability is decided by the fence, not by this.
-    pub observed_identity: Option<yadorilink_root_authority::fs_identity::FileIdentity>,
+    pub observed_identity: Option<yadorilink_fs_platform::fs_identity::FileIdentity>,
     /// The state the open-batch transaction left the row in. The finalizer
     /// commits only while the row is still in it: a path superseded during
     /// the batch's writes gets no proof and keeps its intent, rather than
@@ -169,7 +169,7 @@ pub enum ExactActualState {
         // Boxed to keep this variant's size close to `Absent`'s (clippy
         // large_enum_variant): `FileIdentity` is comparatively large and
         // only this arm carries it.
-        identity: Box<Option<yadorilink_root_authority::fs_identity::FileIdentity>>,
+        identity: Box<Option<yadorilink_fs_platform::fs_identity::FileIdentity>>,
     },
     /// Disk holds the exact desired absence.
     Absent,
@@ -180,7 +180,7 @@ pub enum ExactActualState {
     /// the path while the namespace requires one.
     StructuralDirectory {
         // Boxed for the same reason as `Object`'s.
-        identity: Box<Option<yadorilink_root_authority::fs_identity::FileIdentity>>,
+        identity: Box<Option<yadorilink_fs_platform::fs_identity::FileIdentity>>,
     },
 }
 

@@ -7,7 +7,6 @@
 use std::sync::Arc;
 
 use crate::update::manager::UpdateManager;
-use crate::update::policy::UpdateState;
 
 #[derive(Debug, Clone)]
 pub(crate) struct UpdateStatusView {
@@ -48,7 +47,7 @@ impl UpdateStatusQueryService {
             release_notes_url: policy.available_release_notes_url.clone().unwrap_or_default(),
             mandatory: policy.mandatory,
             holdback_reason: policy.holdback_reason.clone().unwrap_or_default(),
-            waiting_for_safe_point: policy.state == UpdateState::Deferred,
+            waiting_for_safe_point: false,
             last_error_category: policy.last_error_category.clone().unwrap_or_default(),
             last_error_message: policy.last_error_message.clone().unwrap_or_default(),
             automatic_checks_enabled: policy.automatic_checks_enabled,

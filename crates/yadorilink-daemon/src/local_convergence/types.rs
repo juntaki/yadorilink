@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use yadorilink_local_storage::{
-    persist_reconstructed_file, reconstruct_file_to_temp, verify_write_target_within_root,
+    persist_reconstructed_file_in, reconstruct_file_to_temp_in, verify_write_target_within_root,
 };
 use yadorilink_peer_session::hazard;
 use yadorilink_peer_session::PeerSessionError;
@@ -120,7 +120,7 @@ pub(crate) enum TombstoneRemoval {
     /// the index holds a file), which is kept for good.
     Retained {
         reason: &'static str,
-        removable: Option<Box<yadorilink_root_authority::fs_identity::FileIdentity>>,
+        removable: Option<Box<yadorilink_fs_platform::fs_identity::FileIdentity>>,
     },
 }
 
@@ -237,7 +237,7 @@ pub enum SettlementEvidence {
         // Boxed to keep this variant's size close to the other arms'
         // (clippy large_enum_variant): `FileIdentity` is comparatively
         // large and only this arm carries it.
-        identity: Box<Option<yadorilink_root_authority::fs_identity::FileIdentity>>,
+        identity: Box<Option<yadorilink_fs_platform::fs_identity::FileIdentity>>,
         mutation_generation: i64,
     },
     /// Disk holds the exact desired absence: a tombstone deletion
@@ -250,7 +250,7 @@ pub enum SettlementEvidence {
     /// relocated beside it). Same `mutation_generation` contract as
     /// `ExactObject`.
     StructuralDirectory {
-        identity: Box<Option<yadorilink_root_authority::fs_identity::FileIdentity>>,
+        identity: Box<Option<yadorilink_fs_platform::fs_identity::FileIdentity>>,
         mutation_generation: i64,
     },
     /// A policy-authorized deferral: an on-demand placeholder was
@@ -422,49 +422,6 @@ impl From<MaterializeResult> for LocalMaterializeOutcome {
     fn from(result: MaterializeResult) -> Self {
         Self::Concluded(result)
     }
-}
-
-/// Outcome of one `retire_conflict_copies_only` attempt for a group.
-/// Exists so a generation-tracked caller (`engine_wrapper.rs`'s
-/// `RetirementWake`) can tell "this pass genuinely verified the frontier
-/// generation it targeted" from every way it might not have -- a plain
-/// `bool`/`Result<(), _>` return collapsed all three into "ran" vs
-/// "errored", which is exactly the shape that let a guard-busy skip get
-/// treated as a completed pass (see `RetirementWake`'s own doc comment for
-/// the resulting lost-wakeup bug this type closes).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RetirementAttempt {
-    /// Every copy-shaped file this pass examined was either justified by
-    /// the current frontier or successfully retired. Only this variant
-    /// means the caller may call `RetirementWake::complete` for the
-    /// generation this pass targeted. `retired` counts how many copies
-    /// were actually removed (informational only, not part of the
-    /// completion contract).
-    Settled { retired: usize },
-    /// `RetirementAuditGuard` contention: another retirement pass for this
-    /// same group already holds it, so this pass did not run at all. Not
-    /// an error -- that other pass's own retire step covers SOME
-    /// evaluation of this group, but not necessarily the frontier
-    /// generation this pass was asked to verify.
-    Busy,
-    /// The pass ran, but at least one copy's tombstone `materialize`
-    /// returned `MaterializeResult::RetryRequired` or errored -- that
-    /// copy's justification was never actually re-verified against the
-    /// targeted frontier, so the pass as a whole did not settle it.
-    RetryRequired,
-    /// The pass ran and every copy it examined resolved cleanly, but this
-    /// device's own admitted native frontier for the group was different
-    /// after the pass than before it started -- see
-    /// `retire_conflict_copies_only`'s own doc comment for exactly what is
-    /// compared and why. Every decision this pass made (justified/
-    /// unjustified, retire/retain) was made against SOME frontier that
-    /// existed during the pass, but not provably the one the caller's
-    /// generation was meant to verify, so it must not be treated as a
-    /// completion of that generation -- not "undo what this pass did"
-    /// (already-correct-for-some-real-frontier mutations are left as they
-    /// are), but "do not trust this pass's verdict as final; run again
-    /// against the CURRENT frontier."
-    FrontierChanged,
 }
 
 /// The outcome of one `reconcile_group_paths` call, split into two
@@ -848,10 +805,18 @@ pub(crate) fn materialize_symlink_at(
     #[cfg(unix)]
     {
         let _ = windows_opt_in; // only meaningful on Windows
-        yadorilink_local_storage::materialize_symlink(&out_path, &target)?;
+        yadorilink_local_storage::materialize_symlink_in(
+            &out_path,
+            &target,
+            &state.temp_ledger(group_id),
+        )?;
     }
     #[cfg(windows)]
-    yadorilink_local_storage::materialize_symlink_windows(&out_path, &target)?;
+    yadorilink_local_storage::materialize_symlink_windows_in(
+        &out_path,
+        &target,
+        &state.temp_ledger(group_id),
+    )?;
 
     let mutation_generation =
         mutation_generation.expect("write_eligible implies the fence was bumped above");
@@ -878,8 +843,7 @@ pub(crate) fn materialize_symlink_at(
     // has landed yet. Dropping the guard unclear is safe -- it has no
     // `Drop` behaviour of its own; the commit below owns the clear.
     let version = written.version_hash;
-    let identity =
-        yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path).ok();
+    let identity = yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path).ok();
     if !state.commit_internal_materialized_state_if_fence_current(
         group_id,
         &record.path,
@@ -1229,6 +1193,7 @@ pub(crate) async fn reconstruct_file_to_temp_off_runtime(
     blocks: &[yadorilink_replica_domain::file::BlockInfo],
     mtime_unix_nanos: i64,
     headroom: Option<Arc<super::reconcile::HeadroomReservation>>,
+    ledger: Arc<dyn yadorilink_local_storage::TempFileLedger>,
 ) -> Result<std::path::PathBuf, PeerSessionError> {
     let out_path = out_path.to_path_buf();
     let blocks = blocks.to_vec();
@@ -1237,18 +1202,24 @@ pub(crate) async fn reconstruct_file_to_temp_off_runtime(
     // removes the finished temp file: this future once it has the path, the
     // task itself or the drop guard otherwise.
     let owner = Arc::new(std::sync::Mutex::new(TempOwner::Assembling));
-    let guard = TempGuard(owner.clone());
+    let guard = TempGuard(owner.clone(), ledger.clone());
     let permit = super::receive_write_gate::admit(super::receive_write_gate::global()).await;
     match spawn_blocking(move || {
         let _permit = permit;
         // The reserved space is released only when this task, temp file
         // included, is done, whatever happens to the future awaiting it.
         let _headroom = headroom;
-        let result = reconstruct_file_to_temp(store.as_ref(), &out_path, &blocks, mtime_unix_nanos);
+        let result = reconstruct_file_to_temp_in(
+            store.as_ref(),
+            &out_path,
+            &blocks,
+            mtime_unix_nanos,
+            ledger.as_ref(),
+        );
         if let Ok(tmp_path) = &result {
             let mut owner = owner.lock().unwrap_or_else(|p| p.into_inner());
             if matches!(*owner, TempOwner::Abandoned) {
-                let _ = std::fs::remove_file(tmp_path);
+                yadorilink_local_storage::discard_temp_file(tmp_path, ledger.as_ref());
             } else {
                 *owner = TempOwner::Finished(tmp_path.clone());
             }
@@ -1279,7 +1250,10 @@ enum TempOwner {
 }
 
 /// Removes an assembled temp file nobody is waiting for any more.
-struct TempGuard(Arc<std::sync::Mutex<TempOwner>>);
+struct TempGuard(
+    Arc<std::sync::Mutex<TempOwner>>,
+    Arc<dyn yadorilink_local_storage::TempFileLedger>,
+);
 
 impl TempGuard {
     fn hand_over(&self) {
@@ -1293,7 +1267,7 @@ impl Drop for TempGuard {
         match std::mem::replace(&mut *owner, TempOwner::HandedOver) {
             TempOwner::Assembling => *owner = TempOwner::Abandoned,
             TempOwner::Finished(tmp_path) => {
-                let _ = std::fs::remove_file(tmp_path);
+                yadorilink_local_storage::discard_temp_file(&tmp_path, self.1.as_ref());
             }
             other => *owner = other,
         }
@@ -1306,9 +1280,14 @@ impl Drop for TempGuard {
 pub(crate) async fn persist_reconstructed_file_off_runtime(
     tmp_path: std::path::PathBuf,
     out_path: &std::path::Path,
+    ledger: Arc<dyn yadorilink_local_storage::TempFileLedger>,
 ) -> Result<(), PeerSessionError> {
     let out_path = out_path.to_path_buf();
-    match spawn_blocking(move || persist_reconstructed_file(&tmp_path, &out_path)).await {
+    match spawn_blocking(move || {
+        persist_reconstructed_file_in(&tmp_path, &out_path, ledger.as_ref())
+    })
+    .await
+    {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.into()),
         Err(join_err) => Err(PeerSessionError::from(std::io::Error::other(format!(
@@ -1512,7 +1491,7 @@ pub(crate) fn hazard_reason_for_volume(
     // (`hazard_reason_for_siblings`), each answered by an index lookup on the
     // key stored with every row instead of by folding every sibling.
     if volume.case_insensitive {
-        let folded = yadorilink_root_authority::canonical_fold::case_fold(path);
+        let folded = yadorilink_fs_platform::canonical_fold::case_fold(path);
         let matches = state.name_fold_matches(group_id, NameFoldKey::Case, &folded, path)?;
         if let Some(colliding) = matches.first() {
             return Ok(held(hazard::HELD_REASON_CASE_COLLISION, colliding));
@@ -1520,13 +1499,13 @@ pub(crate) fn hazard_reason_for_volume(
     }
     // Both remaining checks match on the combined key: two names equal under
     // NFC alone are equal under it, and the combined check is it exactly.
-    let canonical = yadorilink_root_authority::canonical_fold::canonical_fold(path);
+    let canonical = yadorilink_fs_platform::canonical_fold::canonical_fold(path);
     let candidates = state.name_fold_matches(group_id, NameFoldKey::Canonical, &canonical, path)?;
     if volume.normalization_insensitive {
-        let nfc = yadorilink_root_authority::canonical_fold::nfc(path);
+        let nfc = yadorilink_fs_platform::canonical_fold::nfc(path);
         if let Some(colliding) = candidates
             .iter()
-            .find(|sibling| yadorilink_root_authority::canonical_fold::nfc(sibling) == nfc)
+            .find(|sibling| yadorilink_fs_platform::canonical_fold::nfc(sibling) == nfc)
         {
             return Ok(held(hazard::HELD_REASON_NORMALIZATION_COLLISION, colliding));
         }
@@ -1703,17 +1682,6 @@ pub(crate) fn next_audit_attempt_id() -> u64 {
     NEXT_AUDIT_ATTEMPT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// `retire_conflict_copies_only`'s whole-pass frontier freshness check --
-/// factored out to a pure function so its exact semantics (a plain slice
-/// comparison; any number of intermediate admissions during the pass
-/// collapses to the same before/after mismatch as a single one) can be
-/// tested without any async execution, store, or session plumbing. The
-/// frontier is the group's native author frontier (each author's position and
-/// tip), which is a map and so compares equal regardless of admission order.
-pub(crate) fn frontier_changed_during_pass<T: PartialEq + ?Sized>(before: &T, after: &T) -> bool {
-    before != after
-}
-
 pub(crate) struct MaterializationAuditGuard {
     key: String,
 }
@@ -1736,50 +1704,6 @@ impl MaterializationAuditGuard {
 impl Drop for MaterializationAuditGuard {
     fn drop(&mut self) {
         if let Some(in_flight) = MATERIALIZATION_AUDITS_IN_FLIGHT.get() {
-            in_flight.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.key);
-        }
-    }
-}
-
-static RETIREMENT_AUDITS_IN_FLIGHT: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
-
-/// `retire_conflict_copies_only`'s own single-flight, deliberately a
-/// SEPARATE key space from `MaterializationAuditGuard` rather than sharing
-/// its key. Before this, retirement contended with `reconcile_local_
-/// materialization_audit`/`reconcile_paths_directly` for the exact same
-/// per-group slot: a full audit or direct path reconciliation already in
-/// flight for a group made every retirement pass against it report `Busy`
-/// for that entire duration, even though retirement's own physical
-/// mutation is already independently serialized per-path by `state.
-/// path_lock` (see `retire_unjustified_ephemeral_conflict_copies`'s own
-/// path-lock acquisition, and `reconcile_group_paths`'/`apply_locked_
-/// record`'s matching ones) -- the group-wide guard was serializing far
-/// more than the one thing (two writers racing the SAME path) that
-/// actually needed serializing. Only retirement passes now contend with
-/// each other; a long-running full audit no longer blocks retirement's own
-/// progress, and vice versa.
-pub(crate) struct RetirementAuditGuard {
-    key: String,
-}
-
-impl RetirementAuditGuard {
-    pub(crate) fn try_acquire(
-        state: &Arc<crate::replica_coordinator::ReplicaCoordinator>,
-        group_id: &str,
-    ) -> Option<Self> {
-        let key = format!("{:p}:{group_id}", Arc::as_ptr(state));
-        let in_flight = RETIREMENT_AUDITS_IN_FLIGHT.get_or_init(Default::default);
-        let mut in_flight = in_flight.lock().unwrap_or_else(|p| p.into_inner());
-        if !in_flight.insert(key.clone()) {
-            return None;
-        }
-        Some(Self { key })
-    }
-}
-
-impl Drop for RetirementAuditGuard {
-    fn drop(&mut self) {
-        if let Some(in_flight) = RETIREMENT_AUDITS_IN_FLIGHT.get() {
             in_flight.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.key);
         }
     }

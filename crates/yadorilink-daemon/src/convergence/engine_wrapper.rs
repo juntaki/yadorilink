@@ -1,6 +1,5 @@
 //! Runs the existing materialization engine together with its independent
-//! maintenance loops (ephemeral conflict-copy retirement, hazard and ignore
-//! rechecks).
+//! maintenance loops (hazard and ignore rechecks).
 //!
 //! Keeping the loops in a wrapper leaves `engine.rs` free to evolve
 //! independently. If either essential loop exits, this wrapper exits and
@@ -10,37 +9,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::local_convergence::types::RetirementAttempt;
-use yadorilink_root_authority::ignore_patterns::{
-    is_ignore_file_relative_path, EffectiveIgnoreSet,
-};
+use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
 
 use crate::daemon_state::DaemonState;
 
 pub use super::engine_impl::ConvergenceEngine;
 
-/// The retirement loop's own backstop cadence, now that
-/// `RetirementWake`-driven events (native frontier advanced, materialization
-/// job completed) are its primary trigger -- see
-/// `run_ephemeral_conflict_copy_retire_loop`'s own doc comment. Kept far
-/// looser than a correctness-critical poll needs to be: this pass exists
-/// only to catch a group whose dirty mark was somehow lost (a crash between
-/// the state change and the `notify_retirement_wake` call, or a group
-/// linked after an earlier mark for it was already drained), not to carry
-/// ordinary retirement latency.
-const RETIREMENT_BACKSTOP_INTERVAL: Duration = Duration::from_secs(30);
-
-/// `RETIREMENT_BACKSTOP_INTERVAL` itself, for a test that needs to wait
-/// past it deterministically (see `retirement_backstop_group_
-/// deauthorization.rs`'s own doc comment) without hardcoding a duplicate
-/// value that would silently stop exercising the real regression if this
-/// constant is ever retuned.
-#[cfg(any(test, feature = "test-support"))]
-pub fn retirement_backstop_interval_for_tests() -> Duration {
-    RETIREMENT_BACKSTOP_INTERVAL
-}
-/// Same role as `RETIREMENT_BACKSTOP_INTERVAL`, for the hazard re-check
-/// loop's own `HazardRecheckWake`-driven events -- a correctness backstop
+/// The hazard re-check loop's backstop cadence, for its own `HazardRecheckWake`-driven events -- a correctness backstop
 /// only, for a mark lost to a crash or a race with linking.
 const HAZARD_RECHECK_BACKSTOP_INTERVAL: Duration = Duration::from_secs(30);
 /// The ignore-recheck loop's own backstop cadence -- unlike the retirement
@@ -122,91 +97,26 @@ pub async fn run(engine: Arc<ConvergenceEngine>) {
     // `tokio::task::JoinSet`'s "aborts every remaining task and awaits their
     // completion" contract explicitly -- this function never returns while
     // any of the four tasks is still alive.
-    let retire_state = state.clone();
     let hazard_recheck_state = state.clone();
     let ignore_recheck_state = state;
     let mut engine_handle = tokio::spawn(super::engine_impl::run(engine));
-    let mut retire_handle = tokio::spawn(run_ephemeral_conflict_copy_retire_loop(retire_state));
     let mut hazard_recheck_handle = tokio::spawn(run_hazard_recheck_loop(hazard_recheck_state));
     let mut ignore_recheck_handle = tokio::spawn(run_ignore_recheck_loop(ignore_recheck_state));
     // Cancelling this future (an aborted supervisor) must stop all four
     // rather than detach them.
     let _stop_with_wrapper = [
         crate::supervise::AbortOnDrop(engine_handle.abort_handle()),
-        crate::supervise::AbortOnDrop(retire_handle.abort_handle()),
         crate::supervise::AbortOnDrop(hazard_recheck_handle.abort_handle()),
         crate::supervise::AbortOnDrop(ignore_recheck_handle.abort_handle()),
     ];
     tokio::select! {
         _ = &mut engine_handle => {}
-        _ = &mut retire_handle => {}
         _ = &mut hazard_recheck_handle => {}
         _ = &mut ignore_recheck_handle => {}
     }
-    for handle in [
-        &mut engine_handle,
-        &mut retire_handle,
-        &mut hazard_recheck_handle,
-        &mut ignore_recheck_handle,
-    ] {
+    for handle in [&mut engine_handle, &mut hazard_recheck_handle, &mut ignore_recheck_handle] {
         handle.abort();
         let _ = handle.await;
-    }
-}
-
-/// Retires ephemeral conflict copies -- ones whose losing branch has since
-/// been superseded with no cross-branch merge, so no admitted change ever
-/// carries them, and a device that already materialized one keeps it
-/// forever while a device that first reconciles after the window closed
-/// never derives it: byte-identical DAGs, permanently different file sets
-/// (see `PeerSyncSession::retire_unjustified_ephemeral_conflict_copies`'s
-/// own doc comment). Without retirement, one device (of several, all on an
-/// identical multi-head native frontier) can keep holding a conflict copy
-/// every device's own `resolve_path_heads` agrees is no longer required.
-///
-/// Primarily event-driven, not polled: `RetirementWake::mark_dirty` fires
-/// after exactly the two events that can change a copy's justification --
-/// this device's own native frontier advancing (locally authored or admitted
-/// from a peer) and a materialization job reaching `Completed` -- so this
-/// loop reacts within one wake rather than waiting up to a whole poll
-/// interval. `RETIREMENT_BACKSTOP_INTERVAL` remains as a correctness
-/// backstop only, for a mark lost to a crash or a race with linking, not as
-/// the primary liveness path. This loop is needed because the Convergence
-/// Engine (`engine.rs`) drives ordinary path reconciliation through
-/// `reconcile_paths_directly`, which never calls this audit; the periodic
-/// materialization-repair sweep in `daemon_state.rs` does, but a group
-/// whose sweep interval is long -- or disabled for a whole run, as strict
-/// acceptance tests do to prove the Convergence Engine's own mechanism
-/// converges without it -- would otherwise have no path that ever retires
-/// a copy at all.
-async fn run_ephemeral_conflict_copy_retire_loop(state: Arc<DaemonState>) {
-    loop {
-        tokio::select! {
-            _ = state.replica_coordinator.retirement_wake().retirement_wake_notified() => {
-                let pending = state.replica_coordinator.retirement_wake().pending();
-                run_retirement_pass(&state, pending).await;
-            }
-            _ = tokio::time::sleep(RETIREMENT_BACKSTOP_INTERVAL) => {
-                // Counted so a test waiting past this interval can check that
-                // the tick it is waiting for actually happened, rather than
-                // assume a long enough sleep implies one. Observation only;
-                // nothing reads it to decide anything.
-                state.note_retirement_backstop_tick();
-                if let Some(groups) = list_linked_groups_for_retirement(&state).await {
-                    // Backstop recovery for a mark lost before this
-                    // generation-tracked state existed for the group at
-                    // all (e.g. linked after an earlier drop, or after a
-                    // crash) -- `mark_dirty` makes every linked group
-                    // reportable by `pending`, matching the old flat
-                    // poll's "just re-check everything" behavior.
-                    for group_id in &groups {
-                        state.replica_coordinator.retirement_wake().mark_dirty(group_id);
-                    }
-                    let pending = state.replica_coordinator.retirement_wake().pending();
-                    run_retirement_pass(&state, pending).await;
-                }
-            }
-        }
     }
 }
 
@@ -241,50 +151,6 @@ async fn list_linked_groups_for_retirement(state: &Arc<DaemonState>) -> Option<B
     }
 }
 
-/// Runs `ConvergenceRetirementService::reconcile_group` for each group in
-/// `pending` (group id -> the generation `RetirementWake::pending` reported
-/// for it) -- no peer session involved, because retirement's decision never
-/// depended on which, or any, peer happened to be connected.
-/// `RetirementWake::complete` is
-/// called for a group ONLY when `settles_generation` says the outcome was
-/// `RetirementAttempt::Settled` -- see that function's and
-/// `RetirementAttempt`'s own doc comments for why `Busy` and
-/// `RetryRequired` must not be treated as completions. Not completing
-/// leaves the group in `pending` with no separate re-mark needed -- see
-/// `RetirementWake::pending`'s own doc comment.
-async fn run_retirement_pass(state: &Arc<DaemonState>, pending: BTreeMap<String, u64>) {
-    let service = super::retirement_service::ConvergenceRetirementService::new(state.clone());
-    for (group_id, generation) in pending {
-        match service.reconcile_group(&group_id).await {
-            Ok(attempt) if settles_generation(&attempt) => {
-                state.replica_coordinator.retirement_wake().complete(&group_id, generation);
-            }
-            // `Busy` (a full audit already holds this group's guard) or
-            // `RetryRequired` (ran, but at least one copy's evaluation was
-            // not verified against the targeted frontier) -- neither
-            // settles this pass's target generation. Left pending; the
-            // next wake or backstop tries again.
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(
-                    %group_id,
-                    %error,
-                    "ephemeral conflict-copy retire audit failed"
-                );
-            }
-        }
-    }
-}
-
-/// Whether `attempt` means the pass that produced it may be treated as
-/// having genuinely verified the frontier generation it targeted -- the
-/// single place the "only `Settled` completes a generation" contract is
-/// enforced, factored out so a test can exercise the decision without any
-/// `PeerSyncSession`/`DaemonState` plumbing.
-fn settles_generation(attempt: &RetirementAttempt) -> bool {
-    matches!(attempt, RetirementAttempt::Settled { .. })
-}
-
 /// Re-evaluates every currently-`HazardHeld` path in a group whenever this
 /// device's native frontier advances or a materialization job completes --
 /// see `MaterializationStateRepository::list_held_paths`'s own doc comment
@@ -293,13 +159,13 @@ fn settles_generation(attempt: &RetirementAttempt) -> bool {
 /// `run_ephemeral_conflict_copy_retire_loop`: event-driven via
 /// `HazardRecheckWake`, with `HAZARD_RECHECK_BACKSTOP_INTERVAL` as a
 /// correctness backstop only for a mark lost to a crash or a race with
-/// linking. Uses a separate `RetirementWake` instance
+/// linking. Uses a separate `GroupWake` instance
 /// (`hazard_recheck_wake`), not the retirement loop's own, since `pending`/
 /// `complete` are consumer-specific -- see that field's own doc comment.
 async fn run_hazard_recheck_loop(state: Arc<DaemonState>) {
     loop {
         tokio::select! {
-            _ = state.replica_coordinator.hazard_recheck_wake().retirement_wake_notified() => {
+            _ = state.replica_coordinator.hazard_recheck_wake().wake_notified() => {
                 let pending = state.replica_coordinator.hazard_recheck_wake().pending();
                 run_hazard_recheck_pass(&state, pending).await;
             }
@@ -316,7 +182,7 @@ async fn run_hazard_recheck_loop(state: Arc<DaemonState>) {
     }
 }
 
-/// For each group in `pending` (group id -> the generation `RetirementWake::
+/// For each group in `pending` (group id -> the generation `GroupWake::
 /// pending` reported for it), lists its currently-held paths and, if any,
 /// re-resolves them directly against this device's current native heads via
 /// `reconcile_paths_directly` -- the SAME entry point the Convergence
@@ -448,7 +314,7 @@ async fn run_hazard_recheck_pass(state: &Arc<DaemonState>, pending: BTreeMap<Str
 /// ever calls `is_locally_ignored` for it again on its own.
 ///
 /// Deliberately backstop-only for now, unlike the retirement/hazard loops
-/// (no `RetirementWake`-style event-driven fast path): the natural trigger
+/// (no `GroupWake`-style event-driven fast path): the natural trigger
 /// -- "the ignore-set cache for this group just reloaded from a changed
 /// `.yadorilinkignore`" -- fires deep inside `yadorilink-peer-session`'s
 /// `effective_ignore_set`, and wiring a cross-crate notification back into
@@ -589,10 +455,6 @@ async fn run_ignore_recheck_pass(state: &Arc<DaemonState>, group_id: &str) {
         state.replica_coordinator.materialization_wake().notify_materialization_wake();
     }
 }
-
-#[cfg(test)]
-#[path = "engine_wrapper/tests.rs"]
-mod tests;
 
 /// `run_hazard_recheck_pass`'s own regression coverage: proves a path
 /// marked `HazardHeld` gets re-examined and un-held by the sweep alone,

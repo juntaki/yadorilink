@@ -3,7 +3,7 @@
 //!
 //! A bare-`PeerSyncSession` DST scenario never runs the periodic sweeps a
 //! real daemon runs (`repair_interrupted_materializations` +
-//! `cleanup_stale_temp_files`, driven by `link_runtime`), so a state the
+//! `remove_recorded_temp_files`, driven by `link_runtime`), so a state the
 //! production daemon would have repaired on its next sweep -- an interrupted
 //! eager materialize's live-but-fileless index row plus an orphaned
 //! `.yadorilink-tmp.*` file -- surfaced as `StructuralIndexDiskMismatch` /
@@ -29,7 +29,6 @@ use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_filesystem_sync::materialization_repair::{
     repair_interrupted_materializations, RepairMode,
 };
-use yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files;
 use yadorilink_local_storage::BlockContentStore;
 
 use super::oracle::{Violation, ViolationKind};
@@ -76,10 +75,10 @@ pub fn run_self_healing(
         }
     }
 
-    for removed in cleanup_stale_temp_files(root) {
+    for removed in state.remove_recorded_temp_files(group_id, root).unwrap_or_default() {
         findings.push(repaired(
             removed.to_string_lossy().into_owned(),
-            "removed an orphaned .yadorilink-tmp.* file",
+            "removed a recorded temp file a crash left",
         ));
     }
 
@@ -191,24 +190,14 @@ mod tests {
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
-        // Only a partial file on disk + an orphaned temp file: the
-        // interrupted-materialize window. The orphan is left by a *previous*
-        // (crashed) process, so its pid segment is deliberately a foreign
-        // constant, not this live process's id: `chunker::unique_tmp_path`
-        // stamps its own temps with the current pid plus a process-global
-        // atomic counter, so a same-pid orphan can collide with this run's own
-        // reconstruction temp once a concurrently-running test has advanced
-        // that shared counter past 0 — the reconstruction would then rename the
-        // orphan away as its own write target and the cleanup finding would
-        // vanish. A foreign pid can never collide, while
-        // `cleanup_stale_temp_files` still recognizes it (any `<digits>.<digits>`
-        // suffix matches).
+        // Only a partial file on disk + a temp file a previous (crashed)
+        // process had recorded before creating it: the interrupted-materialize
+        // window. The record, not the file name, is what lets the sweep remove it.
         std::fs::write(root.path().join("pre-crash.bin"), &content[..content.len() / 3]).unwrap();
-        std::fs::write(
-            root.path().join("pre-crash.bin.yadorilink-tmp.4242.1"),
-            b"interrupted materialize temp",
-        )
-        .unwrap();
+        let orphan = root.path().join("pre-crash.bin.yadorilink-tmp.4242.1");
+        yadorilink_local_storage::TempFileLedger::record(&state.temp_ledger(GROUP_ID), &orphan)
+            .unwrap();
+        std::fs::write(&orphan, b"interrupted materialize temp").unwrap();
 
         let findings = run_self_healing(&state, &store, root.path(), GROUP_ID);
 
@@ -224,7 +213,7 @@ mod tests {
             "expected a reconstruction finding: {findings:?}"
         );
         assert!(
-            findings.iter().any(|f| f.detail.contains("orphaned")),
+            findings.iter().any(|f| f.detail.contains("removed a recorded temp file")),
             "expected a temp-file cleanup finding: {findings:?}"
         );
 

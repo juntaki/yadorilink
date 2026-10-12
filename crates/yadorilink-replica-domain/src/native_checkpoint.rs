@@ -64,62 +64,28 @@ impl std::fmt::Debug for NamespaceRoot {
     }
 }
 
-/// The digest of the projection facts a checkpoint's bundle carries (kept
-/// copies, stable names and placements), which the namespace and frontier roots
-/// do not cover. Opaque here, like the roots: the carried encoding is defined
-/// where those facts are. [`Self::NONE`] commits to a bundle that carries none.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProjectionDigest(pub [u8; 32]);
-
-impl ProjectionDigest {
-    /// The digest of a state with no projection facts.
-    pub const NONE: Self = Self([0u8; 32]);
-}
-
-impl std::fmt::Debug for ProjectionDigest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ProjectionDigest({})", hex::encode(self.0))
-    }
-}
-
 /// A sealer's signed commitment to a group's state at one point: `group`,
-/// `namespace_root`, `author_state_root` and the `projection_digest` of the
-/// facts a bundle carries beside them, plus the sealer's signature over all
-/// four.
+/// `namespace_root` and `author_state_root`, plus the sealer's signature over
+/// all three.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NativeCheckpoint {
     pub group_id: FolderGroupId,
     pub namespace_root: NamespaceRoot,
     pub author_state_root: AuthorStateRoot,
-    pub projection_digest: ProjectionDigest,
     /// Ed25519 by the sealing writer's device key over
     /// [`Self::canonical_encoding`] with the signature field zeroed.
     pub signature: [u8; 64],
 }
 
 impl NativeCheckpoint {
-    /// Builds an unsigned checkpoint committing to no projection facts (see
-    /// [`Self::with_projection_digest`]); call [`Self::sign`] before it is
-    /// trusted by anything.
+    /// Builds an unsigned checkpoint; call [`Self::sign`] before it is trusted
+    /// by anything.
     pub fn new(
         group_id: FolderGroupId,
         namespace_root: NamespaceRoot,
         author_state_root: AuthorStateRoot,
     ) -> Self {
-        Self {
-            group_id,
-            namespace_root,
-            author_state_root,
-            projection_digest: ProjectionDigest::NONE,
-            signature: [0u8; 64],
-        }
-    }
-
-    /// This checkpoint committing to `digest` of the projection facts it
-    /// travels with.
-    pub fn with_projection_digest(mut self, digest: ProjectionDigest) -> Self {
-        self.projection_digest = digest;
-        self
+        Self { group_id, namespace_root, author_state_root, signature: [0u8; 64] }
     }
 
     /// The encoding the sealer signs and the encoding this checkpoint's
@@ -132,7 +98,6 @@ impl NativeCheckpoint {
         put_str(&mut buf, self.group_id.as_str());
         buf.extend_from_slice(&self.namespace_root.0);
         buf.extend_from_slice(&self.author_state_root.0);
-        buf.extend_from_slice(&self.projection_digest.0);
         buf
     }
 
@@ -171,13 +136,12 @@ impl NativeCheckpoint {
         let group_id = FolderGroupId(r.string()?);
         let namespace_root = NamespaceRoot(r.array32()?);
         let author_state_root = AuthorStateRoot(r.array32()?);
-        let projection_digest = ProjectionDigest(r.array32()?);
         let signature: [u8; 64] = r
             .take(64)?
             .try_into()
             .map_err(|_| ChangeError::Encoding("signature must be 64 bytes".into()))?;
         r.expect_end()?;
-        Ok(Self { group_id, namespace_root, author_state_root, projection_digest, signature })
+        Ok(Self { group_id, namespace_root, author_state_root, signature })
     }
 }
 
@@ -195,8 +159,7 @@ mod tests {
             FolderGroupId("g1".into()),
             NamespaceRoot([1u8; 32]),
             AuthorStateRoot([2u8; 32]),
-        )
-        .with_projection_digest(ProjectionDigest([4u8; 32]));
+        );
         checkpoint.sign(&sealer_key());
         checkpoint
     }
@@ -236,19 +199,6 @@ mod tests {
     }
 
     #[test]
-    fn the_projection_digest_is_signed_and_part_of_the_identity() {
-        let checkpoint = sample();
-        let mut altered = checkpoint.clone();
-        altered.projection_digest = ProjectionDigest([5u8; 32]);
-        assert_ne!(altered.checkpoint_hash(), checkpoint.checkpoint_hash());
-        assert_eq!(
-            altered.verify_signature(&sealer_key().verifying_key()),
-            Err(ChangeError::BadSignature),
-            "the signature covers the digest"
-        );
-    }
-
-    #[test]
     fn foreign_generation_tag_is_refused() {
         let checkpoint = sample();
         let mut bytes = checkpoint.to_wire_bytes();
@@ -281,7 +231,7 @@ mod tests {
         assert_eq!(NATIVE_CHECKPOINT_DOMAIN_TAG[7], NATIVE_PROTOCOL_GENERATION);
         assert_eq!(
             hex::encode(sample().checkpoint_hash().0),
-            "596b81a95c027505be1a8ec8d205e209625594c93f40b41dcbf9758b644eca5c"
+            "499a8b54f800e647710c14177de1f92432df0429c7ba028b5569f37421a05e29"
         );
     }
 }

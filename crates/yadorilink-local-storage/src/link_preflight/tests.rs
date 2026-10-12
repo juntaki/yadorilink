@@ -76,8 +76,8 @@ fn ignored_entries_dont_count_as_non_empty_but_are_summarized() {
 #[test]
 fn reserved_namespace_collision_is_named_not_only_counted_as_ignored() {
     let dir = tempdir();
-    let artefact_name = yadorilink_root_authority::reserved_namespace::artefact_component_name(
-        yadorilink_root_authority::reserved_namespace::ArtefactKind::Stage,
+    let artefact_name = yadorilink_fs_platform::reserved_namespace::artefact_component_name(
+        yadorilink_fs_platform::reserved_namespace::ArtefactKind::Stage,
         "deadbeef",
     )
     .unwrap();

@@ -3,16 +3,17 @@ import YadoriLinkModel
 
 /// The one place the app chooses its client.
 ///
-/// Release builds always use the live client over the Rust client core.
-/// Debug builds use the fake client with fixture states by default, for
-/// development and screenshots; pass `-live` (or set `YADORILINK_CLIENT=live`)
-/// to run a Debug build against the real daemon instead. The fake shows
-/// made-up folders and only pretends to act, so it is never compiled into a
-/// Release build. Every view and view model only sees `YadoriLinkClient`.
+/// Every build, Debug included, uses the live client over the Rust client
+/// core by default. The fake client (made-up folders, pretend operations)
+/// exists only in Debug builds and is chosen only explicitly: set
+/// `YADORILINK_CLIENT=fake` in the environment, or run the
+/// `YadoriLink Fixtures` scheme, which sets it. The UI then shows a
+/// "Fixture" badge so fake data is never mistaken for real data. Previews
+/// and the package tests build the fake client themselves. Every view and
+/// view model only sees `YadoriLinkClient`.
 ///
-/// In Debug, pick a fixture with `-fixture <name>` on the command line or
-/// the `YADORILINK_FIXTURE` environment variable, for example
-/// `open YadoriLink.app --args -fixture daemonDown`.
+/// With the fake client, pick a scenario with `-fixture <name>` or the
+/// `YADORILINK_FIXTURE` environment variable.
 enum ClientFactory {
     /// How the app brings the daemon up: through its LaunchAgent, falling
     /// back to the installed binary by absolute path.
@@ -29,11 +30,13 @@ enum ClientFactory {
 import YadoriLinkFixtures
 
 extension ClientFactory {
+    /// Live unless `YADORILINK_CLIENT=fake` is set. No other input (a build
+    /// configuration, a `-fixture` argument alone) selects the fixture client.
     static func makeClient(arguments: [String] = CommandLine.arguments, environment: [String: String] = ProcessInfo.processInfo.environment) -> any YadoriLinkClient {
-        if arguments.contains("-live") || environment["YADORILINK_CLIENT"] == "live" {
-            return makeLiveClient()
+        if environment["YADORILINK_CLIENT"] == "fake" {
+            return FakeYadoriLinkClient(scenario: fixture(arguments: arguments, environment: environment))
         }
-        return FakeYadoriLinkClient(scenario: fixture(arguments: arguments, environment: environment))
+        return makeLiveClient()
     }
 
     static func fixture(arguments: [String], environment: [String: String]) -> FakeScenario {
@@ -55,8 +58,8 @@ extension ClientFactory {
 }
 #endif
 
-/// Whether the Add Folder flow offers a File Provider folder. It mirrors the daemon's
-/// `PROVIDER_ROOTS_ENABLED` (which refuses the request while it is off); the two are switched together.
+/// Whether the Add Folder flow offers a File Provider folder. The daemon refuses the request
+/// on platforms without a provider adapter.
 enum ProviderFolders {
     static let available = true
 }

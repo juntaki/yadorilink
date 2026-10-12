@@ -26,47 +26,36 @@ schema_version = 1
 [modules]
 # The indexing/state core is touched by every scenario.
 index = [
-    "dst_directory_chaos",
     "dst_peer_reconcile_race",
-    "dst_hydration_under_fault_chaos",
     "dst_watcher_debounce",
 ]
 local_change = [
-    "dst_directory_chaos",
     "dst_peer_reconcile_race",
     "dst_watcher_debounce",
 ]
 watcher = [
     "dst_watcher_debounce",
-    "dst_directory_chaos",
     "dst_peer_reconcile_race",
 ]
 debounce = [
     "dst_watcher_debounce",
-    "dst_directory_chaos",
     "dst_peer_reconcile_race",
 ]
 ignore_patterns = [
     "dst_watcher_debounce",
-    "dst_directory_chaos",
     "dst_peer_reconcile_race",
 ]
 # The complete-dependency public wrapper over `peer_session`. Any scenario
 # that drives a real session goes through it, so it carries the same list.
 peer_session_public = [
     "dst_peer_reconcile_race",
-    "dst_directory_chaos",
 ]
 peer_session = [
     "dst_peer_reconcile_race",
-    "dst_directory_chaos",
 ]
 conflict = [
-    "dst_directory_chaos",
 ]
 materialization = [
-    "dst_hydration_under_fault_chaos",
-    "dst_directory_chaos",
 ]
 types = [
 ]
@@ -76,7 +65,6 @@ types = [
 # so a change here can alter what any scenario sees on disk or admits into
 # history. Scoped to the scenarios that actually drive those paths.
 reserved_namespace = [
-    "dst_directory_chaos",
     "dst_peer_reconcile_race",
     "dst_watcher_debounce",
 ]
@@ -161,11 +149,8 @@ captured_authoring = []
 # exercise cross-process contention.
 sync_root_lock = []
 block_serve = [
-    "dst_hydration_under_fault_chaos",
 ]
 materialization_jobs = [
-    "dst_dag_catchup_chaos",
-    "dst_hydration_under_fault_chaos",
 ]
 # No DST scenario drives the retroactive conflict-copy repair loop
 # directly yet -- it lives in yadorilink-daemon (engine_wrapper.rs), not
@@ -195,18 +180,14 @@ root_commit = []
 # convergence, no resurrection, deterministic conflict-copy naming, and
 # store-and-forward semantics.
 dst_sec_convergence = { oracles = ["Convergence", "ConflictCopyAccounting"], first_divergence = false }
-dst_directory_chaos = { oracles = ["Convergence", "NoLoss", "Corruption", "ConflictCopyAccounting", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow", "SlowConvergence"], first_divergence = false }
-dst_hydration_under_fault_chaos = { oracles = ["Convergence", "NoLoss", "Corruption", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow"], first_divergence = false }
 dst_peer_reconcile_race = { oracles = ["NoLoss"], first_divergence = false }
 dst_watcher_debounce = { oracles = ["NoLoss"], first_divergence = false }
 # A targeted regression guard for directory-rename vs a concurrent child edit:
 # asserts the edited bytes survive in both orderings with its own assert rather
 # than a `check_*` oracle, so no ViolationKind is listed.
-dst_directory_move_edit_race = { oracles = [], first_divergence = false }
 # Repeated long-offline -> reconnect -> heal against the DAG heads-announce
 # catch-up. Drives its own terminal convergence assertion rather than a `check_*`
 # oracle, so no ViolationKind is listed.
-dst_dag_catchup_chaos = { oracles = [], first_divergence = false }
 # Recursive delete and directory rename concurrent with a peer's write inside
 # the directory, on two product-stack devices. Asserts its own database-state
 # oracle (unobserved heads survive, observed versions are removed, the devices

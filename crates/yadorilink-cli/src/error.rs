@@ -21,7 +21,7 @@ pub enum CliError {
     #[error("authentication failed: {0}")]
     AuthFailed(String),
 
-    #[error("could not reach the coordination plane: {0}")]
+    #[error("could not reach the YadoriLink server: {0}")]
     CoordinationPlaneUnreachable(String),
 
     // A per-account quota
@@ -46,6 +46,11 @@ pub enum CliError {
 
     #[error("{0}")]
     Other(String),
+
+    // The user declined a confirmation (or none could be asked): nothing
+    // failed, so it is neither reportable nor a bug.
+    #[error("{0}")]
+    Cancelled(String),
 
     // Distinct from the generic `DaemonNotRunning` — this fires
     // specifically when a *reporting* command needed the daemon (the
@@ -75,12 +80,12 @@ pub enum CliError {
 impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
-            CliError::NotLoggedIn | CliError::AuthFailed(_) => 2,
+            CliError::NotLoggedIn | CliError::AuthFailed(_) => 10,
             CliError::CredentialStore(_) => 9,
             CliError::CoordinationPlaneUnreachable(_) => 3,
             CliError::DaemonNotRunning => 4,
             CliError::PeerConnectivity(_) => 5,
-            CliError::Other(_) => 1,
+            CliError::Other(_) | CliError::Cancelled(_) => 1,
             CliError::ReportingDaemonRequired(_) => 6,
             CliError::LimitExceeded(_) => 7,
             CliError::EnrollmentPendingReconciliation(_) => 8,
@@ -118,6 +123,7 @@ impl CliError {
             CliError::DaemonNotRunning => "cli_daemon_not_running",
             CliError::PeerConnectivity(_) => "cli_peer_connectivity",
             CliError::Other(_) => "cli_command_failed",
+            CliError::Cancelled(_) => "cli_cancelled",
             CliError::ReportingDaemonRequired(_) => "cli_reporting_daemon_required",
             CliError::LimitExceeded(_) => "cli_limit_exceeded",
             CliError::EnrollmentPendingReconciliation(_) => "cli_enrollment_pending_reconciliation",
@@ -173,9 +179,9 @@ impl From<CoreError> for CliError {
 
 impl From<std::io::Error> for CliError {
     fn from(e: std::io::Error) -> Self {
-        if e.kind() == std::io::ErrorKind::NotFound
-            || e.kind() == std::io::ErrorKind::ConnectionRefused
-        {
+        // A missing file is not a missing daemon: the daemon socket's own
+        // absence is mapped where it is opened (`client-core` `send`).
+        if e.kind() == std::io::ErrorKind::ConnectionRefused {
             CliError::DaemonNotRunning
         } else {
             CliError::Other(e.to_string())

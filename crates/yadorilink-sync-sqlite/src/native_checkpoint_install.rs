@@ -65,14 +65,11 @@ pub const CLEARED_BY_INSTALL: &[&str] = &[
     "native_delta_bodies",
     "native_delta_holds",
     "native_delta_log",
-    "native_head_keep",
     "native_heads",
     "native_history_floor",
     "native_local_capture",
-    "native_physical_placement",
     "native_recursive_operation_parts",
     "native_removal_operation",
-    "native_stable_projection_binding",
 ];
 
 /// Tables with a `group_id` column the install keeps: the rebootstrap's own
@@ -88,6 +85,9 @@ pub const PRESERVED_BY_INSTALL: &[&str] = &[
     "native_rebootstrap_recovery_item",
     // Recovery items: only an explicit discard deletes them.
     "native_recovery_item",
+    // The contested paths: re-judged for every path whose heads the install
+    // changes ([`crate::native_desired_state::arm_projection_for_state_change`]).
+    "native_contest_candidate",
     // The units of own intent a replay did not author: the area that holds them stays.
     "native_unreplayed_unit",
     // A cache token that moves by trigger when the tables it covers change.
@@ -101,7 +101,6 @@ pub const PRESERVED_BY_INSTALL: &[&str] = &[
     "file_version_blocks",
     "file_versions",
     "files",
-    "group_authority",
     "group_block_provenance",
     "group_local_history_floor",
     "group_policy_watermark",
@@ -111,13 +110,13 @@ pub const PRESERVED_BY_INSTALL: &[&str] = &[
     "local_dirty_paths",
     "materialization_intents",
     "materialization_replaced_targets",
+    "materialization_tmp_files",
     "offline_group_policy_log",
     "offline_peer_authorization_group",
     "path_actual_mutation_fences",
     "path_materialized_generations",
     "paused_items",
     "provider_dirs",
-    "provider_placements",
     "provider_dirty_paths",
     "provider_items",
     "provider_roots",
@@ -128,7 +127,6 @@ pub const PRESERVED_BY_INSTALL: &[&str] = &[
     "restore_operations",
     "retained_directories",
     "role_loss_operations",
-    "structural_directory_intents",
     "structural_directory_origins",
     "structural_provenance_lost",
 ];
@@ -485,7 +483,6 @@ fn write_target(
         }
     }
 
-    crate::group_authority::adopt_native_if_fresh(tx, group.as_str())?;
     crate::native_checkpoint_frontier::adopt_verified_checkpoint(
         tx,
         group,
@@ -570,7 +567,6 @@ fn write_target(
     // This replica holds no bodies below the frontier it installed: the checkpoint is
     // where its history begins.
     crate::native_history_floor::adopt_history_floor(tx, group, &checkpoint_hash)?;
-    crate::native_row_witness::install_native_snapshot_state(tx, group.as_str(), &payload.native)?;
     Ok(())
 }
 

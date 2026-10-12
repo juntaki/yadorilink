@@ -28,14 +28,17 @@
 //!    published under its final name. The final name therefore never exists in
 //!    a partially written state, so a power cut can lose the write but can
 //!    never corrupt an identity that was already there.
-//!  * Publication uses `hard_link`, not `rename`. `rename` replaces the
+//!  * Publication refuses to replace by default. A plain `rename` replaces the
 //!    destination unconditionally, which would silently break the create-race
 //!    recovery both callers in `keys.rs` depend on: two daemons starting
 //!    concurrently would each publish their own freshly generated identity and
-//!    the loser would keep using a secret that is no longer on disk. `link`
+//!    the loser would keep using a secret that is no longer on disk. A
+//!    no-replace publish (`durable_dir::publish_durably` with `Replace::No`: a
+//!    no-replace durable move, or a hard link where the volume offers none)
 //!    fails with `AlreadyExists` instead, so the loser reliably re-reads the
 //!    winner's file. [`Publish::Replace`] opts into clobbering, and is used
-//!    only to repair a file whose bytes are already known to be garbage.
+//!    only to repair a file whose bytes are already known to be garbage. The
+//!    new name is on disk when the publish returns.
 //!  * The file is made owner-only *before* any secret byte reaches it, and a
 //!    hardening failure aborts the write rather than warning. A key file at the
 //!    OS default ACL is not an acceptable outcome.
@@ -149,18 +152,7 @@ fn write_secret_file(
     // failure it holds a secret that nobody will ever read.
     let _ = std::fs::remove_file(&temp_path);
 
-    published?;
-
-    // Make the new directory entry itself durable. Best-effort: the secret's
-    // bytes are already fsync'd and the entry was published atomically, so the
-    // only state losing this can produce is "file absent" — which the keyring
-    // recovery and the caller's regenerate path both handle. Failing the whole
-    // identity write here would trade a recoverable outcome for an outage, and
-    // directory fsync has no portable meaning on Windows anyway.
-    if let Err(err) = sync_dir(&parent) {
-        tracing::warn!("could not flush the directory entry for the device key file: {err}");
-    }
-    Ok(())
+    published
 }
 
 /// Creates a uniquely named, owner-only, empty temporary file next to `path`.
@@ -242,25 +234,13 @@ fn write_and_publish(
     file.sync_all()?;
     drop(file);
 
+    use yadorilink_fs_platform::durable_dir::{publish_durably, Replace};
     match publish {
         // Atomic *and* exclusive. See the module docs for why this is not a
-        // `rename`.
-        Publish::CreateNew => std::fs::hard_link(temp_path, path)?,
-        Publish::Replace => std::fs::rename(temp_path, path)?,
+        // plain `rename`.
+        Publish::CreateNew => publish_durably(temp_path, path, Replace::No)?,
+        Publish::Replace => publish_durably(temp_path, path, Replace::Yes)?,
     }
-    Ok(())
-}
-
-/// Flushes a directory's entries so a newly published name survives a power
-/// cut. No portable equivalent exists on Windows, where a directory cannot be
-/// opened as a file.
-#[cfg(unix)]
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::File::open(dir)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

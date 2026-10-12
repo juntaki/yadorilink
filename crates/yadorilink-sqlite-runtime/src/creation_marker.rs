@@ -78,14 +78,29 @@ pub fn record_database_created(db_path: &Path) -> std::io::Result<()> {
     if marker.try_exists()? {
         return Ok(());
     }
-    let mut file = std::fs::File::create(&marker)?;
-    file.write_all(b"yadorilink database creation marker\n")?;
-    file.sync_all()?;
-    #[cfg(unix)]
-    if let Some(parent) = marker.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::File::open(parent)?.sync_all()?;
+    // Written and flushed under a name of its own, then published by a durable
+    // move that refuses an occupied name: the marker is never seen half
+    // written, and it is on disk when this returns.
+    let staged = marker.with_extension(format!("tmp.{}", std::process::id()));
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&staged)?;
+        file.write_all(b"yadorilink database creation marker\n")?;
+        file.sync_all()
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
     }
-    Ok(())
+    match yadorilink_fs_platform::durable_dir::publish_durably(
+        &staged,
+        &marker,
+        yadorilink_fs_platform::durable_dir::Replace::No,
+    ) {
+        Ok(()) => Ok(()),
+        // Another writer recorded it first.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]

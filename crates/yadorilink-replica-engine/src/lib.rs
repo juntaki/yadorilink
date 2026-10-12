@@ -12,8 +12,6 @@ pub mod custody;
 mod engine;
 pub mod error;
 pub mod handoff_lease;
-pub mod namespace;
-pub mod native_snapshot;
 pub mod outcomes;
 pub mod ports;
 

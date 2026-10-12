@@ -229,12 +229,17 @@ fn links_lines(links: &[LinkStatus]) -> Vec<String> {
             )
         };
         lines.push(format!(
-            "{}  group={}  {}{}{}{}",
+            "{}  group={}  {}{}{}{}{}",
             place,
             link.group_id,
             if link.paused { "paused" } else { "syncing" },
             if link.conflict_count > 0 {
                 format!("  conflicts={}", link.conflict_count)
+            } else {
+                String::new()
+            },
+            if link.conflicts_pending > 0 {
+                format!("  conflicts_pending={}", link.conflicts_pending)
             } else {
                 String::new()
             },

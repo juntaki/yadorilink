@@ -16,7 +16,7 @@ use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
 use yadorilink_local_storage::{chunk_file, SegmentBlockStore};
 use yadorilink_replica_domain::admission::LocalAuthorKey;
 use yadorilink_replica_domain::file::BlockInfo;
-use yadorilink_replica_domain::ids::{FolderGroupId, SyncPath};
+
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::root_commit::{RootCommitPermit, RootLease};
 use yadorilink_root_authority::root_identity::VerifiedRoot;
@@ -44,6 +44,13 @@ impl Fixture {
         let root = root_dir.path().canonicalize().unwrap();
         let _ = state.link_repository().add_link(&root.to_string_lossy(), GROUP);
         VerifiedRoot::open(&root, GROUP, state.as_ref()).unwrap();
+        state
+            .link_repository()
+            .set_capture_volume_identity_for_group(
+                GROUP,
+                &yadorilink_filesystem_sync::device_boundary::root_volume_identity(&root).unwrap(),
+            )
+            .unwrap();
         // The processor signs what it captures, so every row it indexes names
         // the native head it was authored as.
         let processor = LocalChangeProcessor::new(
@@ -339,37 +346,13 @@ async fn a_crash_after_the_object_was_taken_aside_preserves_a_save_it_took() {
     assert!(fx.is_remote_with_no_object("doc.txt"));
 }
 
-/// The first free numbered copy name of the head at `path`: the name the live
-/// reconciler gives an entry that a directory keeps out of its own path.
-fn copy_name_of(fx: &Fixture, path: &str) -> String {
-    let heads = fx
-        .state
-        .database()
-        .read(|conn| {
-            yadorilink_sync_sqlite::native_store::native_heads_at(
-                conn,
-                &FolderGroupId(GROUP.to_owned()),
-                &SyncPath(path.to_owned()),
-            )
-        })
-        .unwrap();
-    assert_eq!(heads.len(), 1, "the fixture authored one head at {path}");
-    yadorilink_replica_domain::native_resolver::numbered_copy_name(
-        path,
-        heads[0].payload.version.0,
-        1,
-    )
-}
-
 /// A directory the user made holds the name a held entry needs. The
-/// directory is kept, and the entry goes to its copy name beside it, in the
-/// index and on disk: the index never names a file where the disk has a
-/// directory.
+/// directory is kept with everything in it, the entry waits and its path stays
+/// held: nothing is moved to a copy name, and the obstacle is the user's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_held_entry_over_a_users_directory_goes_to_its_copy_name() {
+async fn a_held_entry_over_a_users_directory_waits_and_nothing_moves() {
     let fx = Fixture::new();
     fx.hydrated("a", CURRENT).await;
-    let expected = copy_name_of(&fx, "a");
     fx.hold("a");
     std::fs::remove_file(fx.root.join("a")).unwrap();
     std::fs::create_dir(fx.root.join("a")).unwrap();
@@ -379,51 +362,11 @@ async fn a_held_entry_over_a_users_directory_goes_to_its_copy_name() {
     fx.repair();
 
     assert_eq!(std::fs::read(fx.root.join("a/mine")).unwrap(), b"the user's own");
-    assert_eq!(fx.indexed_blocks("a"), None, "the index names a file where a directory is");
-    assert_eq!(fx.indexed_blocks(&expected), Some(fx.blocks(CURRENT)));
-    assert!(fx.is_remote_with_no_object(&expected), "{:?}", fx.disk_entries());
-    assert!(fx.holds().is_empty(), "{:?}", fx.holds());
-}
-
-/// A pass that crashes right after it moved a held entry's row to its copy
-/// name beside a directory of the user's -- the relocation and the release of
-/// the entry's hold commit together -- must not leave that directory
-/// unrecorded: nothing would ever bring the path back, and the offline scan
-/// would author the user's untracked directory as an explicit `Directory a`
-/// over the file `a`, which an uninterrupted pass never does. The directory's
-/// retained record commits with the relocation.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_crash_right_after_an_entry_is_relocated_beside_a_users_directory_authors_nothing() {
-    let fx = Fixture::new();
-    fx.hydrated("a", CURRENT).await;
-    fx.hold("a");
-    std::fs::remove_file(fx.root.join("a")).unwrap();
-    std::fs::create_dir(fx.root.join("a")).unwrap();
-    std::fs::write(fx.root.join("a/mine"), b"the user's own").unwrap();
-    {
-        let _hook = set_reconcile_step_hook_for_test(|step, _| {
-            if step == ReconcileStepForTest::EntryRelocated {
-                panic!("crash right after the relocation commits");
-            }
-        });
-        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fx.repair()));
-        assert!(crashed.is_err());
-    }
-    fx.repair();
-    fx.repair();
-
     assert_eq!(
-        fx.state.sqlite().retained_directory_reason(GROUP, "a").unwrap().as_deref(),
-        Some(yadorilink_sync_sqlite::structural_origin::RETAINED_UNTRACKED_CONTENT),
-        "the user's directory holding the entry's name is not recorded as retained"
+        fx.indexed_blocks("a"),
+        Some(fx.blocks(CURRENT)),
+        "the entry's row is untouched: nothing is moved to a copy name"
     );
-    let minted: Vec<String> = fx
-        .processor
-        .scan_existing_files(GROUP, &fx.root)
-        .unwrap()
-        .into_iter()
-        .map(|record| record.path)
-        .collect();
-    assert_eq!(minted, vec!["a/mine".to_string()], "only the user's own file is new content");
-    assert!(fx.holds().is_empty(), "{:?}", fx.holds());
+    assert_eq!(fx.holds(), vec!["a".to_string()], "the entry waits, held");
+    assert_eq!(fx.disk_entries(), vec!["a".to_string()], "no copy name appeared on disk");
 }

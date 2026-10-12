@@ -162,6 +162,8 @@ public final class AppModel {
             let syncing = snapshot.folders.filter { $0.state == .syncing }.count
             if syncing > 0 { return "Syncing \(Plural.folders(syncing))" }
             if snapshot.folders.allSatisfy(\.paused) { return "Syncing is paused" }
+            let paused = snapshot.folders.filter(\.paused).count
+            if paused > 0 { return "\(Plural.folders(paused)) paused" }
             return "All folders up to date"
         }
     }

@@ -15,7 +15,6 @@ pub mod backoff;
 pub mod engine;
 #[path = "engine.rs"]
 mod engine_impl;
-pub mod retirement_service;
 
 #[cfg(test)]
 mod receive_budget_tests;
@@ -25,8 +24,6 @@ mod receive_completion_tests;
 mod receive_cost_tests;
 #[cfg(test)]
 mod receive_kernel_bench;
-#[cfg(test)]
-mod retirement_candidates_tests;
 
 // `engine.rs` drives both via `DaemonState`. `availability`/`scheduler` as
 // their own modules are stage-3/stage-2 concerns (block-availability

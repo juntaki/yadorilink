@@ -284,6 +284,9 @@ fn open_session(
         state.peers.remove_if_current(device, &session);
         return None;
     }
+    // The same event also makes custody confirmable: ask the peer now rather
+    // than at the next periodic sweep (the backstop).
+    state.request_custody_refresh(&servable_groups(&state.authority, device));
     Some(session)
 }
 

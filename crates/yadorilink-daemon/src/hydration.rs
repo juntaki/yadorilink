@@ -208,7 +208,7 @@ const WORKER_IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from
 /// would mean hashing the file at every re-check, a full read of it each
 /// time.
 pub(crate) type DiskIdentity =
-    Option<(yadorilink_root_authority::fs_identity::DiskRaceFingerprint, Option<(u64, u64)>)>;
+    Option<(yadorilink_fs_platform::fs_identity::DiskRaceFingerprint, Option<(u64, u64)>)>;
 
 pub(crate) fn disk_identity(path: &std::path::Path) -> Result<DiskIdentity, SyncError> {
     Ok(std::fs::symlink_metadata(path).ok().as_ref().map(disk_identity_of))
@@ -216,7 +216,7 @@ pub(crate) fn disk_identity(path: &std::path::Path) -> Result<DiskIdentity, Sync
 
 pub(crate) fn disk_identity_of(
     meta: &std::fs::Metadata,
-) -> (yadorilink_root_authority::fs_identity::DiskRaceFingerprint, Option<(u64, u64)>) {
+) -> (yadorilink_fs_platform::fs_identity::DiskRaceFingerprint, Option<(u64, u64)>) {
     #[cfg(unix)]
     let file_id = {
         use std::os::unix::fs::MetadataExt as _;
@@ -224,7 +224,7 @@ pub(crate) fn disk_identity_of(
     };
     #[cfg(not(unix))]
     let file_id = None;
-    (yadorilink_root_authority::fs_identity::disk_race_fingerprint_of(meta), file_id)
+    (yadorilink_fs_platform::fs_identity::disk_race_fingerprint_of(meta), file_id)
 }
 
 /// Journals `path` dirty when the file on disk is no longer the one the
@@ -303,7 +303,7 @@ fn heal_hydrated_proof_for_current_version(
     // An observation that fails costs the re-prove, nothing else: the
     // claim stays unproven and the caller fails closed, which is where it
     // was already heading.
-    let Ok(identity) = yadorilink_root_authority::fs_identity::FileIdentity::observe_path(out_path)
+    let Ok(identity) = yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(out_path)
     else {
         return Ok(false);
     };
@@ -1590,6 +1590,8 @@ async fn assemble_to_temp(
             &blocks,
             canonical.snapshot.mtime_unix_nanos,
             headroom,
+            // A provider's staging directory is not a linked folder start recovers.
+            Arc::new(yadorilink_local_storage::NoTempLedger),
         )
         .await
         .map_err(|error| SyncError::HydrationFailed(format!("{path}: {error}")))?;
@@ -2218,14 +2220,16 @@ async fn hydrate_inner(
             // only ran before the assemble let the rename discard the edit
             // and report `Present`. What stays unguarded is the gap
             // between this re-check and the rename itself, not the assemble.
+            let temp_ledger = state.replica_coordinator.temp_ledger(group_id);
             let tmp_path = run_blocking_sweep_offloaded(|| {
-                yadorilink_local_storage::reconstruct_file_to_temp(
+                yadorilink_local_storage::reconstruct_file_to_temp_in(
                     &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
                         state.block_store.clone(),
                     ),
                     &out_path,
                     &record.blocks,
                     record.mtime_unix_nanos,
+                    &temp_ledger,
                 )
             })?;
             let untouched = (|| -> Result<bool, SyncError> {
@@ -2242,7 +2246,7 @@ async fn hydrate_inner(
                     .is_path_dirty(group_id, path)?)
             })();
             if !matches!(untouched, Ok(true)) {
-                let _ = std::fs::remove_file(&tmp_path);
+                yadorilink_local_storage::discard_temp_file(&tmp_path, &temp_ledger);
                 untouched?;
                 tracing::warn!(
                     %path,
@@ -2259,7 +2263,11 @@ async fn hydrate_inner(
             // (which clears it) or repair settles the path: clearing it would leave bytes under a
             // stale proof with nothing saying an unfinished write put them there.
             let placed = run_blocking_sweep_offloaded(|| {
-                yadorilink_local_storage::persist_reconstructed_file(&tmp_path, &out_path)
+                yadorilink_local_storage::persist_reconstructed_file_in(
+                    &tmp_path,
+                    &out_path,
+                    &temp_ledger,
+                )
             });
             intent.disarm();
             placed?;
@@ -2324,8 +2332,7 @@ async fn hydrate_inner(
             // primitive below accepts an optional identity: a hydration
             // that cannot see what it just wrote has nothing to vouch for.
             let identity =
-                match yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path)
-                {
+                match yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path) {
                     Ok(identity) => identity,
                     Err(error) => {
                         tracing::warn!(
@@ -2890,8 +2897,9 @@ async fn restore_to_version_inner(
             // after the local-edit guards are asked again: the assembly takes
             // time proportional to the file, and a save landing in it would
             // otherwise be renamed over, with nothing left to capture.
+            let temp_ledger = state.replica_coordinator.temp_ledger(group_id);
             let tmp_path = run_blocking_sweep_offloaded(|| {
-                yadorilink_local_storage::reconstruct_file_to_temp(
+                yadorilink_local_storage::reconstruct_file_to_temp_in(
                     &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
                         state.block_store.clone(),
                     ),
@@ -2905,6 +2913,7 @@ async fn restore_to_version_inner(
                     // on-disk/indexed-mtime invariant `reconstruct_file`'s own
                     // doc comment describes.
                     now_unix_nanos,
+                    &temp_ledger,
                 )
             })?;
             #[cfg(test)]
@@ -2919,14 +2928,18 @@ async fn restore_to_version_inner(
                 &root_commit_permit,
             );
             if !matches!(declined, Ok(false)) {
-                let _ = std::fs::remove_file(&tmp_path);
+                yadorilink_local_storage::discard_temp_file(&tmp_path, &temp_ledger);
                 // The journal row stays: startup reconciliation reads the
                 // disk and discards it, since the disk holds the local edit.
                 declined?;
                 return Err(SyncError::PathChangedLocally(format!("{group_id}/{path}")));
             }
             run_blocking_sweep_offloaded(|| {
-                yadorilink_local_storage::persist_reconstructed_file(&tmp_path, &out_path)
+                yadorilink_local_storage::persist_reconstructed_file_in(
+                    &tmp_path,
+                    &out_path,
+                    &temp_ledger,
+                )
             })?;
             // Confirmed inside this write, before the final mode. A restore
             // whose attributes cannot be confirmed still happened -- it is
@@ -2952,7 +2965,11 @@ async fn restore_to_version_inner(
             Some(target) => {
                 #[cfg(unix)]
                 {
-                    yadorilink_local_storage::materialize_symlink(&out_path, target)?;
+                    yadorilink_local_storage::materialize_symlink_in(
+                        &out_path,
+                        target,
+                        &state.replica_coordinator.temp_ledger(group_id),
+                    )?;
                 }
                 #[cfg(windows)]
                 {
@@ -2965,7 +2982,11 @@ async fn restore_to_version_inner(
                         .link_repository()
                         .windows_symlink_opt_in_for_group(group_id)?
                     {
-                        yadorilink_local_storage::materialize_symlink_windows(&out_path, target)?;
+                        yadorilink_local_storage::materialize_symlink_windows_in(
+                            &out_path,
+                            target,
+                            &state.replica_coordinator.temp_ledger(group_id),
+                        )?;
                     }
                 }
                 #[cfg(not(any(unix, windows)))]

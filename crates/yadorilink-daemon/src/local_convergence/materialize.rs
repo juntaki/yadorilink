@@ -236,8 +236,8 @@ impl super::LocalConvergenceExecutor {
         // function's doc comment. Also NOT the broader exclusion
         // predicate: a legacy `.yadorilink-tmp.`-marked path can be a
         // genuine user file (the marker is a substring match, and
-        // `materialization::cleanup_stale_temp_files` already refuses to
-        // delete exactly such a look-alike) or an already-admitted change
+        // recovery never deletes a file by its name,
+        // so such a look-alike is safe) or an already-admitted change
         // from before this module existed — either way it must still
         // materialize, matching admission's own choice of predicate. See
         // `reserved_namespace`'s "Two predicates, not one".
@@ -255,7 +255,7 @@ impl super::LocalConvergenceExecutor {
         // materialization just created at the same path — two processes each
         // believing they exclusively own this sync root, exactly the state
         // `sync_root_lock` exists to make unreachable.
-        if yadorilink_root_authority::reserved_namespace::path_has_artefact_component_in_wire_path(
+        if yadorilink_fs_platform::reserved_namespace::path_has_artefact_component_in_wire_path(
             &record.path,
         ) || yadorilink_root_authority::sync_root_lock::wire_path_names_sync_root_lock(
             &record.path,
@@ -273,7 +273,7 @@ impl super::LocalConvergenceExecutor {
         // must not get a second chance to reach disk here — writing it
         // would let this path silently alias a different on-disk name than
         // the one this device's own index believes it just materialized.
-        if yadorilink_root_authority::reserved_namespace::path_has_non_portable_wire_component(
+        if yadorilink_fs_platform::reserved_namespace::path_has_non_portable_wire_component(
             &record.path,
         ) {
             return Err(PeerSessionError::NonPortablePath(record.path.clone()));

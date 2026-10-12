@@ -55,12 +55,16 @@ use windows::Win32::Storage::CloudFilters::{
     CF_HYDRATION_POLICY_MODIFIER_NONE, CF_INSYNC_POLICY_TRACK_ALL, CF_OPERATION_INFO,
     CF_OPERATION_PARAMETERS, CF_OPERATION_PARAMETERS_0, CF_OPERATION_PARAMETERS_0_6,
     CF_OPERATION_TRANSFER_DATA_FLAG_NONE, CF_OPERATION_TYPE_TRANSFER_DATA,
+    CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION,
     CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC, CF_PLACEHOLDER_CREATE_INFO,
     CF_PLACEHOLDER_MANAGEMENT_POLICY_DEFAULT, CF_POPULATION_POLICY,
-    CF_POPULATION_POLICY_MODIFIER_NONE, CF_POPULATION_POLICY_PARTIAL, CF_REGISTER_FLAG_NONE,
-    CF_SYNC_POLICIES, CF_SYNC_REGISTRATION,
+    CF_POPULATION_POLICY_ALWAYS_FULL, CF_POPULATION_POLICY_MODIFIER_NONE,
+    CF_POPULATION_POLICY_PARTIAL, CF_REGISTER_FLAG_NONE, CF_REGISTER_FLAG_UPDATE, CF_SYNC_POLICIES,
+    CF_SYNC_REGISTRATION,
 };
-use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
+use windows::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO,
+};
 use yadorilink_ipc_proto::shellipc::LocalTransition;
 
 /// Fixed provider identity. Namespace-derived, like the
@@ -75,25 +79,30 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// connection key (`CF_CONNECTION_KEY.0`) -> the local root path that
-/// sync root was registered for, so the fetch-data callback (a bare
-/// `extern "system" fn` with no way to receive a closure environment) can
-/// resolve `CF_CALLBACK_INFO::NormalizedPath` (relative to the sync root)
-/// back to an absolute path. Also indexed the other way (`KEYS_BY_ROOT`)
-/// so `disconnect`/`unregister` can look up a root's connection key by
-/// path — needed because `CfUnregisterSyncRoot` documents failing with
-/// `ERROR_CLOUD_FILE_INVALID_REQUEST` if a provider is still connected
-/// (confirmed the hard way against real cfapi), so unregistering this
-/// process's own connection must disconnect it first.
-static ROOTS_BY_CONNECTION: Mutex<Option<HashMap<i64, PathBuf>>> = Mutex::new(None);
+/// A connected sync root: where it is, and, for a provider root, the root id the daemon declared.
+#[derive(Clone)]
+struct ConnectedRoot {
+    path: PathBuf,
+    provider_root: Option<Vec<u8>>,
+}
+
+/// connection key (`CF_CONNECTION_KEY.0`) -> the connected root, so the fetch-data callback (a
+/// bare `extern "system" fn` with no way to receive a closure environment) can resolve
+/// `CF_CALLBACK_INFO::NormalizedPath` (relative to the sync root) back to an absolute path or a
+/// provider root. Also indexed the other way (`KEYS_BY_ROOT`) so `disconnect`/`unregister` can
+/// look up a root's connection key by path — needed because `CfUnregisterSyncRoot` documents
+/// failing with `ERROR_CLOUD_FILE_INVALID_REQUEST` if a provider is still connected (confirmed
+/// the hard way against real cfapi), so unregistering this process's own connection must
+/// disconnect it first.
+static ROOTS_BY_CONNECTION: Mutex<Option<HashMap<i64, ConnectedRoot>>> = Mutex::new(None);
 static KEYS_BY_ROOT: Mutex<Option<HashMap<PathBuf, i64>>> = Mutex::new(None);
 
-fn register_root(key: i64, local_path: &Path) {
+fn register_root(key: i64, local_path: &Path, provider_root: Option<Vec<u8>>) {
     ROOTS_BY_CONNECTION
         .lock()
         .unwrap()
         .get_or_insert_with(HashMap::new)
-        .insert(key, local_path.to_path_buf());
+        .insert(key, ConnectedRoot { path: local_path.to_path_buf(), provider_root });
     KEYS_BY_ROOT
         .lock()
         .unwrap()
@@ -101,14 +110,23 @@ fn register_root(key: i64, local_path: &Path) {
         .insert(local_path.to_path_buf(), key);
 }
 
-fn root_for_connection(key: i64) -> Option<PathBuf> {
+fn connected_root(key: i64) -> Option<ConnectedRoot> {
     ROOTS_BY_CONNECTION.lock().unwrap().as_ref()?.get(&key).cloned()
+}
+
+fn root_for_connection(key: i64) -> Option<PathBuf> {
+    connected_root(key).map(|root| root.path)
 }
 
 fn take_key_for_root(local_path: &Path) -> Option<i64> {
     let key = KEYS_BY_ROOT.lock().unwrap().as_mut()?.remove(local_path)?;
     ROOTS_BY_CONNECTION.lock().unwrap().as_mut().map(|m| m.remove(&key));
     Some(key)
+}
+
+/// Whether this process holds a connection for the sync root at `local_path`.
+pub fn is_connected(local_path: &Path) -> bool {
+    KEYS_BY_ROOT.lock().unwrap().as_ref().is_some_and(|keys| keys.contains_key(local_path))
 }
 
 /// Converts Unix nanoseconds since the epoch (`FileRecord::mtime_unix_nanos`)
@@ -132,6 +150,17 @@ fn unix_nanos_to_filetime_ticks(unix_nanos: i64) -> i64 {
 /// which files are placeholders vs. fully present, which is exactly the
 /// OnDemand model).
 pub fn register_and_connect(local_path: &Path) -> WinResult<()> {
+    register_and_connect_root(local_path, None)
+}
+
+/// Registers and connects the sync root of a provider root. The root id is stored in the
+/// registration as the sync root identity, so the registration itself says which declared root it
+/// serves.
+pub fn register_and_connect_provider(root_id: &[u8], local_path: &Path) -> WinResult<()> {
+    register_and_connect_root(local_path, Some(root_id))
+}
+
+fn register_and_connect_root(local_path: &Path, provider_root: Option<&[u8]>) -> WinResult<()> {
     let path_wide = wide(&local_path.to_string_lossy());
     let provider_name_wide = wide(PROVIDER_NAME);
     let provider_version_wide = wide(PROVIDER_VERSION);
@@ -140,8 +169,8 @@ pub fn register_and_connect(local_path: &Path) -> WinResult<()> {
         StructSize: std::mem::size_of::<CF_SYNC_REGISTRATION>() as u32,
         ProviderName: PCWSTR::from_raw(provider_name_wide.as_ptr()),
         ProviderVersion: PCWSTR::from_raw(provider_version_wide.as_ptr()),
-        SyncRootIdentity: std::ptr::null(),
-        SyncRootIdentityLength: 0,
+        SyncRootIdentity: provider_root.map_or(std::ptr::null(), |id| id.as_ptr().cast()),
+        SyncRootIdentityLength: provider_root.map_or(0, |id| id.len() as u32),
         FileIdentity: std::ptr::null(),
         FileIdentityLength: 0,
         ProviderId: PROVIDER_ID,
@@ -154,7 +183,13 @@ pub fn register_and_connect(local_path: &Path) -> WinResult<()> {
             Modifier: CF_HYDRATION_POLICY_MODIFIER_NONE,
         },
         Population: CF_POPULATION_POLICY {
-            Primary: CF_POPULATION_POLICY_PARTIAL,
+            // A provider root is populated by the host itself (every folder is created fully
+            // populated), so the operating system never waits for a population callback.
+            Primary: if provider_root.is_some() {
+                CF_POPULATION_POLICY_ALWAYS_FULL
+            } else {
+                CF_POPULATION_POLICY_PARTIAL
+            },
             Modifier: CF_POPULATION_POLICY_MODIFIER_NONE,
         },
         InSync: CF_INSYNC_POLICY_TRACK_ALL,
@@ -162,13 +197,24 @@ pub fn register_and_connect(local_path: &Path) -> WinResult<()> {
         PlaceholderManagement: CF_PLACEHOLDER_MANAGEMENT_POLICY_DEFAULT,
     };
 
+    // A root registered by an earlier run of this host (or by the previous version of the
+    // registration) is updated in place; a new one is registered.
     unsafe {
-        CfRegisterSyncRoot(
+        if CfRegisterSyncRoot(
             PCWSTR::from_raw(path_wide.as_ptr()),
             &registration,
             &policies,
-            CF_REGISTER_FLAG_NONE,
-        )?;
+            CF_REGISTER_FLAG_UPDATE,
+        )
+        .is_err()
+        {
+            CfRegisterSyncRoot(
+                PCWSTR::from_raw(path_wide.as_ptr()),
+                &registration,
+                &policies,
+                CF_REGISTER_FLAG_NONE,
+            )?;
+        }
     }
 
     // Sentinel-terminated array: a `CF_CALLBACK_TYPE_NONE` entry marks the
@@ -189,7 +235,7 @@ pub fn register_and_connect(local_path: &Path) -> WinResult<()> {
             CF_CONNECT_FLAG_NONE,
         )?
     };
-    register_root(key.0, local_path);
+    register_root(key.0, local_path, provider_root.map(<[u8]>::to_vec));
     Ok(())
 }
 
@@ -266,6 +312,32 @@ fn decode_generation_identity(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(buf))
 }
 
+/// The tag of the identity blob of a provider item's placeholder (see [`encode_generation_identity`]
+/// for the other tag): the tag byte, then the item id exactly as the daemon issued it.
+const ITEM_IDENTITY_TAG: u8 = 2;
+/// The longest item id this host accepts in an identity blob.
+const MAX_ITEM_ID_BYTES: usize = 64;
+
+/// The `FileIdentity` blob of the placeholder of provider item `item_id`.
+pub fn encode_item_identity(item_id: &[u8]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(1 + item_id.len());
+    blob.push(ITEM_IDENTITY_TAG);
+    blob.extend_from_slice(item_id);
+    blob
+}
+
+/// The item id inside an identity blob, or `None` when the blob is not a provider item's.
+pub fn decode_item_identity(bytes: &[u8]) -> Option<&[u8]> {
+    match bytes.split_first() {
+        Some((&ITEM_IDENTITY_TAG, item_id))
+            if !item_id.is_empty() && item_id.len() <= MAX_ITEM_ID_BYTES =>
+        {
+            Some(item_id)
+        }
+        _ => None,
+    }
+}
+
 /// Native Windows eviction. First verifies the placeholder
 /// currently at `path` still carries exactly the `expected` generation (an ABA guard against dehydrating a placeholder that
 /// was deleted and replaced by an unrelated one at the same path since the
@@ -303,7 +375,7 @@ pub fn dehydrate_placeholder(path: &Path, expected: u64) -> Result<(), String> {
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
-    let wide_path = wide(&path.to_string_lossy());
+    let wide_path = wide(&yadorilink_fs_platform::long_path::for_win32(path).to_string_lossy());
     // SAFETY: `wide_path` is a valid NUL-terminated UTF-16 buffer for the
     // duration of this call. `GENERIC_READ | GENERIC_WRITE`: dehydrating
     // mutates the placeholder's population state, unlike a read-only
@@ -412,8 +484,36 @@ pub fn create_placeholder(
     let file_name =
         full_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(relative_path);
 
+    let identity = encode_generation_identity(generation);
+    create_placeholder_entry(base_dir, &file_name, size, mtime_unix_nanos, &identity, false)
+}
+
+/// Creates the placeholder of a provider item named `name` below the existing directory
+/// `parent_dir`. The identity blob is the item's tag and id (see [`encode_item_identity`]). A
+/// directory is created as fully populated (this host fills its children itself), so the
+/// operating system never asks for a population callback this host does not serve.
+pub fn create_item_placeholder(
+    parent_dir: &Path,
+    name: &str,
+    item_id: &[u8],
+    size: u64,
+    mtime_unix_nanos: i64,
+    directory: bool,
+) -> WinResult<()> {
+    let identity = encode_item_identity(item_id);
+    create_placeholder_entry(parent_dir, name, size, mtime_unix_nanos, &identity, directory)
+}
+
+fn create_placeholder_entry(
+    base_dir: &Path,
+    file_name: &str,
+    size: u64,
+    mtime_unix_nanos: i64,
+    file_identity: &[u8],
+    directory: bool,
+) -> WinResult<()> {
     let base_dir_wide = wide(&base_dir.to_string_lossy());
-    let file_name_wide = wide(&file_name);
+    let file_name_wide = wide(file_name);
     let ticks = unix_nanos_to_filetime_ticks(mtime_unix_nanos);
 
     // `FileIdentity` is documented as a *mandatory* field for files (not
@@ -428,8 +528,6 @@ pub fn create_placeholder(
     // let `yadorilink-daemon`'s Windows dirty-detection reader
     // (`placeholder_inspect_windows::inspect_placeholder`) confirm a
     // placeholder is still the exact one the daemon expects.
-    let file_identity = encode_generation_identity(generation);
-
     let mut entries = [CF_PLACEHOLDER_CREATE_INFO {
         RelativeFileName: PCWSTR::from_raw(file_name_wide.as_ptr()),
         FsMetadata: windows::Win32::Storage::CloudFilters::CF_FS_METADATA {
@@ -438,9 +536,13 @@ pub fn create_placeholder(
                 LastAccessTime: ticks,
                 LastWriteTime: ticks,
                 ChangeTime: ticks,
-                FileAttributes: FILE_ATTRIBUTE_NORMAL.0,
+                FileAttributes: if directory {
+                    FILE_ATTRIBUTE_DIRECTORY.0
+                } else {
+                    FILE_ATTRIBUTE_NORMAL.0
+                },
             },
-            FileSize: size as i64,
+            FileSize: if directory { 0 } else { size as i64 },
         },
         FileIdentity: file_identity.as_ptr() as *const c_void,
         FileIdentityLength: file_identity.len() as u32,
@@ -470,7 +572,12 @@ pub fn create_placeholder(
         // this codebase yet -- only the dead backend's OWN combination
         // (`MARK_IN_SYNC | ALWAYS_FULL`, no fetch callback) was
         // empirically confirmed working.
-        Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
+        Flags: if directory {
+            CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC
+                | CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION
+        } else {
+            CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC
+        },
         Result: windows::Win32::Foundation::S_OK,
         CreateUsn: 0,
     }];
@@ -499,9 +606,19 @@ unsafe extern "system" fn fetch_data_callback(
 ) {
     let info = &*callback_info;
     let params = &*callback_parameters;
-    // Safety: `CF_CALLBACK_TYPE_FETCH_DATA` guarantees the `FetchData`
-    // union arm is the active one, per the documented callback contract.
+    // Safety: `CF_CALLBACK_TYPE_FETCH_DATA` guarantees the `FetchData` union arm is the active
+    // one, per the documented callback contract.
     let fetch = params.Anonymous.FetchData;
+
+    let identity: &[u8] = if info.FileIdentity.is_null() || info.FileIdentityLength == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(info.FileIdentity.cast::<u8>(), info.FileIdentityLength as usize)
+    };
+    if let Some(item_id) = decode_item_identity(identity) {
+        fetch_provider_item(info, fetch.RequiredFileOffset, fetch.RequiredLength, item_id);
+        return;
+    }
 
     let full_path = root_for_connection(info.ConnectionKey.0).map(|root| {
         let normalized = info.NormalizedPath.to_string().unwrap_or_default();
@@ -527,7 +644,21 @@ unsafe extern "system" fn fetch_data_callback(
     };
 
     let length = if status == STATUS_SUCCESS { buffer.len() as i64 } else { fetch.RequiredLength };
+    transfer_data(info, status, &buffer, 0, length);
+}
 
+/// One `CfExecute(TRANSFER_DATA)` call: hands `buffer` to the operating system as the bytes
+/// `[offset, offset + length)` of the file with `status`. With a failure status and an empty
+/// buffer it fails the pending range instead, which is what unblocks the reader. Best effort: if
+/// this itself fails there is nothing further a callback can do to unblock the caller; the
+/// driver's own recall timeout becomes the last resort.
+unsafe fn transfer_data(
+    info: &CF_CALLBACK_INFO,
+    status: NTSTATUS,
+    buffer: &[u8],
+    offset: i64,
+    length: i64,
+) {
     let op_info = CF_OPERATION_INFO {
         StructSize: std::mem::size_of::<CF_OPERATION_INFO>() as u32,
         Type: CF_OPERATION_TYPE_TRANSFER_DATA,
@@ -548,18 +679,105 @@ unsafe extern "system" fn fetch_data_callback(
                 } else {
                     buffer.as_ptr() as *const c_void
                 },
-                Offset: 0,
+                Offset: offset,
                 Length: length,
             },
         },
     };
-    // Best-effort: if this itself fails there is nothing further this
-    // callback can do to unblock the caller — the driver's own recall
-    // timeout becomes the last resort. Not logged to stdout/stderr here
-    // since a callback runs on an arbitrary threadpool thread inside a
-    // long-lived host process; `yadorilink-cfapi-host`'s caller is expected
-    // to run with console output visible for diagnosis if needed.
     let _ = CfExecute(&op_info, &mut op_params);
+}
+
+/// The bytes of one chunk of a fetch: a multiple of the 4 KiB the driver requires of every
+/// chunk but the last.
+const FETCH_CHUNK: usize = 1 << 20;
+
+/// Serves a fetch of a provider item through the daemon's ordinary materialization: the daemon
+/// assembles and verifies the current bytes and names the file in its handoff directory; this
+/// reads that file and hands it to the operating system with `TRANSFER_DATA`, then removes it.
+/// Any failure fails the pending range, so the reader gets an error and never a hang or partial
+/// bytes.
+unsafe fn fetch_provider_item(
+    info: &CF_CALLBACK_INFO,
+    required_offset: i64,
+    required_length: i64,
+    item_id: &[u8],
+) {
+    use std::io::Read;
+
+    let mut sent: i64 = 0;
+    let served = (|| -> Result<(), String> {
+        let root = connected_root(info.ConnectionKey.0)
+            .and_then(|root| root.provider_root)
+            .ok_or("the sync root is not a provider root")?;
+        crate::provider_client::note_fetch_activity(&root, item_id);
+        let request_id = next_request_id();
+        let response = crate::provider_client::materialize(&root, item_id, &request_id)
+            .ok_or("the daemon did not answer the materialization")?;
+        if !response.ok {
+            return Err(format!(
+                "the daemon refused the materialization (failure {}): {}",
+                response.failure, response.error
+            ));
+        }
+        let name = response.handoff_name;
+        if name.is_empty() || name.contains(['\\', '/', ':']) || name == ".." {
+            return Err("the daemon named a handoff file that is not a plain name".into());
+        }
+        let path = crate::host_paths::handoff_dir().join(&name);
+        let result = (|| -> Result<(), String> {
+            let mut file =
+                std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let size = file.metadata().map_err(|e| e.to_string())?.len();
+            if size != response.size || (info.FileSize >= 0 && size != info.FileSize as u64) {
+                return Err(format!(
+                    "the materialized file is {size} bytes, the placeholder is {} (the daemon                      said {})",
+                    info.FileSize, response.size
+                ));
+            }
+            let mut buffer = vec![0u8; FETCH_CHUNK];
+            loop {
+                let mut filled = 0;
+                while filled < buffer.len() {
+                    let n = file.read(&mut buffer[filled..]).map_err(|e| e.to_string())?;
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                }
+                if filled == 0 {
+                    return Ok(());
+                }
+                transfer_data(info, STATUS_SUCCESS, &buffer[..filled], sent, filled as i64);
+                sent += filled as i64;
+            }
+        })();
+        let _ = std::fs::remove_file(&path);
+        result
+    })();
+    if let Err(reason) = served {
+        eprintln!("yadorilink-cfapi-host: fetch failed: {reason}");
+        // Fail what was not delivered, so the reader's call returns instead of waiting.
+        let remaining_start = required_offset.max(sent);
+        let remaining = (required_offset + required_length - remaining_start).max(0);
+        let (start, length) = if remaining > 0 {
+            (remaining_start, remaining)
+        } else {
+            (required_offset, required_length)
+        };
+        transfer_data(info, STATUS_UNSUCCESSFUL, &[], start, length);
+    }
+}
+
+/// A request id that is unique within this process and across restarts of it.
+fn next_request_id() -> Vec<u8> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let mut id = Vec::with_capacity(16);
+    id.extend_from_slice(&started.to_be_bytes());
+    id.extend_from_slice(&COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_be_bytes());
+    id
 }
 
 /// Convenience used by `yadorilink-cfapi-host`'s startup/poll loop: creates
@@ -639,9 +857,11 @@ fn placeholder_candidates(
     entries: &[yadorilink_ipc_proto::shellipc::FolderFileEntry],
 ) -> impl Iterator<Item = &yadorilink_ipc_proto::shellipc::FolderFileEntry> {
     entries.iter().filter(|entry| {
-        entry.local_state.as_ref().is_some_and(|s| {
-            !s.current_content_present && s.transition() == LocalTransition::None
-        }) && yadorilink_ipc_proto::shellipc::EntryKind::try_from(entry.kind)
+        entry
+            .local_state
+            .as_ref()
+            .is_some_and(|s| !s.current_content_present && s.transition() == LocalTransition::None)
+            && yadorilink_ipc_proto::shellipc::EntryKind::try_from(entry.kind)
                 == Ok(yadorilink_ipc_proto::shellipc::EntryKind::File)
             && entry.placeholder_generation.is_some()
     })

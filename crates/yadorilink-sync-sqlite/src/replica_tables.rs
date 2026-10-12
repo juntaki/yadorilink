@@ -26,9 +26,6 @@ pub fn init(conn: &Connection) -> Result<(), ReplicaSchemaError> {
     crate::native_publication::init_native_publication_tables(conn)?;
     // Sealing: per-checkpoint seal evidence (native_checkpoint_authorization.rs).
     crate::native_checkpoint_authorization::init_native_checkpoint_authorization_tables(conn)?;
-    // Stable projection binding: loser-name stability
-    // (stable_projection_binding.rs).
-    crate::stable_projection_binding::init_stable_projection_binding_tables(conn)?;
     crate::native_recursive_operation::init_tables(conn)?;
     yadorilink_sqlite_runtime::init_schema(conn)?;
     Ok(())

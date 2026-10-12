@@ -47,21 +47,21 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+use yadorilink_fs_platform::fs_identity::{FileIdentity, ObjectKind};
+use yadorilink_fs_platform::reserved_namespace::{artefact_component_name, ArtefactKind};
 use yadorilink_local_storage::{
     apply_unix_mode, create_dir_all_never_through_a_symlink, create_explicit_directory,
-    intent_target_hash, remove_empty_dir, verify_write_target_within_root, EmptyDirectoryRemoval,
-    ExplicitDirectoryCreation, StructuralDirectoryLedger,
+    intent_target_hash, remove_empty_dir_in, verify_write_target_within_root,
+    EmptyDirectoryRemoval, ExplicitDirectoryCreation, StructuralDirectoryLedger,
 };
 use yadorilink_replica_domain::conflict::conflict_copy_path;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::session_state::HeldPath;
-use yadorilink_root_authority::fs_identity::{FileIdentity, ObjectKind};
-use yadorilink_root_authority::reserved_namespace::{artefact_component_name, ArtefactKind};
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 
 use crate::materialization_execution::{
-    GroupStructuralLedger, MaterializationExecutionError, MaterializationExecutionPort,
-    RepairRowSnapshot,
+    GroupStructuralLedger, GroupTempLedger, MaterializationExecutionError,
+    MaterializationExecutionPort, RepairRowSnapshot,
 };
 
 /// What one reconciliation pass did.
@@ -268,9 +268,8 @@ fn reconcile_one(
                 } else if has_held_descendant(state, group_id, &hold.path)? {
                     return Ok(());
                 } else {
-                    return keep_directory_and_relocate_entry(
-                        state, root, group_id, hold, held, &out_path, report,
-                    );
+                    keep_directory_and_hold_entry(group_id, hold);
+                    return Ok(());
                 }
             }
             if installed_regular_file(&installed).is_some() {
@@ -337,53 +336,17 @@ fn has_held_descendant(
 
 /// A directory this pass may not remove -- the user's, or one holding
 /// content this device does not replicate -- holds the name the installed
-/// entry at `out_path` needs. As in the live projection, the directory is
-/// kept (recorded as retained, removable once empty when this device made
-/// it) and the entry goes to its copy name beside it: the index moves the
-/// row there and holds the copy name for the next pass to place. Left at
-/// the held path, the row would name a file where the disk has a
-/// directory, which the offline-delete scan reads as that file's deletion.
-#[allow(clippy::too_many_arguments)]
-fn keep_directory_and_relocate_entry(
-    state: &dyn MaterializationExecutionPort,
-    root: &Path,
-    group_id: &str,
-    hold: &HeldPath,
-    held: &HashSet<String>,
-    out_path: &Path,
-    report: &mut HeldPathReconcileReport,
-) -> Result<(), MaterializationExecutionError> {
-    let observed = FileIdentity::observe_path(out_path).ok();
-    let made_here = match &observed {
-        Some(identity) if identity.object_kind == ObjectKind::Directory => {
-            state.is_structural_directory(group_id, &hold.path, root, identity)?
-        }
-        _ => false,
-    };
-    // The directory's retained record commits with the relocation: once
-    // the hold is released nothing brings the path back, and an unrecorded
-    // directory there reads to capture as one the user made.
-    let Some(copy) = state.relocate_held_entry_beside_directory(
-        group_id,
-        &hold.path,
-        hold.generation,
-        observed.as_ref().filter(|_| made_here),
-    )?
-    else {
-        // An install renewed the hold: the release sees it and leaves the
-        // path for the next pass.
-        return release(state, root, group_id, hold, held, InstalledNode::Entry, None, report);
-    };
-    reached(ReconcileStepForTest::EntryRelocated, out_path);
+/// entry at `out_path` needs. Nothing is moved and nothing is released: the
+/// path stays held, the directory stays, and the obstacle is the user's to
+/// resolve. A device-local obstacle never becomes a replicated or derived
+/// copy name.
+fn keep_directory_and_hold_entry(group_id: &str, hold: &HeldPath) {
     tracing::info!(
         group_id,
         path = %hold.path,
-        copy = %copy,
         "a directory this device may not remove holds the name an installed entry needs; the \
-         entry goes to its copy name"
+         path stays held"
     );
-    report.released.push(hold.path.clone());
-    Ok(())
 }
 
 /// Places the installed explicit Directory row at `out_path` through the
@@ -501,13 +464,13 @@ fn remove_directory_at_held_path(
         return Ok(false);
     }
     state.begin_held_path_disk_write(group_id, &hold.path)?;
-    match remove_empty_dir(out_path)? {
+    match remove_empty_dir_in(out_path, &GroupTempLedger::new(state, group_id))? {
         EmptyDirectoryRemoval::Removed | EmptyDirectoryRemoval::Absent => {
             reached(ReconcileStepForTest::DirectoryRemoved, out_path);
             state.forget_removed_directory(group_id, &hold.path)?;
             Ok(true)
         }
-        EmptyDirectoryRemoval::NotEmpty => {
+        EmptyDirectoryRemoval::NotEmpty | EmptyDirectoryRemoval::Stranded(_) => {
             if retain {
                 tracing::info!(
                     group_id,
@@ -562,7 +525,7 @@ fn release(
         // would be read as the newer row's projection or moved aside as a
         // conflict copy of nothing.
         if let Some(identity) = made_directory {
-            withdraw_own_directory(&out_path, &identity)?;
+            withdraw_own_directory(state, group_id, &out_path, &identity)?;
         }
         report.renewed.push(hold.path.clone());
         return Ok(());
@@ -574,6 +537,8 @@ fn release(
 /// Removes the directory this pass created at `out_path` while it is still
 /// exactly that object and empty. Anything else is left for the next pass.
 fn withdraw_own_directory(
+    state: &dyn MaterializationExecutionPort,
+    group_id: &str,
     out_path: &Path,
     identity: &FileIdentity,
 ) -> Result<(), MaterializationExecutionError> {
@@ -581,7 +546,7 @@ fn withdraw_own_directory(
     if observed.volume_identity == identity.volume_identity
         && observed.object_id == identity.object_id
     {
-        remove_empty_dir(out_path)?;
+        remove_empty_dir_in(out_path, &GroupTempLedger::new(state, group_id))?;
     }
     Ok(())
 }
@@ -640,12 +605,14 @@ fn prune_structural_ancestors(
         let path_lock = state.path_lock(group_id, ancestor);
         let Ok(_guard) = path_lock.try_lock() else { return Ok(false) };
         state.begin_held_path_disk_write(group_id, ancestor)?;
-        match remove_empty_dir(&dir)? {
+        match remove_empty_dir_in(&dir, &GroupTempLedger::new(state, group_id))? {
             EmptyDirectoryRemoval::Removed | EmptyDirectoryRemoval::Absent => {
                 reached(ReconcileStepForTest::AncestorRemoved, &dir);
                 state.forget_removed_directory(group_id, ancestor)?;
             }
-            EmptyDirectoryRemoval::NotEmpty | EmptyDirectoryRemoval::NotADirectory => {
+            EmptyDirectoryRemoval::NotEmpty
+            | EmptyDirectoryRemoval::NotADirectory
+            | EmptyDirectoryRemoval::Stranded(_) => {
                 return Ok(true);
             }
         }
@@ -776,11 +743,11 @@ pub(crate) fn move_aside(
         let preserved_as = conflict_copy_path(rel_path, mtime_unix_nanos, origin, &disambiguator);
         let dst = root.join(&preserved_as);
         verify_write_target_within_root(&dst, root, ledger)?;
-        match yadorilink_local_storage::rename_no_replace(src, &dst) {
+        match yadorilink_local_storage::move_no_replace_durably(src, &dst) {
             Ok(()) => {
-                // The conflict copy is the object's only name now: make it
-                // durable before anyone treats the object as recovered.
-                yadorilink_local_storage::sync_parent_dir(&dst)?;
+                // The conflict copy is the object's only name now, and the move
+                // that gave it that name is durable before anyone treats the
+                // object as recovered.
                 crate::materialization_eviction::trace_step("synced");
                 return Ok(preserved_as);
             }
@@ -818,7 +785,7 @@ fn object_digest(
     } else if file_type.is_symlink() {
         hasher.update(b"symlink");
         let target = std::fs::read_link(path)?;
-        hasher.update(yadorilink_root_authority::fs_identity::target_to_bytes(&target));
+        hasher.update(yadorilink_fs_platform::fs_identity::target_to_bytes(&target));
     } else {
         hasher.update(b"other");
         #[cfg(unix)]
@@ -867,10 +834,6 @@ pub enum ReconcileStepForTest {
     /// structural record is not forgotten yet. The path given is the
     /// ancestor's.
     AncestorRemoved,
-    /// An installed entry's row is moved to its copy name beside a
-    /// directory this pass may not remove, and that directory recorded as
-    /// retained, in one transaction; the pass has not moved on yet.
-    EntryRelocated,
 }
 
 /// Where reconciliation takes the object at `rel_path` under `root` while
@@ -932,7 +895,6 @@ enum ReconcileStepForTest {
     StructuralDirectoryMade,
     DirectoryRemoved,
     AncestorRemoved,
-    EntryRelocated,
 }
 
 #[cfg(not(any(test, feature = "test-support")))]
@@ -955,11 +917,17 @@ mod tests {
         fn complete(
             &self,
             rel_path: &str,
-            _identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+            _identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
         ) -> Result<(), yadorilink_local_storage::StorageError> {
             panic!("moving aside created a directory: {rel_path}")
         }
         fn abandon(&self, rel_path: &str) -> Result<(), yadorilink_local_storage::StorageError> {
+            panic!("moving aside created a directory: {rel_path}")
+        }
+        fn interrupted(
+            &self,
+            rel_path: &str,
+        ) -> Result<(), yadorilink_local_storage::StorageError> {
             panic!("moving aside created a directory: {rel_path}")
         }
     }

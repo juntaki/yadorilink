@@ -489,7 +489,14 @@ async fn without_a_host_nothing_is_published_until_it_reconnects() {
     host.set_evict(Arc::new(|_| Box::pin(async { EvictOutcome::NotConnected })));
     let driver = fx.driver(&host);
     driver.kick(&fx.root);
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // The pass runs on its own task: wait for it to have marked the item pending (a fixed
+    // pause is not enough on a loaded machine, where the item still reads Published).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while fx.publication(&id) != Some(Publication::ContentPending)
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(fx.publication(&id), Some(Publication::ContentPending));
     assert_eq!(fx.served_size(&id), 10);
     // A second pass does not start a second task for the same item.

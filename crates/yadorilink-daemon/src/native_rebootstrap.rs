@@ -197,8 +197,8 @@ impl Machine {
             device: DeviceId(state.device_id.clone()),
             handle: tokio::runtime::Handle::current(),
             hook: state.native_replication.rebootstrap_hook(),
-            recovery_root: crate::device_config::recovery_root(),
-            items_root: crate::device_config::recovery_items_root(),
+            recovery_root: crate::device_config::recovery_root_of(&state.device_id),
+            items_root: crate::device_config::recovery_items_root_of(&state.device_id),
         }
     }
 
@@ -891,9 +891,7 @@ impl QuarantineRoot for DaemonQuarantineRoot {
     }
 
     fn remove(&self, path: &str, expected: &Observed) -> Result<(), String> {
-        use yadorilink_root_authority::reserved_namespace::{
-            artefact_component_name, ArtefactKind,
-        };
+        use yadorilink_fs_platform::reserved_namespace::{artefact_component_name, ArtefactKind};
         let _op = self.lease.begin_operation().map_err(|e| e.to_string())?;
         let Some(full) = self.confined(path)? else { return Ok(()) };
         // Compare-then-unlink by name is not atomic: the user could save in between. The
@@ -906,7 +904,9 @@ impl QuarantineRoot for DaemonQuarantineRoot {
             )
             .map_err(|e| e.to_string())?,
         );
-        match std::fs::rename(&full, &private) {
+        // A durable, never-replacing move: the quarantine name is on disk before
+        // anything is decided about the object under it.
+        match yadorilink_local_storage::move_no_replace_durably(&full, &private) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.to_string()),
@@ -914,15 +914,19 @@ impl QuarantineRoot for DaemonQuarantineRoot {
         let renamed = Self::observe_at(&private)?;
         if renamed == *expected {
             return if matches!(renamed, Observed::Directory) {
-                std::fs::rename(&private, &full).map_err(|e| e.to_string())
+                yadorilink_local_storage::move_no_replace_durably(&private, &full)
+                    .map_err(|e| e.to_string())
             } else {
+                // The removal was committed by the move above; unlinking the
+                // quarantined object is the non-critical part.
                 std::fs::remove_file(&private).map_err(|e| e.to_string())
             };
         }
         // Not what the plan saw any more: the name is given back so the next attempt sees
         // the new content and saves it first.
         if std::fs::symlink_metadata(&full).is_err() {
-            std::fs::rename(&private, &full).map_err(|e| e.to_string())?;
+            yadorilink_local_storage::move_no_replace_durably(&private, &full)
+                .map_err(|e| e.to_string())?;
         }
         Err(format!("{path} changed while it was being removed"))
     }

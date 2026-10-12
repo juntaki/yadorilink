@@ -68,10 +68,17 @@ public struct FolderDetailView: View {
                         Text(why).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }
                     ForEach(model.conflicts) { conflict in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(conflict.title)
-                            Text("\(conflict.subtitle) · \(conflict.relation)")
-                                .font(.caption).foregroundStyle(.secondary)
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(conflict.title)
+                                Text("\(conflict.subtitle) · \(conflict.relation)")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            // Keep this version / Keep both need daemon operations that do not exist yet.
+                            if !model.folder.provider {
+                                Button("Show in Finder") { context.revealInFinder(model.conflictFilePath(conflict)) }
+                            }
                         }
                         .help(conflict.path)
                     }

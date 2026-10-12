@@ -323,7 +323,6 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "dag_snapshot_mutation_fence": 1,
         "set_held": 2,
         "set_held_with_key": 1,
-        "dag_publish_materialized_generation_if_fence_current": 1,
         "dag_complete_obligation_if_exact_proof_current": 1,
         "dag_complete_obligation_if_non_exact_proof_current": 1,
         "commit_internal_materialized_state_if_fence_current": 2,
@@ -427,8 +426,11 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # and xattrs), offline delete;
     # restore-journal recovery (adopting commit, discards after a disk
     # comparison).
+    # has_usable_materialized_generation 3: the live sweep's settled-row
+    # short-circuit reads the proof before hashing the file (a read of the
+    # same predicate the post-compare branch already uses; no state change).
     F + "materialization_repair.rs": {
-        "has_usable_materialized_generation": 2,
+        "has_usable_materialized_generation": 3,
         "commit_recovered_materialized_state": 2,
         "open_materialization_intent_guard": 1,
         "dag_bump_mutation_fence": 3,
@@ -496,14 +498,6 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "set_materialization_state_in_tx": 1,
         "retire_unproven_actual_state_in_tx": 1,
     },
-    # A snapshot install's reconciliation that keeps a directory where an
-    # installed entry belongs moves the entry to its copy name, releases
-    # the path's hold and records the directory as retained in one
-    # transaction: a crash between the two would leave the directory
-    # unrecorded with nothing held to bring the path back.
-    S + "held_path.rs": {
-        "record_retained_directory": 1,
-    },
     # A structural `mkdir` bumps the path's fence as it records its intent,
     # and the intent's completion refuses a fence that moved since; a
     # rename's rekey forgets the record at the old name.
@@ -560,7 +554,7 @@ ALLOWLIST: dict[str, dict[str, int]] = {
 #   L daemon/local_convergence/types.rs                             3
 #   L daemon/materialization_intent.rs                              2
 #   L filesystem-sync/materialization_eviction.rs                   1
-#   L filesystem-sync/materialization_repair.rs                    13
+#   L filesystem-sync/materialization_repair.rs                    14
 #   L local-capture/local_change/event_ingest.rs                    4
 #   L local-capture/local_change/flush.rs                           1
 #   L local-capture/local_change/scan.rs                            2
@@ -570,7 +564,7 @@ ALLOWLIST: dict[str, dict[str, int]] = {
 #   O daemon/replica_coordinator/materialization_execution.rs       7
 #   O daemon/replica_coordinator/materialization_owner.rs           3
 #   O daemon/replica_coordinator/materialization_owner/hydration.rs 10
-#   O daemon/replica_coordinator/materialization_owner/lanes.rs    27
+#   O daemon/replica_coordinator/materialization_owner/lanes.rs    26
 #   O daemon/replica_coordinator/materialization_owner/repair.rs 14
 #   O daemon/replica_coordinator/materialization_owner/structural.rs 11
 #   O daemon/replica_coordinator/peer_replica_state.rs             17
@@ -579,13 +573,12 @@ ALLOWLIST: dict[str, dict[str, int]] = {
 #   R sync-sqlite/materialization_state.rs                          1
 #   R sync-sqlite/materialized_generation.rs                        2
 #   R sync-sqlite/restore_operation.rs                              4
-#   R sync-sqlite/held_path.rs                          1
 #   R sync-sqlite/store.rs                                         12
 #   R sync-sqlite/structural_origin.rs                              3
 #   ------------------------------------------------------------
-#   total 189 = lane 43 + owner 89 + repository 57 (the per-file rows above are
+#   total 188 = lane 44 + owner 88 + repository 56 (the per-file rows above are
 #   indicative; the pins in ALLOWLIST are authoritative)
-EXPECTED_ALLOWED = 189
+EXPECTED_ALLOWED = 188
 
 # The in-family row mutators outside `FORBIDDEN`. Each also writes
 # materialization-relevant columns (a peer row's version and authoring, the
@@ -1037,7 +1030,6 @@ def self_test() -> None:
         ("not(test)", False),
         ("any(test, madsim)", False),
         ("any(test, not(madsim))", False),
-        ('any(test, feature = "evict-custody-test-bypass")', False),
         ('feature = "test"', False),
         ("unix", False),
         ("all(not(test), unix)", False),

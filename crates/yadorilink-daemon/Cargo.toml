@@ -90,6 +90,7 @@ yadorilink-sync-substrate = { path = "../yadorilink-sync-substrate" }
 # doc comment.
 yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
 yadorilink-peer-session = { path = "../yadorilink-peer-session" }
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync" }
 yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
@@ -213,14 +214,7 @@ yadorilink-sync-substrate = { path = "../yadorilink-sync-substrate", features = 
 # the feature half of that gate.
 yadorilink-daemon = { path = ".", features = ["test-support"] }
 # Test-only: `placeholder_backend::OverrideForTest` needs this feature to be
-# reachable from this crate's own `#[cfg(test)]` unit tests and integration
-# binaries, same reason as the two overrides above. Deliberately does NOT
-# also enable `yadorilink-filesystem-sync`'s separate
-# `evict-custody-test-bypass` feature: this crate's own eviction test
-# (`gc::tests::eviction_without_remote_lease_never_reaches_physical_reclaim`)
-# asserts that an instantaneous custody confirmation without a durable
-# remote lease must NOT authorize physical block deletion, so they need the
-# real `verify_reclaim_custody`, not the bypass.
+# reachable from this crate's own tests, same reason as the overrides above.
 yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync", features = ["test-support"] }
 # `materialization_execution.rs`'s own tests need `create_or_defer_
 # placeholder`'s Windows-deferred-outcome failure-injection seam

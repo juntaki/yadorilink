@@ -73,13 +73,31 @@ pub fn resolve_group_and_rel_path(
     Some((link.group_id.clone(), rel_path))
 }
 
-/// Resolves a path inside a macOS File Provider location to `(group_id, relative_path)`.
+/// Resolves a path inside a provider folder's local location to `(group_id, relative_path)`.
 ///
-/// A provider root has no directory of its own (and no filesystem authority): the OS shows it at
-/// `<home>/Library/CloudStorage/<extension name>-<display name>`, so the root is found by the
-/// display name that ends that first component, never by comparing against a stored path. A
-/// display name that two roots could both claim (one is a suffix of the other) is refused.
+/// A provider root has no directory of its own that the daemon reads (and no filesystem authority).
+/// On macOS the OS shows it at `<home>/Library/CloudStorage/<extension name>-<display name>`, so
+/// the root is found by the display name that ends that first component, never by comparing
+/// against a stored path. On Windows the Cloud Files host records where it put each sync root
+/// (`windows_sync_roots`), and the path is matched against those places.
 pub fn resolve_provider_group_and_rel_path(
+    sync_state: &ReplicaCoordinator,
+    absolute_path: &str,
+) -> Option<(String, String)> {
+    #[cfg(windows)]
+    {
+        let (root_id, rel_path) = crate::windows_sync_roots::locate(absolute_path)?;
+        let group_id = sync_state.provider_repository().group_of_root(&root_id).ok().flatten()?;
+        Some((group_id, rel_path))
+    }
+    #[cfg(not(windows))]
+    {
+        resolve_cloud_storage_path(sync_state, absolute_path)
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_cloud_storage_path(
     sync_state: &ReplicaCoordinator,
     absolute_path: &str,
 ) -> Option<(String, String)> {

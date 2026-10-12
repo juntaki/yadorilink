@@ -25,11 +25,18 @@ pub struct ControlContext {
     pub(crate) queries: Arc<QueryServices>,
     /// The provider roots' lines of `status`, filled in by the shell side.
     pub(crate) provider_status: Arc<crate::provider_status::ProviderStatusSource>,
+    /// Frees the local copy of a provider folder's file; installed by the shell side.
+    pub(crate) provider_evict: Arc<crate::provider_evict::ProviderEvictSlot>,
 }
 
 impl ControlContext {
     pub(crate) fn new(application: Arc<ApplicationServices>, queries: Arc<QueryServices>) -> Self {
-        Self { application, queries, provider_status: Arc::default() }
+        Self {
+            application,
+            queries,
+            provider_status: Arc::default(),
+            provider_evict: Arc::default(),
+        }
     }
 
     /// Builds both from a real `Arc<DaemonState>`, matching the exact

@@ -76,7 +76,9 @@ fn create_first_pipe_server(pipe_name: &str) -> std::io::Result<NamedPipeServer>
 
 fn create_next_pipe_server(pipe_name: &str) -> std::io::Result<NamedPipeServer> {
     let mut attrs = PipeSecurityAttributes::new_current_user_and_system_only()?;
-    unsafe { ServerOptions::new().create_with_security_attributes_raw(pipe_name, attrs.as_mut_ptr()) }
+    unsafe {
+        ServerOptions::new().create_with_security_attributes_raw(pipe_name, attrs.as_mut_ptr())
+    }
 }
 
 /// Runs forever, accepting one connection at a time and spawning a handler

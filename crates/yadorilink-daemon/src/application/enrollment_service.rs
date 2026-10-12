@@ -30,6 +30,8 @@ pub(crate) struct EnrollmentService {
     /// Serializes provider-folder creations, so two requests with one token cannot both pass the
     /// retry check.
     provider_creation: tokio::sync::Mutex<()>,
+    /// The provider adapter this host serves; `None` refuses every provider link.
+    provider_kind: Option<yadorilink_replica_domain::session_state::ProviderKind>,
     device_id: String,
     repository: Arc<dyn EnrollmentRepository>,
     coordination: Arc<dyn EnrollmentCoordination>,
@@ -254,11 +256,33 @@ impl EnrollmentService {
     ) -> Self {
         Self {
             provider_creation: tokio::sync::Mutex::new(()),
+            provider_kind:
+                yadorilink_replica_domain::session_state::ProviderKind::for_host_platform(),
             device_id,
             repository,
             coordination,
             links,
         }
+    }
+
+    /// The provider adapter for a provider link, or a refusal on a platform that has none. Checked
+    /// before the first journal write or remote call.
+    fn require_provider_kind(
+        &self,
+    ) -> Result<yadorilink_replica_domain::session_state::ProviderKind, EnrollmentError> {
+        self.provider_kind.ok_or_else(|| EnrollmentError::PreparationRejected {
+            detail: "provider folders are not available on this operating system".to_string(),
+        })
+    }
+
+    /// Test seam: the adapter kind this service serves, independent of the host OS.
+    #[cfg(test)]
+    pub(crate) fn with_provider_kind(
+        mut self,
+        kind: Option<yadorilink_replica_domain::session_state::ProviderKind>,
+    ) -> Self {
+        self.provider_kind = kind;
+        self
     }
 
     pub(crate) async fn create_and_link(
@@ -283,6 +307,7 @@ impl EnrollmentService {
                 }
                 command.absolute_path = PathBuf::from(creation.locator());
                 Some(crate::application::ports::ProviderLinkTarget {
+                    kind: self.require_provider_kind()?,
                     display_name: creation.display_name.clone(),
                     empty_owner: true,
                     on_demand: command.on_demand,
@@ -433,6 +458,7 @@ impl EnrollmentService {
                 }
                 command.absolute_path = PathBuf::from(creation.locator());
                 Some(crate::application::ports::ProviderLinkTarget {
+                    kind: self.require_provider_kind()?,
                     display_name: creation.display_name.clone(),
                     empty_owner: false,
                     on_demand: command.on_demand,

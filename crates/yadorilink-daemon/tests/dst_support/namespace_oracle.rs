@@ -15,7 +15,7 @@
 //! desired physical tree is a pure function `project(E)`.
 //!
 //! * **Projection oracles** (pure, over explicit state `E` and the tree
-//!   `project(E)` from `yadorilink_replica_engine::namespace`):
+//!   `project(E)`, the tree a converged replica shows):
 //!   [`check_projection`] re-derives `NeedsDirectory` independently of
 //!   `project` and compares the directory set, explicit-vs-structural
 //!   labelling, tree well-formedness, and data preservation on shape
@@ -50,14 +50,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
+use yadorilink_fs_platform::reserved_namespace::is_reserved_component;
 use yadorilink_replica_domain::conflict::is_conflict_copy_of;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME;
 use yadorilink_replica_engine::conflict::PathHead;
-use yadorilink_replica_engine::namespace::{
-    project, DirectoryNode, PhysicalNode, PlacedEntry, Placement,
-};
-use yadorilink_root_authority::reserved_namespace::is_reserved_component;
 use yadorilink_root_authority::sync_root_lock::SYNC_ROOT_LOCK_FILE_NAME;
 
 /// The per-device sync-root identity marker. Device-local by design, so it
@@ -175,6 +172,202 @@ fn violation(
 // Explicit state
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// The settled tree: what a converged replica shows
+// ---------------------------------------------------------------------------
+
+/// How a directory in the settled tree came to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryNode {
+    /// A Directory head lives at the path; `version_hash` is its winning version.
+    Explicit { version_hash: [u8; 32] },
+    /// Only live descendants require the directory.
+    Structural,
+}
+
+/// Where a leaf sits relative to the path that owns it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// At its own path.
+    AtPath,
+    /// At `copy_path(source, version)`: the loser of a contest, which its
+    /// author moved there.
+    ConflictCopy,
+}
+
+/// A File or Symlink version in the tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacedEntry {
+    pub kind: RecordKind,
+    pub version_hash: [u8; 32],
+    /// The path the content was written at, before any author moved it.
+    pub source: String,
+    pub placement: Placement,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PhysicalNode {
+    Directory(DirectoryNode),
+    Entry(PlacedEntry),
+}
+
+impl PhysicalNode {
+    pub fn is_directory(&self) -> bool {
+        matches!(self, Self::Directory(_))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NamespaceProjection {
+    nodes: BTreeMap<String, PhysicalNode>,
+}
+
+impl NamespaceProjection {
+    pub fn nodes(&self) -> &BTreeMap<String, PhysicalNode> {
+        &self.nodes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionError {
+    Undecidable { path: String, version_hash: [u8; 32] },
+}
+
+impl std::fmt::Display for ProjectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self::Undecidable { path, version_hash } = self;
+        write!(f, "the kind of version {} at {path:?} is unknown", short_hex(version_hash))
+    }
+}
+
+/// The tree a replica converges to from the explicit state `heads`: contested
+/// paths are resolved the way the product resolves them (the author of each
+/// losing head moves it to `copy_path(path, version)`, round after round,
+/// until nothing is contested), then every path is projected. A function of
+/// the head sets alone.
+pub fn project(
+    heads: &ExplicitHeads,
+    kind_of: impl Fn(&[u8; 32]) -> Option<RecordKind>,
+) -> Result<NamespaceProjection, ProjectionError> {
+    use yadorilink_replica_domain::author::{AuthorId, IncarnationId};
+    use yadorilink_replica_domain::ids::{AuthorSeq, DeviceId, SyncPath, VersionHash};
+    use yadorilink_replica_domain::native_fork::copy_path;
+    use yadorilink_replica_domain::native_project::{
+        contests, loses, project_tree, DirectoryNode as Dir, Projection, Settled,
+    };
+    use yadorilink_replica_domain::native_state::{
+        DeltaHash, Dot, HeadPayload, LiveHead, PathHeads,
+    };
+
+    for (path, path_heads) in heads {
+        for version in path_heads.iter().filter_map(version_of) {
+            if kind_of(&version).is_none() {
+                return Err(ProjectionError::Undecidable {
+                    path: path.clone(),
+                    version_hash: version,
+                });
+            }
+        }
+    }
+    let kind = |v: &VersionHash| kind_of(&v.0);
+    let mut seqs: BTreeMap<String, u64> = BTreeMap::new();
+    let mut world: BTreeMap<SyncPath, PathHeads> = BTreeMap::new();
+    let mut origin: BTreeMap<String, String> = BTreeMap::new();
+    let mut put = |world: &mut BTreeMap<SyncPath, PathHeads>,
+                   path: &str,
+                   device: &str,
+                   version: [u8; 32],
+                   provenance: [u8; 32]| {
+        let seq = seqs.entry(device.to_owned()).or_insert(0);
+        *seq += 1;
+        let dot = Dot {
+            author: AuthorId {
+                device: DeviceId(device.to_owned()),
+                incarnation: IncarnationId([1; 16]),
+            },
+            seq: AuthorSeq(*seq),
+        };
+        world.entry(SyncPath(path.to_owned())).or_default().insert(
+            dot,
+            HeadPayload { version: VersionHash(version), provenance: DeltaHash(provenance) },
+        );
+    };
+    for (path, path_heads) in heads {
+        for head in path_heads {
+            if let Some(content) = &head.content {
+                put(&mut world, path, &head.device_id, content.version_hash, head.change_hash);
+            }
+        }
+    }
+    for _round in 0..16 {
+        let tree = project_tree(&world, kind);
+        let pending = contests(&tree);
+        if pending.is_empty() {
+            break;
+        }
+        let mut moved = false;
+        for contest in pending {
+            let path = contest.path.clone();
+            let has_descendant = world
+                .range(SyncPath(format!("{}/", path.as_str()))..)
+                .next()
+                .is_some_and(|(key, _)| key.as_str().starts_with(&format!("{}/", path.as_str())));
+            let Some(at_path) = world.get(&path).cloned() else { continue };
+            for (dot, payload) in &at_path {
+                let live = LiveHead { dot: dot.clone(), payload: payload.clone() };
+                if loses(&live, kind, &at_path, has_descendant) != Some(true) {
+                    continue;
+                }
+                world.get_mut(&path).expect("present").remove(dot);
+                let copy = copy_path(path.as_str(), &payload.version);
+                let source =
+                    origin.get(path.as_str()).cloned().unwrap_or_else(|| path.as_str().to_owned());
+                origin.insert(copy.clone(), source);
+                put(
+                    &mut world,
+                    &copy,
+                    &dot.author.device.0,
+                    payload.version.0,
+                    payload.provenance.0,
+                );
+                moved = true;
+            }
+            world.retain(|_, heads| !heads.is_empty());
+        }
+        if !moved {
+            break;
+        }
+    }
+    let tree = project_tree(&world, kind);
+    let mut nodes = BTreeMap::new();
+    for (path, projection) in tree {
+        let Projection::Settled(settled) = projection else { continue };
+        let node = match settled {
+            Settled::Directory(Dir::Explicit { version }) => {
+                PhysicalNode::Directory(DirectoryNode::Explicit { version_hash: version.0 })
+            }
+            Settled::Directory(Dir::Structural) => {
+                PhysicalNode::Directory(DirectoryNode::Structural)
+            }
+            Settled::Entry { kind, version, .. } => {
+                let source = origin.get(path.as_str()).cloned();
+                PhysicalNode::Entry(PlacedEntry {
+                    kind,
+                    version_hash: version.0,
+                    placement: if source.is_some() {
+                        Placement::ConflictCopy
+                    } else {
+                        Placement::AtPath
+                    },
+                    source: source.unwrap_or_else(|| path.as_str().to_owned()),
+                })
+            }
+        };
+        nodes.insert(path.as_str().to_owned(), node);
+    }
+    Ok(NamespaceProjection { nodes })
+}
+
 /// Explicit replicated state `E` as `project` takes it: per path, its live
 /// heads (content and removing heads alike).
 pub type ExplicitHeads = BTreeMap<String, Vec<PathHead>>;
@@ -232,7 +425,7 @@ pub fn reference_needs_directory(
 /// * every node's parent is a directory, and no leaf sits at a path that
 ///   must be a directory;
 /// * a leaf is `AtPath` iff it sits at its own source path, and a copy
-///   (`ConflictCopy` / `Relocated`) is a sibling of its source;
+///   (`ConflictCopy`) is a sibling of its source;
 /// * every live File/Symlink version of every path is placed somewhere
 ///   (no data loss on a shape conflict), and every placed leaf is a live
 ///   version of its source path (nothing invented).
@@ -367,9 +560,7 @@ fn check_placed_entry(
             vec![],
             format!("AtPath leaf whose source is {:?}", entry.source),
         )),
-        Placement::ConflictCopy | Placement::Relocated
-            if at_own_path || parent_of(path) != parent_of(&entry.source) =>
-        {
+        Placement::ConflictCopy if at_own_path || parent_of(path) != parent_of(&entry.source) => {
             out.push(violation(
                 K::MalformedTree,
                 path,
@@ -821,7 +1012,6 @@ pub fn check_trees_converge(trees: &[(usize, DiskTree)]) -> Vec<NamespaceViolati
 mod tests {
     use super::*;
     use yadorilink_replica_engine::conflict::PathHeadContent;
-    use yadorilink_replica_engine::namespace::project;
 
     const FILE_1: [u8; 32] = [0x11; 32];
     const FILE_2: [u8; 32] = [0x12; 32];
@@ -941,7 +1131,7 @@ mod tests {
         let relocated = nodes
             .iter()
             .find(|(_, n)| {
-                matches!(n, PhysicalNode::Entry(e) if e.placement == Placement::Relocated && e.source == "a")
+                matches!(n, PhysicalNode::Entry(e) if e.placement == Placement::ConflictCopy && e.source == "a")
             })
             .map(|(p, _)| p.clone())
             .expect("File a is relocated beside directory a");

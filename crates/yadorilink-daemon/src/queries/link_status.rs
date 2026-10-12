@@ -110,6 +110,10 @@ pub(crate) struct LinkStatusView {
     pub(crate) group_id: String,
     pub(crate) paused: bool,
     pub(crate) conflict_count: u64,
+    /// Paths contested in the replicated state, not yet resolved by their fork.
+    pub(crate) conflicts_pending: u64,
+    /// Why a resolved conflict has not reached the local files yet, when it has not.
+    pub(crate) conflict_note: String,
     /// `MaterializationPolicy::as_db_str()`'s own stable string, not
     /// re-derived as a separate enum here -- see that method's own doc.
     pub(crate) materialization_policy: String,
@@ -142,6 +146,8 @@ pub(crate) struct LinkStatusView {
     /// entry means the group is linked twice and refusing to sync -- the
     /// invariant this reports on.
     pub(crate) ambiguous_local_paths: Vec<String>,
+    /// The folder's root is no longer on the volume its index was built from.
+    pub(crate) capture_volume_changed: bool,
     /// Device ids of every OTHER device currently recorded
     /// (netmap-derived, content-blind) as an authorized-writer full
     /// replica for this group -- feeds the user-facing "Complete copies"

@@ -19,12 +19,12 @@ fn command(code: ApplicationErrorCode) -> CoreError {
 #[test]
 fn every_core_error_maps_to_the_historical_message_and_exit_code() {
     let cases: Vec<(CoreError, &str, i32)> = vec![
-        (CoreError::NotLoggedIn, "not logged in — run `yadorilink login`", 2),
-        (CoreError::AuthFailed("bad".into()), "authentication failed: bad", 2),
+        (CoreError::NotLoggedIn, "not logged in — run `yadorilink login`", 10),
+        (CoreError::AuthFailed("bad".into()), "authentication failed: bad", 10),
         (CoreError::Forbidden("not_group_owner".into()), "not_group_owner", 1),
         (
             CoreError::CoordinationPlaneUnreachable("down".into()),
-            "could not reach the coordination plane: down",
+            "could not reach the YadoriLink server: down",
             3,
         ),
         (
@@ -78,4 +78,13 @@ fn a_credential_store_error_keeps_its_own_category() {
     let cli = CliError::from(CoreError::CredentialStore(store));
     assert!(matches!(cli, CliError::CredentialStore(_)));
     assert_eq!(cli.exit_code(), 9);
+}
+
+#[test]
+fn a_missing_file_is_not_reported_as_a_missing_daemon() {
+    let missing = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+    let cli = CliError::from(missing);
+    assert!(matches!(cli, CliError::Other(_)), "{cli:?}");
+    let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+    assert!(matches!(CliError::from(refused), CliError::DaemonNotRunning));
 }

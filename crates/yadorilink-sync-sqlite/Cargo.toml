@@ -16,6 +16,7 @@ yadorilink-replica-engine = { path = "../yadorilink-replica-engine" }
 # The `RootCommitPermit` gate on the `materialization_intents`
 # crash-recovery journal writes. No cycle: yadorilink-root-authority only
 # depends on yadorilink-replica-domain (already a dependency here).
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 # `StorageError` and `PlaceholderDiskIdentity`. It depends on no
 # persistence crate, so there is no cycle.
@@ -61,23 +62,11 @@ rusqlite = { version = "0.31", features = ["bundled", "functions", "hooks", "tra
 # `RootCommitPermit::for_tests`/`RootLease::for_tests` for this crate's own
 # `dag_store` test fixtures.
 yadorilink-root-authority = { path = "../yadorilink-root-authority", features = ["test-support"] }
-# `dag_store/mod.rs`'s own test module (`rejected_change_rolls_back_its_versions_and_
-# grants_no_block_capability`, `dual_write_commits_index_row_and_change_together`, etc.)
-# and `tests/dag_admission_order_fuzz.rs` exercise the DAG-store free
-# functions through `yadorilink_daemon::replica_coordinator::
-# ReplicaCoordinator`/`ChangeContent` as an integration-style fixture, not
-# through this crate's own types -- `dag_store` and `materialized_generation`
-# both live in this crate, so this dependency is no longer needed for
-# schema-init helpers, only for that fixture reuse. No
-# cycle: this is a dev-dependency, only compiled for this crate's own tests,
-# never part of the production dependency graph (which already runs the
-# other direction, daemon -> sync-sqlite). `test-support` IS needed here
-# (unlike the pre-deletion `SyncState` fixture, which was never
-# feature-gated): `ReplicaCoordinator::open_in_memory` is
-# `#[cfg(any(test, feature = "test-support"))]` in `yadorilink-daemon`, and
-# `cfg(test)` is crate-local the same way it is for the
-# `yadorilink-root-authority` dev-dependency above.
-yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"] }
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform", features = ["test-support", "evidence"] }
+# Integration tests need the crate's own and replica-domain's test-only helpers
+# (previously enabled by feature unification through a daemon dev-dependency).
+yadorilink-sync-sqlite = { path = ".", features = ["test-support"] }
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain", features = ["test-support"] }
 
 [lints]
 workspace = true

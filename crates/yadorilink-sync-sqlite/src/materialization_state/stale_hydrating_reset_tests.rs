@@ -73,7 +73,8 @@ fn a_hydrating_row_with_no_intent_is_reset_and_one_with_an_intent_is_left_for_re
         .begin_materialization_intent(GROUP, "interrupted-batch.txt", &[7u8; 32], &permit)
         .unwrap();
 
-    let reset = MaterializationStateRepository::new(db.clone()).reset_stale_hydrating().unwrap();
+    let reset =
+        MaterializationStateRepository::new(db.clone()).reset_stale_transients(&[], &[]).unwrap().0;
 
     assert_eq!(reset, 1, "only the row with nothing in flight may be reset");
     assert_eq!(
@@ -112,7 +113,8 @@ fn a_hydrating_row_repair_would_skip_is_reset_even_though_it_holds_an_intent() {
         intents.begin_materialization_intent(GROUP, path, &[7u8; 32], &permit).unwrap();
     }
 
-    let reset = MaterializationStateRepository::new(db.clone()).reset_stale_hydrating().unwrap();
+    let reset =
+        MaterializationStateRepository::new(db.clone()).reset_stale_transients(&[], &[]).unwrap().0;
 
     assert_eq!(reset, 2, "every row repair declines must be freed here");
     for path in ["empty.txt", "tombstoned.txt"] {
@@ -144,7 +146,8 @@ fn a_hydrating_symlink_or_directory_with_an_intent_is_left_for_repair() {
         intents.begin_materialization_intent(GROUP, path, &[7u8; 32], &permit).unwrap();
     }
 
-    let reset = MaterializationStateRepository::new(db.clone()).reset_stale_hydrating().unwrap();
+    let reset =
+        MaterializationStateRepository::new(db.clone()).reset_stale_transients(&[], &[]).unwrap().0;
 
     assert_eq!(reset, 0);
     assert_eq!(state_of(&db, "link"), MaterializationState::Hydrating);
@@ -196,7 +199,8 @@ fn a_hydrating_row_over_a_standing_proof_goes_back_to_present() {
         .begin_materialization_intent(GROUP, "with-intent.txt", &[7u8; 32], &permit)
         .unwrap();
 
-    let reset = MaterializationStateRepository::new(db.clone()).reset_stale_hydrating().unwrap();
+    let reset =
+        MaterializationStateRepository::new(db.clone()).reset_stale_transients(&[], &[]).unwrap().0;
 
     assert_eq!(reset, 2, "both rows without an intent leave Hydrating");
     assert_eq!(

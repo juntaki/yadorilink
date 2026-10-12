@@ -688,7 +688,7 @@ mod dag_resolution_tests;
 
 #[cfg(all(test, unix))]
 mod disk_race_fingerprint_tests {
-    use yadorilink_root_authority::fs_identity::disk_race_fingerprint;
+    use yadorilink_fs_platform::fs_identity::disk_race_fingerprint;
 
     /// How many write+observe cycles
     /// [`ctime_can_distinguish_back_to_back_writes`] samples before
