@@ -311,10 +311,17 @@ async fn winner_arrival_never_overwrites_an_unsynced_local_edit() {
         contents.contains(&b"edited here, never captured".to_vec()),
         "the local edit must survive, at the path or as a conflict copy: {contents:?}"
     );
-    assert!(
-        contents.contains(&b"the peer's newer version".to_vec()),
-        "the peer's change must land, at the path or as a conflict copy: {contents:?}"
-    );
+    // Which side wins the path is not fixed. When the peer's version wins, writing it needs the
+    // winner to replace the local edit's original, which the closed Windows gate withholds (the
+    // edit's copy is made, the original stays); the edit survives either way, checked above.
+    if crate::test_support::windows_durability_gate_allows_tests(
+        "the peer's winning version replacing the local original",
+    ) {
+        assert!(
+            contents.contains(&b"the peer's newer version".to_vec()),
+            "the peer's change must land, at the path or as a conflict copy: {contents:?}"
+        );
+    }
 }
 
 /// A file that keeps changing is never written over while it does, and
