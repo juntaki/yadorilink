@@ -68,13 +68,29 @@ impl Fx {
     /// Commits a version of `path` whose bytes are `data` (one block, present in the store with
     /// this group's provenance).
     fn commit(&self, path: &str, seq: i64, data: &[u8]) {
-        let hash = self.state.block_store.put(data).unwrap();
-        let hash_bytes = hex::decode(&hash).unwrap();
-        self.state
-            .replica_coordinator
-            .record_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
-            .unwrap();
-        let blocks = format!(r#"[{{"hash":{:?},"offset":0,"size":{}}}]"#, hash_bytes, data.len());
+        self.commit_blocks(path, seq, &[data]);
+    }
+
+    /// Like `commit`, with one block per slice of `chunks`.
+    fn commit_blocks(&self, path: &str, seq: i64, chunks: &[&[u8]]) {
+        let mut offset = 0u64;
+        let mut entries = Vec::new();
+        for data in chunks {
+            let hash = self.state.block_store.put(data).unwrap();
+            let hash_bytes = hex::decode(&hash).unwrap();
+            self.state
+                .replica_coordinator
+                .record_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
+                .unwrap();
+            entries.push(format!(
+                r#"{{"hash":{:?},"offset":{offset},"size":{}}}"#,
+                hash_bytes,
+                data.len()
+            ));
+            offset += data.len() as u64;
+        }
+        let blocks = format!("[{}]", entries.join(","));
+        let total = offset as i64;
         self.state
             .replica_coordinator
             .database()
@@ -87,7 +103,7 @@ impl Fx {
                 tx.execute(
                     "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, \
                      deleted, version_seq, state) VALUES (?1, ?2, ?3, 1, ?5, 0, ?4, 'current')",
-                    rusqlite::params![GROUP, path, data.len() as i64, seq, blocks],
+                    rusqlite::params![GROUP, path, total, seq, blocks],
                 )?;
                 let row = yadorilink_sync_sqlite::read_canonical_current_row(tx, GROUP, path)?
                     .expect("the row just written");
@@ -123,6 +139,7 @@ impl Fx {
                 root_id: hex::decode(&self.root).unwrap(),
                 item_id: item.to_vec(),
                 requested_version_hash: requested.to_vec(),
+                ..Default::default()
             })),
         };
         assert!(materialize_message(&self.context, &self.requests, &self.tx, &message));
@@ -473,6 +490,7 @@ async fn an_undelivered_response_leaves_no_handoff_and_no_ledger_entry() {
             root_id: hex::decode(&fx.root).unwrap(),
             item_id: item.to_vec(),
             requested_version_hash: Vec::new(),
+            ..Default::default()
         })),
     };
     assert!(materialize_message(&fx.context, &fx.requests, &dead_tx, &message));
@@ -1045,4 +1063,198 @@ fn a_windows_restart_removes_every_leftover() {
     assert!(!dir.path().join("handoff/fresh").exists());
     assert!(!dir.path().join("handoff/older").exists());
     drop(root);
+}
+
+// ---- ranged requests ----------------------------------------------------------------------
+
+impl Fx {
+    fn request_range(&self, id: &[u8], item: &ItemId, version: &[u8], offset: u64, len: u64) {
+        let message = ShellIpcMessage {
+            payload: Some(Payload::MaterializeToTempRequest(MaterializeToTempRequest {
+                request_id: id.to_vec(),
+                root_id: hex::decode(&self.root).unwrap(),
+                item_id: item.to_vec(),
+                requested_version_hash: version.to_vec(),
+                ranged: true,
+                range_offset: offset,
+                range_length: len,
+            })),
+        };
+        assert!(materialize_message(&self.context, &self.requests, &self.tx, &message));
+    }
+
+    async fn ask_range(
+        &mut self,
+        id: &[u8],
+        item: &ItemId,
+        version: &[u8],
+        offset: u64,
+        len: u64,
+    ) -> MaterializeToTempResponse {
+        self.request_range(id, item, version, offset, len);
+        self.response().await
+    }
+}
+
+fn three_blocks() -> [Vec<u8>; 3] {
+    [data_of(11, 40_000), data_of(12, 50_000), data_of(13, 30_000)]
+}
+
+/// A window comes back as a file of exactly those bytes. The item is not recorded as handed over
+/// to the OS and its row is untouched: a window is never "present".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ranged_request_hands_over_just_the_window_and_records_no_handoff() {
+    let mut fx = Fx::new().await;
+    let chunks = three_blocks();
+    let whole: Vec<u8> = chunks.concat();
+    fx.commit_blocks("r.bin", 1, &[&chunks[0], &chunks[1], &chunks[2]]);
+    let item = fx.repo().mint_item(&fx.root, "r.bin").unwrap();
+    fx.repo().publish_first(&fx.root, &item, fx.current_hash(&item)).unwrap();
+    let before = fx
+        .state
+        .replica_coordinator
+        .materialization_state_repository()
+        .get_materialization_state(GROUP, "r.bin")
+        .unwrap();
+    let version = fx.current_hash(&item).0.to_vec();
+
+    // Across the first block boundary, ending past the end of the file.
+    let response = fx.ask_range(b"req-r1", &item, &version, 39_990, 1 << 40).await;
+    assert!(response.ok, "{}", response.error);
+    assert!(response.ranged);
+    assert_eq!(
+        (response.range_offset, response.range_length),
+        (39_990, whole.len() as u64 - 39_990)
+    );
+    assert_eq!(response.size, whole.len() as u64, "size is the whole version's");
+    assert_eq!(response.version_hash, version);
+    assert_eq!(
+        std::fs::read(fx.handoff_dir().join(&response.handoff_name)).unwrap(),
+        whole[39_990..]
+    );
+    assert!(names_in(&fx.staging()).is_empty(), "staging was not cleaned");
+
+    // Give a recorded handoff every chance to appear, then check there is none.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        fx.repo().handoff(&fx.root, &item).unwrap().is_none(),
+        "a window was recorded as a handoff"
+    );
+    assert!(response.content_version.is_empty(), "a window was paired with a generation");
+    assert_eq!(
+        fx.repo().served(&fx.root, &item).unwrap(),
+        Served::Never,
+        "a window was recorded as served content"
+    );
+    assert_eq!(
+        fx.state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "r.bin")
+            .unwrap(),
+        before
+    );
+
+    // A full request on the same connection still answers the whole file, unranged.
+    let full = fx.ask(b"req-r2", &item).await;
+    assert!(full.ok && !full.ranged, "{}", full.error);
+    assert_eq!(std::fs::read(fx.handoff_dir().join(&full.handoff_name)).unwrap(), whole);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ranged_request_needs_the_version_and_a_reachable_offset() {
+    let mut fx = Fx::new().await;
+    let chunks = three_blocks();
+    fx.commit_blocks("r.bin", 1, &[&chunks[0], &chunks[1], &chunks[2]]);
+    let item = fx.repo().mint_item(&fx.root, "r.bin").unwrap();
+    let version = fx.current_hash(&item).0.to_vec();
+
+    let unversioned = fx.ask_range(b"req-n1", &item, &[], 0, 10).await;
+    assert!(!unversioned.ok);
+    assert_eq!(failure(&unversioned), MaterializeFailure::RangeNotSatisfiable);
+
+    let past = fx.ask_range(b"req-n2", &item, &version, 120_001, 1).await;
+    assert_eq!(failure(&past), MaterializeFailure::RangeNotSatisfiable);
+
+    // The very end is a window of no bytes; the empty file is a valid answer.
+    let end = fx.ask_range(b"req-n3", &item, &version, 120_000, 5).await;
+    assert!(end.ok && end.ranged && end.range_length == 0, "{}", end.error);
+    assert!(std::fs::read(fx.handoff_dir().join(&end.handoff_name)).unwrap().is_empty());
+
+    let other = fx.ask_range(b"req-n4", &item, &[7u8; 32], 0, 10).await;
+    assert_eq!(failure(&other), MaterializeFailure::VersionOutOfDate);
+    assert_eq!(fx.handoff_names().len(), 1, "a refused request left a file");
+}
+
+// ---- a window is revocable from the moment its response can be read ------------------------
+
+impl Fx {
+    fn ranged_item(&self, path: &str) -> (ItemId, Vec<u8>) {
+        let chunks = three_blocks();
+        self.commit_blocks(path, 1, &[&chunks[0], &chunks[1], &chunks[2]]);
+        let item = self.repo().mint_item(&self.root, path).unwrap();
+        self.repo().publish_first(&self.root, &item, self.current_hash(&item)).unwrap();
+        let version = self.current_hash(&item).0.to_vec();
+        (item, version)
+    }
+
+    fn handoff_root(&self) -> Arc<HandoffRoot> {
+        self.context.handoff.get().unwrap()
+    }
+}
+
+/// The exact hole: V1's window is on disk and its response is being written, V2 commits and its
+/// publication revokes unconsumed handoffs. The window is already tracked, so it is taken back
+/// before the client can read it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_is_revoked_by_a_newer_version_while_its_response_is_being_written() {
+    let mut fx = Fx::new().await;
+    let (item, version) = fx.ranged_item("race-r.bin");
+    fx.request_range(b"req-w1", &item, &version, 10, 20);
+    // The response is queued but its framed write has not completed.
+    let delivery = fx.delivery().await;
+    let Some(Payload::MaterializeToTempResponse(response)) = &delivery.message.payload else {
+        panic!("not a response")
+    };
+    assert!(response.ok && response.ranged, "{}", response.error);
+    let file = fx.handoff_dir().join(&response.handoff_name);
+    assert!(file.exists());
+
+    // V2 commits and its publication takes back unconsumed handoffs of the item.
+    fx.commit("race-r.bin", 2, &data_of(77, 1_000));
+    let revoked = fx.handoff_root().revoke_unconsumed(&fx.root, &item).unwrap();
+    assert_eq!(revoked, 1, "the window was not tracked");
+    assert!(!file.exists(), "the old window is still readable");
+    if let Some(written) = delivery.written {
+        let _ = written.send(true);
+    }
+    eventually("the request to finish", || fx.requests.inflight.lock().unwrap().is_empty()).await;
+    assert!(fx.repo().handoff(&fx.root, &item).unwrap().is_none());
+}
+
+/// The registration lives exactly as long as the file: gone with it when the response was never
+/// written, and until the file's lifetime ends after a delivered one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_windows_tracking_is_dropped_on_a_failed_response_and_after_delivery() {
+    let mut fx = Fx::with_lifetime(Duration::from_millis(300)).await;
+    let (item, version) = fx.ranged_item("track-r.bin");
+
+    fx.request_range(b"req-t1", &item, &version, 0, 5);
+    let delivery = fx.delivery().await;
+    assert_eq!(fx.handoff_root().tracked_handoffs(), 1);
+    if let Some(written) = delivery.written {
+        let _ = written.send(false);
+    }
+    eventually("the failed response to clean up", || {
+        fx.requests.inflight.lock().unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(fx.handoff_root().tracked_handoffs(), 0, "a failed response stayed tracked");
+    assert!(fx.handoff_names().is_empty(), "a failed response left its file");
+
+    let delivered = fx.ask_range(b"req-t2", &item, &version, 0, 5).await;
+    assert!(delivered.ok, "{}", delivered.error);
+    assert_eq!(fx.handoff_root().tracked_handoffs(), 1);
+    eventually("the lifetime to end", || fx.handoff_root().tracked_handoffs() == 0).await;
+    assert!(fx.handoff_names().is_empty());
 }

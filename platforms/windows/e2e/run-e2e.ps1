@@ -15,6 +15,7 @@
 #    5 rename on Windows               12 daemon restart
 #    6 delete on Windows               13 Windows reboot (needs the driver, see below)
 #    7 remote modify shows up on Windows
+#   17 (only with -OnDemandObserver) the on-demand external observer: allocated bytes of the folder and of the block store, first-open latency
 #   15 a local edit during a hydration is kept and shared
 #   16 a change made on the other device during a hydration wins
 #   14 (clean-up) the remote delete of the iteration directory reaches Windows
@@ -54,6 +55,11 @@ param(
     [string]$Subject = '',
     [switch]$Fresh,
     [switch]$SkipReboot,
+    # Scenario 17: the on-demand external-observer measurement (allocated bytes before hydration, after it and after an
+    # evict; first-open latency) on this provider folder, run by this Python script. Not part of a default run.
+    [string]$OnDemandObserver = '',
+    # The full corpus (4 KiB x 200, 1 MiB x 200, 1 GiB x 1) instead of the smoke corpus.
+    [switch]$ObserverFullCorpus,
     # Scenario 13 restarts the whole machine. It only runs when this file exists, i.e. when somebody declared the
     # machine to be dedicated to these runs.
     [string]$RebootMarker = (Join-Path $env:ProgramData 'yadorilink-e2e-machine.marker')
@@ -154,7 +160,8 @@ function Initialize-Run {
     Stop-AllComponents
     Start-Sleep 2
     # Take the previous run's sync roots out of the registry of Windows before their folders go.
-    $oldRegistry = Join-Path $script:WorkDir 'localappdata-a\yadorilink\cfapi_sync_roots.txt'
+    # The registry is published as generation files (cfapi_sync_roots.txt.<seq>).
+    $oldRegistry = Join-Path $script:WorkDir 'localappdata-a\yadorilink\cfapi_sync_roots.txt.*'
     if (Test-Path $oldRegistry) { Set-DeviceEnv 'a'; & $script:HostExe --unregister-all 2>&1 | Out-Null }
     foreach ($d in 'localappdata-a', 'localappdata-b', 'profile-a', 'profile-b', 'cfga', 'cfgb', 'folderB', 'stage', 'logs', 'failures', 'hold') { Remove-Item -Recurse -Force (Join-Path $script:WorkDir $d) -ErrorAction SilentlyContinue }
     foreach ($d in 'cfga', 'cfgb', 'folderB') { Assert-That (-not (Test-Path (Join-Path $script:WorkDir $d))) "could not remove the previous run's $d (a process still holds it)" }
@@ -411,7 +418,9 @@ function Invoke-Iteration([int]$Iter) {
         Assert-That ((Get-Sha256 $p) -eq $want) 'evict.bin differs before the eviction'
         $sizeBefore = (Get-Item -LiteralPath $p).Length
         $script:attempts = 0; $script:out = ''
-        $t = Wait-Until { $script:attempts++; $script:out = Invoke-Cli 'a' @('evict', $p); $script:out -match 'Evicted' } 30
+        # The daemon drops the copy only for an item it has heard the host report as materialized after the
+        # handoff (a poll or two after the read), so the first attempts may be answered 'not evicted'.
+        $t = Wait-Until { $script:attempts++; $script:out = Invoke-Cli 'a' @('evict', $p); $script:out -cmatch '^Evicted ' } 60
         $attempts = $script:attempts; $out = $script:out
         Assert-That ($null -ne $t) "evict never succeeded: $out"
         $t2 = Wait-Until { (Get-LocalState $p) -eq 'placeholder' } 30
@@ -424,7 +433,7 @@ function Invoke-Iteration([int]$Iter) {
         $null = Get-Sha256 $p2
         $fs = [IO.File]::Open($p2, 'Append', 'Write', 'ReadWrite,Delete'); $fs.Write([byte[]](1, 2, 3, 4), 0, 4); $fs.Dispose()
         $refusal = Invoke-Cli 'a' @('evict', $p2)
-        Assert-That ($refusal -notmatch 'Evicted') "an unshared local edit was evicted: $refusal"
+        Assert-That ($refusal -cnotmatch '^Evicted ') "an unshared local edit was evicted: $refusal"
         Assert-That ((Get-Item -LiteralPath $p2).Length -eq 3600011) 'the unshared edit is gone from the file'
         $t3 = Wait-Until { (Get-Item -LiteralPath (Join-Path $B 'evict2.bin')).Length -eq 3600011 -and (Get-Sha256 (Join-Path $B 'evict2.bin')) -eq (Get-Sha256 $p2) } $Tmo
         Assert-That ($null -ne $t3) 'the edit refused for eviction never reached B'
@@ -511,6 +520,27 @@ function Invoke-Iteration([int]$Iter) {
         $t = Wait-Until { (Get-Sha256 $p) -eq $newSha } $Tmo
         Assert-That ($null -ne $t) 'A never read the new version after the change made during its hydration'
         "settled on the new version in ${t}s; interrupted read: $($outcome.Substring(0, [math]::Min(50, $outcome.Length)))"
+    }
+
+    if ($OnDemandObserver -ne '') {
+        Invoke-Scenario $Iter 17 'on-demand external observer (allocated bytes)' {
+            $outFile = Join-Path $script:WorkDir ("observer-it{0:D2}.json" -f $Iter)
+            $observerArgs = @($OnDemandObserver, '--cli', $script:Cli, '--a-root', (Join-Path $script:A "observer-$Iter"), '--b-root', (Join-Path $script:B "observer-$Iter"),
+                '--block-store', (Join-Path $script:WorkDir 'cfga\blocks'), '--out', $outFile)
+            if (-not $ObserverFullCorpus) { $observerArgs += '--small' }
+            # A read of an unread placeholder is refused until the peer session is up (see Wait-SyncReady).
+            $null = Wait-SyncReady
+            Set-DeviceEnv 'a'
+            $o = & python @observerArgs 2>&1 | Out-String
+            Assert-That (Test-Path $outFile) "the observer wrote no result: $o"
+            $r = Get-Content -Raw $outFile | ConvertFrom-Json
+            Assert-That ($r.final_state -in 'VALID', 'SMOKE') "the observer measurement was $($r.final_state): $(($r.PSObject.Properties | Where-Object Name -in 'refused', 'not_applicable', 'detail' | ForEach-Object Value) -join ' ')"
+            $d = $r.metrics.deltas
+            Assert-That ($r.metrics.reopen_success) 'a re-open after the eviction did not return the right bytes'
+            Assert-That ($d.hydrate_working_tree_bytes -gt 0) 'hydration allocated no bytes in the folder'
+            Assert-That ($d.working_tree_released_by_evict_bytes -gt 0) 'the evict released no bytes of the folder'
+            "hydrate +$($d.hydrate_working_tree_bytes) B in the folder, evict released $($d.working_tree_released_by_evict_bytes) B of the folder and $($d.block_store_released_by_evict_bytes) B of the block store; result in $outFile"
+        }
     }
 
     if (-not $SkipReboot) { Start-RebootScenario $Iter $tok }

@@ -204,6 +204,11 @@ targets:
         INFOPLIST_FILE: Extension/Info.plist
         PRODUCT_NAME: YadoriLinkFinderSync
         CODE_SIGN_ENTITLEMENTS: Extension/Extension.entitlements
+        # Release builds select the Developer ID provisioning profile by
+        # passing this variable (platforms/macos/package/xcode-signing-args.sh);
+        # it is empty, and so ignored, in development builds. Only the
+        # extensions get one: the host app claims no restricted entitlement.
+        PROVISIONING_PROFILE_SPECIFIER: $(YADORILINK_FINDERSYNC_PROFILE)
         SWIFT_OBJC_BRIDGING_HEADER: Extension/YadoriLinkFinderSync-Bridging-Header.h
         HEADER_SEARCH_PATHS: ../core/include
         LIBRARY_SEARCH_PATHS: ../core/target/aarch64-apple-darwin/release
@@ -265,6 +270,8 @@ targets:
         INFOPLIST_FILE: ../YadoriLinkFileProvider/Extension/Info.plist
         PRODUCT_NAME: YadoriLinkFileProvider
         CODE_SIGN_ENTITLEMENTS: ../YadoriLinkFileProvider/Extension/Extension.entitlements
+        # See the matching comment on YadoriLinkFinderSync.
+        PROVISIONING_PROFILE_SPECIFIER: $(YADORILINK_FILEPROVIDER_PROFILE)
         SWIFT_OBJC_BRIDGING_HEADER: ../YadoriLinkFileProvider/Extension/YadoriLinkFileProvider-Bridging-Header.h
         HEADER_SEARCH_PATHS: ../fileprovider-core/include
         LIBRARY_SEARCH_PATHS: ../fileprovider-core/target/aarch64-apple-darwin/release

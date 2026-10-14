@@ -160,9 +160,12 @@ public final class UpdatesModel {
     public private(set) var isWorking = false
     public var notice: Notice?
     @ObservationIgnored private let now: () -> Date
+    /// Opens a page in the browser; `false` when it could not be opened.
+    @ObservationIgnored private let openURL: (URL) -> Bool
 
-    public init(client: any YadoriLinkClient, now: @escaping () -> Date = Date.init) {
+    public init(client: any YadoriLinkClient, openURL: @escaping (URL) -> Bool = { _ in true }, now: @escaping () -> Date = Date.init) {
         self.client = client
+        self.openURL = openURL
         self.now = now
     }
 
@@ -170,31 +173,54 @@ public final class UpdatesModel {
         do { status = try await client.updateStatus() } catch { notice = .failure(error) }
     }
 
-    public var headline: String {
-        guard let s = status else { return "" }
-        let next = s.availableVersion ?? ""
+    /// An update that can be fetched: YadoriLink only reports it. Every state
+    /// that carries a version is the same to the user, because nothing is
+    /// downloaded or installed on their behalf.
+    public var canDownload: Bool {
+        guard let s = status, s.availableVersion != nil else { return false }
         switch s.state {
-        case .available, .downloaded, .verified:
-            return s.availableVersion.map { "Update \($0) available" } ?? "An update is available"
-        case .upToDate, .idle: return "YadoriLink \(s.currentVersion) is up to date"
-        case .checking: return "Checking for updates…"
-        case .downloading: return "Downloading update \(next)…"
-        case .installing: return "Installing update…"
-        case .failed: return "The last update didn't install"
-        case .heldBack: return "Update \(next) is held back for now"
-        case .killSwitched: return "Updates are paused by the publisher"
-        case .deferred: return "Update \(next) will install later"
-        case .unknown: return "YadoriLink \(s.currentVersion)"
+        case .available, .downloading, .downloaded, .verified, .installing, .deferred: return true
+        default: return false
         }
     }
 
-    /// Small notes shown only under an available update.
+    /// The last look for a newer version failed. This is not an install failure:
+    /// nothing is installed here. The way out is to look again.
+    /// The button that gets the new version: a package-managed install is shown
+    /// its steps, everything else is sent to the download page.
+    public var downloadButtonTitle: String {
+        status?.packageManaged == true ? UpdateWording.showStepsButton : UpdateWording.downloadButton
+    }
+
+    public var lookupFailed: Bool { status?.state == .failed }
+
+    public var headline: String {
+        guard let s = status else { return "" }
+        let next = s.availableVersion ?? ""
+        if canDownload { return UpdateWording.available(next) }
+        switch s.state {
+        case .upToDate, .idle: return UpdateWording.upToDate(s.currentVersion)
+        case .checking: return UpdateWording.checking
+        case .failed: return UpdateWording.lookupFailed
+        case .heldBack: return UpdateWording.heldBack(next)
+        case .killSwitched: return UpdateWording.paused
+        case .available, .downloading, .downloaded, .verified, .installing, .deferred:
+            return UpdateWording.availableUnnamed
+        case .unknown: return UpdateWording.current(s.currentVersion)
+        }
+    }
+
+    /// Small notes under the headline.
     public var notes: [String] {
-        guard let s = status, canInstall else { return [] }
+        guard let s = status else { return [] }
         var notes: [String] = []
-        if s.mandatory { notes.append("This update is required.") }
-        if s.waitingForSafePoint { notes.append("It will install when syncing is idle.") }
-        if let reason = s.holdbackReason, !reason.isEmpty { notes.append(reason) }
+        if canDownload {
+            if s.mandatory { notes.append(UpdateWording.required) }
+            if let reason = s.holdbackReason, !reason.isEmpty { notes.append(reason) }
+        }
+        if lookupFailed {
+            notes.append(s.lastErrorMessage.flatMap { $0.isEmpty ? nil : $0 } ?? UpdateWording.lookupFailedHint)
+        }
         return notes
     }
 
@@ -203,9 +229,9 @@ public final class UpdatesModel {
         return "Last checked \(Format.relative(checked, now: now()))"
     }
 
-    public var canInstall: Bool {
-        guard let s = status, s.availableVersion != nil else { return false }
-        return s.state == .available || s.state == .downloaded || s.state == .verified
+    public var releaseNotesURL: URL? {
+        guard let raw = status?.releaseNotesUrl, let url = URL(string: raw), url.scheme == "https" else { return nil }
+        return url
     }
 
     public var automaticChecks: Bool { status?.config.automaticChecks ?? true }
@@ -214,20 +240,25 @@ public final class UpdatesModel {
         await work { self.status = try await self.client.checkForUpdates() }
     }
 
-    public func install() async {
+    /// Shows where to get the new version. YadoriLink downloads and installs
+    /// nothing, so the result says what was actually done: a page was opened
+    /// (or a command is shown), and the user installs it.
+    public func download() async {
         await work {
-            switch try await self.client.installUpdate() {
-            case .installing: self.notice = Notice(kind: .success, text: "Download the new version from the YadoriLink releases page.")
-            case .deferred: self.notice = Notice(kind: .success, text: "Download the new version from the YadoriLink releases page.")
-            case .storeManaged(let guidance): self.notice = Notice(kind: .success, text: guidance)
-            case .other(let raw): self.notice = Notice(kind: .success, text: "Download the new version from the YadoriLink releases page.", detail: raw)
+            let guidance = try await self.client.downloadGuidance()
+            if let raw = guidance.url, let url = URL(string: raw), url.scheme == "https" {
+                self.notice = self.openURL(url)
+                    ? Notice(kind: .success, text: UpdateWording.openedDownloadPage)
+                    : Notice(kind: .failure, text: UpdateWording.couldNotOpenDownloadPage, detail: raw)
+            } else {
+                self.notice = Notice(kind: .success, text: UpdateWording.updateSteps(guidance.guidance))
             }
         }
     }
 
     public func setAutomaticChecks(_ on: Bool) async {
         await work {
-            let config = try await self.client.setUpdateConfig(automaticChecks: on, installMode: nil)
+            let config = try await self.client.setAutomaticUpdateChecks(on)
             self.status?.config = config
         }
     }

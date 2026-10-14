@@ -143,8 +143,14 @@ impl FullReplicaCustody for DaemonState {
         self.full_replica_custody_confirmation(group_id, path, version_hash, blocks)
     }
 
-    fn confirmation_still_valid(&self, group_id: &str, stamp: &CustodyStamp) -> bool {
-        self.custody_confirmation_still_valid(group_id, stamp)
+    fn confirmation_still_valid(
+        &self,
+        group_id: &str,
+        path: &str,
+        version_hash: &VersionHash,
+        stamp: &CustodyStamp,
+    ) -> bool {
+        self.custody_confirmation_still_valid(group_id, path, version_hash, stamp)
     }
 }
 
@@ -244,6 +250,8 @@ pub struct DaemonState {
     /// path. A later sweep leaves such a link alone instead of stacking a
     /// second whole-folder pass on the first.
     backstop_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Wakes the custody-hold reconciler task (`crate::custody_holds`).
+    pub(crate) custody_hold_wake: Arc<tokio::sync::Notify>,
     /// The daemon's single owner of replica state: every production read
     /// and provider registration goes through this field (there is no
     /// separate `SyncState` handle on `DaemonState`).
@@ -481,11 +489,6 @@ pub struct DaemonState {
     /// (below) is exactly "this counter is zero" — install is deferred
     /// whenever it isn't, per the "Safe Update Windows" decision.
     active_write_ops: AtomicI64,
-    /// Serializes block-reference creation against physical GC deletion.
-    /// Sync writes hold a shared guard from block `put` through index
-    /// commit; GC holds an exclusive guard from its live-set snapshot
-    /// through the final deletion.
-    block_liveness_gate: BlockLivenessGate,
     /// When this `DaemonState`
     /// (i.e. this daemon process) was constructed — feeds the diagnostics
     /// bundle's coarse `daemon.uptime_bucket` field via `uptime` below.
@@ -875,6 +878,7 @@ impl DaemonState {
     ) -> Arc<Self> {
         let (status_push_tx, _) = broadcast::channel(256);
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let local_device_id = device_id.clone();
         let governance_config = GovernanceConfigStore::new(crate::device_config::config_dir());
         // Apply whatever's on disk
         // (or the safe unlimited/no-override default if nothing's ever
@@ -921,6 +925,7 @@ impl DaemonState {
         let state = Arc::new(Self {
             device_id,
             backstop_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            custody_hold_wake: replica_coordinator.custody_hold_wake(),
             replica_coordinator,
             block_store,
             hydrate_single_flight: crate::hydration_single_flight::HydrateSingleFlight::new(),
@@ -948,7 +953,7 @@ impl DaemonState {
             ),
             peers: Arc::new(crate::peer_registry::PeerRegistry::new()),
             peer_connectivity: Arc::new(
-                crate::peer_connectivity_runtime::PeerConnectivityRuntime::new(),
+                crate::peer_connectivity_runtime::PeerConnectivityRuntime::new(local_device_id),
             ),
             send_service: tokio::sync::OnceCell::new(),
             send_grant_peers: Mutex::new(Vec::new()),
@@ -987,7 +992,6 @@ impl DaemonState {
                 current_crate_version(),
             )),
             active_write_ops: AtomicI64::new(0),
-            block_liveness_gate: BlockLivenessGate::default(),
             started_at: std::time::Instant::now(),
             last_activity_unix: AtomicI64::new(now_unix()),
             gc: Arc::new(crate::gc_state::GcState::new()),
@@ -1734,10 +1738,14 @@ impl DaemonState {
         self.durability.install_custody_confirmer(confirmer);
     }
 
-    /// Wires the peer-to-peer custody confirmer. Physical cache reclamation is
-    /// still disabled until confirmations carry crash-durable responder-side
-    /// GC leases; this wiring preserves exact-version diagnostics and the
-    /// generation-stamped implementation that the future lease flow will use.
+    /// Wires the peer-to-peer custody confirmer: a confirmation is the
+    /// responder's durable custody lease, acquired over the peer session.
+    /// Physical cache reclamation is enabled
+    /// ([`yadorilink_replica_engine::custody::REMOTE_CUSTODY_LEASES_SUPPORTED`])
+    /// on platforms that offer durable namespace changes: the requester
+    /// records its eviction intent and releases the lease when it no longer
+    /// needs it, and a responder losing its full-replica role hands its leases
+    /// off or refuses.
     pub fn install_p2p_custody_confirmer(self: &Arc<Self>) {
         self.durability.install_custody_confirmer(Arc::new(
             crate::adapters::runtime::custody::P2pCustodyConfirmer::new(self),
@@ -1771,8 +1779,14 @@ impl DaemonState {
         self.full_replica_custody_confirmation(group_id, path, version_hash, blocks).is_some()
     }
 
-    fn custody_confirmation_still_valid(&self, group_id: &str, stamp: &CustodyStamp) -> bool {
-        self.durability.confirmation_still_valid(group_id, stamp)
+    fn custody_confirmation_still_valid(
+        &self,
+        group_id: &str,
+        path: &str,
+        version_hash: &VersionHash,
+        stamp: &CustodyStamp,
+    ) -> bool {
+        self.durability.confirmation_still_valid(group_id, path, version_hash, stamp)
     }
 
     /// Asks every currently-connected, currently-authorized full-replica peer
@@ -1883,6 +1897,26 @@ impl DaemonState {
         // expected case) is treated the same as "no peer confirmed" — fail
         // closed, matching every other unconfirmed outcome here.
         confirmed_by_any.unwrap_or(None)
+    }
+
+    /// Ends the lease `peer_id` holds for this device on exactly this version.
+    /// `true` once the peer acknowledged; `false` when it is not connected or
+    /// did not answer, in which case the lease stays and the release is
+    /// retried.
+    pub async fn release_custody_lease_via_peer(
+        &self,
+        peer_id: &str,
+        group_id: &str,
+        path: &str,
+        version_hash: VersionHash,
+        attempt_token: [u8; 16],
+    ) -> bool {
+        let Some((_, session)) =
+            self.peers.all_sessions().into_iter().find(|(id, _)| id == peer_id)
+        else {
+            return false;
+        };
+        session.request_custody_release(group_id, path, version_hash, attempt_token).await
     }
 
     /// Whether some OTHER full replica of `group_id` can be confirmed, right
@@ -2885,31 +2919,55 @@ impl DaemonState {
         Some((grant, pinned_digest))
     }
 
-    /// Releases both halves of a provisional lease owned by this target.
-    /// The local pin is released even when coordination configuration is no
-    /// longer available; Worker TTL remains the fallback for a failed POST.
-    pub async fn release_owned_handoff_lease(&self, group_id: &str, lease_id: &str) {
-        if let Err(e) = self
-            .replica_coordinator
-            .handoff_lease_repository()
-            .set_handoff_lease_state(lease_id, HandoffLeaseState::Released)
-        {
-            tracing::debug!(
-                error = %e,
-                group_id,
-                lease_id,
-                "could not release local handoff lease pin"
-            );
+    /// Ends a lease this target granted: coordination plane first, local pin
+    /// second.
+    ///
+    /// The order is the fail-safe one. The local pin is dropped only after the
+    /// plane reports its lease ended (`released` / `gone`); a lease the plane
+    /// leaves alone (held by a running removal) keeps its pin, so retention
+    /// never under-retains while the plane's lease is still authoritative. A
+    /// crash between the two steps over-retains until retry or TTL: safe. No
+    /// rollback of the pin is ever needed.
+    ///
+    /// `true` only when both are ended, which is what lets the caller
+    /// acknowledge the requesting peer (the holder of a removal ticket then
+    /// treats that ticket as unusable). A lease this device has no record of
+    /// is not one it can say is ended, and no configured coordination service
+    /// is not an acknowledgement.
+    pub async fn release_owned_handoff_lease(&self, group_id: &str, lease_id: &str) -> bool {
+        let repository = self.replica_coordinator.handoff_lease_repository();
+        match repository.list_handoff_leases_for_group(group_id) {
+            Ok(leases) if leases.iter().any(|lease| lease.lease_id == lease_id) => {}
+            Ok(_) => {
+                tracing::debug!(group_id, lease_id, "no local record of the handoff lease");
+                return false;
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, group_id, lease_id, "could not read local handoff lease");
+                return false;
+            }
         }
-        if let Some(config) = self.coordination_client_config.get() {
-            crate::coordination_client::release_handoff_lease(
-                &config.addr,
-                &config.auth,
-                group_id,
-                &self.device_id,
-                lease_id,
-            )
-            .await;
+        let Some(config) = self.coordination_client_config.get() else {
+            return false;
+        };
+        if !crate::coordination_client::release_handoff_lease(
+            &config.addr,
+            &config.auth,
+            group_id,
+            &self.device_id,
+            lease_id,
+        )
+        .await
+        {
+            return false;
+        }
+        match repository.set_handoff_lease_state(lease_id, HandoffLeaseState::Released) {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(e) => {
+                tracing::debug!(error = %e, group_id, lease_id, "could not release local handoff lease pin");
+                false
+            }
         }
     }
 
@@ -2940,9 +2998,23 @@ impl DaemonState {
         target_peer_device_id: &str,
         my_digest: [u8; 32],
     ) -> Option<String> {
+        self.obtain_handoff_lease_grant_from_peer(group_id, target_peer_device_id, my_digest)
+            .await
+            .map(|(lease_id, _ttl_seconds)| lease_id)
+    }
+
+    /// [`Self::obtain_handoff_lease_from_peer`] that also returns how long the
+    /// lease lives (seconds, a duration: never compared with a clock).
+    pub async fn obtain_handoff_lease_grant_from_peer(
+        &self,
+        group_id: &str,
+        target_peer_device_id: &str,
+        my_digest: [u8; 32],
+    ) -> Option<(String, i64)> {
         let session = self.peers.session(target_peer_device_id)?;
         let grant = session.request_handoff_lease_from_peer(group_id).await?;
         let lease_id = handoff_lease_grant_matches_digest(&grant, my_digest);
+        let ttl_seconds = grant.ttl_seconds;
         if lease_id.is_none() {
             tracing::info!(
                 group_id,
@@ -2961,7 +3033,7 @@ impl DaemonState {
                 );
             }
         }
-        lease_id
+        lease_id.map(|lease_id| (lease_id, ttl_seconds))
     }
 
     /// The removed-device-ticket RESPONDER half of `HandoffTicketRequest`,
@@ -3015,13 +3087,51 @@ impl DaemonState {
         &self,
         group_id: &str,
     ) -> Option<PeerHandoffTicketGrant> {
+        // A ticket says this device may be removed without losing data. The
+        // custody leases it holds for other devices are data only it has, so
+        // they move first. The group stays closed to new leases while the
+        // ticket is worked out, and for a while after it is granted, since the
+        // removal is committed by another device at a later moment; any
+        // refusal reopens it.
+        let closed = match self.hand_off_custody_leases(group_id).await {
+            Ok(closed) => closed,
+            Err(reason) => {
+                tracing::warn!(group_id, %reason, "refusing a removal ticket: custody leases could not be handed off");
+                return None;
+            }
+        };
         let proof = self.full_replica_handoff_proof(group_id).await?;
         let digest = proof.root_digest();
         let (lease_id, target_device_id) = match proof.into_peer_device_id() {
-            None => (None, None),
+            // Nothing to hand off: the ticket carries no lease, cannot be bound
+            // to a lease-guarded commit, and the responder discards it. It
+            // closes nothing.
+            None => {
+                return Some(PeerHandoffTicketGrant {
+                    lease_id: None,
+                    target_device_id: None,
+                    expires_at_unix: 0,
+                })
+            }
             Some(peer_id) => {
-                let lease_id =
-                    self.obtain_handoff_lease_from_peer(group_id, &peer_id, digest).await?;
+                let (lease_id, ttl_seconds) =
+                    self.obtain_handoff_lease_grant_from_peer(group_id, &peer_id, digest).await?;
+                // The removal is committed inside that lease; the group stays
+                // closed to new custody leases for as long as it can live,
+                // counted from now (the grant has only just arrived).
+                if let Err(reason) = closed.hold_for_ticket(
+                    crate::custody_handoff::ticket_close_for(ttl_seconds),
+                    &lease_id,
+                ) {
+                    // No ticket leaves this device without a close that outlives
+                    // a restart; the lease just obtained from the target is given back.
+                    tracing::warn!(group_id, %reason, "refusing a removal ticket: its close could not be recorded");
+                    if let Some(session) = self.peers.session(&peer_id) {
+                        // Best effort; the lease's own lifetime is the backstop.
+                        let _ = session.release_handoff_lease_to_peer(group_id, &lease_id).await;
+                    }
+                    return None;
+                }
                 (Some(lease_id), Some(peer_id))
             }
         };
@@ -3420,7 +3530,7 @@ impl DaemonState {
     /// of this same crate but need the exact same guard type
     /// `on_local_native_commit`'s own private `begin_broadcast` uses internally.
     pub fn begin_write_activity(&self) -> WriteActivityGuard<'_> {
-        let liveness = self.block_liveness_gate.begin_reference_write();
+        let liveness = self.block_liveness_gate().begin_reference_write();
         self.active_write_ops.fetch_add(1, Ordering::SeqCst);
         // Every existing call site of this
         // guard (the local-change flush executor started via the daemon's own `LinkRuntimeController`,
@@ -3432,11 +3542,43 @@ impl DaemonState {
     }
 
     pub(crate) fn begin_block_deletion(&self) -> BlockPhysicalDeletionGuard<'_> {
-        self.block_liveness_gate.begin_physical_deletion()
+        self.block_liveness_gate().begin_physical_deletion()
+    }
+
+    pub(crate) fn try_begin_block_deletion(&self) -> Option<BlockPhysicalDeletionGuard<'_>> {
+        self.block_liveness_gate().try_begin_physical_deletion()
+    }
+
+    /// Whether every block of a version is in this device's block store with bytes that read back
+    /// and hash to their name. This is the proof that the version is recoverable from the device
+    /// alone, and the only evidence on which a destructive step (dropping the OS copy, releasing a
+    /// remote custody lease) may rely on the local store; index presence (`exists`) is not.
+    ///
+    /// It is the same strong read the custody acquire runs (`BlockStore::get` re-hashes the
+    /// payload), under the same block-reference guard, so no deletion pass can take a block while
+    /// it is read. Any read, decode, hash or length failure answers `false`. The reads run on the
+    /// blocking pool; the cost is one full read of the version's bytes.
+    pub(crate) async fn blocks_verified_locally(&self, blocks: Vec<VersionBlock>) -> bool {
+        let store = self.block_store.clone();
+        let coordinator = self.replica_coordinator.clone();
+        let verified = tokio::task::spawn_blocking(move || {
+            let _no_block_deletion =
+                coordinator.block_liveness_gate().begin_reference_write_barging();
+            let _reads = yadorilink_local_storage::io_diag::attribute_reads(
+                yadorilink_local_storage::io_diag::ReadReason::CustodyEvidence,
+            );
+            blocks.iter().all(|block| {
+                store
+                    .get(&hex::encode(&block.hash.0))
+                    .is_ok_and(|bytes| bytes.len() as u64 == u64::from(block.size))
+            })
+        })
+        .await;
+        verified.unwrap_or(false)
     }
 
     pub(crate) fn block_liveness_gate(&self) -> &BlockLivenessGate {
-        &self.block_liveness_gate
+        self.replica_coordinator.block_liveness_gate()
     }
 
     /// Marks "now" as the most recent
@@ -3760,6 +3902,7 @@ impl HandoffLeaseResponder for DaemonState {
                 lease_id: grant.lease_id,
                 root_digest,
                 expires_at_unix: grant.expires_at_unix,
+                ttl_seconds: grant.ttl_seconds,
             })
         })
     }
@@ -3768,7 +3911,7 @@ impl HandoffLeaseResponder for DaemonState {
         &'a self,
         group_id: &'a str,
         lease_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move { self.release_owned_handoff_lease(group_id, lease_id).await })
     }
 }
@@ -3797,19 +3940,51 @@ impl HandoffTicketResponder for DaemonState {
         lease_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            let session = self.peers.session(target_device_id);
-            if let Some(session) = session {
-                if let Err(e) = session.release_handoff_lease_to_peer(group_id, lease_id).await {
-                    tracing::debug!(
-                        error = %e,
-                        group_id,
-                        target_device_id,
-                        lease_id,
-                        "could not forward removed-device ticket release; TTL remains the backstop"
-                    );
+            self.end_ticket_close_when_released(group_id, lease_id, || async move {
+                match self.peers.session(target_device_id) {
+                    Some(session) => {
+                        match session.release_handoff_lease_to_peer(group_id, lease_id).await {
+                            Ok(()) => true,
+                            Err(error) => {
+                                tracing::debug!(%error, group_id, target_device_id, lease_id, "removed-device ticket release was not acknowledged");
+                                false
+                            }
+                        }
+                    }
+                    None => false,
                 }
-            }
+            })
+            .await;
         })
+    }
+}
+
+impl DaemonState {
+    /// The removal a ticket was for is done or abandoned, which this device
+    /// learns from the device that holds the ticket. Its close on new custody
+    /// leases ends only once the lease target has acknowledged the release (the
+    /// ticket can then no longer be used). Until then the close stays, durably,
+    /// and the release can be repeated; the close also ends on its own when
+    /// the ticket's lifetime has run out. Scoped to (group, lease): another
+    /// ticket's close is untouched.
+    pub(crate) async fn end_ticket_close_when_released<F, Fut>(
+        &self,
+        group_id: &str,
+        lease_id: &str,
+        release_at_target: F,
+    ) where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        if release_at_target().await {
+            self.replica_coordinator.custody_closing().release_ticket(group_id, lease_id);
+        } else {
+            tracing::warn!(
+                group_id,
+                lease_id,
+                "the ticket's handoff lease release was not acknowledged; keeping the group closed"
+            );
+        }
     }
 }
 

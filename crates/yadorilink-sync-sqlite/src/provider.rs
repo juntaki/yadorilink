@@ -949,6 +949,31 @@ impl ProviderRepository {
         })
     }
 
+    /// Whether the version last handed over for the item has exactly the content of its current
+    /// version (the metadata may differ). False when nothing was handed over or either version is
+    /// unreadable.
+    pub fn handoff_has_current_content(
+        &self,
+        root_id: &str,
+        item_id: &ItemId,
+    ) -> Result<bool, SyncSqliteError> {
+        self.read_settled(|conn| {
+            let row: Option<(Vec<u8>, String, String)> = conn
+                .query_row(
+                    "SELECT h.version_hash, i.group_id, i.path FROM provider_handoffs h \
+                     JOIN provider_items i ON i.root_id = h.root_id AND i.item_id = h.item_id \
+                     WHERE h.root_id = ?1 AND h.item_id = ?2 AND i.live = 1",
+                    rusqlite::params![root_id, &item_id[..]],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((handed, group_id, path)) = row else { return Ok(false) };
+            let handed = crate::dag_store::get_file_version(conn, &group_id, &hash_from(&handed)?)?;
+            let current = current_version(conn, &group_id, &path)?;
+            Ok(matches!((handed, current), (Some(handed), Some(current)) if same_content(&handed, &current)))
+        })
+    }
+
     /// The latest evidence sequence of the root (replayable state: the host reads it on connect).
     pub fn latest_evidence_seq(&self, root_id: &str) -> Result<Option<u64>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {

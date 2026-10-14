@@ -244,6 +244,8 @@ extension AttentionCategory {
             subject.map { "\($0) has conflicting copies of some files." } ?? "Some files have conflicting copies."
         case .held:
             subject.map { "Some files in \($0) are on hold and haven't synced." } ?? "Some files are on hold and haven't synced."
+        case .strandedDirectory:
+            subject.map { "A folder in \($0) couldn't be removed safely and was left under a temporary name. Nothing was deleted." } ?? "A folder couldn't be removed safely and was left under a temporary name. Nothing was deleted."
         case .lowDiskCritical:
             subject.map { "The disk holding \($0) is almost full. Syncing has stopped." } ?? "Your disk is almost full. Syncing has stopped."
         case .lowDisk:
@@ -253,7 +255,7 @@ extension AttentionCategory {
         case .recentError:
             "Something went wrong recently."
         case .updateFailed:
-            "The last update didn't install."
+            "Couldn't check for updates."
         case .unrecognized:
             "Something needs attention."
         }
@@ -335,6 +337,94 @@ public struct Notice: Sendable, Equatable {
         }
         return Notice(kind: .failure, text: ErrorWording.text(error), detail: error.message)
     }
+}
+
+/// What a list says when its read failed. An empty list is only ever shown
+/// after a read succeeded; these lines stand in for it otherwise.
+public enum LoadWording {
+    public static let sharedFolders = "Couldn't load shared folders."
+    public static let devices = "Couldn't load devices."
+    public static let received = "Couldn't load received files."
+    public static let members = "Couldn't load who has access."
+    public static let folderDetails = "Couldn't load this folder's details."
+    public static let fileHistory = "Couldn't load this file's history."
+    public static let retry = "Retry"
+
+    /// A refresh failed while an earlier list is still shown.
+    public static func stale(_ what: String) -> String {
+        "Couldn't refresh \(what). Showing what loaded earlier, which may be out of date."
+    }
+}
+
+/// "Stop Syncing This Folder…": what stops, what stays, and what the risk is.
+public enum UnlinkWording {
+    public static let menuTitle = "Stop Syncing This Folder…"
+    public static let confirmButton = "Stop Syncing"
+    public static let overrideButton = "Stop syncing anyway and accept the risk"
+
+    public static func title(_ folder: FolderSummary) -> String {
+        "Stop syncing \(folder.name) on this Mac?"
+    }
+
+    public static func message(_ folder: FolderSummary) -> String {
+        var lines: [String]
+        if folder.provider {
+            lines = [
+                "YadoriLink will stop syncing \(folder.name) on this Mac and ask macOS to remove it from Finder.",
+                "macOS decides what stays on this Mac, and files that were never downloaded won't be available here afterwards.",
+            ]
+        } else {
+            lines = [
+                "YadoriLink will stop syncing \(folder.name) on this Mac. The files in the folder stay where they are and are not deleted.",
+            ]
+            if folder.mode == .onDemand {
+                lines.append("Files that were never downloaded to this Mac are not downloaded by this.")
+            }
+        }
+        lines.append("The shared folder and the other devices that sync it are not affected. You can link it again later.")
+        return lines.joined(separator: "\n\n")
+    }
+
+    public static func overrideTitle(_ folder: FolderSummary) -> String {
+        "\(folder.name) may be left without a complete copy"
+    }
+
+    public static func overrideMessage(_ folder: FolderSummary) -> String {
+        "YadoriLink couldn't confirm that another device can keep a complete copy of \(folder.name). If you stop syncing it here anyway, files that exist only on this Mac may never reach another device."
+    }
+
+    public static func success(_ folder: FolderSummary) -> String {
+        folder.provider
+            ? "Stopped syncing \(folder.name) on this Mac. YadoriLink asked macOS to remove it from Finder."
+            : "Stopped syncing \(folder.name) on this Mac. Its files were left in place."
+    }
+}
+
+/// Updates are checked for by YadoriLink and installed by the user: no
+/// wording here may say or imply that YadoriLink installs anything.
+public enum UpdateWording {
+    public static let downloadButton = "Download Update…"
+    public static let showStepsButton = "Show Update Steps…"
+    public static let checkButton = "Check Now"
+    public static let checkAgainButton = "Check Again"
+    public static let releaseNotesButton = "Release Notes…"
+    public static let automaticChecks = "Check for updates automatically"
+    public static let checksOnlyNote = "YadoriLink only checks for updates. You download and install them yourself."
+    public static let checking = "Checking for updates…"
+    public static let lookupFailed = "Couldn't check for updates."
+    public static let lookupFailedHint = "Check your connection and try again."
+    public static let paused = "Updates are paused by the publisher"
+    public static let required = "This update is required."
+    public static let availableUnnamed = "An update is available"
+    public static let couldNotOpenDownloadPage = "Couldn't open the download page. Open it in your browser to get the new version."
+    public static let openedDownloadPage = "Opened the download page. Download the new version and install it yourself; YadoriLink doesn't install updates."
+
+    public static func available(_ version: String) -> String { "Update \(version) available" }
+    public static func upToDate(_ version: String) -> String { "YadoriLink \(version) is up to date" }
+    public static func current(_ version: String) -> String { "YadoriLink \(version)" }
+    public static func heldBack(_ version: String) -> String { "Update \(version) isn't offered to this Mac yet" }
+    /// `steps` is the daemon's instruction for an install a package manager owns.
+    public static func updateSteps(_ steps: String) -> String { steps }
 }
 
 /// Labels for settings that appear in more than one place.

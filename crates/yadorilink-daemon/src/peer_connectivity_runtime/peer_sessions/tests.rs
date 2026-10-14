@@ -251,7 +251,7 @@ async fn a_quiet_authorized_peer_stays_connected_and_available_while_its_keeper_
     }
 }
 
-/// Issue 79: custody confirmation runs when the peer session opens, not at
+/// Custody confirmation runs when the peer session opens, not at
 /// the next 90 s sweep (no sweep task exists in this fixture), and fetch
 /// availability follows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -284,7 +284,7 @@ async fn a_burst_of_session_events_coalesces_to_one_refresh_per_group() {
     assert_eq!(alice.request_custody_refresh(&groups), 1);
 }
 
-// Issue 79 integration: a real, content-bearing group and a real peer that
+// Integration: a real, content-bearing group and a real peer that
 // answers the custody question. The 90 s sweep task does not exist in this
 // fixture and no clock is advanced, so anything that becomes available did so
 // because the session opening ran the refresh.

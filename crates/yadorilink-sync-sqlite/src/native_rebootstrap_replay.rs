@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 use rusqlite::Connection;
 
 use yadorilink_replica_domain::author::AuthorId;
+use yadorilink_replica_domain::file::{FileVersion, RecordKind};
 use yadorilink_replica_domain::ids::{AuthorSeq, FolderGroupId, SyncPath, VersionHash};
 use yadorilink_replica_domain::native_state::{DeltaHash, Dot, NativeState};
 use yadorilink_replica_domain::recursive_operation::RecursiveOperationId;
@@ -76,6 +77,10 @@ pub(crate) fn init_tables(conn: &Connection) -> Result<(), SyncSqliteError> {
             group_id    TEXT NOT NULL,
             recovery_id TEXT NOT NULL,
             unit        INTEGER NOT NULL,
+            -- Whether an original of the unit left the sync root: read from what the
+            -- quarantine did, in the transaction that records the unit, because the
+            -- quarantine rows end with the rebootstrap and this row does not.
+            originals_quarantined INTEGER NOT NULL,
             PRIMARY KEY (group_id, recovery_id, unit)
         ) WITHOUT ROWID;
         "#,
@@ -146,6 +151,8 @@ pub enum MachinePoint {
     InUnit { unit: usize, ordinal: usize },
     /// The unit is committed.
     AfterUnit(usize),
+    /// A retried unit's preserved bytes are in the block store; nothing is authored yet.
+    AfterImport(usize),
     /// A retried unit is authored and its record deleted; the transaction is not committed.
     BeforeResolve(usize),
 }
@@ -312,12 +319,20 @@ pub fn unreplayed_units(
     conn: &Connection,
     group: &FolderGroupId,
 ) -> Result<Vec<(String, usize)>, SyncSqliteError> {
+    Ok(held_unit_rows(conn, group)?.into_iter().map(|(id, unit, _)| (id, unit)).collect())
+}
+
+/// `(recovery id, unit, originals quarantined)` of every held unit.
+fn held_unit_rows(
+    conn: &Connection,
+    group: &FolderGroupId,
+) -> Result<Vec<(String, usize, bool)>, SyncSqliteError> {
     let mut stmt = conn.prepare(
-        "SELECT recovery_id, unit FROM native_unreplayed_unit WHERE group_id = ?1 \
-         ORDER BY recovery_id, unit",
+        "SELECT recovery_id, unit, originals_quarantined FROM native_unreplayed_unit \
+         WHERE group_id = ?1 ORDER BY recovery_id, unit",
     )?;
     let rows = stmt.query_map([group.as_str()], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize, row.get::<_, i64>(2)? != 0))
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
@@ -329,8 +344,8 @@ pub struct HeldOwnUnit {
     pub unit: usize,
     /// The paths the unit's operations touch.
     pub paths: Vec<String>,
-    /// The planning judged the unit not replayable, so the originals it names were moved out of
-    /// the folder into the recovery area (a unit that only failed later left them in place).
+    /// An original of the unit was moved out of the folder into the recovery area, as the
+    /// quarantine recorded it (a unit that only failed later left them in place).
     pub originals_quarantined: bool,
 }
 
@@ -343,7 +358,7 @@ pub fn held_own_units(
     group: &FolderGroupId,
 ) -> Result<Vec<HeldOwnUnit>, SyncSqliteError> {
     let mut out = Vec::new();
-    for (recovery_id, unit) in unreplayed_units(conn, group)? {
+    for (recovery_id, unit, originals_quarantined) in held_unit_rows(conn, group)? {
         let area = RecoveryArea::open_existing(recovery_root, group, &recovery_id)
             .map_err(|e| SyncSqliteError::CorruptState(e.to_string()))?;
         let manifest = Manifest::from_bytes(
@@ -360,12 +375,7 @@ pub fn held_own_units(
             .collect();
         paths.sort();
         paths.dedup();
-        out.push(HeldOwnUnit {
-            recovery_id,
-            unit,
-            paths,
-            originals_quarantined: manifest.units.get(unit).is_some_and(|u| !u.reassertable),
-        });
+        out.push(HeldOwnUnit { recovery_id, unit, paths, originals_quarantined });
     }
     Ok(out)
 }
@@ -503,6 +513,8 @@ pub enum RetryError {
     /// The installed state refuses the unit; it stays held.
     Refused,
     Blocked(BlockedReason),
+    /// The unit's preserved bytes could not be imported; the unit stays held.
+    Import(String),
     Crashed,
     Store(SyncSqliteError),
 }
@@ -525,12 +537,21 @@ impl From<rusqlite::Error> for RetryError {
 /// incarnation). The unit's record is deleted in that transaction, so a crash leaves it held
 /// with nothing authored, or authored and resolved, never both authored and held. The
 /// recovery area stays: only the user's own action deletes preserved data.
+///
+/// The bytes of the unit's put versions live in the recovery area, not in the block store (the
+/// install dropped the references the old heads held), so before anything is authored each of
+/// them is read back from the area, checked against the manifest and handed to `import`, which
+/// stores its blocks and records their provenance in this transaction. The caller holds the
+/// block store's write-activity guard across the whole call, so no sweep can delete what was
+/// imported before the authored heads reference it. An import that fails ends the retry with
+/// nothing authored; blocks already stored are unreferenced and the next retry stores them again.
 pub fn retry_replay_unit(
     conn: &Connection,
     ctx: &ReplayContext<'_>,
     group: &FolderGroupId,
     recovery_id: &str,
     unit: usize,
+    import: &mut UnitImport<'_>,
     hook: &mut dyn FnMut(MachinePoint) -> Result<(), Crash>,
 ) -> Result<ReplayReport, RetryError> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
@@ -564,6 +585,8 @@ pub fn retry_replay_unit(
     {
         return Err(RetryError::NotAWriter);
     }
+    import_unit_versions(&area, &manifest, &members, import)?;
+    hook(MachinePoint::AfterImport(unit)).map_err(|_| RetryError::Crashed)?;
     let outcome =
         match author_unit(&tx, ctx, group, recovery_id, unit, &members, Admission::Local, hook) {
             Ok(Some(outcome)) => outcome,
@@ -587,6 +610,51 @@ pub fn retry_replay_unit(
         moot: outcome.moot,
         unreplayed_units: Vec::new(),
     })
+}
+
+/// Stores one preserved file version's bytes: its record and the whole content, already checked
+/// against the manifest. Returns why it could not.
+pub type UnitImport<'a> = dyn FnMut(&FileVersion, &[u8]) -> Result<(), String> + 'a;
+
+/// Reads every file version the unit puts back from the recovery area, checks it against the
+/// manifest, and imports it. A version the manifest does not list, or lists without bytes, is
+/// an inconsistent area: the unit is not authored over content that cannot be obtained.
+fn import_unit_versions(
+    area: &RecoveryArea,
+    manifest: &Manifest,
+    members: &[&ReplayStep],
+    import: &mut UnitImport<'_>,
+) -> Result<(), RetryError> {
+    let inconsistent =
+        |detail: String| RetryError::Blocked(BlockedReason::ManifestInconsistent { detail });
+    let blocked = |e| RetryError::Blocked(crate::native_rebootstrap::area_failure(e));
+    let mut seen = BTreeSet::new();
+    for version in members.iter().flat_map(|s| &s.intents).filter_map(|i| i.put) {
+        if !seen.insert(version) {
+            continue;
+        }
+        let entry = manifest
+            .versions
+            .iter()
+            .find(|v| v.version == version)
+            .ok_or_else(|| inconsistent("a put version is not in the manifest".into()))?;
+        let record = area.read_record(&version).map_err(blocked)?;
+        if entry.record_kind != record.meta.record_kind.as_db_str() {
+            return Err(inconsistent("a version record does not match the manifest".into()));
+        }
+        if record.meta.record_kind != RecordKind::File {
+            continue;
+        }
+        if !entry.has_bytes {
+            return Err(inconsistent("a file version of the unit has no preserved bytes".into()));
+        }
+        let bytes = area.read_version(&version).map_err(blocked)?;
+        if sha256(&bytes) != entry.sha256 || bytes.len() as u64 != entry.size {
+            return Err(inconsistent("a preserved version does not match the manifest".into()));
+        }
+        import(&record, &bytes).map_err(RetryError::Import)?;
+    }
+    Ok(())
 }
 
 fn decided_ordinals(
@@ -615,10 +683,22 @@ fn record_unreplayed(
             (group.as_str(), step.ordinal as i64),
         )?;
     }
+    let mut quarantined = false;
+    for step in members {
+        for intent in &step.intents {
+            quarantined |= tx.query_row(
+                "SELECT COUNT(*) FROM native_rebootstrap_quarantine \
+                 WHERE group_id = ?1 AND recovery_id = ?2 AND path = ?3 \
+                   AND status IN ('removed', 'removed_late_edit', 'retained')",
+                (group.as_str(), recovery_id, intent.path.as_str()),
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+        }
+    }
     tx.execute(
-        "INSERT OR IGNORE INTO native_unreplayed_unit (group_id, recovery_id, unit) \
-         VALUES (?1, ?2, ?3)",
-        (group.as_str(), recovery_id, unit as i64),
+        "INSERT OR IGNORE INTO native_unreplayed_unit \
+         (group_id, recovery_id, unit, originals_quarantined) VALUES (?1, ?2, ?3, ?4)",
+        (group.as_str(), recovery_id, unit as i64, quarantined),
     )?;
     tx.commit()?;
     Ok(())

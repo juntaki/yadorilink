@@ -115,6 +115,12 @@ pub struct GcReport {
 /// Implementations MUST NOT resolve any path outside their configured
 /// storage root, regardless of what `list_by_prefix` prefixes are supplied.
 pub trait BlockStore: Send + Sync {
+    /// The directory whose volume holds this store's bytes, `None` when unknown. Deleting local
+    /// bytes is allowed only where that volume is known to be durable.
+    fn storage_root(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     /// Stores `data`, returning its content hash. Storing a block whose
     /// hash already exists is a no-op that still returns the same hash
     /// (identical content is stored once).

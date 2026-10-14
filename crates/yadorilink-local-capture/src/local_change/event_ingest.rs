@@ -313,6 +313,14 @@ impl LocalChangeProcessor {
         // own lstat-first convention elsewhere (see
         // `build_record_for_created_or_modified`'s identical check just
         // below, and `is_real_directory` in `watcher.rs`).
+        // The disk as it stood BEFORE this event's own observation of the
+        // path (and, below, before its content is read). A batched mutation
+        // is revalidated against exactly this at commit, so a change landing
+        // anywhere between the observation and the commit is seen. Taken
+        // once the mutation was fully built it would describe the changed
+        // file as "what was prepared against", and the stale mutation would
+        // revalidate against itself.
+        let fingerprint_before_observation = disk_race_fingerprint(&event.path);
         let effective_kind = match event.path.symlink_metadata() {
             // Nothing answers to this name at all: a genuine removal.
             Err(error) if error_means_absent(&error) => FsChangeKind::ObservedRemoval,
@@ -495,7 +503,7 @@ impl LocalChangeProcessor {
                                 rel_path: rel_path.clone(),
                                 event_path: event.path.clone(),
                                 observed_at_unix_nanos: observed,
-                                disk_fingerprint_at_prepare: disk_race_fingerprint(&event.path),
+                                disk_fingerprint_at_prepare: fingerprint_before_observation,
                                 mutation:
                                     yadorilink_replica_domain::session_state::PreparedLocalMutation::Delete {
                                         record,
@@ -629,6 +637,8 @@ impl LocalChangeProcessor {
                         // exactly as before.
                         None,
                     )?;
+                #[cfg(any(test, feature = "test-support"))]
+                super::record_builder::fire_post_capture_race_hook(&event.path);
                 if outcome == LocalChangeOutcome::RetryLater {
                     // Nothing was captured, but the path holds a local edit:
                     // keep it journaled dirty, on every route. The debounced
@@ -720,7 +730,7 @@ impl LocalChangeProcessor {
                                         event_path: event.path.clone(),
                                         observed_at_unix_nanos: observed_at_unix_nanos
                                             .unwrap_or_else(now_unix_nanos),
-                                        disk_fingerprint_at_prepare: disk_race_fingerprint(&event.path),
+                                        disk_fingerprint_at_prepare: fingerprint_before_content_read,
                                         mutation:
                                             yadorilink_replica_domain::session_state::PreparedLocalMutation::Upsert {
                                                 record: record.clone(),

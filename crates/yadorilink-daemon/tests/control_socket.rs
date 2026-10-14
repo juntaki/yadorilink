@@ -1168,6 +1168,10 @@ mod unix_socket_tests {
     /// file turns it into a correctly-sized placeholder, over the control
     /// socket end to end.
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "removing an evicted file needs the Linux write lease"
+    )]
     async fn evict_via_control_socket_succeeds_for_an_indexed_hydrated_file() {
         let (socket_path, dir, state) = start_daemon_with_state().await;
         // This test is about the eviction gate's own success path, not the
@@ -1314,6 +1318,10 @@ mod unix_socket_tests {
     /// Evicting a folder over the control socket frees every hydrated file
     /// below it, and only those.
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "removing an evicted file needs the Linux write lease"
+    )]
     async fn evict_via_control_socket_frees_every_hydrated_file_below_a_folder() {
         use yadorilink_replica_domain::session_state::MaterializationState;
         let (socket_path, dir, state) = start_daemon_with_state().await;

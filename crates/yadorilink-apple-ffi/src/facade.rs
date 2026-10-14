@@ -269,17 +269,16 @@ impl ClientCore {
         let core = self.inner.clone();
         bridge(async move { core.check_for_updates().await }).await
     }
-    pub async fn install_update(&self) -> Result<UpdateInstallOutcome, DesktopError> {
+    pub async fn download_guidance(&self) -> Result<UpdateDownloadGuidance, DesktopError> {
         let core = self.inner.clone();
-        bridge(async move { core.install_update().await }).await
+        bridge(async move { core.download_guidance().await }).await
     }
-    pub async fn set_update_config(
+    pub async fn set_automatic_update_checks(
         &self,
-        automatic_checks: Option<bool>,
-        install_mode: Option<UpdateInstallMode>,
+        enabled: bool,
     ) -> Result<UpdateConfig, DesktopError> {
         let core = self.inner.clone();
-        bridge(async move { core.set_update_config(automatic_checks, install_mode).await }).await
+        bridge(async move { core.set_automatic_update_checks(enabled).await }).await
     }
 
     // ---- account ----

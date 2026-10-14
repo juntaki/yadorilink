@@ -18,7 +18,7 @@ use crate::error::DatabaseError;
 /// Bump this whenever the created shape changes at all, since the previous
 /// shape becomes unopenable by this binary and unopenable is the intended
 /// outcome.
-pub const SCHEMA_VERSION: i32 = 117;
+pub const SCHEMA_VERSION: i32 = 125;
 
 /// Reads `PRAGMA user_version` and refuses anything that is not exactly
 /// this binary's [`SCHEMA_VERSION`], in either direction: a newer stamp is
@@ -453,6 +453,18 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
             group_id TEXT NOT NULL,
             tmp_path TEXT NOT NULL,
             PRIMARY KEY (group_id, tmp_path)
+        );
+        -- The directories a durable removal moved aside and could not put back
+        -- (a child appeared meanwhile and something else took the name): the
+        -- directory and its child stand under the reserved name at
+        -- `dir_path` (absolute, as the link root spelled it) and nothing was
+        -- deleted. Written when that happens, so the user can be told; status
+        -- counts the rows whose path still stands. A row is kept when its path
+        -- is gone (an unmounted volume looks the same).
+        CREATE TABLE IF NOT EXISTS stranded_directories (
+            group_id TEXT NOT NULL,
+            dir_path TEXT NOT NULL,
+            PRIMARY KEY (group_id, dir_path)
         );
         -- The content targets of earlier writes of a path that a newer
         -- write's intent replaced before they were proven. Such a write may

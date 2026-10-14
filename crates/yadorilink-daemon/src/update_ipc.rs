@@ -47,8 +47,15 @@ pub(crate) fn encode_check_response(
 
 /// v1 ships manual updates: the daemon never installs, it points the user
 /// at the official download page.
-pub(crate) fn encode_download_response(guidance: String) -> UpdateInstallResponse {
-    UpdateInstallResponse { outcome: "manual_download".into(), guidance }
+pub(crate) fn encode_download_response(
+    guidance: String,
+    download_url: Option<String>,
+) -> UpdateInstallResponse {
+    UpdateInstallResponse {
+        outcome: "manual_download".into(),
+        guidance,
+        download_url: download_url.unwrap_or_default(),
+    }
 }
 
 pub(crate) fn decode_config_request(req: UpdateConfigRequest) -> UpdateConfigCommand {

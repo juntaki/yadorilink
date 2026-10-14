@@ -340,7 +340,13 @@ pub trait CustodyConfirmer: Send + Sync {
         blocks: &[VersionBlock],
     ) -> Option<CustodyStamp>;
 
-    fn confirmation_still_valid(&self, group_id: &str, stamp: &CustodyStamp) -> bool;
+    fn confirmation_still_valid(
+        &self,
+        group_id: &str,
+        path: &str,
+        version_hash: &VersionHash,
+        stamp: &CustodyStamp,
+    ) -> bool;
 }
 
 #[cfg(test)]
@@ -357,7 +363,13 @@ impl<F: Fn(&str, &str, &VersionHash, &[VersionBlock]) -> bool + Send + Sync> Cus
         self(group_id, path, version_hash, blocks).then(|| CustodyStamp::new("test-peer".into(), 0))
     }
 
-    fn confirmation_still_valid(&self, _group_id: &str, _stamp: &CustodyStamp) -> bool {
+    fn confirmation_still_valid(
+        &self,
+        _group_id: &str,
+        _path: &str,
+        _version_hash: &VersionHash,
+        _stamp: &CustodyStamp,
+    ) -> bool {
         true
     }
 }
@@ -858,10 +870,18 @@ impl DurabilityService {
             .and_then(|confirmer| confirmer.confirms_present(group_id, path, version_hash, blocks))
     }
 
-    pub fn confirmation_still_valid(&self, group_id: &str, stamp: &CustodyStamp) -> bool {
+    pub fn confirmation_still_valid(
+        &self,
+        group_id: &str,
+        path: &str,
+        version_hash: &VersionHash,
+        stamp: &CustodyStamp,
+    ) -> bool {
         let confirmer =
             self.custody_confirmer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
-        confirmer.is_some_and(|confirmer| confirmer.confirmation_still_valid(group_id, stamp))
+        confirmer.is_some_and(|confirmer| {
+            confirmer.confirmation_still_valid(group_id, path, version_hash, stamp)
+        })
     }
 }
 

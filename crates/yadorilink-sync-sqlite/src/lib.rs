@@ -87,6 +87,8 @@ pub mod provider_enumerate;
 pub mod provider_projector;
 pub mod provider_provenance;
 pub mod provider_write;
+pub mod remote_custody_hold;
+pub mod remote_custody_lease;
 mod replica_schema;
 pub mod replica_tables;
 pub mod restore_operation;
@@ -106,6 +108,8 @@ pub use held_path::HeldPathRepository;
 pub use materialization_intent_repository::{
     MaterializationIntentRepository, MaterializationTempLedger, TempReleaseQueue,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use materialization_state::{fail_placeholder_reads_for_path, fail_state_reads_for_path};
 pub use materialization_state::{
     ContentHash, MaterializationCounts, MaterializationStateRepository,
     RecordedPlaceholderGeneration,
@@ -117,6 +121,8 @@ pub use offline_peer_authorization::{
 };
 pub use paused_items::PausedItemRepository;
 pub use policy_watermark::{PolicyWatermark, PolicyWatermarkRepository};
+pub use remote_custody_hold::RemoteCustodyHoldRepository;
+pub use remote_custody_lease::RemoteCustodyLeaseRepository;
 pub use replica_schema::{init_replica_schema, ReplicaSchemaError};
 pub use restore_operation::RestoreOperationRepository;
 pub use role_loss_operation::RoleLossOperationRepository;

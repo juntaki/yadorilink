@@ -233,6 +233,11 @@ pub mod sync_stack_fixture;
 #[cfg(any(test, feature = "test-support"))]
 pub mod sim_control_plane;
 
+/// The production provider eviction path with a scripted File Provider host, for integration
+/// binaries that pair real daemons.
+#[cfg(any(test, feature = "test-support"))]
+pub mod provider_evict_harness;
+
 /// The `ReplicaCoordinator`-backed peer-session integration fixture, shared
 /// with `yadorilink-peer-session`'s own integration binaries while the tests
 /// whose subject is materialization, hydration and convergence move to this

@@ -795,6 +795,7 @@
 				OTHER_LDFLAGS = "-lyadorilink_fileprovider_core -liconv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.FileProvider;
 				PRODUCT_NAME = YadoriLinkFileProvider;
+				PROVISIONING_PROFILE_SPECIFIER = "$(YADORILINK_FILEPROVIDER_PROFILE)";
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "../YadoriLinkFileProvider/Extension/YadoriLinkFileProvider-Bridging-Header.h";
 			};
@@ -816,6 +817,7 @@
 				OTHER_LDFLAGS = "-lyadorilink_shell_core -liconv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.FinderSync;
 				PRODUCT_NAME = YadoriLinkFinderSync;
+				PROVISIONING_PROFILE_SPECIFIER = "$(YADORILINK_FINDERSYNC_PROFILE)";
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Extension/YadoriLinkFinderSync-Bridging-Header.h";
 			};
@@ -877,6 +879,7 @@
 				OTHER_LDFLAGS = "-lyadorilink_fileprovider_core -liconv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.FileProvider;
 				PRODUCT_NAME = YadoriLinkFileProvider;
+				PROVISIONING_PROFILE_SPECIFIER = "$(YADORILINK_FILEPROVIDER_PROFILE)";
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "../YadoriLinkFileProvider/Extension/YadoriLinkFileProvider-Bridging-Header.h";
 			};
@@ -898,6 +901,7 @@
 				OTHER_LDFLAGS = "-lyadorilink_shell_core -liconv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.FinderSync;
 				PRODUCT_NAME = YadoriLinkFinderSync;
+				PROVISIONING_PROFILE_SPECIFIER = "$(YADORILINK_FINDERSYNC_PROFILE)";
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Extension/YadoriLinkFinderSync-Bridging-Header.h";
 			};

@@ -55,6 +55,7 @@ use crate::segment_store::index::{
     BlockIndex, GroupCommitPlan, NewBlockRow, RelocationPlan, SegmentAppend, SegmentState,
 };
 use crate::segment_store::segment::{segment_path, RecordFrame, SegmentWriter, SEGMENTS_DIR};
+use crate::segment_store::{remove_judged, VolumeVerdict};
 use crate::traits::{ContentHash, LocallyHashedBlock};
 
 /// Proof that one block is durable: it names where the bytes are, and it
@@ -198,9 +199,15 @@ pub(crate) struct DurabilityCoordinator {
     not_full: Condvar,
     writer: Mutex<WriterState>,
     fault: Mutex<Option<Arc<FaultPlan>>>,
+    /// Test hook run after a group's new blocks are durable and before its dedup hits are
+    /// stamped.
+    before_dedup_stamp_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Set when an injected crash fires. Models the process being gone:
     /// nothing else this handle is asked to do may succeed afterwards.
     halted: AtomicBool,
+    /// Whether the volume of the segments directory may have bytes deleted from it; asked at
+    /// every rollback truncation or unlink (see [`Self::roll_back_one`]).
+    volume_durable: Mutex<VolumeVerdict>,
 }
 
 impl DurabilityCoordinator {
@@ -209,8 +216,10 @@ impl DurabilityCoordinator {
         index: Arc<BlockIndex>,
         limits: GroupCommitLimits,
         next_segment_id: u64,
+        volume_durable: VolumeVerdict,
     ) -> Self {
         Self {
+            volume_durable: Mutex::new(volume_durable),
             root,
             index,
             limits,
@@ -219,8 +228,17 @@ impl DurabilityCoordinator {
             not_full: Condvar::new(),
             writer: Mutex::new(WriterState { active: None, next_segment_id }),
             fault: Mutex::new(None),
+            before_dedup_stamp_hook: Mutex::new(None),
             halted: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn set_volume_verdict(&self, verdict: VolumeVerdict) {
+        *self.volume_durable.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = verdict;
+    }
+
+    fn volume_verdict(&self) -> VolumeVerdict {
+        Arc::clone(&*self.volume_durable.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     pub(crate) fn limits(&self) -> GroupCommitLimits {
@@ -229,6 +247,10 @@ impl DurabilityCoordinator {
 
     pub(crate) fn arm_fault(&self, plan: Option<Arc<FaultPlan>>) {
         *self.fault.lock().unwrap_or_else(|p| p.into_inner()) = plan;
+    }
+
+    pub(crate) fn install_before_dedup_stamp_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.before_dedup_stamp_hook.lock().unwrap_or_else(|p| p.into_inner()) = Some(hook);
     }
 
     pub(crate) fn is_halted(&self) -> bool {
@@ -256,6 +278,11 @@ impl DurabilityCoordinator {
             self.halted.store(true, Ordering::Release);
         }
         Some(fault_error(point, plan.is_survivable()))
+    }
+
+    fn take_rollback_index_read_fault(&self) -> bool {
+        let plan = self.fault.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        plan.is_some_and(|plan| plan.take_rollback_index_read_failure())
     }
 
     fn armed_partial_append(&self, buffered: usize) -> Option<usize> {
@@ -487,35 +514,62 @@ impl DurabilityCoordinator {
 
         let mut receipts: HashMap<[u8; RAW_HASH_LEN], DurableReceipt> = HashMap::new();
         let mut to_write: Vec<([u8; RAW_HASH_LEN], &LocallyHashedBlock)> = Vec::new();
+        let mut hits: Vec<([u8; RAW_HASH_LEN], &LocallyHashedBlock)> = Vec::new();
         for ((hash, block), location) in
             unique_hashes.iter().zip(unique_blocks.iter()).zip(existing.iter())
         {
             match location {
-                Some(location) => {
-                    receipts.insert(
-                        *hash,
-                        DurableReceipt {
-                            hash: block.hash().clone(),
-                            segment_id: location.segment_id,
-                            offset: location.payload_offset(),
-                            length: location.length,
-                            deduplicated: true,
-                        },
-                    );
-                }
+                Some(_) => hits.push((*hash, *block)),
                 None => to_write.push((*hash, block)),
             }
         }
-        if to_write.is_empty() {
-            return Ok(receipts);
+
+        if !to_write.is_empty() {
+            if let Some(error) = self.check_fault(CommitPoint::BeforeAppend) {
+                return Err(error);
+            }
+            let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+            self.append_and_record(&mut writer, &to_write, &mut receipts)?;
         }
 
-        if let Some(error) = self.check_fault(CommitPoint::BeforeAppend) {
-            return Err(error);
+        // A block this put found already stored is stamped as added now, after everything
+        // else the group did, in the transaction that reads its location: the grace window
+        // it is promised starts when the receipt is about to be returned, not when the group
+        // began, and a sweep that removes blocks checks the stamp again. A block that is gone
+        // by then is written afresh.
+        if !hits.is_empty() {
+            let hook =
+                self.before_dedup_stamp_hook.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+            let hit_hashes: Vec<[u8; RAW_HASH_LEN]> = hits.iter().map(|(hash, _)| *hash).collect();
+            let stamped = io_diag::time(Op::IndexDedupe, 0, || {
+                self.index.lookup_many_refreshing(&hit_hashes, unix_nanos_now())
+            })?;
+            let mut gone: Vec<([u8; RAW_HASH_LEN], &LocallyHashedBlock)> = Vec::new();
+            for ((hash, block), location) in hits.iter().zip(stamped.iter()) {
+                match location {
+                    Some(location) => {
+                        receipts.insert(
+                            *hash,
+                            DurableReceipt {
+                                hash: block.hash().clone(),
+                                segment_id: location.segment_id,
+                                offset: location.payload_offset(),
+                                length: location.length,
+                                deduplicated: true,
+                            },
+                        );
+                    }
+                    None => gone.push((*hash, *block)),
+                }
+            }
+            if !gone.is_empty() {
+                let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+                self.append_and_record(&mut writer, &gone, &mut receipts)?;
+            }
         }
-
-        let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
-        self.append_and_record(&mut writer, &to_write, &mut receipts)?;
         Ok(receipts)
     }
 
@@ -579,26 +633,50 @@ impl DurabilityCoordinator {
     /// Undoes one segment's share of a failed group, returning the segment
     /// if it is still usable afterwards.
     ///
-    /// The index, not the batch's own `created` flag, decides which case
-    /// this is: a segment with no committed row cannot be referenced by
-    /// anything and is removed; one with a row is cut back to the
-    /// `durable_end` that row records. If even the truncation fails the
-    /// segment is sealed and left to recovery, which has to be able to
-    /// handle an orphan tail regardless.
+    /// Bytes are only ever deleted on proof. The segment file is removed
+    /// only when this very batch created it *and* the index was read
+    /// successfully and holds no row for it. A segment with a committed row
+    /// is cut back to that row's `durable_end`; if the truncation fails it
+    /// is sealed and left to recovery, which has to handle an orphan tail
+    /// regardless. An index read failure, or a pre-existing segment the
+    /// index does not know, is uncertainty about committed state and
+    /// preserves the file: recovery truncates or reports it at the next
+    /// open, never this path by deletion.
     fn roll_back_one(&self, batch: OpenBatch<'_>) -> Option<SegmentWriter> {
+        let created = batch.created;
         let mut segment = batch.writer;
-        let recorded =
-            self.index.segment(segment.segment_id).ok().flatten().map(|row| row.durable_end);
-        match recorded {
-            Some(durable_end) if segment.truncate(durable_end).is_ok() => Some(segment),
-            Some(_) => {
-                let _ = self.index.set_segment_state(segment.segment_id, SegmentState::Sealed);
+        let segment_id = segment.segment_id;
+        let lookup = if self.take_rollback_index_read_fault() {
+            Err(StorageError::Io(std::io::Error::other("injected index read failure in rollback")))
+        } else {
+            self.index.segment(segment_id)
+        };
+        match lookup {
+            Ok(Some(row)) => {
+                // Cutting bytes needs the verdict of the volume this open file is on. Refused
+                // (or failed): seal and leave the tail to recovery, which is gated the same way.
+                let verdict = self.volume_verdict();
+                let judged = segment
+                    .judge_volume(&segment_path(&self.root, segment_id), |dir| verdict(Some(dir)));
+                if judged && segment.truncate(row.durable_end).is_ok() {
+                    Some(segment)
+                } else {
+                    let _ = self.index.set_segment_state(segment_id, SegmentState::Sealed);
+                    None
+                }
+            }
+            Ok(None) if created => {
+                let path = segment_path(&self.root, segment_id);
+                drop(segment);
+                let _ = remove_judged(&self.volume_verdict(), &path);
                 None
             }
-            None => {
-                let path = segment_path(&self.root, segment.segment_id);
+            Ok(None) | Err(_) => {
+                // Preserve the bytes; best-effort seal so no writer
+                // continues into a segment whose committed prefix is
+                // unproven.
                 drop(segment);
-                let _ = crate::fs_ops::remove_path(&path);
+                let _ = self.index.set_segment_state(segment_id, SegmentState::Sealed);
                 None
             }
         }
@@ -764,7 +842,7 @@ impl DurabilityCoordinator {
     /// not per block.
     fn create_segment(&self, segment_id: u64) -> Result<SegmentWriter, StorageError> {
         let path = segment_path(&self.root, segment_id);
-        let Some(ns) = crate::fs_ops::durable_namespace_beside(&path) else {
+        let Some(ns) = crate::fs_ops::durable_namespace_beside(&path)? else {
             let segment = SegmentWriter::create(&self.root, segment_id)?;
             if let Some(error) = self.check_fault(CommitPoint::AfterSegmentStaged) {
                 return Err(error);

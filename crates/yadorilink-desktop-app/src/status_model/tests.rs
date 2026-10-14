@@ -197,3 +197,25 @@ fn tray_state_maps_status_and_icons_differ() {
         }
     }
 }
+
+#[test]
+fn package_manager_update_guidance_is_a_message_not_an_error() {
+    let page = update_download_notice(Ok(UpdateDownload::OpenedPage));
+    assert_eq!((page.text.as_str(), page.is_error), ("Opened the download page", false));
+
+    let guidance = "Update with your package manager: brew upgrade yadorilink";
+    let shown = update_download_notice(Ok(UpdateDownload::Guidance(guidance.into())));
+    assert_eq!((shown.text.as_str(), shown.is_error), (guidance, false));
+    assert_eq!(shown.details, None);
+
+    let failed = update_download_notice(Err("io error: no browser".into()));
+    assert!(failed.is_error);
+    assert_eq!(failed.text, "Could not open the download page");
+}
+
+#[test]
+fn the_update_action_is_named_for_what_it_does() {
+    assert_eq!(update_download_label("0.4.3", "standalone"), "Download Update (0.4.3)");
+    assert_eq!(update_download_label("0.4.3", "homebrew"), "Show Update Steps (0.4.3)");
+    assert_eq!(update_download_label("0.4.3", "winget"), "Show Update Steps (0.4.3)");
+}

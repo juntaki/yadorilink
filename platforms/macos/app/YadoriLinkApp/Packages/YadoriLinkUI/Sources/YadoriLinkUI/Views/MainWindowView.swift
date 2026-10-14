@@ -48,6 +48,26 @@ public struct MainWindowView: View {
         .sheet(isPresented: $context.showsSignIn) {
             SignInView(model: context.makeSignInModel())
         }
+        .alert(
+            context.unlink.pendingConfirmation.map(UnlinkWording.title) ?? "",
+            isPresented: Binding(get: { context.unlink.pendingConfirmation != nil }, set: { if !$0 { context.unlink.pendingConfirmation = nil } }),
+            presenting: context.unlink.pendingConfirmation
+        ) { _ in
+            Button("Cancel", role: .cancel) { context.unlink.cancel() }
+            Button(UnlinkWording.confirmButton, role: .destructive) { Task { await context.unlink.confirm() } }
+        } message: { folder in
+            Text(UnlinkWording.message(folder))
+        }
+        .alert(
+            context.unlink.pendingOverride.map(UnlinkWording.overrideTitle) ?? "",
+            isPresented: Binding(get: { context.unlink.pendingOverride != nil }, set: { if !$0 { context.unlink.pendingOverride = nil } }),
+            presenting: context.unlink.pendingOverride
+        ) { _ in
+            Button("Cancel", role: .cancel) { context.unlink.cancel() }
+            Button(UnlinkWording.overrideButton, role: .destructive) { Task { await context.unlink.confirmOverride() } }
+        } message: { folder in
+            Text(UnlinkWording.overrideMessage(folder))
+        }
     }
 
     @ViewBuilder private var detail: some View {
@@ -121,11 +141,14 @@ struct HomeContent: View {
                         VStack(alignment: .leading, spacing: 8) {
                             SectionHeader("Devices")
                             if let error = model.devicesError {
-                                EmptyStateText(error)
+                                RetryRow(LoadWording.devices, notice: error) { await model.loadDevices() }
                             } else if model.devices == .loading {
                                 LoadingRow()
                             } else if model.showsNoDevicesMessage {
                                 EmptyStateText("No other devices yet.")
+                            }
+                            if let stale = model.devicesStale {
+                                RetryRow(LoadWording.stale("devices"), notice: stale) { await model.loadDevices() }
                             }
                             ForEach(model.deviceRows) { row in
                                 HStack(spacing: 8) {
@@ -206,6 +229,9 @@ struct FolderOptionsMenu: View {
                 Divider()
                 Button("Show in Finder") { context.revealInFinder(folder.localPath) }
             }
+            Divider()
+            Button(UnlinkWording.menuTitle, role: .destructive) { context.unlink.request(folder) }
+                .disabled(context.unlink.isWorking)
         } label: {
             Image(systemName: "ellipsis.circle")
         }

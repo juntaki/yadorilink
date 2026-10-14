@@ -81,6 +81,44 @@ pub(crate) fn tick_root(state: &DaemonState, root: &ProviderRoot, batch: usize) 
     tick
 }
 
+/// What one pass over the declared roots found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Pass {
+    /// The roots could not be listed. Nothing was projected and nothing is known about the roots:
+    /// the caller retries at the poll interval; this is never a pass over zero roots.
+    RootsUnreadable,
+    /// `roots` declared roots were ticked; wait `delay` before the next pass.
+    Done { roots: usize, delay: Duration },
+}
+
+/// One pass over every declared root. `kick` is told which roots got work or became ready.
+pub(crate) async fn pass(
+    state: &Arc<DaemonState>,
+    batch: usize,
+    kick: impl Fn(&str),
+) -> Result<Pass, tokio::task::JoinError> {
+    let roots = match state.replica_coordinator.provider_repository().list_declared_roots() {
+        Ok(roots) => roots,
+        Err(error) => {
+            tracing::warn!(%error, "the provider projector could not list the provider roots");
+            return Ok(Pass::RootsUnreadable);
+        }
+    };
+    let mut delay = POLL;
+    let count = roots.len();
+    for root in roots {
+        let (worker_state, worker_root) = (state.clone(), root.clone());
+        let tick =
+            tokio::task::spawn_blocking(move || tick_root(&worker_state, &worker_root, batch))
+                .await?;
+        if tick.projected > 0 || tick.became_ready {
+            kick(&root.root_id);
+        }
+        delay = delay.min(next_delay(&tick));
+    }
+    Ok(Pass::Done { roots: count, delay })
+}
+
 /// Runs for the life of the daemon.
 pub(crate) async fn run(
     state: Arc<DaemonState>,
@@ -88,18 +126,10 @@ pub(crate) async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let batch = batch_from(std::env::var("YADORILINK_PROVIDER_PROJECTOR_BATCH").ok().as_deref());
     loop {
-        let mut delay = POLL;
-        let roots = state.replica_coordinator.provider_repository().list_declared_roots();
-        for root in roots.unwrap_or_default() {
-            let (worker_state, worker_root) = (state.clone(), root.clone());
-            let tick =
-                tokio::task::spawn_blocking(move || tick_root(&worker_state, &worker_root, batch))
-                    .await?;
-            if tick.projected > 0 || tick.became_ready {
-                publication.kick(&root.root_id);
-            }
-            delay = delay.min(next_delay(&tick));
-        }
+        let delay = match pass(&state, batch, |root| publication.kick(root)).await? {
+            Pass::Done { delay, .. } => delay,
+            Pass::RootsUnreadable => POLL,
+        };
         tokio::time::sleep(delay).await;
     }
 }

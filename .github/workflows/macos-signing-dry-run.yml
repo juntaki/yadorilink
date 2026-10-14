@@ -1,0 +1,120 @@
+name: macOS signing dry run
+
+# Runs the macOS signing pipeline end to end -- build, Developer ID signing,
+# pkg signing, notarization, stapling and verify-pkg.sh --release -- on a clean
+# runner, and publishes nothing: no release, tag, nightly, update manifest or
+# storage upload exists in this workflow, and it has read-only repository
+# access. It calls the same scripts as the macos-signed-artifacts job of
+# release.yml (build-pkg.sh and the helpers under .github/release), so a green
+# run here is a green run of that job's signing half.
+#
+# Manual only, and only from main or a release tag: the signing credentials
+# are released by the protected release-signing Environment, never to a pull
+# request or a fork.
+on:
+  workflow_dispatch:
+    inputs:
+      profile_source:
+        description: >-
+          How the extension provisioning profiles are obtained: "api" creates or
+          reuses them through the App Store Connect API; "xcode-experiment" lets
+          xcodebuild create them with -allowProvisioningUpdates.
+        required: true
+        type: choice
+        default: api
+        options: [api, xcode-experiment]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-signing-dry-run
+  cancel-in-progress: false
+
+jobs:
+  dry-run:
+    if: github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: macos-latest
+    timeout-minutes: 90
+    environment: release-signing
+    env:
+      YADORILINK_DEFAULT_COORDINATION_ADDR: https://control.yadori.link
+      YADORILINK_SOURCE_REF: ${{ github.sha }}
+      PROFILE_SOURCE: ${{ inputs.profile_source }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master @ 2026-06-30
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # A dry run never writes the shared cache.
+          save-if: false
+          key: macos-release-signed
+
+      - name: Require complete macOS signing configuration
+        env:
+          APP_CERT_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_APP_P12_BASE64 }}
+          APP_CERT_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_APP_P12_PASSWORD }}
+          INSTALLER_CERT_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          INSTALLER_CERT_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_INSTALLER_P12_PASSWORD }}
+          NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MANIFEST_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        run: |
+          set -euo pipefail
+          for name in APP_CERT_BASE64 APP_CERT_PASSWORD INSTALLER_CERT_BASE64 \
+            INSTALLER_CERT_PASSWORD NOTARY_KEY_BASE64 NOTARY_KEY_ID NOTARY_ISSUER_ID \
+            MANIFEST_KEY_ID MANIFEST_PUBLIC_KEY_HEX; do
+            [ -n "${!name:-}" ] || { echo "Missing release-signing Environment secret or variable: $name" >&2; exit 1; }
+          done
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Set up ephemeral signing keychain
+        env:
+          APP_CERT_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_APP_P12_BASE64 }}
+          APP_CERT_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_APP_P12_PASSWORD }}
+          INSTALLER_CERT_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          INSTALLER_CERT_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_INSTALLER_P12_PASSWORD }}
+          NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
+        run: bash .github/release/macos-signing.sh setup
+
+      - name: Obtain the Developer ID provisioning profiles
+        env:
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: bash .github/release/macos-signing.sh profiles
+
+      - name: Build, sign, notarize and staple the .pkg
+        env:
+          YADORILINK_RELEASE_BUILD: "1"
+          YADORILINK_XCODE_PROFILE_EXPERIMENT: ${{ inputs.profile_source == 'xcode-experiment' && '1' || '0' }}
+          YADORILINK_RELEASE_MANIFEST_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+          YADORILINK_APP_SIGN_IDENTITY: ${{ env.APP_SIGN_IDENTITY }}
+          YADORILINK_PKG_SIGN_IDENTITY: ${{ env.PKG_SIGN_IDENTITY }}
+          YADORILINK_NOTARY_KEY: ${{ env.NOTARY_KEY_PATH }}
+          YADORILINK_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          YADORILINK_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: ./platforms/macos/package/build-pkg.sh
+
+      - name: Verify the signed .pkg
+        env:
+          YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        run: bash .github/release/macos-verify-signed-pkg.sh
+
+      - name: Tear down signing material
+        if: always()
+        run: bash .github/release/macos-signing.sh teardown

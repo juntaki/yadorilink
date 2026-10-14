@@ -69,6 +69,79 @@ impl Drop for PreRemovalHookGuardForTest {
     }
 }
 
+/// Tests only: the verdict of every volume, in place of the durable-namespace probe. Per thread.
+#[cfg(any(test, feature = "test-support"))]
+type VolumeVerdictOverride = Box<dyn Fn(Option<&Path>) -> bool>;
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static VOLUME_VERDICT_OVERRIDE: std::cell::RefCell<Option<VolumeVerdictOverride>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Replaces the volume verdict eviction takes before it removes any bytes, until the returned
+/// guard is dropped.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_volume_verdict_for_test(
+    verdict: impl Fn(Option<&Path>) -> bool + 'static,
+) -> VolumeVerdictGuardForTest {
+    VOLUME_VERDICT_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(Box::new(verdict)));
+    VolumeVerdictGuardForTest(())
+}
+
+/// Clears the verdict installed by [`set_volume_verdict_for_test`] on drop.
+#[cfg(any(test, feature = "test-support"))]
+pub struct VolumeVerdictGuardForTest(());
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for VolumeVerdictGuardForTest {
+    fn drop(&mut self) {
+        VOLUME_VERDICT_OVERRIDE.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+/// Whether the bytes on `dir`'s volume may be deleted: the production durable-namespace verdict
+/// (on Windows the global gate and the volume's probe), unless a test replaced it.
+fn volume_durable(dir: Option<&Path>) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(verdict) =
+        VOLUME_VERDICT_OVERRIDE.with(|slot| slot.borrow().as_ref().map(|verdict| verdict(dir)))
+    {
+        return verdict;
+    }
+    yadorilink_fs_platform::durable_dir::volume_offers_durable_namespace(dir)
+}
+
+/// A point at which eviction asks for custody, so a test can observe what is
+/// held and what has been checked by then. Per thread, like [`PreRemovalHook`].
+#[cfg(any(test, feature = "test-support"))]
+type CustodyProbe = Box<dyn FnMut()>;
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static CUSTODY_PROBE: std::cell::RefCell<Option<CustodyProbe>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `probe` each time eviction is about to ask for custody, until the
+/// returned guard is dropped.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_custody_probe_for_test(probe: impl FnMut() + 'static) -> CustodyProbeGuardForTest {
+    CUSTODY_PROBE.with(|slot| *slot.borrow_mut() = Some(Box::new(probe)));
+    CustodyProbeGuardForTest(())
+}
+
+/// Clears the probe installed by [`set_custody_probe_for_test`] on drop.
+#[cfg(any(test, feature = "test-support"))]
+pub struct CustodyProbeGuardForTest(());
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for CustodyProbeGuardForTest {
+    fn drop(&mut self) {
+        CUSTODY_PROBE.with(|slot| slot.borrow_mut().take());
+    }
+}
+
 /// Where eviction detaches an object before removing it, beside the object
 /// so the rename stays on one volume. A reserved artefact name: invisible to
 /// the watcher, the scan and capture.
@@ -194,6 +267,95 @@ pub(crate) fn trace_step(_step: &'static str) {
     RESTORE_TRACE.with(|t| t.borrow_mut().push(_step));
 }
 
+/// Opens the detached object for verification, claiming the operating system's exclusion of
+/// writers where it can prove it (see `yadorilink_fs_platform::write_exclusion`).
+#[cfg(not(windows))]
+fn open_excluding_writers_for_eviction(
+    q: &Path,
+) -> std::io::Result<yadorilink_fs_platform::write_exclusion::WriteExclusion> {
+    #[cfg(any(test, feature = "test-support"))]
+    if ASSUME_EXCLUSION.with(std::cell::Cell::get) {
+        return Ok(yadorilink_fs_platform::write_exclusion::WriteExclusion::assumed(
+            std::fs::File::open(q)?,
+        ));
+    }
+    yadorilink_fs_platform::write_exclusion::open_excluding_writers(q)
+}
+
+/// The held object's bytes match the approved blocks, read through the handle itself.
+#[cfg(not(windows))]
+fn verify_through_handle(
+    file: &std::fs::File,
+    blocks: &[yadorilink_replica_domain::file::BlockInfo],
+) -> bool {
+    use std::io::Seek;
+    let Ok(mut handle) = file.try_clone() else { return false };
+    handle.rewind().is_ok()
+        && matches!(
+            yadorilink_local_storage::file_content_comparison(&mut handle, blocks),
+            Ok(yadorilink_local_storage::DiskContentComparison::Matched)
+        )
+}
+
+// Test-only: stands in for a platform that grants the exclusion, so the unlink path runs on a
+// host (macOS) that never grants it.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static ASSUME_EXCLUSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PRE_UNLINK_HOOK: std::cell::RefCell<Option<PreRemovalHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Makes eviction on this thread behave as if the platform granted the write exclusion, until
+/// the returned guard is dropped.
+#[cfg(any(test, feature = "test-support"))]
+pub fn assume_write_exclusion_for_test() -> AssumedExclusionGuardForTest {
+    ASSUME_EXCLUSION.with(|c| c.set(true));
+    AssumedExclusionGuardForTest(())
+}
+
+/// Ends the assumption made by [`assume_write_exclusion_for_test`] on drop.
+#[cfg(any(test, feature = "test-support"))]
+pub struct AssumedExclusionGuardForTest(());
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for AssumedExclusionGuardForTest {
+    fn drop(&mut self) {
+        ASSUME_EXCLUSION.with(|c| c.set(false));
+    }
+}
+
+/// Runs `hook` with the detached object's path between its verification and its unlink, until
+/// the returned guard is dropped.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_pre_unlink_hook_for_test(
+    hook: impl FnMut(&Path) + 'static,
+) -> PreUnlinkHookGuardForTest {
+    PRE_UNLINK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    PreUnlinkHookGuardForTest(())
+}
+
+/// Clears the hook installed by [`set_pre_unlink_hook_for_test`] on drop.
+#[cfg(any(test, feature = "test-support"))]
+pub struct PreUnlinkHookGuardForTest(());
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for PreUnlinkHookGuardForTest {
+    fn drop(&mut self) {
+        PRE_UNLINK_HOOK.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+#[cfg(not(windows))]
+fn fire_pre_unlink_hook(_q: &Path) {
+    #[cfg(any(test, feature = "test-support"))]
+    PRE_UNLINK_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(_q);
+        }
+    });
+}
+
 fn fire_pre_removal_hook(_out_path: &Path) {
     #[cfg(any(test, feature = "test-support"))]
     PRE_REMOVAL_HOOK.with(|slot| {
@@ -298,23 +460,68 @@ fn evict_to_remote(
         // The detach is durable before anything is decided about the object:
         // a crash from here leaves it under one of the two names.
         if let Err(error) = directory_barrier(out_path) {
-            restore_detached(state, root, group_id, path, &q, out_path)?;
+            if let Err(restore_error) = restore_detached(state, root, group_id, path, &q, out_path)
+            {
+                return Ok(Removal::Unconfirmed(restore_error));
+            }
             return Err(error);
         }
-        let approved_object = approved.matches(&q)
-            && disk_bytes_match_indexed_blocks(&q, approved.blocks).unwrap_or(false);
+        // The object is unlinked only while the operating system guarantees that no program can
+        // write to it. A program that opened the file before the rename above still writes the
+        // same object through its handle, and no check by name or by content fences it: it can
+        // write after any check and after the unlink, and the unlink would make those bytes
+        // unreachable. Without the guarantee (another program holds the file open, or the
+        // platform has no such primitive) the object is not unlinked: it goes back to its path,
+        // where the handle's writes stay reachable and the row stays `Present`.
+        let held = match open_excluding_writers_for_eviction(&q) {
+            Ok(held) => held,
+            Err(error) => {
+                if let Err(restore_error) =
+                    restore_detached(state, root, group_id, path, &q, out_path)
+                {
+                    return Ok(Removal::Unconfirmed(restore_error));
+                }
+                return Err(error.into());
+            }
+        };
+        let approved_object = approved.matches_handle(&held.file)
+            && verify_through_handle(&held.file, approved.blocks);
         if !approved_object {
-            restore_detached(state, root, group_id, path, &q, out_path)?;
+            if let Err(restore_error) = restore_detached(state, root, group_id, path, &q, out_path)
+            {
+                return Ok(Removal::Unconfirmed(restore_error));
+            }
             return Ok(Removal::Diverged);
         }
         trace_step("verified");
+        fire_pre_unlink_hook(&q);
+        if !held.still_excludes_writers().unwrap_or(false) {
+            if let Err(restore_error) = restore_detached(state, root, group_id, path, &q, out_path)
+            {
+                return Ok(Removal::Unconfirmed(restore_error));
+            }
+            return Ok(Removal::WriterMayExist);
+        }
+        // The name still leads to the verified object: the unlink is by name.
+        if !approved.matches(&q) {
+            if let Err(restore_error) = restore_detached(state, root, group_id, path, &q, out_path)
+            {
+                return Ok(Removal::Unconfirmed(restore_error));
+            }
+            return Ok(Removal::Diverged);
+        }
         match std::fs::remove_file(&q) {
             Ok(()) => {}
             Err(error) => {
-                restore_detached(state, root, group_id, path, &q, out_path)?;
+                if let Err(restore_error) =
+                    restore_detached(state, root, group_id, path, &q, out_path)
+                {
+                    return Ok(Removal::Unconfirmed(restore_error));
+                }
                 return Err(error.into());
             }
         }
+        drop(held);
         trace_step("unlinked");
         // Nothing settles `Remote` and no block is reclaimed until the unlink
         // is durable: a crash could otherwise bring the object back under its
@@ -333,7 +540,9 @@ fn evict_to_remote(
 enum Removal {
     /// This eviction removed the object it had approved.
     Removed(yadorilink_local_storage::PlaceholderIdentityToRecord),
-    /// The object was unlinked but the unlink could not be made durable.
+    /// The object was unlinked but the unlink could not be made durable, or it was detached and
+    /// could not be put back. Either way the row stays `Evicting` so startup recovery decides
+    /// from where the object is.
     Unconfirmed(MaterializationExecutionError),
     /// The object was already gone: a competing removal, not this eviction's.
     Competing,
@@ -341,6 +550,10 @@ enum Removal {
     /// landed in between); it has been put back, or kept as a recoverable
     /// copy, untouched.
     Diverged,
+    /// The operating system could not guarantee that no program holds the object open for
+    /// writing, so it was not unlinked: it has been put back, or kept as a recoverable copy,
+    /// untouched. Its content may differ from the approved one by now.
+    WriterMayExist,
 }
 
 /// The object eviction approved by its last check: which file it was and
@@ -374,6 +587,13 @@ impl<'a> ApprovedObject<'a> {
     #[cfg(unix)]
     fn matches(&self, detached: &Path) -> bool {
         self.inode.is_some() && Self::inode_of(detached) == self.inode
+    }
+
+    #[cfg(unix)]
+    fn matches_handle(&self, file: &std::fs::File) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let by_handle = file.metadata().ok().filter(|m| m.is_file()).map(|m| (m.dev(), m.ino()));
+        self.inode.is_some() && by_handle == self.inode
     }
 }
 
@@ -418,6 +638,55 @@ pub struct MaterializationContext<'a> {
     pub permit: &'a RootCommitPermit<'a>,
 }
 
+/// Exact-version custody for the reclaim decision. Only this crate's own unit
+/// tests use the custody bypass; downstream crates always get the real
+/// fails-closed verifier.
+fn verify_custody<'a>(
+    custody: &'a dyn FullReplicaCustody,
+    store: &dyn BlockReclamationStore,
+    root: &Path,
+    group_id: &str,
+    path: &str,
+    version: &yadorilink_replica_domain::file::FileVersion,
+) -> Option<yadorilink_replica_engine::custody::VerifiedCustody<'a>> {
+    #[cfg(any(test, feature = "test-support"))]
+    CUSTODY_PROBE.with(|slot| {
+        if let Some(probe) = slot.borrow_mut().as_mut() {
+            probe();
+        }
+    });
+    #[cfg(test)]
+    {
+        let _ = (root, store);
+        yadorilink_replica_engine::custody::verify_reclaim_custody_for_test(
+            custody,
+            group_id,
+            path,
+            &version.version_hash,
+            &version.blocks,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        // Same Windows gate as the provider reclaim, and per volume: no byte deletion unless the
+        // volume holding the deleted blocks (the block store's) and the linked folder's volume
+        // both offer durable namespace changes (the global gate is part of the verdict).
+        if !yadorilink_fs_platform::durable_dir::all_volumes_durable(
+            volume_durable,
+            &[store.storage_root(), Some(root)],
+        ) {
+            return None;
+        }
+        yadorilink_replica_engine::custody::verify_reclaim_custody(
+            custody,
+            group_id,
+            path,
+            &version.version_hash,
+            &version.blocks,
+        )
+    }
+}
+
 /// Evicts one hydrated file back to a placeholder and, on an on-demand
 /// device, reclaims its now-cached blocks from the block store to free real
 /// disk space — the sync state (version, block list) is untouched.
@@ -436,9 +705,13 @@ pub struct MaterializationContext<'a> {
 /// locally hydrated file are freed; a block still shared with such
 /// a file is kept so its bytes stay materializable on disk.
 ///
-/// Physical reclamation is currently fail-closed in production: until the
-/// responder persists an exact-version custody lease as a GC live root, a
-/// manual eviction writes the placeholder but retains every local block. A
+/// Custody is confirmed under the path lock (see the comment at the call), so
+/// the requester's hold on the leased version cannot be released from under an
+/// eviction that relies on it.
+///
+/// Physical reclamation is currently fail-closed in production: until a
+/// responder that loses its full-replica role hands its leases off, a manual
+/// eviction writes the placeholder but retains every local block. A
 /// VersionPresent acknowledgement alone is instantaneous and cannot authorize
 /// deleting the requester's last recoverable copy.
 ///
@@ -497,33 +770,6 @@ pub fn evict_file(
     )?;
     let initial_disk_identity = disk_identity(&out_path)?;
     let approved_object = ApprovedObject::observe(&out_path, &record.blocks);
-    // Only this crate's own unit tests use the custody bypass; downstream
-    // crates always get the real fails-closed verifier.
-    let verified_custody = (!is_full_replica)
-        .then(|| {
-            #[cfg(test)]
-            {
-                yadorilink_replica_engine::custody::verify_reclaim_custody_for_test(
-                    custody,
-                    group_id,
-                    path,
-                    &evicting_version.version_hash,
-                    &evicting_version.blocks,
-                )
-            }
-            #[cfg(not(test))]
-            {
-                yadorilink_replica_engine::custody::verify_reclaim_custody(
-                    custody,
-                    group_id,
-                    path,
-                    &evicting_version.version_hash,
-                    &evicting_version.blocks,
-                )
-            }
-        })
-        .flatten();
-
     let path_lock = state.path_lock(group_id, path);
     let _path_guard = path_lock
         .try_lock()
@@ -546,6 +792,22 @@ pub fn evict_file(
         // Bail out before writing the placeholder: the file is left fully
         // materialized, so `dehydrated` stays `false` (the default): nothing
         // was freed.
+        return Ok(EvictionOutcome { blocks_retained: true, ..Default::default() });
+    }
+
+    // Custody is confirmed HERE, under the path lock and after the
+    // revalidation above, never before the lock: the confirmation commits a
+    // hold on the version about to be reclaimed, and the one reconciler that
+    // releases holds takes this same lock, so it can never release a lease an
+    // in-flight eviction is about to rely on. The lock is held across one
+    // bounded round trip. A full replica never reclaims, so it never asks.
+    let verified_custody = (!is_full_replica)
+        .then(|| verify_custody(custody, store, root, group_id, path, &evicting_version))
+        .flatten();
+
+    // The working-tree bytes are removed (Windows: dehydrated) below whatever the custody says,
+    // so the sync root's own volume must be known durable too; otherwise nothing is touched.
+    if !volume_durable(Some(root)) {
         return Ok(EvictionOutcome { blocks_retained: true, ..Default::default() });
     }
 
@@ -598,7 +860,7 @@ pub fn evict_file(
         Ok(Removal::Removed(outcome)) => outcome,
         // The row stays `Evicting` (not rolled back, not settled).
         Ok(Removal::Unconfirmed(error)) => return Err(error),
-        Ok(not_removed @ (Removal::Competing | Removal::Diverged)) => {
+        Ok(not_removed @ (Removal::Competing | Removal::Diverged | Removal::WriterMayExist)) => {
             // (`Unconfirmed` returned above.)
             // Nothing of this eviction's was removed. The row goes back to
             // `Present` (no proof: the fence was bumped), and what happened
@@ -606,6 +868,7 @@ pub fn evict_file(
             // stays delete evidence, a save stays an edit.
             let kind = match not_removed {
                 Removal::Competing => "removed",
+                // A held object may have been written through its handle: capture re-reads it.
                 _ => "created_or_modified",
             };
             abandon_failed_eviction(
@@ -736,6 +999,13 @@ pub fn evict_file(
     // Upgrade from the shared reference-write phase to an exclusive physical
     // deletion phase. The coordinator revalidates the exact version and all
     // cross-group references only after exclusivity is established.
+    //
+    // The path lock is released first: a reference writer (a local-change flush, a hydration) can
+    // hold its write while it waits for that lock, and waiting for the writers with the lock held
+    // would deadlock the two. Nothing is lost by letting go: the coordinator revalidates, under
+    // the exclusive guard, that the path is still `Remote` at this exact version and that the
+    // custody is still valid, and refuses (keeping every block) otherwise.
+    drop(_path_guard);
     drop(reference_write);
     let physical_deletion = liveness_gate.begin_physical_deletion();
     let report =

@@ -383,9 +383,10 @@ impl ReplicaCoordinator {
         group_id: &str,
         path: &str,
         planned: Option<&yadorilink_replica_domain::ids::VersionHash>,
+        folds_onto_path: &dyn Fn(&str) -> bool,
     ) -> Result<yadorilink_sync_sqlite::displacement_guard::DisplacementGuard, SyncSqliteError>
     {
-        self.file_index_repository().displacement_guard(group_id, path, planned)
+        self.file_index_repository().displacement_guard(group_id, path, planned, folds_onto_path)
     }
 
     /// One directory level of native's materialization plan: the exact live

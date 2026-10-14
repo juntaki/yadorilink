@@ -367,6 +367,17 @@ impl yadorilink_local_storage::TempFileLedger for GroupTempLedger<'_> {
     fn release(&self, tmp_path: &std::path::Path) {
         self.port.release_temp_file(self.group_id, tmp_path);
     }
+
+    fn strand(
+        &self,
+        dir_path: &std::path::Path,
+    ) -> Result<(), yadorilink_local_storage::StorageError> {
+        self.port.record_stranded_directory(self.group_id, dir_path).map_err(|error| {
+            yadorilink_local_storage::StorageError::Io(std::io::Error::other(format!(
+                "stranded directory ledger: {error}"
+            )))
+        })
+    }
 }
 
 pub trait MaterializationExecutionPort: Send + Sync {
@@ -380,6 +391,15 @@ pub trait MaterializationExecutionPort: Send + Sync {
 
     /// Forgets a recorded temp file once it is renamed away or removed.
     fn release_temp_file(&self, group_id: &str, tmp_path: &Path);
+
+    /// Records a directory a durable removal moved aside and could not put
+    /// back, so status can report it (see
+    /// `yadorilink_local_storage::TempFileLedger::strand`).
+    fn record_stranded_directory(
+        &self,
+        group_id: &str,
+        dir_path: &Path,
+    ) -> Result<(), MaterializationExecutionError>;
 
     fn get_file(
         &self,

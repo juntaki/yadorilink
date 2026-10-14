@@ -130,3 +130,14 @@ $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $outputPath
 $sidecar = "$outputPath.sha256"
 "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $outputPath)" | Set-Content -LiteralPath $sidecar -NoNewline
 Write-Output "Wrote $sidecar"
+
+# Record which commit and which bytes this installer is, so a later
+# verification run can bind its results to exactly this build.
+$commit = (git -C $PSScriptRoot rev-parse HEAD).Trim()
+$prov = "$outputPath.provenance.json"
+[ordered]@{
+    schema = "yadorilink-release-provenance/1"
+    artifact_sha256 = $hash.Hash.ToLowerInvariant()
+    product_sha = $commit
+} | ConvertTo-Json | Set-Content -LiteralPath $prov
+Write-Output "Wrote $prov"

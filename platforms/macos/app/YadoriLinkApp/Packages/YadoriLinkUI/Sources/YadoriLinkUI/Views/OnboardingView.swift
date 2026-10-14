@@ -136,13 +136,22 @@ public struct OnboardingView: View {
                 }
             }
             Section("Sync with") {
-                Picker("Sync with", selection: $model.destinationId) {
-                    ForEach(model.destinations) { Text($0.title).tag($0.id) }
-                }
-                .pickerStyle(.radioGroup)
-                .labelsHidden()
-                if model.destinationId == "new" {
-                    TextField("Shared folder name", text: $model.newFolderName)
+                if let error = model.destinationsError {
+                    // No "New shared folder" here: the existing shared folders could not be checked.
+                    RetryRow(LoadWording.sharedFolders, notice: error) { await model.retryDestinations() }
+                } else if model.destinationsPhase == .loading {
+                    LoadingRow()
+                } else if model.destinationsPhase == .notLoaded {
+                    EmptyStateText("Sign in to choose where to sync.")
+                } else {
+                    Picker("Sync with", selection: $model.destinationId) {
+                        ForEach(model.destinations) { Text($0.title).tag($0.id) }
+                    }
+                    .pickerStyle(.radioGroup)
+                    .labelsHidden()
+                    if model.destinationId == "new" {
+                        TextField("Shared folder name", text: $model.newFolderName)
+                    }
                 }
             }
             Section("Files on this Mac") {

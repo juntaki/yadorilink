@@ -7,13 +7,8 @@
 //! ("Unsafe eviction/local-copy removal is backend-gated"). The PER-FILE
 //! block-reclaim custody path (`P2pCustodyConfirmer::confirms_present`,
 //! `materialization_eviction::evict_file`'s physical-deletion half) is
-//! feature-gated off in every build today
-//! (`REMOTE_CUSTODY_LEASES_SUPPORTED = false` -- its own doc comment says
-//! outright "this method is not actually reachable in any build today"),
-//! so testing it end-to-end here would exercise dead code; it is already
-//! covered at the unit level by `gc.rs`'s own
-//! `eviction_without_remote_lease_never_reaches_physical_reclaim`, and is
-//! out of scope for this pass until that feature actually ships.
+//! covered end to end by `custody_evict_e2e.rs` and at the unit level by
+//! `gc.rs`'s own `eviction_without_custody_confirmation_never_reaches_physical_reclaim`.
 //!
 //! **Why compose two fakes, not one**: `FakeCoordination` (the netmap
 //! WebSocket subscription) and the coordination service's plain HTTP API are

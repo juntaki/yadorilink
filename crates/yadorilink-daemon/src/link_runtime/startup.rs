@@ -126,6 +126,11 @@ impl GroupStartupReadyGuard {
             .replica_coordinator
             .startup_readiness()
             .mark_group_ready(&self.group_id, self.generation);
+        yadorilink_fs_platform::join_timeline::mark(
+            &self.deps.device_id,
+            &self.group_id,
+            yadorilink_fs_platform::join_timeline::Milestone::LinkReady,
+        );
         self.resolved = true;
     }
 

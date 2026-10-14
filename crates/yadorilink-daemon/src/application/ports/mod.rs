@@ -38,7 +38,7 @@ pub(crate) use link_lifecycle::{
 };
 #[allow(unused_imports)]
 pub(crate) use materialization::{
-    EvictOutcome, LocalPresence, LocalTransition, MaterializationPort,
+    ByteRange, EvictOutcome, LocalPresence, LocalTransition, MaterializationPort,
     MaterializationStatusSummary, TempAssembly, TempMaterialization, TempOutcome,
 };
 #[allow(unused_imports)]
@@ -49,8 +49,8 @@ pub(crate) use membership::{
 pub(crate) use preserved::PreservedPort;
 #[allow(unused_imports)]
 pub(crate) use replica_role::{
-    HandoffReadinessPort, LinkRuntimePort, OnDemandCapabilityPort, ReplicaRoleRepository,
-    RoleLossCoordination, RoleLossJournal,
+    CustodyLeaseHandoffPort, HandoffReadinessPort, LinkRuntimePort, OnDemandCapabilityPort,
+    ReplicaRoleRepository, RoleLossCoordination, RoleLossJournal,
 };
 #[allow(unused_imports)]
 pub(crate) use reporting::{

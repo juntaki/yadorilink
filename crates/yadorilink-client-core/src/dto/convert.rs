@@ -84,14 +84,6 @@ fn update_state(raw: &str) -> UpdateState {
     }
 }
 
-fn install_mode(raw: &str) -> UpdateInstallMode {
-    match raw {
-        "automatic" => UpdateInstallMode::Automatic,
-        "manual" => UpdateInstallMode::Manual,
-        other => UpdateInstallMode::Other { raw: other.to_owned() },
-    }
-}
-
 fn reachability(peer: Option<&PeerStatus>) -> PeerReachability {
     match peer.map(PeerStatus::reachability) {
         Some(wire::PeerReachability::Connecting) => PeerReachability::Connecting,
@@ -234,6 +226,7 @@ pub fn attention_reason(raw: &str, links: &[LinkStatus]) -> AttentionReason {
         "fetch_availability_unknown" => (AttentionCategory::FetchAvailabilityUnknown, true),
         "conflict" => (AttentionCategory::Conflict, true),
         "held" => (AttentionCategory::Held, true),
+        "stranded_directory" => (AttentionCategory::StrandedDirectory, true),
         "low_disk_critical" => (AttentionCategory::LowDiskCritical, false),
         "low_disk" => (AttentionCategory::LowDisk, false),
         "peer_disconnected" => (AttentionCategory::PeerDisconnected, false),
@@ -698,29 +691,24 @@ pub fn update_status(status: &UpdateStatusResponse) -> UpdateStatus {
         waiting_for_safe_point: status.waiting_for_safe_point,
         last_error_category: text(&status.last_error_category),
         last_error_message: text(&status.last_error_message),
-        config: UpdateConfig {
-            automatic_checks: status.automatic_checks_enabled,
-            install_mode: install_mode(&status.automatic_install_mode),
-        },
+        package_managed: crate::ops::updates::is_package_managed(&status.install_source),
+        config: UpdateConfig { automatic_checks: status.automatic_checks_enabled },
     }
 }
 
 pub fn update_config(config: &UpdateConfigResponse) -> UpdateConfig {
-    UpdateConfig {
-        automatic_checks: config.automatic_checks_enabled,
-        install_mode: install_mode(&config.automatic_install_mode),
-    }
+    UpdateConfig { automatic_checks: config.automatic_checks_enabled }
 }
 
-pub fn update_install_outcome(outcome: &UpdateInstallResponse) -> UpdateInstallOutcome {
-    match outcome.outcome.as_str() {
-        "installing" => UpdateInstallOutcome::Installing,
-        "deferred" => UpdateInstallOutcome::Deferred,
-        "manual_download" | "store_managed" => {
-            UpdateInstallOutcome::StoreManaged { guidance: outcome.guidance.clone() }
-        }
-        other => UpdateInstallOutcome::Other { raw: other.to_owned() },
-    }
+/// The checked download reply (see [`crate::ops::updates::check_download_reply`]).
+///
+/// # Errors
+/// The reason the reply is refused.
+pub fn update_download_guidance(
+    response: &UpdateInstallResponse,
+) -> Result<UpdateDownloadGuidance, String> {
+    let (guidance, url) = crate::ops::updates::check_download_reply(response)?;
+    Ok(UpdateDownloadGuidance { guidance, url })
 }
 
 pub fn account_deletion_status(status: &DeletionStatus) -> AccountDeletionStatus {

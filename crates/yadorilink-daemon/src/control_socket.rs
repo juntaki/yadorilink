@@ -517,11 +517,14 @@ async fn handle_request(
             }
         }
 
-        Some(ReqPayload::ListProviderPending(r)) => RespPayload::ListProviderPending(
-            yadorilink_ipc_proto::daemonctl::ListProviderPendingResponse {
-                items: context.provider_status.pending_items(r.limit),
-            },
-        ),
+        Some(ReqPayload::ListProviderPending(r)) => {
+            match context.provider_status.pending_items(r.limit) {
+                Ok(items) => RespPayload::ListProviderPending(
+                    yadorilink_ipc_proto::daemonctl::ListProviderPendingResponse { items },
+                ),
+                Err(error) => RespPayload::Error(error),
+            }
+        }
 
         Some(ReqPayload::Status(_)) => match context.queries.runtime_status.snapshot() {
             Ok(view) => {
@@ -593,19 +596,24 @@ async fn handle_request(
                         dehydrated: outcome.dehydrated,
                         blocks_reclaimed: outcome.blocks_reclaimed,
                         bytes_reclaimed: outcome.bytes_reclaimed,
+                        ..Default::default()
                     }),
                     Err(e) => RespPayload::Error(e.to_string()),
                 }
             }
             None => match context.queries.linked_path.resolve_provider(&r.absolute_path) {
-                // A file in a provider folder: the host drops the OS copy once a full replica
-                // is confirmed to hold the version.
+                // A file in a provider folder: the host drops the OS copy, and the daemon frees
+                // its cached blocks when a full replica holds a durable lease on the version.
                 Some((group_id, path)) => {
                     match context.provider_evict.evict(&group_id, &path).await {
                         Ok(outcome) => RespPayload::Evict(EvictResponse {
                             dehydrated: outcome.dehydrated,
-                            blocks_reclaimed: outcome.blocks_reclaimed,
-                            bytes_reclaimed: outcome.bytes_reclaimed,
+                            blocks_reclaimed: outcome.reclaimed.blocks,
+                            bytes_reclaimed: outcome.reclaimed.bytes,
+                            retained_reason: outcome
+                                .retained
+                                .map(|why| why.code().to_owned())
+                                .unwrap_or_default(),
                         }),
                         Err(e) => RespPayload::Error(e.to_string()),
                     }
@@ -742,6 +750,7 @@ async fn handle_request(
         Some(ReqPayload::UpdateInstall(_)) => {
             RespPayload::UpdateInstall(crate::update_ipc::encode_download_response(
                 context.application.update.download_guidance(),
+                context.application.update.download_page_url(),
             ))
         }
         Some(ReqPayload::UpdateConfig(r)) => {
@@ -1429,6 +1438,7 @@ fn preserved_item_to_proto(
         kind: match item.kind {
             PreservedKind::RemoteOnly => "remote_only",
             PreservedKind::BeyondClosureCutoff => "beyond_closure_cutoff",
+            PreservedKind::LateEdit => "late_edit",
             PreservedKind::OwnUnit => "own_unit",
         }
         .to_owned(),
@@ -1849,6 +1859,7 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
         hydrating_count: view.hydrating_count,
         held_file_count,
         held_files,
+        stranded_directory_count: view.stranded_directory_count,
         skipped_symlink_count: view.skipped_symlink_count,
         degraded: view.degraded.is_some(),
         degraded_reason: view.degraded.map(|d| d.reason).unwrap_or_default(),
@@ -1996,6 +2007,9 @@ fn overall_status(response: &StatusResponse) -> (OverallState, Vec<String>) {
         }
         if link.held_file_count > 0 {
             attention_reasons.push(format!("held:{}", link.group_id));
+        }
+        if link.stranded_directory_count > 0 {
+            attention_reasons.push(format!("stranded_directory:{}", link.group_id));
         }
     }
     for root in &response.provider_roots {

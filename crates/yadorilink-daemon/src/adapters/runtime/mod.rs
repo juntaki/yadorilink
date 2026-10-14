@@ -4,6 +4,7 @@
 //! isn't durable-storage or coordination-plane HTTP.
 
 pub(crate) mod custody;
+pub(crate) mod custody_handoff;
 pub(crate) mod enrollment_attempts;
 pub(crate) mod enrollment_link;
 pub(crate) mod governance;

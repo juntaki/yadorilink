@@ -244,6 +244,14 @@ impl super::LocalConvergenceExecutor {
         call_timer: &crate::local_convergence::call_timer::ReconcileCallTimer,
     ) -> Result<ProjectionAttempt, PeerSessionError> {
         let call_started = std::time::Instant::now();
+        if !seed_paths.is_empty() {
+            yadorilink_fs_platform::join_timeline::mark_with_peer(
+                &self.local_device_id,
+                group_id,
+                yadorilink_fs_platform::join_timeline::Milestone::ProjectionWorkCreated,
+                origin_device_id,
+            );
+        }
         let plan_started = crate::receive_diag::clock();
         let LinkGate::Live { policy, .. } = self.state.link_gate_for_group(group_id)? else {
             return Ok(ProjectionAttempt { settled: Default::default(), retry: seed_paths });
@@ -755,9 +763,13 @@ impl super::LocalConvergenceExecutor {
         planned: Option<&yadorilink_replica_domain::ids::VersionHash>,
     ) -> Result<bool, PeerSessionError> {
         use yadorilink_sync_sqlite::displacement_guard::DisplacementGuard;
+        let volume = probed_volume(&self.sync_root(group_id)?);
         let verdict = self
             .state
-            .displacement_guard(group_id, path, planned)
+            .displacement_guard(group_id, path, planned, &|other| {
+                // A volume whose behaviour is unknown excludes nothing: the path waits.
+                volume.is_some_and(|volume| volume_folds_together(volume, path, other))
+            })
             .map_err(crate::sync_error::SyncError::from)?;
         Ok(match verdict {
             DisplacementGuard::Clear => true,
@@ -915,10 +927,20 @@ impl super::LocalConvergenceExecutor {
             Err(_) => return Ok(MaterializeResult::RetryRequired),
         }
         let row = self.state.get_file(group_id, path)?;
-        let still_live = row.as_ref().is_some_and(|r| !r.deleted);
+        // The `version_seq = 0` scaffold of a metadata step whose head went away is not a live
+        // row: it holds no content and no authorship, so there is nothing to remove for it.
+        let still_live = row.as_ref().is_some_and(|r| !r.deleted)
+            && self.state.has_real_current_row(group_id, path)?;
         if !still_live {
             if !self.observably_absent_on_disk(group_id, path)? {
                 return Ok(MaterializeResult::RetryRequired);
+            }
+            if row.is_some_and(|r| !r.deleted) {
+                // Only the scaffold row, dropped alone; anything on disk was refused above, left
+                // for capture.
+                let authority = self.root_lease_for(group_id)?;
+                let authority_op = authority.begin_operation()?;
+                self.state.retire_bootstrap_scaffold(group_id, path, &authority_op.permit())?;
             }
             let mutation_generation = self.state.dag_snapshot_mutation_fence(group_id, path)?;
             return Ok(MaterializeResult::Settled(SettlementEvidence::ExactAbsent {
@@ -933,6 +955,12 @@ impl super::LocalConvergenceExecutor {
         if self.state.row_authoring(group_id, path)?.is_none() {
             // Not known to be produced under native authority: revalidate
             // when native state speaks for the path, never guess.
+            tracing::debug!(
+                target: "convergence",
+                group_id,
+                path,
+                "removal waits: the live row at the path has no verified native authoring"
+            );
             return Ok(MaterializeResult::RetryRequired);
         }
         if self.removal_would_destroy_unrecorded_state(
@@ -1038,5 +1066,72 @@ mod run_tests {
         assert_eq!(parse_receive_write_concurrency(Some("64")), MAX_RECEIVE_WRITE_CONCURRENCY);
         assert_eq!(parse_receive_write_concurrency(Some("128")), MAX_RECEIVE_WRITE_CONCURRENCY);
         assert_eq!(parse_receive_write_concurrency(Some("1000")), MAX_RECEIVE_WRITE_CONCURRENCY);
+    }
+}
+
+/// What the volume under `root` folds, or `None` when either probe could not run: an exemption
+/// that drops one name for another needs the answer, not the conservative default.
+pub(crate) fn probed_volume(root: &std::path::Path) -> Option<super::types::VolumeFolding> {
+    Some(super::types::VolumeFolding {
+        case_insensitive: yadorilink_peer_session::hazard::probed_case_insensitivity(root)?,
+        normalization_insensitive:
+            yadorilink_peer_session::hazard::probed_normalization_insensitivity(root)?,
+    })
+}
+
+/// Whether `volume` folds `other` and `path` onto one name, so that at most one of them can be
+/// on disk.
+pub(crate) fn volume_folds_together(
+    volume: super::types::VolumeFolding,
+    path: &str,
+    other: &str,
+) -> bool {
+    use yadorilink_fs_platform::canonical_fold::{canonical_fold, case_fold, nfc};
+    (volume.case_insensitive && case_fold(path) == case_fold(other))
+        || (volume.normalization_insensitive && nfc(path) == nfc(other))
+        || (volume.case_insensitive
+            && volume.normalization_insensitive
+            && canonical_fold(path) == canonical_fold(other))
+}
+
+#[cfg(test)]
+mod volume_folding_tests {
+    use super::volume_folds_together;
+    use crate::local_convergence::types::VolumeFolding;
+
+    const SENSITIVE: VolumeFolding =
+        VolumeFolding { case_insensitive: false, normalization_insensitive: false };
+    const CASE: VolumeFolding =
+        VolumeFolding { case_insensitive: true, normalization_insensitive: false };
+
+    #[test]
+    fn a_case_sensitive_volume_folds_nothing_together() {
+        assert!(!volume_folds_together(SENSITIVE, "Photo.jpg", "photo.jpg"));
+    }
+
+    #[test]
+    fn a_case_insensitive_volume_folds_spellings_of_one_name_only() {
+        assert!(volume_folds_together(CASE, "Photo.jpg", "photo.jpg"));
+        assert!(!volume_folds_together(CASE, "Photo.jpg", "other.jpg"));
+        assert!(!volume_folds_together(CASE, "a/Photo.jpg", "b/photo.jpg"));
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::probed_volume;
+
+    #[test]
+    fn a_root_that_cannot_be_probed_has_no_known_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(probed_volume(&file), None);
+    }
+
+    #[test]
+    fn a_probed_root_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(probed_volume(dir.path()).is_some());
     }
 }

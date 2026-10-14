@@ -29,6 +29,35 @@ pub struct MaterializationCounts {
     pub hydrating: u64,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+static FAIL_STATE_READS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Test seam: while `path` is set, [`MaterializationStateRepository::get_materialization_state`]
+/// fails for that path as a database read error would. Keyed by path so tests
+/// running in parallel do not disturb each other.
+#[cfg(any(test, feature = "test-support"))]
+pub fn fail_state_reads_for_path(path: &str, fail: bool) {
+    let mut paths = FAIL_STATE_READS.lock().unwrap_or_else(|p| p.into_inner());
+    paths.retain(|p| p != path);
+    if fail {
+        paths.push(path.to_string());
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static FAIL_PLACEHOLDER_READS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Test seam: like [`fail_state_reads_for_path`], for
+/// [`MaterializationStateRepository::get_placeholder_generation`].
+#[cfg(any(test, feature = "test-support"))]
+pub fn fail_placeholder_reads_for_path(path: &str, fail: bool) {
+    let mut paths = FAIL_PLACEHOLDER_READS.lock().unwrap_or_else(|p| p.into_inner());
+    paths.retain(|p| p != path);
+    if fail {
+        paths.push(path.to_string());
+    }
+}
+
 pub struct MaterializationStateRepository {
     database: Arc<SyncDatabase>,
 }
@@ -43,6 +72,12 @@ impl MaterializationStateRepository {
         group_id: &str,
         path: &str,
     ) -> Result<Option<MaterializationState>, SyncSqliteError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if FAIL_STATE_READS.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|p| p == path) {
+            return Err(SyncSqliteError::CorruptState(
+                "injected materialization state read failure".into(),
+            ));
+        }
         self.database.read::<_, SyncSqliteError>(|conn| {
             let state: Option<String> = conn
                 .query_row(
@@ -508,8 +543,8 @@ impl MaterializationStateRepository {
         })
     }
 
-    /// Block hashes referenced by any retained row other than the exact
-    /// current row being considered for cache eviction. The block store is
+    /// Block hashes referenced by any retained row (or live native head) other than the exact
+    /// current row (and its own native head at `version`) being considered for cache eviction. The block store is
     /// device-global, so this scan crosses groups and includes placeholder,
     /// superseded, and trashed rows. A placeholder elsewhere may still retain
     /// the only local copy because its own custody check failed.
@@ -517,6 +552,7 @@ impl MaterializationStateRepository {
         &self,
         group_id: &str,
         path: &str,
+        version: &yadorilink_replica_domain::ids::VersionHash,
     ) -> Result<HashSet<ContentHash>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let mut stmt = conn.prepare(
@@ -530,6 +566,19 @@ impl MaterializationStateRepository {
                 let blocks: Vec<BlockInfo> = serde_json::from_str(&row?)?;
                 referenced.extend(blocks.into_iter().map(|block| hex::encode(block.hash)));
             }
+            // A custody lease held for another device roots its blocks too.
+            referenced.extend(crate::remote_custody_lease::retained_block_hashes_all_groups(conn)?);
+            // Blocks a recovery item keeps may be the only local copy of unsaved content.
+            referenced
+                .extend(crate::native_recovery_items::retained_block_hashes_all_groups(conn)?);
+            // A committed native head roots its version's blocks before any `files` row
+            // projects it, exactly as it does for the physical sweep. The head of the very
+            // version being decided about is excluded, like its current row: otherwise every
+            // ordinary file (current row and head name the same blocks) would be unreclaimable.
+            referenced.extend(crate::dag_store::native_head_retained_block_hashes_except(
+                conn,
+                Some((group_id, path, version)),
+            )?);
             Ok(referenced)
         })
     }
@@ -1085,6 +1134,17 @@ impl MaterializationStateRepository {
         group_id: &str,
         path: &str,
     ) -> Result<Option<RecordedPlaceholderGeneration>, SyncSqliteError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if FAIL_PLACEHOLDER_READS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|p| p == path)
+        {
+            return Err(SyncSqliteError::CorruptState(
+                "injected placeholder generation read failure".into(),
+            ));
+        }
         self.database.read::<_, SyncSqliteError>(|conn| {
             let row: Option<(Option<i64>, Option<i64>, Option<String>)> = conn
                 .query_row(
@@ -1291,6 +1351,7 @@ pub(crate) fn live_set(
 ) -> Result<HashSet<ContentHash>, SyncSqliteError> {
     let mut live = crate::dag_store::native_head_retained_block_hashes_all_groups(conn)?;
     live.extend(crate::native_recovery_items::retained_block_hashes_all_groups(conn)?);
+    live.extend(crate::remote_custody_lease::retained_block_hashes_all_groups(conn)?);
     between_reads();
     live.extend(files_block_hashes(conn)?);
     Ok(live)

@@ -126,6 +126,34 @@ pub fn action_notice(action: TrayAction, result: Result<(), String>) -> Notice {
     }
 }
 
+/// What "download the new version" did. Both are normal results: a
+/// package-managed install is told its command rather than sent to a page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpdateDownload {
+    OpenedPage,
+    /// The daemon's instruction for an install a package manager owns.
+    Guidance(String),
+}
+
+pub fn update_download_notice(result: Result<UpdateDownload, String>) -> Notice {
+    match result {
+        Ok(UpdateDownload::OpenedPage) => action_notice(TrayAction::DownloadUpdate, Ok(())),
+        Ok(UpdateDownload::Guidance(text)) => Notice { text, is_error: false, details: None },
+        Err(raw) => action_notice(TrayAction::DownloadUpdate, Err(raw)),
+    }
+}
+
+/// The tray and Settings label for getting a new version: an install that a
+/// package manager owns is told its steps, not sent to a page.
+pub fn update_download_label(version: &str, install_source: &str) -> String {
+    let verb = if yadorilink_client_core::ops::updates::is_package_managed(install_source) {
+        "Show Update Steps"
+    } else {
+        "Download Update"
+    };
+    format!("{verb} ({version})")
+}
+
 /// What the tray icon shows; `None` status means the daemon is unreachable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayState {

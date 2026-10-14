@@ -572,6 +572,10 @@ async fn hydrate_file_without_any_connected_peer_fails_immediately() {
     windows,
     ignore = "this test drives an in-place placeholder in a linked folder through the in-process harness; on Windows an on-demand folder is a Cloud Files provider folder served by yadorilink-cfapi-host, which this harness does not run. Windows coverage: platforms/windows/e2e scenarios 8 and 9 evict and reopen a file against the real cfapi-host"
 )]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "removing an evicted file needs the Linux write lease"
+)]
 async fn evict_then_rehydrate_round_trips_to_identical_content() {
     let device_a = Device::new("device-a").await;
     let device_b = device_a.peer("device-b").await;
@@ -627,6 +631,8 @@ async fn evict_then_rehydrate_round_trips_to_identical_content() {
         fn confirmation_still_valid(
             &self,
             _group_id: &str,
+            _path: &str,
+            _version_hash: &yadorilink_replica_domain::ids::VersionHash,
             _stamp: &yadorilink_replica_engine::custody::CustodyStamp,
         ) -> bool {
             false

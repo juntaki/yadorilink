@@ -40,7 +40,10 @@ impl ClientCore {
         Ok(ops::folders::resume_all().await?)
     }
 
-    /// Stops syncing the folder at `local_path`.
+    /// Stops syncing the folder whose link key is `local_path`, exactly as
+    /// the status snapshot reports it: a directory's recorded path, or a
+    /// provider-backed folder's synthetic key, which is not a filesystem
+    /// path and must reach the daemon unchanged.
     ///
     /// # Errors
     /// Without `force`, `DurabilityBlocked{can_force: true}` when this device
@@ -51,7 +54,7 @@ impl ClientCore {
         force: bool,
     ) -> Result<UnlinkOutcome, DesktopError> {
         let handoff =
-            ops::links::send_unlink(&local_path, force).await.map_err(offering_force(force))?;
+            ops::links::send_unlink_key(&local_path, force).await.map_err(offering_force(force))?;
         Ok(UnlinkOutcome { handoff: handoff.as_ref().map(dto::handoff_summary) })
     }
 

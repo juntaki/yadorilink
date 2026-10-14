@@ -39,9 +39,13 @@ fn verifier_binds_token_to_the_confirmed_identity() {
         .is_none());
 }
 
+/// With the flag on, the production verifier defers to the oracle (the stamped, lease-backed
+/// confirmation) and fails closed when it says no.
 #[test]
-fn production_verifier_refuses_instantaneous_confirmation_without_lease() {
+fn production_verifier_defers_to_the_oracle_and_fails_closed() {
     let (version_hash, blocks) = version();
     let accepting = |_: &str, _: &str, _: &VersionHash, _: &[VersionBlock]| true;
-    assert!(verify_reclaim_custody(&accepting, "group", "file", &version_hash, &blocks).is_none());
+    let rejecting = |_: &str, _: &str, _: &VersionHash, _: &[VersionBlock]| false;
+    assert!(verify_reclaim_custody(&accepting, "group", "file", &version_hash, &blocks).is_some());
+    assert!(verify_reclaim_custody(&rejecting, "group", "file", &version_hash, &blocks).is_none());
 }

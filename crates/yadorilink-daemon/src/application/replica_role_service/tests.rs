@@ -372,6 +372,47 @@ impl LinkRuntimePort for FakeRuntime {
     }
 }
 
+/// [`CustodyLeaseHandoffPort`] fake: answers `hand_off_leases` from a queue
+/// (a missing answer is "handed off") and records what the service did with it.
+#[derive(Default)]
+struct FakeCustody {
+    answers: Mutex<VecDeque<Result<(), String>>>,
+    hand_offs: Mutex<Vec<String>>,
+    /// Guards handed out and not yet dropped.
+    open_guards: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many role-loss journal rows existed when the hand-off ran.
+    journal_len_at_hand_off: Mutex<Vec<usize>>,
+    journal: Mutex<Option<Arc<FakeRoleLoss>>>,
+}
+
+struct OpenGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for OpenGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl CustodyLeaseHandoffPort for FakeCustody {
+    fn hand_off_leases<'a>(
+        &'a self,
+        group_id: &'a str,
+    ) -> BoxFuture<'a, Result<Box<dyn Send>, String>> {
+        Box::pin(async move {
+            self.hand_offs.lock().unwrap().push(group_id.to_string());
+            if let Some(journal) = self.journal.lock().unwrap().as_ref() {
+                self.journal_len_at_hand_off
+                    .lock()
+                    .unwrap()
+                    .push(journal.calls.lock().unwrap().len());
+            }
+            self.answers.lock().unwrap().pop_front().unwrap_or(Ok(()))?;
+            self.open_guards.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(OpenGuard(self.open_guards.clone())) as Box<dyn Send>)
+        })
+    }
+}
+
 const FAKE_LINK_PATH: &str = "/home/alice/Photos";
 
 fn link(group_id: &str, policy: MaterializationPolicy) -> FolderLink {
@@ -415,6 +456,25 @@ fn service(
     coordination: Arc<FakeCoordination>,
     runtime: Arc<FakeRuntime>,
 ) -> ReplicaRoleService {
+    service_with_custody(
+        repository,
+        role_loss,
+        readiness,
+        coordination,
+        runtime,
+        Arc::new(FakeCustody::default()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn service_with_custody(
+    repository: Arc<FakeRepository>,
+    role_loss: Arc<FakeRoleLoss>,
+    readiness: Arc<FakeReadiness>,
+    coordination: Arc<FakeCoordination>,
+    runtime: Arc<FakeRuntime>,
+    custody: Arc<FakeCustody>,
+) -> ReplicaRoleService {
     ReplicaRoleService::new(
         "device-a".to_string(),
         repository,
@@ -423,6 +483,7 @@ fn service(
         coordination,
         runtime,
         Arc::new(FakeOnDemandCapability::default()),
+        custody,
     )
 }
 
@@ -445,6 +506,7 @@ async fn on_demand_is_refused_while_the_on_demand_capability_is_not_connected() 
         coordination.clone(),
         Arc::new(FakeRuntime::default()),
         Arc::new(FakeOnDemandCapability { connected: false }),
+        Arc::new(FakeCustody::default()),
     );
 
     let error = svc
@@ -893,4 +955,202 @@ async fn demoting_a_provider_folder_opens_the_role_loss_journal_like_any_other()
     );
     assert!(calls.contains(&Call::MarkWorkerCommitted("op-1".to_string())));
     assert!(calls.contains(&Call::SettleSuccess("op-1".to_string())));
+}
+
+// ===== custody leases at role loss =====
+
+type DemotionFixtures = (
+    Arc<FakeRepository>,
+    Arc<FakeRoleLoss>,
+    Arc<FakeReadiness>,
+    Arc<FakeCoordination>,
+    Arc<FakeRuntime>,
+);
+
+fn confirmed_demotion_fixtures() -> DemotionFixtures {
+    let repository = Arc::new(
+        FakeRepository::default().with_link(link("group-1", MaterializationPolicy::Eager)),
+    );
+    let readiness = Arc::new(FakeReadiness::default());
+    readiness.full_replica.store(true, Ordering::SeqCst);
+    readiness
+        .digest_and_peer
+        .lock()
+        .unwrap()
+        .push_back(Some(([1u8; 32], Some("device-b".to_string()))));
+    readiness.lease.lock().unwrap().push_back(Some("lease-1".to_string()));
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination.commit_result.lock().unwrap().push_back(RoleLossCommitOutcome::Committed(
+        HandoffCommitResult {
+            target_device_id: "device-b".to_string(),
+            membership_generation: 3,
+            lease_id: Some("lease-1".to_string()),
+        },
+    ));
+    (
+        repository,
+        Arc::new(FakeRoleLoss::default()),
+        readiness,
+        coordination,
+        Arc::new(FakeRuntime::default()),
+    )
+}
+
+/// A demotion moves the custody leases first -- before any journal row or
+/// coordination commit exists -- and keeps the group closed while it commits.
+#[tokio::test]
+async fn demotion_hands_the_custody_leases_off_before_anything_is_committed() {
+    let (repository, role_loss, readiness, coordination, runtime) = confirmed_demotion_fixtures();
+    let custody = Arc::new(FakeCustody::default());
+    *custody.journal.lock().unwrap() = Some(role_loss.clone());
+
+    let result = service_with_custody(
+        repository.clone(),
+        role_loss.clone(),
+        readiness,
+        coordination,
+        runtime,
+        custody.clone(),
+    )
+    .set_storage_mode("group-1", true)
+    .await;
+
+    assert!(result.is_ok());
+    assert_eq!(*custody.hand_offs.lock().unwrap(), vec!["group-1".to_string()]);
+    assert_eq!(*custody.journal_len_at_hand_off.lock().unwrap(), vec![0], "nothing journaled yet");
+    assert!(repository.calls.lock().unwrap().contains(&Call::SetPolicy(FAKE_LINK_PATH.into())));
+    assert_eq!(custody.open_guards.load(Ordering::SeqCst), 0, "the group reopens when done");
+}
+
+/// A lease that cannot move blocks the demotion: no journal row, no
+/// coordination commit (an unqueued commit would panic the fake), no policy
+/// flip, and the group is open again for the retry.
+#[tokio::test]
+async fn demotion_is_refused_and_recoverable_when_a_custody_lease_cannot_move() {
+    let (repository, role_loss, readiness, _coordination, runtime) = confirmed_demotion_fixtures();
+    let coordination = Arc::new(FakeCoordination::configured());
+    let custody = Arc::new(FakeCustody::default());
+    custody.answers.lock().unwrap().push_back(Err("1 custody lease(s) could not move".into()));
+
+    let result = service_with_custody(
+        repository.clone(),
+        role_loss.clone(),
+        readiness,
+        coordination,
+        runtime,
+        custody.clone(),
+    )
+    .set_storage_mode("group-1", true)
+    .await;
+
+    assert_eq!(result.unwrap_err(), "1 custody lease(s) could not move");
+    assert!(role_loss.calls.lock().unwrap().is_empty(), "no journal row");
+    assert!(repository.calls.lock().unwrap().is_empty(), "no local change");
+    assert_eq!(custody.open_guards.load(Ordering::SeqCst), 0, "nothing stays closed");
+}
+
+/// The leases are moved after the readiness gate but also when the coordination
+/// commit then fails: nothing is lost by having moved them, and the group
+/// reopens so the retry can start from scratch.
+#[tokio::test]
+async fn a_failed_demotion_after_the_hand_off_reopens_the_group() {
+    let (repository, role_loss, readiness, _coordination, runtime) = confirmed_demotion_fixtures();
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination
+        .commit_result
+        .lock()
+        .unwrap()
+        .push_back(RoleLossCommitOutcome::DefinitelyRejected("no".into()));
+    let custody = Arc::new(FakeCustody::default());
+
+    let result = service_with_custody(
+        repository,
+        role_loss,
+        readiness,
+        coordination,
+        runtime,
+        custody.clone(),
+    )
+    .set_storage_mode("group-1", true)
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(custody.open_guards.load(Ordering::SeqCst), 0);
+}
+
+/// Unlinking an eager link hands the leases off first and refuses (no link
+/// change) when one cannot move.
+#[tokio::test]
+async fn unlink_of_an_eager_link_is_refused_when_a_custody_lease_cannot_move() {
+    let repository = Arc::new(
+        FakeRepository::default().with_link(link("group-1", MaterializationPolicy::Eager)),
+    );
+    let custody = Arc::new(FakeCustody::default());
+    custody.answers.lock().unwrap().push_back(Err("a lease cannot move".into()));
+    let runtime = Arc::new(FakeRuntime::default());
+
+    let result = service_with_custody(
+        repository.clone(),
+        Arc::new(FakeRoleLoss::default()),
+        Arc::new(FakeReadiness::default()),
+        Arc::new(FakeCoordination::configured()),
+        runtime.clone(),
+        custody.clone(),
+    )
+    .unlink(FAKE_LINK_PATH, false)
+    .await;
+
+    assert_eq!(result.err().as_deref(), Some("a lease cannot move"));
+    assert!(repository.calls.lock().unwrap().is_empty());
+    assert!(runtime.calls.lock().unwrap().is_empty(), "the watcher was not stopped");
+}
+
+/// A forced unlink goes ahead without the hand-off; nothing here touches the
+/// leases it could not move (they stay with their requesters' releases).
+#[tokio::test]
+async fn forced_unlink_proceeds_without_the_hand_off() {
+    let repository = Arc::new(
+        FakeRepository::default().with_link(link("group-1", MaterializationPolicy::Eager)),
+    );
+    let readiness = Arc::new(FakeReadiness::default());
+    readiness.digest_and_peer.lock().unwrap().push_back(None);
+    let custody = Arc::new(FakeCustody::default());
+    custody.answers.lock().unwrap().push_back(Err("a lease cannot move".into()));
+
+    let result = service_with_custody(
+        repository.clone(),
+        Arc::new(FakeRoleLoss::default()),
+        readiness,
+        Arc::new(FakeCoordination::configured()),
+        Arc::new(FakeRuntime::default()),
+        custody.clone(),
+    )
+    .unlink(FAKE_LINK_PATH, true)
+    .await;
+
+    assert!(result.is_ok());
+    assert!(repository.calls.lock().unwrap().contains(&Call::RemoveLink(FAKE_LINK_PATH.into())));
+    assert_eq!(custody.hand_offs.lock().unwrap().len(), 1, "the hand-off was attempted");
+    assert_eq!(custody.open_guards.load(Ordering::SeqCst), 0);
+}
+
+/// An on-demand link holds no leases: nothing to hand off.
+#[tokio::test]
+async fn unlink_of_an_on_demand_link_does_not_touch_the_custody_leases() {
+    let repository = Arc::new(
+        FakeRepository::default().with_link(link("group-1", MaterializationPolicy::OnDemand)),
+    );
+    let custody = Arc::new(FakeCustody::default());
+    service_with_custody(
+        repository,
+        Arc::new(FakeRoleLoss::default()),
+        Arc::new(FakeReadiness::default()),
+        Arc::new(FakeCoordination::configured()),
+        Arc::new(FakeRuntime::default()),
+        custody.clone(),
+    )
+    .unlink(FAKE_LINK_PATH, false)
+    .await
+    .unwrap();
+    assert!(custody.hand_offs.lock().unwrap().is_empty());
 }

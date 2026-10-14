@@ -8,6 +8,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use yadorilink_replica_domain::ids::VersionHash;
+
 use crate::rate_limiter::RateLimiters;
 
 /// Lets the convergence executor ask whether the path it's about to
@@ -128,8 +130,8 @@ impl HandoffLeaseResponder for DeniedHandoffLeaseResponder {
         &'a self,
         _group_id: &'a str,
         _lease_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async {})
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async { false })
     }
 }
 
@@ -153,6 +155,21 @@ impl HandoffTicketResponder for DeniedHandoffTicketResponder {
     }
 }
 
+struct DeniedCustodyRehomeResponder;
+
+impl CustodyRehomeResponder for DeniedCustodyRehomeResponder {
+    fn rehome<'a>(
+        &'a self,
+        _from_peer: &'a str,
+        _group_id: &'a str,
+        _file_path: &'a str,
+        _version_hash: VersionHash,
+        _attempt_token: [u8; 16],
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async { false })
+    }
+}
+
 /// Everything a session is given that is not its peer, its transport or
 /// its storage: the two handoff responders it answers service RPCs
 /// through, and the runtime knobs the daemon sets from shared global state.
@@ -167,6 +184,7 @@ pub struct PeerSyncSessionDeps {
     pub block_serve_engine: Option<Arc<crate::block_serve::BlockServeEngine>>,
     pub handoff_lease_responder: Arc<dyn HandoffLeaseResponder>,
     pub handoff_ticket_responder: Arc<dyn HandoffTicketResponder>,
+    pub custody_rehome_responder: Arc<dyn CustodyRehomeResponder>,
 }
 
 impl Clone for PeerSyncSessionDeps {
@@ -176,6 +194,7 @@ impl Clone for PeerSyncSessionDeps {
             block_serve_engine: self.block_serve_engine.clone(),
             handoff_lease_responder: self.handoff_lease_responder.clone(),
             handoff_ticket_responder: self.handoff_ticket_responder.clone(),
+            custody_rehome_responder: self.custody_rehome_responder.clone(),
         }
     }
 }
@@ -198,6 +217,7 @@ impl PeerSyncSessionDeps {
             )),
             handoff_lease_responder: Arc::new(DeniedHandoffLeaseResponder),
             handoff_ticket_responder: Arc::new(DeniedHandoffTicketResponder),
+            custody_rehome_responder: Arc::new(DeniedCustodyRehomeResponder),
         }
     }
 
@@ -226,6 +246,9 @@ pub struct PeerHandoffLeaseGrant {
     /// it retains — the same digest a source-side readiness check computes.
     pub root_digest: [u8; 32],
     pub expires_at_unix: i64,
+    /// The lease's lifetime as a duration, for a caller that must outlast it
+    /// without comparing its own clock to the coordination plane's.
+    pub ttl_seconds: i64,
 }
 
 /// Returns `None` when this device could not obtain a live lease this
@@ -240,11 +263,14 @@ pub trait HandoffLeaseResponder: Send + Sync {
         group_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Option<PeerHandoffLeaseGrant>> + Send + 'a>>;
 
+    /// Ends the lease. `true` only when it is ended for good (a later attempt
+    /// to use it fails); the answer is what the asker's own close of the group
+    /// waits for.
     fn release_handoff_lease<'a>(
         &'a self,
         group_id: &'a str,
         lease_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 }
 
 /// Caller-injected guard factory that lets a session serialize creation of
@@ -293,4 +319,24 @@ pub trait HandoffTicketResponder: Send + Sync {
         target_device_id: &'a str,
         lease_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+/// Lets a session answer a full replica that is about to stop being one and
+/// asks this device, the requester of a custody lease it holds, to move that
+/// custody elsewhere (`ServiceRequest::CustodyRehome`). The implementation
+/// owns the decision: it knows which holds this device recorded and what the
+/// path still depends on, and `from_peer` is the authenticated peer the
+/// request arrived from, never a name the request supplies.
+///
+/// `true` only when this device no longer depends on `from_peer`'s lease
+/// and that lease is released; every refusal and failure is `false`.
+pub trait CustodyRehomeResponder: Send + Sync {
+    fn rehome<'a>(
+        &'a self,
+        from_peer: &'a str,
+        group_id: &'a str,
+        file_path: &'a str,
+        version_hash: VersionHash,
+        attempt_token: [u8; 16],
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 }

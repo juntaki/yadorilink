@@ -50,6 +50,7 @@ public struct ShareTarget: Identifiable, Hashable, Sendable {
 public final class AppContext {
     public let app: AppModel
     public let loginItem: LoginItemModel
+    public let unlink: UnlinkModel
     public var sidebar: SidebarItem? = .home
     public var folderPath: [String] = []
     public var shareTarget: ShareTarget?
@@ -63,6 +64,9 @@ public final class AppContext {
         self.app = app
         self.loginItem = loginItem
         self.openURL = openURL
+        self.unlink = UnlinkModel(app: app)
+        // Leave any folder screen that points at what was just unlinked.
+        unlink.onUnlinked = { [weak self] path in self?.folderPath.removeAll { $0 == path } }
     }
 
     /// True when the app runs on the fake client: everything shown is made up.

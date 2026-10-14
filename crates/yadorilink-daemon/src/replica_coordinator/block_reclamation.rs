@@ -51,9 +51,12 @@ impl ReplicaCoordinator {
             return Ok(GcReport::default());
         }
 
-        let needed = self
-            .materialization_state_repository()
-            .blocks_referenced_outside_current_file(custody.group_id(), custody.path())?;
+        let needed =
+            self.materialization_state_repository().blocks_referenced_outside_current_file(
+                custody.group_id(),
+                custody.path(),
+                custody.version_hash(),
+            )?;
         let reclaimable: Vec<String> = current
             .blocks
             .iter()

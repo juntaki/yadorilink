@@ -154,6 +154,8 @@ impl StoreVerification {
 /// path this store takes holds a lock across an `fsync`.
 pub struct SegmentBlockStore {
     root: PathBuf,
+    /// `root/segments`: the directory that holds the segment files, whose volume decides deletion.
+    segments_dir: PathBuf,
     index: Arc<BlockIndex>,
     coordinator: Arc<DurabilityCoordinator>,
     /// Read-only handles, opened on demand and bounded. Purely a cache:
@@ -171,7 +173,33 @@ pub struct SegmentBlockStore {
     /// the `durable -> authoritative` boundary, observable from another
     /// thread. See [`SegmentBlockStore::install_durability_barrier_hook_for_tests`].
     durability_barrier_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Fires inside a sweep after its candidates are chosen and before any is removed. See
+    /// [`SegmentBlockStore::install_sweep_candidates_hook_for_tests`].
+    sweep_candidates_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     recovery_report: RecoveryReport,
+    /// Whether the volume of a directory holding segment files may have bytes deleted from it.
+    /// Taken afresh before every physical deletion, on the segments directory itself.
+    volume_durable: VolumeVerdict,
+}
+
+type VolumeVerdict = Arc<dyn Fn(Option<&Path>) -> bool + Send + Sync>;
+
+/// Removes the segment file at `path` after the verdict accepted the volume of that very file
+/// (see [`yadorilink_fs_platform::durable_dir::remove_file_judged`]): the outer error is a refusal
+/// (nothing removed), the inner result is the removal's own.
+fn remove_judged(
+    verdict: &VolumeVerdict,
+    path: &Path,
+) -> Result<std::io::Result<()>, StorageError> {
+    use yadorilink_fs_platform::durable_dir::{remove_file_judged, JudgedRemoveError};
+    match remove_file_judged(path, |dir| verdict(Some(dir))) {
+        Ok(()) => Ok(Ok(())),
+        Err(JudgedRemoveError::Io(e)) => Ok(Err(e)),
+        Err(JudgedRemoveError::Refused) => Err(StorageError::DeletionRefused(format!(
+            "the volume holding {} is not known to offer durable namespace changes",
+            path.display()
+        ))),
+    }
 }
 
 /// One cached segment handle plus its recency stamp.
@@ -193,6 +221,22 @@ impl SegmentBlockStore {
         root: impl Into<PathBuf>,
         limits: GroupCommitLimits,
     ) -> Result<Self, StorageError> {
+        Self::with_limits_and_verdict(
+            root,
+            limits,
+            yadorilink_fs_platform::durable_dir::volume_offers_durable_namespace,
+        )
+    }
+
+    /// [`Self::with_limits`] with the volume verdict that gates every physical deletion, recovery
+    /// on open included: where the segments directory's volume is not known durable and recovery
+    /// would delete or truncate anything, the open is refused and nothing is touched.
+    pub fn with_limits_and_verdict(
+        root: impl Into<PathBuf>,
+        limits: GroupCommitLimits,
+        verdict: impl Fn(Option<&Path>) -> bool + Send + Sync + 'static,
+    ) -> Result<Self, StorageError> {
+        let volume_durable: VolumeVerdict = Arc::new(verdict);
         let root = root.into();
         crate::fs_ops::create_dir_all_durably(&root)?;
         ensure_segments_directory(&root)?;
@@ -214,7 +258,22 @@ impl SegmentBlockStore {
             )));
         }
         let index = Arc::new(BlockIndex::open(&index_path)?);
-        let recovered = recovery::recover(&root, &index)?;
+        let recovered = recovery::recover(
+            &root,
+            &index,
+            || {
+                if volume_durable(Some(&root.join(segment::SEGMENTS_DIR))) {
+                    Ok(())
+                } else {
+                    Err(StorageError::DeletionRefused(format!(
+                    "opening {} would delete or truncate segment bytes on a volume that is not \
+                     known to offer durable namespace changes",
+                    root.display()
+                )))
+                }
+            },
+            |path| remove_judged(&volume_durable, path),
+        )?;
         if !recovered.report.is_clean() {
             tracing::warn!(
                 truncated = ?recovered.report.truncated_segments,
@@ -231,9 +290,11 @@ impl SegmentBlockStore {
             Arc::clone(&index),
             limits,
             recovered.next_segment_id,
+            Arc::clone(&volume_durable),
         ));
 
         Ok(Self {
+            segments_dir: root.join(segment::SEGMENTS_DIR),
             root,
             index,
             coordinator,
@@ -242,8 +303,37 @@ impl SegmentBlockStore {
             headroom_enforced: AtomicBool::new(false),
             headroom_override_bytes: Mutex::new(None),
             durability_barrier_hook: Mutex::new(None),
+            sweep_candidates_hook: Mutex::new(None),
             recovery_report: recovered.report,
+            volume_durable,
         })
+    }
+
+    /// Replaces the volume verdict that gates every physical deletion (production: the
+    /// durable-namespace probe of the volume under the segments directory).
+    pub fn with_volume_verdict(
+        mut self,
+        verdict: impl Fn(Option<&Path>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let verdict: VolumeVerdict = Arc::new(verdict);
+        self.coordinator.set_volume_verdict(Arc::clone(&verdict));
+        self.volume_durable = verdict;
+        self
+    }
+
+    /// Fail closed unless the volume under the segments directory is known durable. Resolved
+    /// afresh on every call, so a directory swapped for a junction or mount point since the last
+    /// deletion is judged by the volume it leads to now.
+    fn require_durable_volume(&self) -> Result<(), StorageError> {
+        let dir = &self.segments_dir;
+        if (self.volume_durable)(Some(dir)) {
+            Ok(())
+        } else {
+            Err(StorageError::DeletionRefused(format!(
+                "the volume holding {} is not known to offer durable namespace changes",
+                dir.display()
+            )))
+        }
     }
 
     /// Whether `root` holds any segment file with a record in it, without
@@ -340,7 +430,11 @@ impl SegmentBlockStore {
         min_dead_bytes: u64,
     ) -> Result<CompactionReport, StorageError> {
         let mut total = CompactionReport::default();
-        for candidate in compaction::candidates(&self.index, dead_ratio, min_dead_bytes)? {
+        let candidates = compaction::candidates(&self.index, dead_ratio, min_dead_bytes)?;
+        if !candidates.is_empty() {
+            self.require_durable_volume()?;
+        }
+        for candidate in candidates {
             let report = compaction::compact_segment(
                 &self.index,
                 &self.coordinator,
@@ -391,9 +485,17 @@ impl SegmentBlockStore {
     /// Deletes the files of already-retired segments. Safe to call at any
     /// time; a file still held open elsewhere is simply left for later.
     pub fn reclaim_retired(&self) -> Result<u64, StorageError> {
-        compaction::reclaim_retired_segments(&self.root, &self.index, |segment_id| {
-            self.evict_reader(segment_id);
-        })
+        // The verdict is taken at each unlink, on the very rows the reclaim read: a segment retired
+        // by a concurrent open after any earlier look is still judged before it is deleted.
+        compaction::reclaim_retired_segments(
+            &self.root,
+            &self.index,
+            || self.require_durable_volume(),
+            |path| remove_judged(&self.volume_durable, path),
+            |segment_id| {
+                self.evict_reader(segment_id);
+            },
+        )
     }
 
     /// Seals the segment currently being appended to, so the next group
@@ -647,6 +749,22 @@ impl SegmentBlockStore {
             Some(Arc::new(hook));
     }
 
+    /// Installs a hook fired inside a sweep between choosing its candidates and removing them,
+    /// so a test can put a block back at exactly that point. Never call this outside a test.
+    pub fn install_sweep_candidates_hook_for_tests(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.sweep_candidates_hook.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(Arc::new(hook));
+    }
+
+    /// Installs a hook run in a put after its new blocks are durable and before the blocks it
+    /// found already stored are stamped. Never call this outside a test.
+    pub fn install_before_dedup_stamp_hook_for_tests(
+        &self,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) {
+        self.coordinator.install_before_dedup_stamp_hook(Arc::new(hook));
+    }
+
     /// Arms a crash or I/O failure at one commit boundary. See
     /// [`FaultPlan`]. Never call this outside a test.
     pub fn arm_commit_fault_for_tests(&self, plan: FaultPlan) {
@@ -689,6 +807,10 @@ impl SegmentBlockStore {
 }
 
 impl BlockStore for SegmentBlockStore {
+    fn storage_root(&self) -> Option<&std::path::Path> {
+        Some(&self.segments_dir)
+    }
+
     fn put(&self, data: &[u8]) -> Result<ContentHash, StorageError> {
         let prepared = LocallyHashedBlock::from_bytes(data.to_vec());
         let hash = prepared.hash().clone();
@@ -721,6 +843,7 @@ impl BlockStore for SegmentBlockStore {
 
     fn delete(&self, hash: &str) -> Result<(), StorageError> {
         let raw = raw_hash(hash)?;
+        self.require_durable_volume()?;
         self.index.remove_blocks(std::slice::from_ref(&raw))?;
         Ok(())
     }
@@ -744,8 +867,11 @@ impl BlockStore for SegmentBlockStore {
         grace_cutoff: SystemTime,
         dry_run: bool,
     ) -> Result<GcReport, StorageError> {
+        // Checked, not filtered: a live hash that cannot be decoded means
+        // the liveness set is incomplete, and an incomplete set must never
+        // reach a deletion decision. Dry runs validate identically.
         let live_raw: HashSet<[u8; RAW_HASH_LEN]> =
-            live.iter().filter_map(|hash| raw_hash(hash).ok()).collect();
+            live.iter().map(|hash| raw_hash(hash)).collect::<Result<_, _>>()?;
         let candidates =
             self.index.sweep_candidates(&live_raw, system_time_to_unix_nanos(grace_cutoff))?;
         let mut report = GcReport {
@@ -755,9 +881,17 @@ impl BlockStore for SegmentBlockStore {
         if dry_run {
             return Ok(report);
         }
+        if !candidates.is_empty() {
+            self.require_durable_volume()?;
+        }
         let hashes: Vec<[u8; RAW_HASH_LEN]> =
             candidates.into_iter().map(|(hash, _)| hash).collect();
-        let summary = self.index.remove_blocks(&hashes)?;
+        let hook = self.sweep_candidates_hook.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+        let summary =
+            self.index.remove_swept_blocks(&hashes, system_time_to_unix_nanos(grace_cutoff))?;
         report.blocks_deleted = summary.blocks_removed;
         report.bytes_reclaimed = summary.payload_bytes_removed;
         // GC is exactly when reclaiming physical space is wanted and
@@ -769,6 +903,9 @@ impl BlockStore for SegmentBlockStore {
 
     fn reclaim_cached_blocks(&self, hashes: &[ContentHash]) -> Result<GcReport, StorageError> {
         let raw = Self::raw_hashes(hashes)?;
+        if !raw.is_empty() {
+            self.require_durable_volume()?;
+        }
         let summary = self.index.remove_blocks(&raw)?;
         self.compact_if_needed()?;
         Ok(GcReport {

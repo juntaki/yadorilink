@@ -47,6 +47,10 @@ static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// on-demand-sync spec "Evicting a hydrated file frees local disk space".
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "removing an evicted file needs the Linux write lease"
+)]
 async fn evict_command_removes_a_present_file_and_leaves_its_row_remote() {
     let _guard = TEST_MUTEX.lock().await;
     // `evict` refuses outright unless a placeholder provider is connected

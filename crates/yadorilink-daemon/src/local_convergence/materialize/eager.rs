@@ -166,6 +166,11 @@ impl super::super::LocalConvergenceExecutor {
         &self,
         plan: &MaterializationPlan<'_>,
     ) -> Result<LocalMaterializeOutcome, PeerSessionError> {
+        yadorilink_fs_platform::join_timeline::mark(
+            &self.local_device_id,
+            plan.group_id,
+            yadorilink_fs_platform::join_timeline::Milestone::MaterializationStarted,
+        );
         let observed = self.observe_target(plan)?;
         let located = match self.locate_content(plan, observed)? {
             ContentLocation::NeedBlocks(requirement) => {
@@ -1102,6 +1107,11 @@ impl super::super::LocalConvergenceExecutor {
                 if let (Some(claim), Some(_)) = (plan.claim, obligation) {
                     claim.record_decided(&record.path);
                 }
+                yadorilink_fs_platform::join_timeline::mark(
+                    &self.local_device_id,
+                    group_id,
+                    yadorilink_fs_platform::join_timeline::Milestone::FirstFileCommitted,
+                );
                 Ok(MaterializeResult::Settled(evidence).into())
             }
         }

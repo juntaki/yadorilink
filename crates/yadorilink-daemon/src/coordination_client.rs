@@ -1407,13 +1407,18 @@ mod imp {
     /// means the lease is instead cleaned up later by the coordination service's
     /// own TTL sweep, so it is logged at debug and swallowed rather than
     /// surfaced to the caller.
+    ///
+    /// `true` only when the service reports the lease ended (`released`, or
+    /// `gone` for no such lease). A success answer without that state, or one
+    /// saying the lease is left alone (`reserved-not-released`,
+    /// `confirmed-not-released`), is `false`.
     pub async fn release_handoff_lease(
         addr: &str,
         auth: &CoordinationAuth,
         group_id: &str,
         target_device_id: &str,
         lease_id: &str,
-    ) {
+    ) -> bool {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Body<'a> {
@@ -1422,13 +1427,29 @@ mod imp {
         let url = format!("{addr}/shares/groups/{group_id}/handoff/lease/{lease_id}/release");
         let body = Body { target_device_id };
         let result = reqwest::Client::new().post(&url).json(&body).send_authorized(auth).await;
+        #[derive(serde::Deserialize)]
+        struct Answer {
+            state: String,
+        }
         match result {
-            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) if resp.status().is_success() => match resp.json::<Answer>().await {
+                Ok(answer) if matches!(answer.state.as_str(), "released" | "gone") => true,
+                Ok(answer) => {
+                    tracing::debug!(state = %answer.state, "handoff lease left in place");
+                    false
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "handoff lease release answer unreadable");
+                    false
+                }
+            },
             Ok(resp) => {
                 tracing::debug!(status = %resp.status(), "handoff lease release rejected");
+                false
             }
             Err(e) => {
                 tracing::debug!(error = %e, "handoff lease release failed");
+                false
             }
         }
     }

@@ -194,6 +194,8 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
                     .as_deref()
                         != Some(stored.as_str())
                 });
+            let stranded_directory_count =
+                state.replica_coordinator.temp_ledger(&link.group_id).standing_stranded_count()?;
             let provider = match &link.location {
                 yadorilink_replica_domain::session_state::LinkLocation::Provider {
                     root_id,
@@ -233,6 +235,7 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
                 hydrating_count: materialization.hydrating,
                 held_files,
                 skipped_symlink_count,
+                stranded_directory_count,
                 degraded,
                 transfer,
                 durability_status,

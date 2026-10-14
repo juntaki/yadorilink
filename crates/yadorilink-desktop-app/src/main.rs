@@ -462,7 +462,10 @@ fn build_menu(status: Option<&StatusResponse>, notice: Option<&status_model::Not
         if !status.update_available_version.is_empty() {
             let _ = menu.append(&MenuItem::with_id(
                 "download_update",
-                format!("Download Update ({})", status.update_available_version),
+                crate::status_model::update_download_label(
+                    &status.update_available_version,
+                    &status.update_install_source,
+                ),
                 true,
                 None,
             ));
@@ -567,7 +570,20 @@ fn handle_menu_event(id: &str) {
         "pause_all" => run_async(TrayAction::PauseAll, actions::pause_all()),
         "resume_all" => run_async(TrayAction::ResumeAll, actions::resume_all()),
         "check_updates" => run_async(TrayAction::CheckUpdates, actions::check_for_updates()),
-        "download_update" => run_async(TrayAction::DownloadUpdate, actions::download_update()),
+        "download_update" => {
+            std::thread::spawn(|| {
+                let rt = tokio::runtime::Runtime::new().expect("failed to start action runtime");
+                let result = rt.block_on(actions::download_update()).map_err(|e| e.to_string());
+                if let Err(e) = &result {
+                    tracing::warn!(error = %e, "tray action failed");
+                }
+                if let Some(proxy) = PROXY.get() {
+                    let _ = proxy.send_event(UserEvent::Notice(
+                        status_model::update_download_notice(result),
+                    ));
+                }
+            });
+        }
         "export_diagnostics" => {
             std::thread::spawn(|| {
                 let rt = tokio::runtime::Runtime::new().expect("failed to start action runtime");

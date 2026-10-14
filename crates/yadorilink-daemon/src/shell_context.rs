@@ -56,6 +56,8 @@ pub struct ShellContext {
     pub(crate) eager: Arc<crate::provider_eager::EagerDriver>,
     /// The idle-only breadth-first prefetch of provider roots.
     pub(crate) prefetch: Arc<crate::provider_prefetch::PrefetchScheduler>,
+    /// Native evictions waiting for the daemon to free its cached blocks.
+    pub(crate) reclaim_queue: Arc<crate::provider_reclaim::ReclaimQueue>,
     /// The author identity, block store and authoring lease the provider write path uses.
     pub(crate) writer: Arc<crate::provider_writer::ProviderWriter>,
 }
@@ -105,18 +107,25 @@ impl ShellContext {
             let extras_coordinator = coordinator.clone();
             let extras_host = host.clone();
             control.provider_status.install_extras(Arc::new(move || {
-                let removals = extras_coordinator
-                    .provider_repository()
-                    .removals()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|r| yadorilink_ipc_proto::daemonctl::ProviderRemovalStatus {
-                        root_id: r.root_id.chars().take(8).collect(),
-                        display_name: r.display_name,
-                        removed: !r.requested,
-                        preserved_location: r.preserved_location.unwrap_or_default(),
-                    })
-                    .collect();
+                let removals = match extras_coordinator.provider_repository().removals() {
+                    Ok(removals) => removals
+                        .into_iter()
+                        .map(|r| yadorilink_ipc_proto::daemonctl::ProviderRemovalStatus {
+                            root_id: r.root_id.chars().take(8).collect(),
+                            display_name: r.display_name,
+                            removed: !r.requested,
+                            preserved_location: r.preserved_location.unwrap_or_default(),
+                        })
+                        .collect(),
+                    // An unreadable list is not "no removals": one line says so.
+                    Err(error) => {
+                        tracing::warn!(%error, "could not read the provider removals for status");
+                        vec![yadorilink_ipc_proto::daemonctl::ProviderRemovalStatus {
+                            display_name: format!("removals unreadable: {error}"),
+                            ..Default::default()
+                        }]
+                    }
+                };
                 let orphans = extras_host
                     .orphans()
                     .into_iter()
@@ -145,9 +154,12 @@ impl ShellContext {
                 crate::provider_status::provider_root_lines(&coordinator, &eager, &inputs, now_ms)
             }));
         }
+        let reclaim = Arc::new(crate::provider_reclaim::ProviderReclaim::new(state.clone()));
         control.provider_evict.install(Arc::new(crate::provider_evict::ProviderEvictor::new(
             state.clone(),
             provider_host.clone(),
+            reclaim.clone(),
+            membership.clone(),
         )));
         Self {
             application: control.application.clone(),
@@ -162,6 +174,10 @@ impl ShellContext {
             )),
             provider_host,
             membership,
+            reclaim_queue: Arc::new(crate::provider_reclaim::ReclaimQueue::new(
+                state.clone(),
+                reclaim,
+            )),
             handoff: crate::provider_handoff::HandoffSlot::empty(),
             writer: Arc::new(crate::provider_writer::ProviderWriter::new(state.clone())),
             eager,
@@ -175,6 +191,16 @@ impl ShellContext {
     #[cfg(test)]
     pub(crate) fn with_eager(mut self, eager: Arc<crate::provider_eager::EagerDriver>) -> Self {
         self.eager = eager;
+        self
+    }
+
+    /// Replaces the reclaim queue (tests give it a fake custody source).
+    #[cfg(test)]
+    pub(crate) fn with_reclaim_queue(
+        mut self,
+        queue: Arc<crate::provider_reclaim::ReclaimQueue>,
+    ) -> Self {
+        self.reclaim_queue = queue;
         self
     }
 

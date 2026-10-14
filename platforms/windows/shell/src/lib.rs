@@ -26,8 +26,11 @@ mod overlay;
 pub mod provider_authoring;
 pub mod provider_client;
 pub mod provider_namespace;
+pub mod provider_report;
 pub mod provider_session;
 mod registration;
+pub mod stage_ledger;
+mod windowed_fetch;
 mod windows_pipe_security;
 
 use windows::core::{IUnknown, Interface, Result, GUID, HRESULT};

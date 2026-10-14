@@ -25,7 +25,7 @@ use yadorilink_ipc_proto::shellipc::{
 use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_sync_sqlite::provider::ItemId;
 
-use crate::application::ports::{TempMaterialization, TempOutcome};
+use crate::application::ports::{ByteRange, TempMaterialization, TempOutcome};
 use crate::provider_publication::{fetch_gate, FetchGate};
 use crate::shell_context::ShellContext;
 use crate::sync_error::SyncError;
@@ -107,18 +107,40 @@ pub(crate) const MAX_INFLIGHT_REQUESTS: usize = 64;
 
 /// A file named in `handoff/` that is removed on every way out (an abort, a lost claim, an
 /// undelivered response) unless it is kept once its response was delivered.
-struct HandoffFile(Option<std::path::PathBuf>);
+struct HandoffFile {
+    path: Option<std::path::PathBuf>,
+    /// A file registered with the handoff root before its response (a window): removing the file
+    /// also drops that registration.
+    tracked: Option<(Arc<crate::provider_handoff::HandoffRoot>, String, ItemId, String)>,
+}
 
 impl HandoffFile {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path: Some(path), tracked: None }
+    }
+
     fn keep(&mut self) {
-        self.0 = None;
+        self.path = None;
+        self.tracked = None;
     }
 }
 
 impl Drop for HandoffFile {
     fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = std::fs::remove_file(path);
+        if let Some(path) = self.path.take() {
+            let removed = match std::fs::remove_file(&path) {
+                Ok(()) => true,
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            };
+            if let Some((root, root_id, item, name)) = self.tracked.take() {
+                if removed {
+                    root.forget_delivered(&root_id, &item, &name);
+                } else if tokio::runtime::Handle::try_current().is_ok() {
+                    // Still on disk: it stays tracked (a newer version revokes it) and its
+                    // lifetime sweep retries the removal.
+                    root.sweep_later(root_id, item, name);
+                }
+            }
         }
     }
 }
@@ -130,6 +152,8 @@ struct Handoff {
     name: String,
     version: VersionHash,
     file: HandoffFile,
+    /// The file holds a window of the version, not the version.
+    ranged: bool,
 }
 
 /// Test seams: a hook keyed by (point, key) that can stall or interfere at a named point.
@@ -268,6 +292,18 @@ fn after_response(context: &ShellContext, mut handoff: Handoff) {
     // Registered BEFORE the presence-evidence ledger is written: a newer version of the item that commits from now
     // on finds the file and revokes it before it evicts. One that committed earlier is seen by
     // the presence-evidence ledger (below) and the file is dropped here.
+    if handoff.ranged {
+        // The OS gets a window of the bytes, never the file: no handoff is recorded, so the item
+        // stays "not present" and nothing may evict or reclaim on the strength of it. Nor is the
+        // content recorded as served: that summary vouches for a whole version's content, which
+        // a window is not. The file has been registered for revocation since before the response
+        // was sent (see `run`); here it only ages out like any unconsumed handoff.
+        handoff.file.keep();
+        if let Some(root) = context.handoff.get() {
+            root.sweep_later(handoff.root.clone(), handoff.item, handoff.name.clone());
+        }
+        return;
+    }
     if let Some(root) = context.handoff.get() {
         root.note_delivered(&handoff.root, handoff.item, &handoff.name);
     }
@@ -306,6 +342,7 @@ struct Answer {
     version: VersionHash,
     generation: u64,
     size: u64,
+    range: Option<ByteRange>,
 }
 
 async fn run(
@@ -341,6 +378,20 @@ async fn run(
             bytes.try_into().map_err(|_| fail(MaterializeFailure::NotFound, "invalid version"))?,
         )),
     };
+    // A window is only meaningful for one exact version: bytes of "whatever is current" could
+    // not be told apart from another version's.
+    let range = match (request.ranged, requested) {
+        (false, _) => None,
+        (true, Some(_)) => {
+            Some(ByteRange { offset: request.range_offset, len: request.range_length })
+        }
+        (true, None) => {
+            return Err(fail(
+                MaterializeFailure::RangeNotSatisfiable,
+                "a ranged request must name the version",
+            ));
+        }
+    };
     match fetch_gate(&context.replica_coordinator, &root, &item)
         .map_err(|e| fail(MaterializeFailure::NotFound, &e.to_string()))?
     {
@@ -372,6 +423,7 @@ async fn run(
             path: &path,
             requested_version: requested,
             staging_file: &staging_file,
+            range,
         })
         .await
         .map_err(failure_of);
@@ -384,7 +436,8 @@ async fn run(
                 context.eager.record_failure(&context.replica_coordinator, &root, &item, attempted);
             }
         }
-        Ok(TempOutcome::Assembled(_)) => {
+        // A window is not the content the Eager driver is after.
+        Ok(TempOutcome::Assembled(assembled)) if assembled.range.is_none() => {
             context.eager.record_success(&context.replica_coordinator, &root, &item);
         }
         _ => {}
@@ -394,6 +447,12 @@ async fn run(
         TempOutcome::Assembled(assembled) => assembled,
         TempOutcome::VersionOutOfDate => {
             return Err(fail(MaterializeFailure::VersionOutOfDate, "the version is not current"));
+        }
+        TempOutcome::RangeNotSatisfiable => {
+            return Err(fail(
+                MaterializeFailure::RangeNotSatisfiable,
+                "the range starts past the end of the version",
+            ));
         }
     };
     // From here nothing awaits until the response is sent. The item must still be at the version
@@ -417,34 +476,68 @@ async fn run(
     // BEFORE anything may reach the OS: the content we MAY HAVE handed over is recorded durably
     // and monotonically (the item's sticky served summary), and the transaction has committed
     // before the file is named to anyone. If it fails, nothing is served. Nothing later (a
-    // failed send, a restart, a signal) ever un-records it.
-    let generation = match repo.record_may_serve(&root, &item, assembled.version_hash) {
-        Ok(Some(generation)) => generation,
-        Ok(None) => {
-            let _ = std::fs::remove_file(&assembled.assembled);
-            return Err(fail(MaterializeFailure::VersionOutOfDate, "the version is not current"));
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(&assembled.assembled);
-            return Err((MaterializeFailure::Unobtainable, error.to_string()));
+    // failed send, a restart, a signal) ever un-records it. A window is not a whole version's
+    // content: it records nothing and is paired with no generation (the version was checked
+    // current just above, and again after the response is sent).
+    let generation = if assembled.range.is_some() {
+        0
+    } else {
+        match repo.record_may_serve(&root, &item, assembled.version_hash) {
+            Ok(Some(generation)) => generation,
+            Ok(None) => {
+                let _ = std::fs::remove_file(&assembled.assembled);
+                return Err(fail(
+                    MaterializeFailure::VersionOutOfDate,
+                    "the version is not current",
+                ));
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&assembled.assembled);
+                return Err((MaterializeFailure::Unobtainable, error.to_string()));
+            }
         }
     };
     handoff_root
         .publish(&assembled.assembled, &name)
         .map_err(|e| (MaterializeFailure::Unobtainable, e.to_string()))?;
+    let mut file = HandoffFile::new(handoff_root.handoff_file(&name));
+    if assembled.range.is_some() {
+        // A window records no served content, so a newer version's publication finds it only
+        // through this registration: it is made BEFORE the response can be read, and the version
+        // is checked again with it in place. A version that commits after this check revokes the
+        // file; one that committed before is seen here. On any failure `file` removes both the
+        // file and the registration.
+        handoff_root.note_delivered(&root, item, &name);
+        file.tracked = Some((handoff_root.clone(), root.clone(), item, name.clone()));
+        if !matches!(
+            repo.current_version_hash(&root, &item),
+            Ok(Some(current)) if current == assembled.version_hash
+        ) {
+            return Err(fail(MaterializeFailure::VersionOutOfDate, "the version is not current"));
+        }
+        if !matches!(fetch_gate(&context.replica_coordinator, &root, &item), Ok(FetchGate::Allowed))
+        {
+            return Err(fail(
+                MaterializeFailure::PublicationPending,
+                "a newer version is being published",
+            ));
+        }
+    }
     Ok((
         Answer {
             name: name.clone(),
             version: assembled.version_hash,
             generation,
             size: assembled.size,
+            range: assembled.range,
         },
         Handoff {
-            file: HandoffFile(Some(handoff_root.handoff_file(&name))),
+            file,
             root,
             item,
             name,
             version: assembled.version_hash,
+            ranged: assembled.range.is_some(),
         },
     ))
 }
@@ -469,10 +562,15 @@ fn response(request_id: &[u8], answer: Result<Answer, Failure>) -> ShellIpcMessa
             handoff_name: answer.name,
             version_hash: answer.version.0.to_vec(),
             size: answer.size,
-            content_version: super::provider_enumerate::versioned(
-                &answer.version.0,
-                answer.generation,
-            ),
+            // A window is paired with no generation: only a whole-version handoff is.
+            content_version: if answer.range.is_some() {
+                Vec::new()
+            } else {
+                super::provider_enumerate::versioned(&answer.version.0, answer.generation)
+            },
+            ranged: answer.range.is_some(),
+            range_offset: answer.range.map_or(0, |r| r.offset),
+            range_length: answer.range.map_or(0, |r| r.len),
         },
         Err((failure, error)) => MaterializeToTempResponse {
             request_id: request_id.to_vec(),
@@ -483,6 +581,9 @@ fn response(request_id: &[u8], answer: Result<Answer, Failure>) -> ShellIpcMessa
             version_hash: Vec::new(),
             size: 0,
             content_version: Vec::new(),
+            ranged: false,
+            range_offset: 0,
+            range_length: 0,
         },
     };
     ShellIpcMessage { payload: Some(Payload::MaterializeToTempResponse(message)) }

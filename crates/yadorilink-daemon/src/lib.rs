@@ -17,6 +17,8 @@ pub mod control_socket;
 pub mod convergence;
 pub mod coordination_client;
 pub mod credential_store;
+pub mod custody_handoff;
+pub mod custody_holds;
 pub mod daemon_state;
 pub mod device_config;
 pub mod diagnostics_ipc;
@@ -90,6 +92,9 @@ pub(crate) mod provider_ingest_windows;
 pub(crate) mod provider_prefetch;
 pub(crate) mod provider_projector;
 pub(crate) mod provider_publication;
+#[cfg(test)]
+pub(crate) mod provider_read_fault;
+pub(crate) mod provider_reclaim;
 pub(crate) mod provider_status;
 pub(crate) mod provider_writer;
 pub mod resource_lock;

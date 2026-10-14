@@ -1,5 +1,5 @@
-//! Production custody confirmer: performs the peer-to-peer version-present
-//! query via `DaemonState::confirm_version_present_witness_via_peer`. The
+//! Production custody confirmer: acquires the responder's durable custody
+//! lease via `DaemonState::acquire_custody_lease_via_peer`. The
 //! eviction sweep is synchronous, so this bridges to the async query with
 //! `block_in_place`, guarded the same way as every other `block_in_place`
 //! call site in this crate (see `confirms_present`'s doc comment for why
@@ -14,6 +14,7 @@ use std::sync::Weak;
 use yadorilink_replica_domain::file::VersionBlock;
 use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_replica_engine::custody::CustodyStamp;
+use yadorilink_sync_sqlite::remote_custody_hold::HoldKey;
 
 use crate::daemon_state::DaemonState;
 use crate::durability_service::CustodyConfirmer;
@@ -29,11 +30,9 @@ impl P2pCustodyConfirmer {
 }
 
 impl CustodyConfirmer for P2pCustodyConfirmer {
-    // The caller, `yadorilink_replica_engine::custody::verify_reclaim_custody`,
-    // fails closed to `None` up front while `REMOTE_CUSTODY_LEASES_SUPPORTED`
-    // is `false` (physical reclamation isn't shipped yet -- see
-    // `DaemonState::install_p2p_custody_confirmer`'s doc comment), so this
-    // method is not actually reachable in any build today.
+    // The caller, `yadorilink_replica_engine::custody::verify_reclaim_custody`, is
+    // reachable now that `REMOTE_CUSTODY_LEASES_SUPPORTED` is `true`. A non-multi-thread
+    // runtime fails closed to `None` below (no confirmation, no reclaim).
     // `block_in_place` panics if called on a current-thread tokio runtime,
     // so the offload path below can only be taken when a *multi-threaded*
     // runtime is actually current -- the same guard used at every other
@@ -46,14 +45,9 @@ impl CustodyConfirmer for P2pCustodyConfirmer {
     // only way to answer it inline on a non-multi-thread runtime would be
     // another blocking call (e.g. a bare `block_on`), which panics for the
     // same reason `block_in_place` does. So the non-multi-thread branch
-    // can't do the work at all; per this impl's doc comment above, that
-    // branch also isn't reachable in any build today
-    // (`REMOTE_CUSTODY_LEASES_SUPPORTED` is `false`), so if it's ever hit it
-    // means either that flag shipped without this bridge being revisited, or
-    // `confirms_present` grew a caller off a non-multi-thread runtime --
-    // both worth surfacing loudly rather than silently returning "no
-    // confirmation", which would look identical to an ordinary "peer didn't
-    // confirm" result.
+    // can't do the work at all, and fails closed: `None` is "no custody", so nothing is
+    // evicted from the working tree's blocks. The sync-over-async bridge is a
+    // known limitation; replacing it does not change the fail-closed outcome.
     fn confirms_present(
         &self,
         group_id: &str,
@@ -71,12 +65,7 @@ impl CustodyConfirmer for P2pCustodyConfirmer {
                 tokio::task::block_in_place(move || {
                     tokio::runtime::Handle::current().block_on(async move {
                         state
-                            .confirm_version_present_witness_via_peer(
-                                &group_id,
-                                &path,
-                                version_hash,
-                                &blocks,
-                            )
+                            .acquire_custody_lease_via_peer(&group_id, &path, version_hash, &blocks)
                             .await
                     })
                 })
@@ -94,11 +83,31 @@ impl CustodyConfirmer for P2pCustodyConfirmer {
         }
     }
 
-    fn confirmation_still_valid(&self, group_id: &str, stamp: &CustodyStamp) -> bool {
+    fn confirmation_still_valid(
+        &self,
+        group_id: &str,
+        path: &str,
+        version_hash: &VersionHash,
+        stamp: &CustodyStamp,
+    ) -> bool {
         let Some(state) = self.state.upgrade() else {
             return false;
         };
-        state.authority.membership_generation() == stamp.membership_generation()
+        // The lease must still be one this device records as granted: a stamp
+        // whose hold was released (or never recorded) backs nothing.
+        let hold = HoldKey {
+            group_id: group_id.to_string(),
+            path: path.to_string(),
+            version_hash: version_hash.0,
+            peer_id: stamp.peer_id().to_string(),
+        };
+        let granted = state
+            .replica_coordinator
+            .remote_custody_hold_repository()
+            .is_granted(&hold)
+            .unwrap_or(false);
+        granted
+            && state.authority.membership_generation() == stamp.membership_generation()
             && state.authority.peer_group_is_full_replica(stamp.peer_id(), group_id)
             && state.authority.peer_is_writer(stamp.peer_id(), group_id)
     }

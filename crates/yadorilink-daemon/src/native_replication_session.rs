@@ -406,6 +406,8 @@ pub fn delta_batches(
 /// The outcome of admitting one received batch.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct IngestReport {
+    /// The group the batch was for.
+    pub group: String,
     /// Deltas newly applied, including those an admission released.
     pub admitted: usize,
     pub duplicates: usize,
@@ -442,7 +444,7 @@ fn ingest_with(
     entries: &[DeltaBatchEntry],
     store_versions: &StoreVersions,
 ) -> IngestReport {
-    let mut report = IngestReport::default();
+    let mut report = IngestReport { group: group_id.0.clone(), ..IngestReport::default() };
     for entry in entries {
         let proof = match protocol5::decode_proof(&entry.proof_encoded) {
             Ok(proof) => proof,

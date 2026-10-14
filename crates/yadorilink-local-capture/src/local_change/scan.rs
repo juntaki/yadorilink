@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::error::LocalCaptureError;
 use crate::scan_block_staging::ScanBlockStaging;
 use yadorilink_filesystem_sync::watcher::FsChangeKind;
-use yadorilink_fs_platform::fs_identity::{disk_race_fingerprint_of, metadata_mtime_matches};
+use yadorilink_fs_platform::fs_identity::{disk_race_fingerprint_of_at, metadata_mtime_matches};
 use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
@@ -96,16 +96,20 @@ pub(super) fn path_is_within_failed_subtree(rel_path: &str, failed_prefixes: &[S
     failed_prefixes.iter().any(|prefix| candidate.starts_with(Path::new(prefix)))
 }
 
-/// A caller-supplied per-chunk-commit observer, threaded through a full
+/// A caller-supplied per-chunk-commit observer, which returns `Err` when its
+/// consumer is gone so the scan stops instead of committing chunks nobody
+/// will announce, threaded through a full
 /// disk scan's batched writes. Factored out (clippy type_complexity).
-pub(super) type OnChunkCommitted<'a> = Option<&'a mut dyn FnMut(&[FileRecord])>;
+pub(super) type OnChunkCommitted<'a> =
+    Option<&'a mut dyn FnMut(&[FileRecord]) -> Result<(), LocalCaptureError>>;
 
 /// `OnChunkCommitted` with the borrow and the trait object's own lifetime
 /// kept apart. `&mut dyn Trait` is invariant in the object lifetime, so the
 /// single-lifetime form above cannot be reborrowed for a shorter span --
 /// which is exactly what the single-flight wrapper has to do to hand the
 /// same callback to a pass and then to its coalesced rerun.
-pub(super) type ChunkCommittedSink<'cb, 'obj> = Option<&'cb mut (dyn FnMut(&[FileRecord]) + 'obj)>;
+pub(super) type ChunkCommittedSink<'cb, 'obj> =
+    Option<&'cb mut (dyn FnMut(&[FileRecord]) -> Result<(), LocalCaptureError> + 'obj)>;
 
 /// Everything one path contributes to a reconciliation scan's commit,
 /// derived from ONE bracketed observation of that path.
@@ -617,7 +621,7 @@ impl LocalChangeProcessor {
         group_id: &str,
         root: &Path,
         ignore_set: &EffectiveIgnoreSet,
-        on_chunk_committed: &mut dyn FnMut(&[FileRecord]),
+        on_chunk_committed: &mut dyn FnMut(&[FileRecord]) -> Result<(), LocalCaptureError>,
     ) -> Result<Vec<FileRecord>, LocalCaptureError> {
         let root = self.verified_root(group_id, root)?;
         self.reconcile_disk_with_ignore(
@@ -1569,7 +1573,8 @@ impl LocalChangeProcessor {
             // same reason the walk sets `follow_links(false)`: a symlink is
             // captured as itself, never as whatever it points at.
             let entry_metadata = std::fs::symlink_metadata(path).ok();
-            let fingerprint_before = entry_metadata.as_ref().map(disk_race_fingerprint_of);
+            let fingerprint_before =
+                entry_metadata.as_ref().map(|meta| disk_race_fingerprint_of_at(meta, path));
             // "Already current" must be judged on the *same* basis as the
             // per-file path (`build_record_for_created_or_modified`'s fast
             // path): the cheap size+mtime stat gate first (via the shared
@@ -1844,7 +1849,7 @@ impl LocalChangeProcessor {
             return Ok(());
         }
         let Ok(lstat) = std::fs::symlink_metadata(path) else { return Ok(()) };
-        let fingerprint_before = Some(disk_race_fingerprint_of(&lstat));
+        let fingerprint_before = Some(disk_race_fingerprint_of_at(&lstat, path));
         let DirectoryVerdict::Author { unix_mode } =
             self.directory_verdict(group_id, root, &rel_path, &lstat)?
         else {
@@ -2183,7 +2188,7 @@ impl LocalChangeProcessor {
             match result {
                 Ok(_) => {
                     if let Some(ref mut cb) = on_chunk_committed {
-                        cb(&kept);
+                        cb(&kept)?;
                     }
                     committed.extend(kept);
                 }
@@ -2503,7 +2508,7 @@ impl LocalChangeProcessor {
                 Ok(_) => {
                     committed.extend_from_slice(&chunk_records);
                     if let Some(ref mut cb) = on_chunk_committed {
-                        cb(&chunk_records);
+                        cb(&chunk_records)?;
                     }
                 }
                 // The group's policy is stale or has not loaded yet this

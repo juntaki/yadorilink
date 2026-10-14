@@ -572,6 +572,10 @@ impl NetmapSessionState<'_> {
     /// epoch bump that wakes supervisors to the whole update.
     async fn apply_snapshot(&mut self, update: AdmittedNetmapMessage) -> Result<(), DaemonError> {
         let (update, generation) = update.into_parts();
+        yadorilink_fs_platform::join_timeline::mark_device(
+            &self.state.device_id,
+            yadorilink_fs_platform::join_timeline::Milestone::NetmapReceived,
+        );
         // Recorded before anything this frame writes, so every row it
         // mirrors carries this frame's provenance: a later run compares a
         // first frame's generation against it to decide whether that frame
@@ -782,7 +786,7 @@ impl NetmapSessionState<'_> {
                 &peer.device_id,
                 peer.substrate_reachability.clone(),
             );
-            apply_authoritative_peer_metadata(
+            let effective_groups = apply_authoritative_peer_metadata(
                 state,
                 &peer.device_id,
                 Some(peer.signing_key),
@@ -790,6 +794,29 @@ impl NetmapSessionState<'_> {
                 &peer.full_replica_groups,
                 retained_group_validation_cache,
             );
+            // Measurement only, for the groups the peer was actually admitted to.
+            if yadorilink_fs_platform::join_timeline::is_active() {
+                let has_address = peer
+                    .substrate_reachability
+                    .as_ref()
+                    .is_some_and(|r| !r.direct.is_empty() || !r.relays.is_empty());
+                for group in &effective_groups {
+                    if has_address {
+                        yadorilink_fs_platform::join_timeline::mark_with_peer(
+                            &state.device_id,
+                            group,
+                            yadorilink_fs_platform::join_timeline::Milestone::PeerAddressAvailable,
+                            &peer.device_id,
+                        );
+                    }
+                    yadorilink_fs_platform::join_timeline::mark_with_peer(
+                        &state.device_id,
+                        group,
+                        yadorilink_fs_platform::join_timeline::Milestone::PeerAuthorized,
+                        &peer.device_id,
+                    );
+                }
+            }
         }
     }
 }

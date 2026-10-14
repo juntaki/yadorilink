@@ -38,6 +38,10 @@ struct Snapshot {
     reported_at: std::time::Instant,
     /// item -> the `observed_after_seq` of the report that listed it.
     items: HashMap<ItemId, u64>,
+    /// The last COMPLETE snapshot of this connection that this one is replacing, while its pages
+    /// are still arriving: what it held and this one does not has left once this one completes.
+    /// Never carried across `clear` (a disconnected host says nothing about the OS).
+    replacing: Option<HashMap<ItemId, u64>>,
 }
 
 #[derive(Default)]
@@ -68,11 +72,25 @@ impl ProviderMembership {
     ///   continues the pages of the incomplete snapshot of its own epoch; a later full report in
     ///   an epoch, or an old epoch's, is a replay and never restores earlier membership;
     /// * `observed_after_seq` is at most `latest_issued` and never decreases within an epoch.
+    #[cfg(test)]
     pub(crate) fn apply(
         &self,
         report: &ProviderMaterializedReport,
         latest_issued: u64,
     ) -> ProviderReportAck {
+        self.apply_reporting_departures(report, latest_issued).0
+    }
+
+    /// [`Self::apply`], plus the items an accepted report took OUT of the materialized set: the OS
+    /// dropped its copy of them (the user removed the download, or an update landed), each with
+    /// the `observed_after_seq` of the report that last listed it. A delta names them; a full
+    /// snapshot replacing a complete one of the same connection reports them when its last page
+    /// arrives.
+    pub(crate) fn apply_reporting_departures(
+        &self,
+        report: &ProviderMaterializedReport,
+        latest_issued: u64,
+    ) -> (ProviderReportAck, Vec<(ItemId, u64)>) {
         let root = hex::encode(&report.root_id);
         let mut state = self.roots.lock().unwrap_or_else(|p| p.into_inner());
         let answer = |accepted_seq: u64, needs_full: bool| ProviderReportAck {
@@ -81,7 +99,7 @@ impl ProviderMembership {
             accepted_seq,
             needs_full,
         };
-        let refused = || answer(0, true);
+        let refused = || (answer(0, true), Vec::new());
         if report.observed_after_seq > latest_issued {
             return refused();
         }
@@ -104,7 +122,14 @@ impl ProviderMembership {
                     snapshot.last_seq = report.report_seq;
                     snapshot.reported_at = std::time::Instant::now();
                     snapshot.complete = !report.more;
-                    return answer(report.report_seq, false);
+                    let departed = if snapshot.complete {
+                        let items = &snapshot.items;
+                        let old = snapshot.replacing.take().unwrap_or_default();
+                        old.into_iter().filter(|(id, _)| !items.contains_key(id)).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    return (answer(report.report_seq, false), departed);
                 }
             }
             let newest = state.highest_epoch.get(&root).copied().unwrap_or(0);
@@ -112,18 +137,38 @@ impl ProviderMembership {
                 return refused();
             }
             state.highest_epoch.insert(root.clone(), report.reporter_epoch);
+            // The last complete snapshot is what this one replaces; an unfinished one before it
+            // passes its own predecessor on.
+            let replacing = state.snapshots.remove(&root).and_then(|old| {
+                if old.complete {
+                    Some(old.items)
+                } else {
+                    old.replacing
+                }
+            });
+            let items: HashMap<ItemId, u64> = listed().collect();
+            let complete = !report.more;
+            let departed = match (&replacing, complete) {
+                (Some(old), true) => old
+                    .iter()
+                    .filter(|(id, _)| !items.contains_key(*id))
+                    .map(|(id, at)| (*id, *at))
+                    .collect(),
+                _ => Vec::new(),
+            };
             state.snapshots.insert(
                 root,
                 Snapshot {
                     epoch: report.reporter_epoch,
                     last_seq: 1,
                     observed_after: report.observed_after_seq,
-                    complete: !report.more,
+                    complete,
                     reported_at: std::time::Instant::now(),
-                    items: listed().collect(),
+                    items,
+                    replacing: if complete { None } else { replacing },
                 },
             );
-            return answer(1, false);
+            return (answer(1, false), departed);
         }
         match state.snapshots.get_mut(&root) {
             Some(snapshot)
@@ -132,14 +177,19 @@ impl ProviderMembership {
                     && report.report_seq == snapshot.last_seq + 1
                     && report.observed_after_seq >= snapshot.observed_after =>
             {
+                let mut departed = Vec::new();
                 for id in report.removed.iter().filter_map(|b| item_id(b)) {
-                    snapshot.items.remove(&id);
+                    if let Some(listed_at) = snapshot.items.remove(&id) {
+                        departed.push((id, listed_at));
+                    }
                 }
                 snapshot.items.extend(listed());
+                // Listed again in the same report: it did not leave.
+                departed.retain(|(id, _)| !snapshot.items.contains_key(id));
                 snapshot.last_seq = report.report_seq;
                 snapshot.observed_after = report.observed_after_seq;
                 snapshot.reported_at = std::time::Instant::now();
-                answer(report.report_seq, false)
+                (answer(report.report_seq, false), departed)
             }
             _ => refused(),
         }
@@ -227,6 +277,27 @@ pub(crate) fn provider_local_presence(
         Ok(Some(_)) => {}
     }
     LocalPresence { current_content_present: true, ..object_only }
+}
+
+/// Whether the daemon's evidence shows the OS holds the CURRENT CONTENT of an item: the host
+/// lists it, in a report that began after the daemon's last handoff of it; that handoff has the
+/// content the item has now (it may differ in metadata only); and no content change is pending
+/// publication. Any error reads as "no".
+pub(crate) fn os_holds_current_content(
+    coordinator: &ReplicaCoordinator,
+    membership: &ProviderMembership,
+    root_id: &str,
+    item: &ItemId,
+) -> bool {
+    let Some(stamp) = membership.stamp(root_id, item) else { return false };
+    let repo = coordinator.provider_repository();
+    let Ok(Some(handoff)) = repo.handoff(root_id, item) else { return false };
+    stamp >= handoff.evidence_seq
+        && matches!(repo.handoff_has_current_content(root_id, item), Ok(true))
+        && !matches!(
+            repo.publication(root_id, item),
+            Ok(Some(Publication::ContentPending)) | Err(_) | Ok(None)
+        )
 }
 
 #[cfg(test)]

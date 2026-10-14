@@ -29,7 +29,8 @@ use yadorilink_sync_sqlite::native_rebootstrap::{
     RecoveryContentSource, RestartOutcome,
 };
 use yadorilink_sync_sqlite::native_rebootstrap_install::{
-    install_rebootstrap, InstallContext, InstallError, InstallPoint, Observed, QuarantineRoot,
+    install_rebootstrap, observe_regular_file, unlink_exclusively, InstallContext, InstallError,
+    InstallPoint, Observed, QuarantineRoot, Removal, Unlinked,
 };
 use yadorilink_sync_sqlite::native_rebootstrap_replay::{
     catch_up, replay_own_intent, CatchUpLimits, CatchUpPass, CatchUpSource, MachinePoint,
@@ -857,8 +858,10 @@ impl DaemonQuarantineRoot {
         let kind = meta.file_type();
         if kind.is_symlink() {
             let target = std::fs::read_link(path).map_err(|e| e.to_string())?;
+            // The raw platform-native bytes, as ordinary capture reads them: never a lossy
+            // UTF-8 conversion, which would save a different target than the link has.
             return Ok(Observed::Symlink {
-                target: target.to_string_lossy().into_owned().into_bytes(),
+                target: yadorilink_fs_platform::fs_identity::target_to_bytes(&target),
             });
         }
         if kind.is_dir() {
@@ -867,8 +870,16 @@ impl DaemonQuarantineRoot {
         if !kind.is_file() {
             return Ok(Observed::Other);
         }
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        Ok(Observed::File { size: bytes.len() as u64, sha256: Sha256::digest(&bytes).into() })
+        observe_regular_file(std::fs::File::open(path).map_err(|e| e.to_string())?)
+    }
+}
+
+impl DaemonQuarantineRoot {
+    fn claimed_name(full: &Path, claim: &str) -> Result<PathBuf, String> {
+        use yadorilink_fs_platform::reserved_namespace::{artefact_component_name, ArtefactKind};
+        Ok(full.with_file_name(
+            artefact_component_name(ArtefactKind::Preimage, claim).map_err(|e| e.to_string())?,
+        ))
     }
 }
 
@@ -881,45 +892,62 @@ impl QuarantineRoot for DaemonQuarantineRoot {
         }
     }
 
-    fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+    fn open_file(&self, path: &str) -> Result<Box<dyn std::io::Read>, String> {
         let _op = self.lease.begin_operation().map_err(|e| e.to_string())?;
         let full = self.confined(path)?.ok_or_else(|| format!("{path} does not exist"))?;
         if !std::fs::symlink_metadata(&full).map_err(|e| e.to_string())?.is_file() {
             return Err(format!("{path} is not a regular file"));
         }
-        std::fs::read(full).map_err(|e| e.to_string())
+        // Streamed by the caller through a bounded buffer; the lease operation covers the open,
+        // and the removal that follows verifies the object against what was observed.
+        let file = std::fs::File::open(full).map_err(|e| e.to_string())?;
+        if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err(format!("{path} is not a regular file"));
+        }
+        Ok(Box::new(file))
     }
 
-    fn remove(&self, path: &str, expected: &Observed) -> Result<(), String> {
-        use yadorilink_fs_platform::reserved_namespace::{artefact_component_name, ArtefactKind};
+    fn remove(&self, path: &str, expected: &Observed, claim: &str) -> Result<Removal, String> {
         let _op = self.lease.begin_operation().map_err(|e| e.to_string())?;
-        let Some(full) = self.confined(path)? else { return Ok(()) };
+        let Some(full) = self.confined(path)? else { return Ok(Removal::Removed) };
         // Compare-then-unlink by name is not atomic: the user could save in between. The
         // object is renamed to a private name in its own directory first, so it cannot be
         // written under its old name, and is checked there.
-        let private = full.with_file_name(
-            artefact_component_name(
-                ArtefactKind::Preimage,
-                &hex::encode(rand::random::<[u8; 8]>()),
-            )
-            .map_err(|e| e.to_string())?,
-        );
+        // The name is derived from `claim`, which the install recorded before this call, so
+        // whatever is under it after a crash is owned and given back by `release_claim`.
+        let private = Self::claimed_name(&full, claim)?;
         // A durable, never-replacing move: the quarantine name is on disk before
         // anything is decided about the object under it.
         match yadorilink_local_storage::move_no_replace_durably(&full, &private) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Removal::Removed),
             Err(e) => return Err(e.to_string()),
         }
-        let renamed = Self::observe_at(&private)?;
-        if renamed == *expected {
-            return if matches!(renamed, Observed::Directory) {
+        if std::fs::symlink_metadata(&private).map_err(|e| e.to_string())?.is_file() {
+            // A regular file may still be open for writing in a program that opened it before
+            // the move: it is unlinked only under an exclusion the platform guarantees, and
+            // kept under its claim otherwise.
+            match unlink_exclusively(
+                &private,
+                expected,
+                &yadorilink_sync_sqlite::native_rebootstrap_install::open_excluding_writers,
+                &|| {},
+                &yadorilink_fs_platform::durable_dir::remove_file_durably,
+            )? {
+                Unlinked::Done(removal) => return Ok(removal),
+                Unlinked::ChangedBeforeUnlink => {}
+            }
+        } else if Self::observe_at(&private)? == *expected {
+            return if matches!(expected, Observed::Directory) {
                 yadorilink_local_storage::move_no_replace_durably(&private, &full)
                     .map_err(|e| e.to_string())
+                    .map(|()| Removal::Removed)
             } else {
                 // The removal was committed by the move above; unlinking the
-                // quarantined object is the non-critical part.
-                std::fs::remove_file(&private).map_err(|e| e.to_string())
+                // quarantined link is the non-critical part.
+                yadorilink_fs_platform::durable_dir::remove_file_durably(&private)
+                    .map_err(|e| e.to_string())
+                    .map(|()| Removal::Removed)
             };
         }
         // Not what the plan saw any more: the name is given back so the next attempt sees
@@ -929,6 +957,23 @@ impl QuarantineRoot for DaemonQuarantineRoot {
                 .map_err(|e| e.to_string())?;
         }
         Err(format!("{path} changed while it was being removed"))
+    }
+
+    fn release_claim(&self, path: &str, claim: &str) -> Result<(), String> {
+        let _op = self.lease.begin_operation().map_err(|e| e.to_string())?;
+        // The claim is cleared only once the moved object is gone or back; a parent that
+        // vanished meanwhile leaves the object unreachable by this path, so it fails closed.
+        let full = self
+            .confined(path)?
+            .ok_or_else(|| format!("{path}: a parent is gone while its original is moved aside"))?;
+        let private = Self::claimed_name(&full, claim)?;
+        match yadorilink_local_storage::move_no_replace_durably(&private, &full) {
+            Ok(()) => Ok(()),
+            // Nothing under the claim: the removal finished (the object was verified and
+            // unlinked), or the move never happened.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 }
 

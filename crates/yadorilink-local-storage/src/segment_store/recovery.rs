@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::error::StorageError;
-use crate::fs_ops::{remove_path, sync_directory};
+use crate::fs_ops::sync_directory;
 use crate::segment_store::format::SEGMENT_HEADER_LEN;
 use crate::segment_store::index::{BlockIndex, SegmentState};
 use crate::segment_store::segment::{
@@ -82,7 +82,14 @@ pub(crate) struct RecoveredStore {
     pub(crate) next_segment_id: u64,
 }
 
-pub(crate) fn recover(root: &Path, index: &BlockIndex) -> Result<RecoveredStore, StorageError> {
+/// `may_delete` is asked immediately before every unlink or truncation and fails the open when the
+/// volume is not known durable.
+pub(crate) fn recover(
+    root: &Path,
+    index: &BlockIndex,
+    may_delete: impl Fn() -> Result<(), StorageError>,
+    remove: impl Fn(&Path) -> Result<std::io::Result<()>, StorageError>,
+) -> Result<RecoveredStore, StorageError> {
     let mut report = RecoveryReport::default();
     let on_disk = enumerate_segment_files(root)?;
     let rows = index.segments()?;
@@ -99,7 +106,10 @@ pub(crate) fn recover(root: &Path, index: &BlockIndex) -> Result<RecoveredStore,
             // Retirement is decided durably, in the transaction that
             // emptied the segment. Removing the file is the only part left,
             // and it is safe to retry on any later open.
-            if present && remove_path(&path).is_err() {
+            if present {
+                may_delete()?;
+            }
+            if present && remove(&path)?.is_err() {
                 continue;
             }
             deleted_any_file |= present;
@@ -127,6 +137,7 @@ pub(crate) fn recover(root: &Path, index: &BlockIndex) -> Result<RecoveredStore,
             // referenced by nothing: either its transaction never
             // committed or it was never even fsynced. Cutting it back is
             // what keeps the file's length and the index's claim equal.
+            may_delete()?;
             let mut writer = SegmentWriter::reopen(root, row.segment_id, file_len)?;
             writer.truncate(row.durable_end)?;
             report.truncated_segments.push(row.segment_id);
@@ -153,7 +164,8 @@ pub(crate) fn recover(root: &Path, index: &BlockIndex) -> Result<RecoveredStore,
         if known.contains(&segment_id) {
             continue;
         }
-        if remove_path(&segment_path(root, segment_id)).is_ok() {
+        may_delete()?;
+        if remove(&segment_path(root, segment_id))?.is_ok() {
             deleted_any_file = true;
             report.removed_orphan_segments.push(segment_id);
         }
@@ -164,7 +176,8 @@ pub(crate) fn recover(root: &Path, index: &BlockIndex) -> Result<RecoveredStore,
         if known.contains(&stage.0) {
             continue;
         }
-        if remove_path(&stage.1).is_ok() {
+        may_delete()?;
+        if remove(&stage.1)?.is_ok() {
             deleted_any_file = true;
             highest_id = highest_id.max(stage.0);
         }

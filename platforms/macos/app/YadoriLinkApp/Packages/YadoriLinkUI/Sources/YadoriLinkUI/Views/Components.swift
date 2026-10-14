@@ -170,6 +170,32 @@ public struct LoadingRow: View {
     }
 }
 
+/// A failed list read: one line, the common error wording as secondary text,
+/// and one Retry that re-runs only that read.
+public struct RetryRow: View {
+    let title: String
+    let notice: Notice
+    let retry: () async -> Void
+    public init(_ title: String, notice: Notice, retry: @escaping () async -> Void) {
+        self.title = title
+        self.notice = notice
+        self.retry = retry
+    }
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title).foregroundStyle(.secondary)
+                Spacer()
+                Button(LoadWording.retry) { Task { await retry() } }
+            }
+            Text(notice.text).font(.caption).foregroundStyle(.secondary)
+                .help(notice.detail ?? "")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 4)
+    }
+}
+
 public struct EmptyStateText: View {
     let text: String
     public init(_ text: String) { self.text = text }

@@ -68,6 +68,17 @@ pub(crate) struct TempMaterialization<'a> {
     pub requested_version: Option<yadorilink_replica_domain::ids::VersionHash>,
     /// A file name inside the daemon's staging directory; the assembly is built beside it.
     pub staging_file: &'a std::path::Path,
+    /// `Some`: only the bytes of this window of the version, not the whole file. Only the blocks
+    /// covering it are fetched; the file's materialization state is untouched either way.
+    pub range: Option<ByteRange>,
+}
+
+/// A byte window `[offset, offset + len)` of one file version. The end is clamped to the file's
+/// size; an offset past the size cannot be satisfied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ByteRange {
+    pub offset: u64,
+    pub len: u64,
 }
 
 /// A fully written, verified, fsynced file in the staging directory.
@@ -75,7 +86,11 @@ pub(crate) struct TempMaterialization<'a> {
 pub(crate) struct TempAssembly {
     pub assembled: std::path::PathBuf,
     pub version_hash: yadorilink_replica_domain::ids::VersionHash,
+    /// The size of the whole file version.
     pub size: u64,
+    /// For a ranged request, the window the file holds (clamped to the size); `None`: the whole
+    /// file.
+    pub range: Option<ByteRange>,
 }
 
 #[derive(Debug)]
@@ -84,6 +99,8 @@ pub(crate) enum TempOutcome {
     /// The named version is not the current one, or the version kept moving while it was
     /// assembled. Old bytes are never returned.
     VersionOutOfDate,
+    /// A ranged request whose offset is past the end of the version. Nothing was fetched.
+    RangeNotSatisfiable,
 }
 
 pub(crate) trait MaterializationPort: Send + Sync {

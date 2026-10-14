@@ -153,3 +153,47 @@ async fn on_an_on_demand_folder_a_hydrated_loser_is_copied_and_not_left_a_placeh
     // What the on-demand lane then does at `x` (a placeholder for the winner) is
     // its own business; the loser's bytes stand at the copy path whatever it does.
 }
+
+/// Ten guards that each find another path holding the displaced version must all finish: the
+/// question whether that path can coexist is answered on the guard's own connection, so a
+/// guard never holds one pooled connection while waiting for a second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 12)]
+async fn concurrent_displacement_guards_do_not_exhaust_the_connection_pool() {
+    let h = Harness::new(false);
+    let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    for name in ["a", "b"] {
+        std::fs::write(h.path(name), b"same bytes").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(h.path(name))
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        assert!(matches!(h.capture(name).await, LocalChangeOutcome::FileChanged(_)));
+    }
+    let a = VersionHash(h.own_head("a").content.unwrap().version_hash);
+    let b = VersionHash(h.own_head("b").content.unwrap().version_hash);
+    assert_eq!(a, b, "sanity: the two paths hold one version");
+    let state = Arc::new(h.state.clone());
+    assert!(
+        matches!(
+            state.displacement_guard(GROUP, "a", None, &|_| false).unwrap(),
+            yadorilink_sync_sqlite::displacement_guard::DisplacementGuard::Guarded(_)
+        ),
+        "sanity: `a` is displacing a version that lives on at `b`"
+    );
+    let started = std::time::Instant::now();
+    let guards: Vec<_> = (0..10)
+        .map(|_| {
+            let state = state.clone();
+            tokio::task::spawn_blocking(move || {
+                // The volume folds `b` onto `a`.
+                state.displacement_guard(GROUP, "a", None, &|other| other == "b").unwrap()
+            })
+        })
+        .collect();
+    for guard in guards {
+        guard.await.unwrap();
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "guards stalled on the pool");
+}

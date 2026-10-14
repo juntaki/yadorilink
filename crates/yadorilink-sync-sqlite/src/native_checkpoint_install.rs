@@ -85,6 +85,17 @@ pub const PRESERVED_BY_INSTALL: &[&str] = &[
     "native_rebootstrap_recovery_item",
     // Recovery items: only an explicit discard deletes them.
     "native_recovery_item",
+    // Custody leases this device holds for other devices: a promise to a
+    // requester that only its explicit release ends.
+    "remote_custody_lease",
+    // Attempts a requester released, kept so a late acquire commits nothing.
+    "remote_custody_release_tombstone",
+    // The close a granted removal ticket holds on new custody leases: a promise
+    // to the device that holds the ticket, ended only by its release.
+    "custody_ticket_close",
+    // Custody this device asked other devices to hold for it: the record the
+    // release of those leases is driven from.
+    "remote_custody_hold",
     // The contested paths: re-judged for every path whose heads the install
     // changes ([`crate::native_desired_state::arm_projection_for_state_change`]).
     "native_contest_candidate",
@@ -127,6 +138,7 @@ pub const PRESERVED_BY_INSTALL: &[&str] = &[
     "restore_operations",
     "retained_directories",
     "role_loss_operations",
+    "stranded_directories",
     "structural_directory_origins",
     "structural_provenance_lost",
 ];

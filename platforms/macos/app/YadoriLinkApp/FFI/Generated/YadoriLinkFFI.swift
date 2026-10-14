@@ -631,6 +631,8 @@ public protocol ClientCoreProtocol: AnyObject, Sendable {
     
     func denyRequest(groupId: String, deviceId: String) async throws  -> MembershipOutcome
     
+    func downloadGuidance() async throws  -> UpdateDownloadGuidance
+    
     func evictFile(absolutePath: String) async throws  -> EvictOutcome
     
     func exportAccountData() async throws  -> String
@@ -647,8 +649,6 @@ public protocol ClientCoreProtocol: AnyObject, Sendable {
     func folderPeerCounts() async throws  -> [String: UInt32]
     
     func hydrateFile(absolutePath: String) async throws 
-    
-    func installUpdate() async throws  -> UpdateInstallOutcome
     
     func joinGroupAndLink(groupId: String, groupName: String, localPath: String, mode: FolderMode, acknowledgeRisks: Bool) async throws  -> LinkOutcome
     
@@ -721,11 +721,11 @@ public protocol ClientCoreProtocol: AnyObject, Sendable {
     
     func sendToDevice(sourcePath: String, targetDeviceId: String) async throws  -> SentTransfer
     
+    func setAutomaticUpdateChecks(enabled: Bool) async throws  -> UpdateConfig
+    
     func setBandwidthLimits(limits: BandwidthLimits) async throws  -> BandwidthLimits
     
     func setStorageMode(groupId: String, mode: FolderMode) async throws  -> StorageModeOutcome
-    
-    func setUpdateConfig(automaticChecks: Bool?, installMode: UpdateInstallMode?) async throws  -> UpdateConfig
     
     /**
      * Revokes this installation, then removes its credential.
@@ -1031,6 +1031,22 @@ open func denyRequest(groupId: String, deviceId: String)async throws  -> Members
         )
 }
     
+open func downloadGuidance()async throws  -> UpdateDownloadGuidance  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_yadorilink_apple_ffi_fn_method_clientcore_download_guidance(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_yadorilink_apple_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_yadorilink_apple_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_yadorilink_apple_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeUpdateDownloadGuidance_lift,
+            errorHandler: FfiConverterTypeDesktopError_lift
+        )
+}
+    
 open func evictFile(absolutePath: String)async throws  -> EvictOutcome  {
     return
         try  await uniffiRustCallAsync(
@@ -1142,22 +1158,6 @@ open func hydrateFile(absolutePath: String)async throws   {
             completeFunc: ffi_yadorilink_apple_ffi_rust_future_complete_void,
             freeFunc: ffi_yadorilink_apple_ffi_rust_future_free_void,
             liftFunc: { $0 },
-            errorHandler: FfiConverterTypeDesktopError_lift
-        )
-}
-    
-open func installUpdate()async throws  -> UpdateInstallOutcome  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_yadorilink_apple_ffi_fn_method_clientcore_install_update(
-                        self.uniffiCloneHandle()
-                )
-            },
-            pollFunc: ffi_yadorilink_apple_ffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_yadorilink_apple_ffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_yadorilink_apple_ffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeUpdateInstallOutcome_lift,
             errorHandler: FfiConverterTypeDesktopError_lift
         )
 }
@@ -1697,6 +1697,22 @@ open func sendToDevice(sourcePath: String, targetDeviceId: String)async throws  
         )
 }
     
+open func setAutomaticUpdateChecks(enabled: Bool)async throws  -> UpdateConfig  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_yadorilink_apple_ffi_fn_method_clientcore_set_automatic_update_checks(
+                        self.uniffiCloneHandle(),FfiConverterBool.lower(enabled)
+                )
+            },
+            pollFunc: ffi_yadorilink_apple_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_yadorilink_apple_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_yadorilink_apple_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeUpdateConfig_lift,
+            errorHandler: FfiConverterTypeDesktopError_lift
+        )
+}
+    
 open func setBandwidthLimits(limits: BandwidthLimits)async throws  -> BandwidthLimits  {
     return
         try  await uniffiRustCallAsync(
@@ -1725,22 +1741,6 @@ open func setStorageMode(groupId: String, mode: FolderMode)async throws  -> Stor
             completeFunc: ffi_yadorilink_apple_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_yadorilink_apple_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeStorageModeOutcome_lift,
-            errorHandler: FfiConverterTypeDesktopError_lift
-        )
-}
-    
-open func setUpdateConfig(automaticChecks: Bool?, installMode: UpdateInstallMode?)async throws  -> UpdateConfig  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_yadorilink_apple_ffi_fn_method_clientcore_set_update_config(
-                        self.uniffiCloneHandle(),FfiConverterOptionBool.lower(automaticChecks),FfiConverterOptionTypeUpdateInstallMode.lower(installMode)
-                )
-            },
-            pollFunc: ffi_yadorilink_apple_ffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_yadorilink_apple_ffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_yadorilink_apple_ffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeUpdateConfig_lift,
             errorHandler: FfiConverterTypeDesktopError_lift
         )
 }
@@ -2286,30 +2286,6 @@ fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionBool: FfiConverterRustBuffer {
-    typealias SwiftType = Bool?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterBool.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterBool.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
     typealias SwiftType = String?
 
@@ -2422,30 +2398,6 @@ fileprivate struct FfiConverterOptionTypeStatusUpdate: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeStatusUpdate.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterOptionTypeUpdateInstallMode: FfiConverterRustBuffer {
-    typealias SwiftType = UpdateInstallMode?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeUpdateInstallMode.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeUpdateInstallMode.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -2847,6 +2799,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_deny_request() != 39558) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_download_guidance() != 36935) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_evict_file() != 9536) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2866,9 +2821,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_hydrate_file() != 8026) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_install_update() != 36439) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_join_group_and_link() != 26761) {
@@ -2973,13 +2925,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_send_to_device() != 60201) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_set_automatic_update_checks() != 14156) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_set_bandwidth_limits() != 51879) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_set_storage_mode() != 34848) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_set_update_config() != 9305) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_sign_out() != 25149) {

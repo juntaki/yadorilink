@@ -81,8 +81,11 @@ final class LiveClientTests: XCTestCase {
         for edge in [YadoriLinkModel.RevokeEdgeOutcome.revoked(outcome: outcome), .alreadyRevoked] {
             XCTAssertEqual(YadoriLinkModel.RevokeEdgeOutcome(YadoriLinkFFI.RevokeEdgeOutcome(edge)), edge)
         }
-        for install in [YadoriLinkModel.UpdateInstallOutcome.installing, .deferred, .storeManaged(guidance: "App Store"), .other(raw: "x")] {
-            XCTAssertEqual(YadoriLinkModel.UpdateInstallOutcome(YadoriLinkFFI.UpdateInstallOutcome(install)), install)
+        for guidance in [
+            YadoriLinkModel.UpdateDownloadGuidance(guidance: "Download the new version", url: "https://github.com/juntaki/yadorilink/releases"),
+            YadoriLinkModel.UpdateDownloadGuidance(guidance: "Run `brew upgrade --cask yadorilink`", url: nil),
+        ] {
+            XCTAssertEqual(YadoriLinkModel.UpdateDownloadGuidance(YadoriLinkFFI.UpdateDownloadGuidance(guidance)), guidance)
         }
         for mode in YadoriLinkModel.FolderMode.allCases { XCTAssertEqual(YadoriLinkModel.FolderMode(YadoriLinkFFI.FolderMode(mode)), mode) }
         for role in YadoriLinkModel.AssignableRole.allCases { XCTAssertEqual(YadoriLinkModel.AssignableRole(YadoriLinkFFI.AssignableRole(role)), role) }

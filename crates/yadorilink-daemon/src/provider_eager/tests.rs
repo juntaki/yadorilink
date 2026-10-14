@@ -715,3 +715,53 @@ async fn a_folder_that_never_finishes_is_given_up_after_a_bound() {
         "the queue never moved past the failing folder"
     );
 }
+
+/// A read that fails is never "nothing left to download": the status is not Done, the query does
+/// not conclude Done, and an exclusion is not settled because its lookup could not be answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_candidate_list_is_not_done() {
+    let fx = Fx::new();
+    let a = fx.item("a.bin", 10);
+    let b = fx.item("b.bin", 20);
+    fx.make_present(&[a, b]);
+    assert_eq!(fx.driver.status(&fx.inputs(), &fx.root).unwrap().state, DriverState::Done);
+
+    let fault = crate::provider_read_fault::Fault::inject(
+        &fx.state.replica_coordinator,
+        "provider_items",
+        "live",
+    );
+    let status = fx.driver.status(&fx.inputs(), &fx.root).unwrap();
+    assert_eq!(status.state, DriverState::Running);
+    assert!(status.unreadable);
+    let response = fx.query(&[a], 2);
+    assert_eq!(Fx::state_of(&response), DriverState::Running);
+    assert!(response.settled_item_ids.is_empty(), "an unanswerable exclusion settled");
+    fault.restore();
+
+    assert_eq!(fx.driver.status(&fx.inputs(), &fx.root).unwrap().state, DriverState::Done);
+    let response = fx.query(&[a], 2);
+    assert_eq!(response.settled_item_ids, [a.to_vec()]);
+    assert_eq!(Fx::state_of(&response), DriverState::Done);
+}
+
+/// A hold, pause or policy that cannot be read is not "nothing wanted": never Done, and the
+/// status says the progress is unreadable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_holds_and_policy_are_not_done() {
+    let fx = Fx::new();
+    let a = fx.item("a.bin", 10);
+    fx.make_present(&[a]);
+    assert_eq!(fx.driver.status(&fx.inputs(), &fx.root).unwrap().state, DriverState::Done);
+
+    for (table, column) in [("held_paths", "path"), ("links", "materialization_policy")] {
+        let fault =
+            crate::provider_read_fault::Fault::inject(&fx.state.replica_coordinator, table, column);
+        let status = fx.driver.status(&fx.inputs(), &fx.root).unwrap();
+        assert!(status.unreadable, "{table}.{column}");
+        assert_ne!(status.state, DriverState::Done, "{table}.{column}");
+        assert_ne!(Fx::state_of(&fx.query(&[], 2)), DriverState::Done, "{table}.{column}");
+        fault.restore();
+        assert_eq!(fx.driver.status(&fx.inputs(), &fx.root).unwrap().state, DriverState::Done);
+    }
+}

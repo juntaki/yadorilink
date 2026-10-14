@@ -195,6 +195,10 @@ mod unix_socket_tests {
     /// Evicting a hydrated file via the shell extension's
     /// context menu turns it back into a placeholder.
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "removing an evicted file needs the Linux write lease"
+    )]
     async fn evict_item_context_action_turns_a_hydrated_file_into_a_placeholder() {
         let (socket_path, state, dir) = start_daemon().await;
         // This test is about the eviction gate's own success path, not the

@@ -174,6 +174,11 @@ message LinkStatus {
   // example an unmounted disk left an empty mountpoint). Deletions under it
   // are withheld rather than synced. Additive; `false` when unchanged.
   bool capture_volume_changed = 39;
+  // Directories a removal moved aside and could not put back (a child
+  // appeared meanwhile and something else took the name). Each still stands,
+  // with its contents, under a reserved name beside its old place; nothing
+  // was deleted. Additive; 0 when none.
+  uint64 stranded_directory_count = 40;
 }
 
 // See `LinkStatus.local_storage_state`'s own doc comment.
@@ -874,7 +879,8 @@ message PreservedSummary {
 
 // One thing a rebootstrap kept for the user: a version another device wrote that the
 // replacing state does not contain (`remote_only`, or `beyond_closure_cutoff` when it is above
-// the cutoff at which that state closes its author), or this device's own changes that were
+// the cutoff at which that state closes its author), an edit made during the freeze to a path
+// whose original the install removed (`late_edit`), or this device's own changes that were
 // not replayed (`own_unit`). Nothing is ever deleted except by an explicit discard.
 message PreservedItem {
   string kind = 1;
@@ -1172,6 +1178,10 @@ message EvictResponse {
   bool dehydrated = 1;
   uint64 blocks_reclaimed = 2;
   uint64 bytes_reclaimed = 3;
+  // Set when the daemon kept its cached blocks of the file although the file was evicted (or
+  // would have been): a stable machine code naming why, e.g. "custody_not_acquired". Empty when
+  // nothing was kept back or the daemon does not say.
+  string retained_reason = 4;
 }
 
 // One file's current materialization state -- the
@@ -1473,9 +1483,14 @@ message UpdateInstallRequest {}
 message UpdateInstallResponse {
   // Always "manual_download".
   string outcome = 1;
-  // The download page URL, or the package-manager command for a
-  // package-managed install.
+  // The sentence to show: names the download page, or gives the
+  // package-manager steps for a package-managed install. Display text
+  // only; clients never extract a link from it.
   string guidance = 2;
+  // The official release page to open, set only for installs that are
+  // not package-managed. Empty for a package-managed install, whose
+  // steps are `guidance`.
+  string download_url = 3;
 }
 
 // `yadorilink update config --checks <on|off> --install <automatic|manual>`

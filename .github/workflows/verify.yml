@@ -301,6 +301,14 @@ jobs:
         run: |
           cargo build --release --manifest-path platforms/macos/app/core/Cargo.toml
           cargo build --release --manifest-path platforms/macos/app/fileprovider-core/Cargo.toml
+      # The release signing helpers run against fakes: no credentials, no
+      # network, no Apple services.
+      - name: macOS signing script tests
+        if: matrix.lane == 'shell'
+        run: |
+          set -e
+          python3 -m unittest discover -s platforms/macos/package/tests
+          for t in platforms/macos/package/tests/*.test.sh; do bash "$t"; done
       - name: Test report
         if: always()
         run: python3 .github/checks/summarize-test-log.py test-output.log

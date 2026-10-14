@@ -79,6 +79,7 @@ fn every_rollup_category_is_recognized_and_an_unknown_one_is_kept_raw() {
         ("fetch_availability_unknown", AttentionCategory::FetchAvailabilityUnknown),
         ("conflict", AttentionCategory::Conflict),
         ("held", AttentionCategory::Held),
+        ("stranded_directory", AttentionCategory::StrandedDirectory),
         ("low_disk_critical", AttentionCategory::LowDiskCritical),
         ("low_disk", AttentionCategory::LowDisk),
         ("peer_disconnected", AttentionCategory::PeerDisconnected),
@@ -638,17 +639,14 @@ fn updates_map_states_modes_and_outcomes() {
     assert_eq!(status.state, UpdateState::KillSwitched);
     assert_eq!(status.last_checked_at, Some(secs(20)));
     assert_eq!(status.available_version, None);
-    assert_eq!(
-        status.config,
-        UpdateConfig { automatic_checks: true, install_mode: UpdateInstallMode::Manual }
-    );
+    assert_eq!(status.config, UpdateConfig { automatic_checks: true });
+    // The install-mode wire field is not product contract: it never changes the config.
     assert_eq!(
         update_config(&UpdateConfigResponse {
             automatic_checks_enabled: false,
             automatic_install_mode: "sometimes".into()
-        })
-        .install_mode,
-        UpdateInstallMode::Other { raw: "sometimes".into() }
+        }),
+        UpdateConfig { automatic_checks: false }
     );
     let states = [
         ("idle", UpdateState::Idle),
@@ -670,16 +668,83 @@ fn updates_map_states_modes_and_outcomes() {
             update_status(&UpdateStatusResponse { state: raw.into(), ..Default::default() });
         assert_eq!(status.state, state, "{raw}");
     }
-    let outcome = |o: &str, g: &str| {
-        update_install_outcome(&UpdateInstallResponse { outcome: o.into(), guidance: g.into() })
+    let reply = |o: &str, g: &str, u: &str| UpdateInstallResponse {
+        outcome: o.into(),
+        guidance: g.into(),
+        download_url: u.into(),
     };
-    assert_eq!(outcome("installing", ""), UpdateInstallOutcome::Installing);
-    assert_eq!(outcome("deferred", ""), UpdateInstallOutcome::Deferred);
+    // A page to open comes only from the structured field, never from the sentence.
     assert_eq!(
-        outcome("store_managed", "use the store"),
-        UpdateInstallOutcome::StoreManaged { guidance: "use the store".into() }
+        update_download_guidance(&reply(
+            "manual_download",
+            "Download the new version from https://github.com/juntaki/yadorilink/releases",
+            "https://github.com/juntaki/yadorilink/releases",
+        )),
+        Ok(UpdateDownloadGuidance {
+            guidance:
+                "Download the new version from https://github.com/juntaki/yadorilink/releases"
+                    .into(),
+            url: Some("https://github.com/juntaki/yadorilink/releases".into()),
+        })
     );
-    assert_eq!(outcome("later", ""), UpdateInstallOutcome::Other { raw: "later".into() });
+    // Steps for a package-managed install: a URL inside the sentence is not trusted.
+    assert_eq!(
+        update_download_guidance(&reply(
+            "manual_download",
+            "Run `brew upgrade` (see https://evil.test/x)",
+            ""
+        )),
+        Ok(UpdateDownloadGuidance {
+            guidance: "Run `brew upgrade` (see https://evil.test/x)".into(),
+            url: None,
+        })
+    );
+    for outcome in ["installing", "deferred", "store_managed", "later", ""] {
+        assert!(update_download_guidance(&reply(outcome, "x", "")).is_err(), "{outcome}");
+    }
+    assert!(update_download_guidance(&reply("manual_download", "", "")).is_err());
+}
+
+#[test]
+fn only_the_official_release_page_is_ever_offered_to_open() {
+    let ok = |url: &str| {
+        update_download_guidance(&UpdateInstallResponse {
+            outcome: "manual_download".into(),
+            guidance: "g".into(),
+            download_url: url.into(),
+        })
+    };
+    assert!(ok("https://github.com/juntaki/yadorilink/releases/tag/v0.4.3").is_ok());
+    for bad in [
+        "http://github.com/juntaki/yadorilink/releases",
+        "https://evil.test/juntaki/yadorilink/releases",
+        "https://github.com/juntaki/yadorilink/releases.evil.test",
+        "https://github.com/juntaki/yadorilink/releasesx",
+        "https://github.com/juntaki/yadorilink/releases ",
+        "https://github.com/juntaki/yadorilink/releases https://evil.test",
+        "https://github.com/juntaki/yadorilink/releases.",
+        "https://github.com/juntaki/yadorilink/releases?next=https://evil.test",
+        "https://github.com/juntaki/yadorilink/releases/../../evil",
+        "file:///etc/passwd",
+    ] {
+        assert!(ok(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn package_managed_installs_are_recognised_by_install_source() {
+    use crate::ops::updates::is_package_managed;
+    for managed in ["homebrew", "apt", "winget", "microsoft_store"] {
+        assert!(is_package_managed(managed), "{managed}");
+    }
+    for other in ["standalone", "", "pkg", "unknown"] {
+        assert!(!is_package_managed(other), "{other}");
+    }
+    let status = update_status(&UpdateStatusResponse {
+        install_source: "homebrew".into(),
+        ..Default::default()
+    });
+    assert!(status.package_managed);
 }
 
 #[test]

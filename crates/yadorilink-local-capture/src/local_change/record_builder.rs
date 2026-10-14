@@ -331,6 +331,81 @@ pub fn disarm_content_read_race_hook(path: &Path) {
     }
 }
 
+/// Hooks that run after a capture has built a path's record and before the
+/// record is committed or queued for a batched commit -- the window in which
+/// a writer can change the file after the capture's own bracket closed.
+#[cfg(any(test, feature = "test-support"))]
+static POST_CAPTURE_RACE_HOOKS: std::sync::OnceLock<ContentReadRaceHookMap> =
+    std::sync::OnceLock::new();
+
+/// Arms a hook for `path` that runs once a capture of that file has built
+/// its record. The closure returns whether it stays armed for the next pass.
+#[cfg(any(test, feature = "test-support"))]
+pub fn arm_post_capture_race_hook(path: PathBuf, f: impl FnMut() -> bool + Send + 'static) {
+    let map = POST_CAPTURE_RACE_HOOKS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(path, Box::new(f));
+}
+
+/// Disarms whatever post-capture hook is armed for `path`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn disarm_post_capture_race_hook(path: &Path) {
+    if let Some(map) = POST_CAPTURE_RACE_HOOKS.get() {
+        map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(path);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn fire_post_capture_race_hook(path: &Path) {
+    let Some(map) = POST_CAPTURE_RACE_HOOKS.get() else { return };
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let keep_armed = match guard.get_mut(path) {
+        Some(f) => f(),
+        None => return,
+    };
+    if !keep_armed {
+        guard.remove(path);
+    }
+}
+
+/// Hooks that run inside a batch commit's revalidation, after the identity
+/// of a kept path has been observed and before the fingerprint re-check that
+/// closes that observation.
+#[cfg(any(test, feature = "test-support"))]
+static POST_IDENTITY_RACE_HOOKS: std::sync::OnceLock<ContentReadRaceHookMap> =
+    std::sync::OnceLock::new();
+
+/// Arms a one-shot-or-repeating hook (the closure returns whether it stays
+/// armed) for `path`, run between a batch commit's identity observation and
+/// the re-check that closes it.
+#[cfg(any(test, feature = "test-support"))]
+pub fn arm_post_identity_race_hook(path: PathBuf, f: impl FnMut() -> bool + Send + 'static) {
+    let map = POST_IDENTITY_RACE_HOOKS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(path, Box::new(f));
+}
+
+/// Disarms whatever post-identity hook is armed for `path`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn disarm_post_identity_race_hook(path: &Path) {
+    if let Some(map) = POST_IDENTITY_RACE_HOOKS.get() {
+        map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(path);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn fire_post_identity_race_hook(path: &Path) {
+    let Some(map) = POST_IDENTITY_RACE_HOOKS.get() else { return };
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let keep_armed = match guard.get_mut(path) {
+        Some(f) => f(),
+        None => return,
+    };
+    if !keep_armed {
+        guard.remove(path);
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 fn fire_content_read_race_hook(path: &Path) {
     let Some(map) = CONTENT_READ_RACE_HOOKS.get() else { return };

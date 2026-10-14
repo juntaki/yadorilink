@@ -13,6 +13,7 @@ pub enum ReasonCode {
     FetchAvailabilityUnknown,
     Conflict,
     Held,
+    StrandedDirectory,
     ProviderNotReady,
     ProviderStuck,
     KeptEdits,
@@ -32,7 +33,7 @@ pub enum ReasonCode {
 }
 
 impl ReasonCode {
-    pub const ALL: [ReasonCode; 24] = [
+    pub const ALL: [ReasonCode; 25] = [
         Self::Degraded,
         Self::Ambiguous,
         Self::DurabilityAtRisk,
@@ -41,6 +42,7 @@ impl ReasonCode {
         Self::FetchAvailabilityUnknown,
         Self::Conflict,
         Self::Held,
+        Self::StrandedDirectory,
         Self::ProviderNotReady,
         Self::ProviderStuck,
         Self::KeptEdits,
@@ -71,6 +73,7 @@ impl ReasonCode {
             Self::FetchAvailabilityUnknown => "fetch_availability_unknown",
             Self::Conflict => "conflict",
             Self::Held => "held",
+            Self::StrandedDirectory => "stranded_directory",
             Self::ProviderNotReady => "provider_not_ready",
             Self::ProviderStuck => "provider_stuck",
             Self::KeptEdits => "kept_edits",
@@ -150,6 +153,7 @@ pub fn presentation(code: ReasonCode, subject: &str) -> Presentation {
         R::FetchAvailabilityUnknown => (A::WaitForPeer, Info, "It is not known yet whether missing files can be fetched."),
         R::Conflict => (A::ReviewConflicts, Attention, "Some files have conflicting copies."),
         R::Held => (A::ReviewDetails, Attention, "Some files were not applied to this device."),
+        R::StrandedDirectory => (A::ReviewDetails, Attention, "A folder could not be removed safely and was left under a temporary name; nothing was deleted."),
         R::ProviderNotReady => (A::ReviewDetails, Attention, "This provider folder is not ready to use."),
         R::ProviderStuck => (A::ReviewDetails, Error, "Some files in this provider folder keep failing to download."),
         R::KeptEdits => (A::ReviewDetails, Attention, "Edits were kept beside a file instead of replacing it."),
@@ -198,7 +202,7 @@ mod tests {
             assert!(!p.fallback_en.is_empty());
             assert!(p.subject.is_none());
         }
-        assert_eq!(keys.len(), 24);
+        assert_eq!(keys.len(), 25);
     }
 
     #[test]
@@ -207,7 +211,7 @@ mod tests {
         assert_eq!(
             keys.join(","),
             "degraded,ambiguous,durability_at_risk,durability_unknown,fetch_unavailable,\
-fetch_availability_unknown,conflict,held,provider_not_ready,provider_stuck,kept_edits,\
+fetch_availability_unknown,conflict,held,stranded_directory,provider_not_ready,provider_stuck,kept_edits,\
 provider_orphan_domain,low_disk_critical,low_disk,peer_disconnected,recent_error,update_failed,\
 case_collision,normalization_collision,case_and_normalization_collision,invalid_name,\
 metadata_unprovable,volume_changed,ownership_lost"

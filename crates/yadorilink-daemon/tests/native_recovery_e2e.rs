@@ -13,6 +13,7 @@ use yadorilink_replica_domain::ids::FolderGroupId;
 use yadorilink_sync_sqlite::native_checkpoint_frontier::{
     checkpoint_frontier, most_recently_adopted_checkpoint,
 };
+use yadorilink_sync_sqlite::native_rebootstrap::Crash;
 use yadorilink_sync_sqlite::native_store;
 
 const GROUP: &str = "native-recovery-group";
@@ -790,4 +791,153 @@ async fn a_held_own_unit_is_retried_once_the_device_is_a_writer_again() {
         preserved_items::retry(shared(&b), GROUP, &unit.item_id).await,
         Err(PreservedError::NotFound)
     ));
+}
+
+/// `b` is demoted to a viewer the moment its rebootstrap begins and has an unsaved `edit.txt`,
+/// so the edit is held as an own unit; returns the pair and the unit's item id.
+async fn held_own_unit(prefix: &str) -> Option<(TopologyNode, TopologyNode, String)> {
+    let (a, b) = lagging_pair(prefix).await;
+    if rebootstrap_refused_and_state_intact(&a, &b).await {
+        return None;
+    }
+    let (states, device) = (vec![a.state.clone(), b.state.clone()], b.device_id.clone());
+    let root = b.root.path().to_path_buf();
+    let done = Arc::new(AtomicBool::new(false));
+    b.state.set_rebootstrap_hook_for_test(Some(Arc::new(move |point| {
+        if point == Point::Begin(Failpoint::BeforeCapture) && !done.swap(true, Ordering::SeqCst) {
+            demote_to_viewer_on(&states, GROUP, &device);
+            std::fs::write(root.join("edit.txt"), b"unsaved").unwrap();
+        }
+        Ok(())
+    })));
+    pair(&a, &b, GROUP).await;
+    converge_to(&[&a, &b], &[("kept.txt", b"kept"), ("doc.txt", b"three")], "the viewer caught up")
+        .await;
+    let unit = preserved_items::list(shared(&b)).await.unwrap().remove(0);
+    assert_eq!(unit.kind, PreservedKind::OwnUnit);
+    grant_writers(&[&a, &b], GROUP);
+    Some((a, b, unit.item_id))
+}
+
+/// The id the block store gives the held edit's only block.
+fn edit_block(node: &TopologyNode) -> String {
+    node.state.block_store.put(b"unsaved").unwrap()
+}
+
+/// The preserved bytes of a held unit live in the recovery area; the block store may no longer
+/// hold them (the references the old heads gave them ended with the install). The retry stores
+/// them again before the heads that name them exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_retried_unit_stores_its_preserved_bytes_in_the_block_store() {
+    setup();
+    let Some((a, b, unit)) = held_own_unit("retry-import").await else { return };
+    let block = edit_block(&b);
+    b.state.block_store.delete(&block).unwrap();
+    assert!(!b.state.block_store.exists(&block).unwrap(), "the block is gone before the retry");
+
+    preserved_items::retry(shared(&b), GROUP, &unit).await.unwrap();
+
+    assert!(b.state.block_store.exists(&block).unwrap(), "the retry stored the preserved bytes");
+    let held = read(&b, |conn| {
+        yadorilink_sync_sqlite::dag_store::group_has_block_provenance(
+            conn,
+            GROUP,
+            &hex::decode(&block).unwrap(),
+        )
+    });
+    assert!(held, "and the group obtained them");
+    converge_to(
+        &[&a, &b],
+        &[("kept.txt", b"kept"), ("doc.txt", b"three"), ("edit.txt", b"unsaved")],
+        "the retried change reached the group",
+    )
+    .await;
+}
+
+/// From the first stored block until the authored heads are committed, a sweep is excluded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_sweep_cannot_run_between_the_import_and_the_commit_of_a_retry() {
+    setup();
+    let Some((_a, b, unit)) = held_own_unit("retry-gc").await else { return };
+    let block = edit_block(&b);
+    b.state.block_store.delete(&block).unwrap();
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (state, log, runtime) =
+        (shared(&b).clone(), observed.clone(), tokio::runtime::Handle::current());
+    let hook: preserved_items::RetryHook = Box::new(move |point| {
+        if matches!(point, MachinePoint::AfterImport(_) | MachinePoint::BeforeResolve(_)) {
+            let swept = runtime.block_on(yadorilink_daemon::gc::run_sweep(state.clone(), false));
+            log.lock().unwrap().push((
+                state.block_store.exists(&block).unwrap(),
+                !state.is_write_safe_point(),
+                matches!(swept, Err(yadorilink_daemon::gc::GcTriggerError::SyncBurstInProgress)),
+            ));
+        }
+        Ok(())
+    });
+
+    preserved_items::retry_with_hook(shared(&b), GROUP, &unit, hook).await.unwrap();
+
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![(true, true, true), (true, true, true)],
+        "at both points the block exists, writes are active and a sweep is refused"
+    );
+    assert!(b.state.block_store.exists(&edit_block(&b)).unwrap());
+}
+
+/// A crash after the import, or after the authoring and before the commit, leaves the unit held
+/// and the next retry succeeds; once resolved nothing is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_retry_interrupted_around_its_import_is_retried_to_completion() {
+    setup();
+    let Some((a, b, unit)) = held_own_unit("retry-crash").await else { return };
+    for at in [0, 1] {
+        let hook: preserved_items::RetryHook = Box::new(move |point| {
+            let crash = match point {
+                MachinePoint::AfterImport(_) => at == 0,
+                MachinePoint::BeforeResolve(_) => at == 1,
+                _ => false,
+            };
+            if crash {
+                Err(Crash)
+            } else {
+                Ok(())
+            }
+        });
+        let halted = preserved_items::retry_with_hook(shared(&b), GROUP, &unit, hook).await;
+        assert!(matches!(halted, Err(PreservedError::Failed(_))), "{at}: {halted:?}");
+        assert_eq!(preserved_items::list(shared(&b)).await.unwrap().len(), 1, "{at}: still held");
+        assert!(!tree(&a).contains_key("edit.txt"), "{at}: nothing reached the group");
+    }
+
+    preserved_items::retry(shared(&b), GROUP, &unit).await.unwrap();
+
+    assert!(preserved_items::list(shared(&b)).await.unwrap().is_empty());
+    assert!(b.state.block_store.exists(&edit_block(&b)).unwrap());
+    converge_to(
+        &[&a, &b],
+        &[("kept.txt", b"kept"), ("doc.txt", b"three"), ("edit.txt", b"unsaved")],
+        "the retried change reached the group",
+    )
+    .await;
+}
+
+/// A block of the preserved bytes that the store already holds under the same name is reused
+/// by `put` without being read. When that stored copy is damaged, the retry must fail and keep
+/// the unit held instead of authoring a head over unreadable bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_retry_over_a_damaged_stored_block_fails_and_keeps_the_unit_held() {
+    setup();
+    let Some((a, b, unit)) = held_own_unit("retry-damaged").await else { return };
+    let block = edit_block(&b);
+    yadorilink_local_storage::segment_store::testing::flip_one_payload_bit(b.store_root(), &block)
+        .unwrap();
+    // No read of the damaged copy here: a failed read drops it from the index.
+
+    let failed = preserved_items::retry(shared(&b), GROUP, &unit).await;
+
+    assert!(matches!(failed, Err(PreservedError::Failed(_))), "{failed:?}");
+    assert_eq!(preserved_items::list(shared(&b)).await.unwrap().len(), 1, "still held");
+    assert!(!tree(&a).contains_key("edit.txt"), "nothing reached the group");
 }

@@ -27,25 +27,31 @@
 //! kept, never removed on that evidence.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use yadorilink_fs_platform::durable_dir::{publish_durably, Replace};
+use yadorilink_fs_platform::generation::{self, seal, unseal};
 use yadorilink_ipc_proto::shellipc::{
-    DomainEvidence, EvictResult, ProviderFolder, ProviderRemoval,
+    DomainEvidence, EvictResult, ProviderFolder, ProviderMaterializedReport, ProviderRemoval,
 };
 use yadorilink_shell_ext::dir_watch::{self, Signal};
 use yadorilink_shell_ext::host_paths;
 use yadorilink_shell_ext::provider_authoring::{self, Authoring, WindowsLocal};
 use yadorilink_shell_ext::provider_namespace::{EvictOutcome, ShownItem, ShownItems};
+use yadorilink_shell_ext::provider_report::Reporter;
 use yadorilink_shell_ext::provider_session::{self, SessionEvent};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long a root must be quiet before what the user did in it is applied: an editor's save is a
 /// burst of creates, renames and deletes, and it is the end state that means something.
 const QUIET: Duration = Duration::from_millis(750);
+/// How long after news of a handoff or an eviction the materialized set is read at every poll
+/// (the OS finishes writing a fetched file a moment after the daemon handed it over).
+const REPORT_SETTLE: Duration = Duration::from_secs(30);
+/// How often the materialized set is read when nothing happened (the user can free space in
+/// Explorer without telling anyone).
+const REPORT_IDLE: Duration = Duration::from_secs(60);
 
 /// Everything the host's loop waits for.
 enum HostEvent {
@@ -76,17 +82,40 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
 
 // ---- the record of registered roots -------------------------------------------------------
 
-/// The registry's contents: root id (hex) -> sync root path. Lines of another shape (a path with
-/// no root id, written by an earlier version) are not this host's roots and are ignored.
-fn parse_registry(contents: &str) -> HashMap<String, PathBuf> {
-    contents
-        .lines()
-        .filter_map(|line| {
-            let (root, path) = line.split_once('\t')?;
-            (unhex(root).is_some() && !path.trim().is_empty())
-                .then(|| (root.to_string(), PathBuf::from(path.trim())))
-        })
-        .collect()
+/// A provider root id as it is written: exactly 16 bytes as 32 lowercase hex digits.
+fn is_root_id(text: &str) -> bool {
+    text.len() == 32 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The registry's contents: root id (hex) -> sync root path. Every line is a root id and a
+/// path; anything else (a bare path, a short or upper case id, a root or a path recorded twice)
+/// means the record cannot be trusted, since skipping or picking one would forget or mix up a
+/// root.
+fn parse_registry(contents: &str) -> Result<HashMap<String, PathBuf>, String> {
+    let mut roots = HashMap::new();
+    let mut paths = HashSet::new();
+    for line in contents.lines() {
+        let malformed = || format!("malformed line {line:?}");
+        let (root, path) = line.split_once('\t').ok_or_else(malformed)?;
+        if !is_root_id(root) || path.trim().is_empty() {
+            return Err(malformed());
+        }
+        // Two lines for one root are not one record: which path is the root's is unknown.
+        if roots.insert(root.to_string(), PathBuf::from(path.trim())).is_some() {
+            return Err(format!("root {root} is recorded twice"));
+        }
+        // One folder cannot be the sync root of two roots (Windows paths do not differ by case).
+        if !paths.insert(path_key(Path::new(path.trim()))) {
+            return Err(format!("the path {} is recorded for two roots", path.trim()));
+        }
+    }
+    Ok(roots)
+}
+
+/// A path as Windows compares it: ignoring case, the kind of separator and a trailing one.
+fn path_key(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('/', "\\");
+    yadorilink_shell_ext::provider_namespace::windows_name_key(text.trim_end_matches('\\'))
 }
 
 fn render_registry(roots: &HashMap<String, PathBuf>) -> String {
@@ -96,22 +125,23 @@ fn render_registry(roots: &HashMap<String, PathBuf>) -> String {
     lines.concat()
 }
 
-fn read_registry_at(file: &Path) -> HashMap<String, PathBuf> {
-    parse_registry(&std::fs::read_to_string(file).unwrap_or_default())
+/// The registered roots. No generation file is a first run (no roots); a record that cannot be
+/// read or understood is an error, never "no roots".
+fn read_registry_at(file: &Path) -> Result<HashMap<String, PathBuf>, String> {
+    match generation::read_latest(file, |text| unseal(text).map(parse_registry)) {
+        generation::Latest::Missing => Ok(HashMap::new()),
+        // The newest complete generation is the registry; one that parses badly is corruption,
+        // not a reason to take an older generation (which may predate a root).
+        generation::Latest::Loaded { value, .. } => {
+            value.map_err(|e| format!("{}: {e}", file.display()))
+        }
+        generation::Latest::Invalid(e) => Err(e),
+    }
 }
 
-/// Writes the registry to a temporary file and renames it over the old one, so a crash cannot
-/// leave every root's record half-written.
+/// Publishes the registry as its next generation (see [`generation`]).
 fn write_registry_at(file: &Path, roots: &HashMap<String, PathBuf>) -> std::io::Result<()> {
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = file.with_extension("tmp");
-    let mut out = std::fs::File::create(&tmp)?;
-    out.write_all(render_registry(roots).as_bytes())?;
-    out.sync_all()?;
-    drop(out);
-    publish_durably(&tmp, file, Replace::Yes)
+    generation::publish_next(file, &seal(&render_registry(roots))).map(drop)
 }
 
 /// One shown item as a line: id, path, parent id, name, kind, size, time, version and parent
@@ -157,37 +187,102 @@ fn decode_shown(line: &str) -> Option<(Vec<u8>, ShownItem)> {
     ))
 }
 
-fn unregister_all() {
-    let file = host_paths::roots_registry_file();
-    let Ok(contents) = std::fs::read_to_string(&file) else {
-        println!("yadorilink-cfapi-host: no recorded sync roots at {}", file.display());
-        return;
+/// What the operating system says is registered at a path (`None`: not this host's sync root).
+type RootIdentity = Result<Option<Vec<u8>>, String>;
+
+/// Unregisters the recorded sync roots that the operating system confirms are this host's, with
+/// the recorded root id as their identity. A root that does not match, or a record that cannot be
+/// understood, is left alone (it may be another provider's, or the only trace of a root). True
+/// when every recorded root is gone, so the record can go too.
+fn unregister_recorded(
+    contents: &str,
+    identity_of: &mut dyn FnMut(&Path) -> RootIdentity,
+    unregister: &mut dyn FnMut(&Path) -> Result<(), String>,
+) -> bool {
+    let roots = match parse_registry(contents) {
+        Ok(roots) => roots,
+        Err(e) => {
+            eprintln!("yadorilink-cfapi-host: the record of the sync roots is not trusted ({e}); no root is unregistered");
+            return false;
+        }
     };
-    // Roots recorded by this version, and (for an uninstall over an old install) the bare paths
-    // an earlier version wrote.
-    let mut paths: Vec<PathBuf> = parse_registry(&contents).into_values().collect();
-    paths.extend(
-        contents
-            .lines()
-            .filter(|line| !line.contains('\t') && !line.trim().is_empty())
-            .map(|line| PathBuf::from(line.trim())),
-    );
-    for path in paths {
-        match yadorilink_shell_ext::cfapi::unregister(&path) {
-            Ok(()) => println!("yadorilink-cfapi-host: unregistered sync root {}", path.display()),
-            Err(e) => eprintln!(
-                "yadorilink-cfapi-host: failed to unregister sync root {}: {e:?}",
-                path.display()
-            ),
+    let mut all_gone = true;
+    for (root, path) in roots {
+        match identity_of(&path) {
+            Ok(None) => {
+                println!("yadorilink-cfapi-host: {} is not a sync root any more", path.display())
+            }
+            Ok(Some(identity)) if unhex(&root).as_deref() == Some(identity.as_slice()) => {
+                match unregister(&path) {
+                    Ok(()) => {
+                        println!("yadorilink-cfapi-host: unregistered sync root {}", path.display())
+                    }
+                    Err(e) => {
+                        all_gone = false;
+                        eprintln!(
+                            "yadorilink-cfapi-host: failed to unregister sync root {}: {e}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            Ok(Some(_)) => {
+                all_gone = false;
+                eprintln!(
+                    "yadorilink-cfapi-host: {} is registered for another root; left alone",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                all_gone = false;
+                eprintln!(
+                    "yadorilink-cfapi-host: cannot tell what is registered at {}: {e}; left alone",
+                    path.display()
+                );
+            }
         }
     }
-    let _ = std::fs::remove_file(&file);
+    all_gone
 }
+
+fn unregister_all() {
+    let file = host_paths::roots_registry_file();
+    let contents = match generation::read_latest(&file, |text| unseal(text).map(str::to_string)) {
+        generation::Latest::Loaded { value, .. } => value,
+        generation::Latest::Missing => {
+            println!("yadorilink-cfapi-host: no recorded sync roots at {}", file.display());
+            return;
+        }
+        generation::Latest::Invalid(e) => {
+            eprintln!("yadorilink-cfapi-host: {e}; nothing is unregistered");
+            return;
+        }
+    };
+    let gone = unregister_recorded(
+        &contents,
+        &mut yadorilink_shell_ext::cfapi::registered_root_identity,
+        &mut |path| yadorilink_shell_ext::cfapi::unregister(path).map_err(|e| format!("{e:?}")),
+    );
+    if gone {
+        if let Err(e) = generation::remove_all(&file) {
+            // Not retired: the record stays as the newest it was, and the next run starts from it.
+            eprintln!("yadorilink-cfapi-host: cannot retire {}: {e}", file.display());
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT` as an `HRESULT`: the path is not a sync root.
+const ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT: windows::core::HRESULT =
+    windows::core::HRESULT(0x8007_0186_u32 as i32);
 
 // ---- the host ------------------------------------------------------------------------------
 
 /// The operating-system side of the host: what it does to sync roots.
 trait Backend {
+    /// Makes sure the folder of a sync root exists. Done before the root is recorded, so that
+    /// registering it creates nothing the record does not already cover.
+    fn prepare_root(&mut self, path: &Path) -> Result<(), String>;
     fn register_and_connect(&mut self, root_id: &[u8], path: &Path) -> Result<(), String>;
     fn unregister(&mut self, path: &Path) -> Result<(), String>;
     /// Makes the sync root show the root's namespace; `None` when it could not be confirmed.
@@ -199,11 +294,19 @@ trait Backend {
         protected: &HashSet<String>,
     ) -> Option<ShownItems>;
     fn evict(&mut self, path: &Path, item_id: &[u8]) -> Result<(), EvictOutcome>;
-    /// The items an earlier run of the host showed in this root, as it showed them (`None`: it
-    /// never showed the namespace completely).
-    fn load_shown(&mut self, root_id: &[u8]) -> Option<ShownItems>;
-    /// Records the items shown in this root now.
-    fn save_shown(&mut self, root_id: &[u8], shown: &ShownItems);
+    /// The items of `shown` the operating system holds bytes of now.
+    fn materialized(&mut self, shown: &ShownItems) -> HashSet<Vec<u8>>;
+    /// The items an earlier run of the host showed in this root, as it showed them. A record that
+    /// exists but cannot be read back is [`LoadedShown::Invalid`], never "nothing was shown".
+    fn load_shown(&mut self, root_id: &[u8]) -> LoadedShown;
+    /// Records the items shown in this root now. False when it could not be made durable: what
+    /// was shown is then not acknowledged (a recorded item whose placeholder is gone reads as the
+    /// user deleting it, and an unrecorded one cannot be told from an item another device made).
+    fn save_shown(&mut self, root_id: &[u8], shown: &ShownItems) -> bool;
+    /// Whether the volume of the sync root `path` may be changed at all: false when the
+    /// durable-namespace probe refused it (an unsupported or unknown volume). The closed global
+    /// gate is not a refusal. Asked before anything is authored or shown there.
+    fn namespace_available(&mut self, path: &Path) -> bool;
     /// Whether `path` is an existing folder.
     fn is_dir(&mut self, path: &Path) -> bool;
     /// Starts signalling changes inside the sync root of `key`; dropping the guard stops it.
@@ -227,6 +330,7 @@ trait Reports {
     fn domain_state(&self, root: &[u8], evidence: DomainEvidence, preserved_location: &str);
     fn signal_done(&self, root: &[u8], revision: u64, request_id: &[u8], error: Option<&str>);
     fn evict_done(&self, root: &[u8], request_id: &[u8], result: EvictResult, error: &str);
+    fn materialized(&self, report: ProviderMaterializedReport);
 }
 
 struct RealBackend {
@@ -244,6 +348,68 @@ impl provider_authoring::Api for DaemonApi {
     ) -> Option<yadorilink_ipc_proto::shellipc::ProviderApplyChangeResponse> {
         yadorilink_shell_ext::provider_client::apply(root, request)
     }
+
+    fn save_shown(&self, root: &[u8], shown: &ShownItems) -> bool {
+        write_shown(root, shown)
+    }
+}
+
+/// Tells the fetch path which version each shown placeholder stands for: a fetch asks the daemon
+/// for a window of exactly that version.
+fn publish_shown_versions(root_id: &[u8], shown: &ShownItems) {
+    yadorilink_shell_ext::provider_client::set_shown_versions(
+        root_id,
+        shown.iter().map(|(id, item)| (id.as_slice(), item.content_version.as_slice())),
+    );
+}
+
+/// What the durable record of the shown items says.
+#[derive(Debug, PartialEq)]
+enum LoadedShown {
+    /// No record was ever made (a first run).
+    Missing,
+    /// The whole record was read back.
+    Loaded(ShownItems),
+    /// A record exists but could not be read or decoded: it is the only evidence of what the user
+    /// may have deleted while the host was not running, so it is not a first run.
+    Invalid(String),
+}
+
+/// The newest complete generation of the shown record at `file` (see [`generation`]).
+fn read_shown_at(file: &Path) -> LoadedShown {
+    match generation::read_latest(file, |text| unseal(text).map(decode_shown_lines)) {
+        generation::Latest::Missing => LoadedShown::Missing,
+        generation::Latest::Loaded { value: Some(value), .. } => LoadedShown::Loaded(value),
+        // Complete (the seal holds) but not understood: that is the newest record, and an older
+        // generation may predate what the user deleted. Only a torn generation is skipped.
+        generation::Latest::Loaded { value: None, seq, .. } => {
+            LoadedShown::Invalid(format!("{}: generation {seq} is malformed", file.display()))
+        }
+        generation::Latest::Invalid(e) => LoadedShown::Invalid(e),
+    }
+}
+
+fn decode_shown_lines(body: &str) -> Option<ShownItems> {
+    body.lines().map(decode_shown).collect()
+}
+
+fn encode_shown_record(shown: &ShownItems) -> String {
+    let mut lines: Vec<String> = shown.iter().map(|(id, item)| encode_shown(id, item)).collect();
+    lines.sort();
+    seal(&lines.iter().map(|line| format!("{line}\n")).collect::<String>())
+}
+
+/// Records the items shown in `root_id` durably: a new generation, published before the
+/// acknowledgement that depends on it (a recorded item whose placeholder is gone reads as the
+/// user deleting it).
+fn write_shown(root_id: &[u8], shown: &ShownItems) -> bool {
+    publish_shown_versions(root_id, shown);
+    let file = authoring_state_dir(root_id).join("shown");
+    let written = generation::publish_next(&file, &encode_shown_record(shown));
+    if let Err(e) = &written {
+        eprintln!("yadorilink-cfapi-host: could not record the shown items: {e}");
+    }
+    written.is_ok()
 }
 
 fn authoring_state_dir(root_id: &[u8]) -> PathBuf {
@@ -251,15 +417,24 @@ fn authoring_state_dir(root_id: &[u8]) -> PathBuf {
 }
 
 impl Backend for RealBackend {
+    fn prepare_root(&mut self, path: &Path) -> Result<(), String> {
+        yadorilink_fs_platform::durable_dir::create_dir_all_durably(path)
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
     fn register_and_connect(&mut self, root_id: &[u8], path: &Path) -> Result<(), String> {
-        std::fs::create_dir_all(path).map_err(|e| format!("{}: {e}", path.display()))?;
         yadorilink_shell_ext::cfapi::register_and_connect_provider(root_id, path)
             .map_err(|e| format!("{e:?}"))
     }
 
     fn unregister(&mut self, path: &Path) -> Result<(), String> {
-        // `cfapi::unregister` already disconnects first.
-        yadorilink_shell_ext::cfapi::unregister(path).map_err(|e| format!("{e:?}"))
+        // `cfapi::unregister` already disconnects first. A root that is not registered any more
+        // is what was asked for: the unregister is repeated after a failed record update.
+        match yadorilink_shell_ext::cfapi::unregister(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.code() == ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT => Ok(()),
+            Err(e) => Err(format!("{e:?}")),
+        }
     }
 
     fn sync_namespace(
@@ -276,30 +451,46 @@ impl Backend for RealBackend {
         yadorilink_shell_ext::provider_namespace::evict(path, item_id)
     }
 
-    fn load_shown(&mut self, root_id: &[u8]) -> Option<ShownItems> {
-        let text = std::fs::read_to_string(authoring_state_dir(root_id).join("shown")).ok()?;
-        text.lines().map(decode_shown).collect()
+    fn materialized(&mut self, shown: &ShownItems) -> HashSet<Vec<u8>> {
+        shown
+            .iter()
+            .filter(|(_, item)| !item.directory)
+            .filter(|(id, item)| {
+                // The placeholder of exactly this item, with its bytes on the disk and not changed
+                // by the user (a plain file put in its place, or an edit, is not the daemon's
+                // version). Attribute access only: nothing is fetched.
+                yadorilink_shell_ext::provider_namespace::placeholder_info(&item.path).is_some_and(
+                    |info| {
+                        info.item_id.as_deref() == Some(id.as_slice())
+                            && !info.is_dir
+                            && !info.dehydrated
+                            && info.in_sync
+                    },
+                )
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
-    fn save_shown(&mut self, root_id: &[u8], shown: &ShownItems) {
-        let dir = authoring_state_dir(root_id);
-        let mut lines: Vec<String> =
-            shown.iter().map(|(id, item)| encode_shown(id, item)).collect();
-        lines.sort();
-        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
-        let file = dir.join("shown");
-        let written = std::fs::create_dir_all(&dir).and_then(|()| {
-            let tmp = file.with_extension("tmp");
-            let mut out = std::fs::File::create(&tmp)?;
-            out.write_all(text.as_bytes())?;
-            out.sync_all()?;
-            drop(out);
-            // On disk before the acknowledgement that depends on it: a recorded item whose
-            // placeholder is gone reads as the user deleting it.
-            publish_durably(&tmp, &file, Replace::Yes)
-        });
-        if let Err(e) = written {
-            eprintln!("yadorilink-cfapi-host: could not record the shown items: {e}");
+    fn load_shown(&mut self, root_id: &[u8]) -> LoadedShown {
+        let loaded = read_shown_at(&authoring_state_dir(root_id).join("shown"));
+        if let LoadedShown::Loaded(shown) = &loaded {
+            publish_shown_versions(root_id, shown);
+        }
+        loaded
+    }
+
+    fn save_shown(&mut self, root_id: &[u8], shown: &ShownItems) -> bool {
+        write_shown(root_id, shown)
+    }
+
+    fn namespace_available(&mut self, path: &Path) -> bool {
+        match yadorilink_shell_ext::provider_namespace::root_offers_durable_namespace(path) {
+            Ok(()) => true,
+            Err(reason) => {
+                eprintln!("yadorilink-cfapi-host: {} is left as it is: {reason}", path.display());
+                false
+            }
         }
     }
 
@@ -382,6 +573,10 @@ impl Reports for provider_session::Session {
     fn evict_done(&self, root: &[u8], request_id: &[u8], result: EvictResult, error: &str) {
         provider_session::Session::evict_done(self, root, request_id, result, error);
     }
+
+    fn materialized(&self, report: ProviderMaterializedReport) {
+        provider_session::Session::materialized(self, report);
+    }
 }
 
 /// One served root.
@@ -392,6 +587,20 @@ struct Served {
     needs_walk: bool,
     /// The items shown by the last complete walk, with their paths.
     shown: ShownItems,
+    /// `shown` is what the last successful `save_shown` (or `load_shown`) recorded. While false,
+    /// it is not a base the daemon may be told about: after a crash the older record would be
+    /// loaded, and a change authored against `shown` would be judged against another base.
+    shown_durable: bool,
+    /// Why the durable record of the shown items cannot be trusted (it exists but is unreadable
+    /// or corrupt). While set, nothing is shown, authored or acknowledged for this root: showing
+    /// the daemon's namespace could put back an item the user deleted while the host was off.
+    baseline_untrusted: Option<String>,
+    /// A readable record exists and the offline changes have not been judged against it yet
+    /// (the root was not ready to be shown). Until they are, nothing is walked or saved: an empty
+    /// in-memory baseline would overwrite the record before a deletion was seen.
+    baseline_held: bool,
+    /// The record was judged (or there was none): it is not looked at again.
+    baseline_judged: bool,
     /// What the user did in the sync root and has not been applied yet.
     pending: BTreeSet<PathBuf>,
     /// Changes were lost: look at everything.
@@ -401,6 +610,13 @@ struct Served {
     /// Paths to look at again after this time (the daemon was busy or a file was changing).
     retry: BTreeSet<PathBuf>,
     retry_after: Option<Instant>,
+    /// The materialized-set reporter of this connection (none: the next report is a full snapshot).
+    reporter: Option<Reporter>,
+    /// The highest handoff sequence the daemon announced for this root.
+    latest_seq: u64,
+    /// Until when the set is read at every poll, and when it was last read.
+    report_settle_until: Option<Instant>,
+    last_report: Option<Instant>,
     /// Keeps the watcher alive.
     _watch: Option<Box<dyn std::any::Any>>,
 }
@@ -412,32 +628,72 @@ struct Host<B: Backend, R: Reports> {
     sync_roots_parent: PathBuf,
     /// Everything ever registered by this host and not yet removed: root id (hex) -> path.
     registry: HashMap<String, PathBuf>,
+    /// Why the registry file cannot be trusted (it exists but is unreadable or corrupt). While
+    /// set, no root is registered, removed or acknowledged: an empty map would forget them all.
+    registry_fault: Option<String>,
     /// The roots connected by this process.
     served: HashMap<String, Served>,
 }
 
 impl<B: Backend, R: Reports> Host<B, R> {
     fn new(backend: B, reports: R, registry_file: PathBuf, sync_roots_parent: PathBuf) -> Self {
-        let registry = read_registry_at(&registry_file);
-        Self {
+        let mut host = Self {
             backend,
             reports,
             registry_file,
             sync_roots_parent,
-            registry,
+            registry: HashMap::new(),
+            registry_fault: None,
             served: HashMap::new(),
+        };
+        host.load_registry();
+        host
+    }
+
+    /// Reads the registry file; an unreadable one is remembered as a fault and read again later.
+    fn load_registry(&mut self) {
+        match read_registry_at(&self.registry_file) {
+            Ok(registry) => {
+                self.registry = registry;
+                self.registry_fault = None;
+            }
+            Err(e) => {
+                if self.registry_fault.as_deref() != Some(e.as_str()) {
+                    eprintln!(
+                        "yadorilink-cfapi-host: the record of the sync roots cannot be read ({e}); \
+                         no root is registered or removed until it can"
+                    );
+                }
+                self.registry_fault = Some(e);
+            }
         }
     }
 
-    fn save_registry(&self) {
-        if let Err(e) = write_registry_at(&self.registry_file, &self.registry) {
-            eprintln!("yadorilink-cfapi-host: could not record the sync roots: {e}");
+    /// Makes `candidate` the registry: durably first, and only then in memory. False (nothing
+    /// changed) when it could not be made durable, so nothing is acknowledged that a restart
+    /// could not find again.
+    fn commit_registry(&mut self, candidate: HashMap<String, PathBuf>) -> bool {
+        match write_registry_at(&self.registry_file, &candidate) {
+            Ok(()) => {
+                self.registry = candidate;
+                true
+            }
+            Err(e) => {
+                eprintln!("yadorilink-cfapi-host: could not record the sync roots: {e}");
+                false
+            }
         }
     }
 
     /// Reconciles the served roots against the daemon's declarations. `None` snapshot (the
     /// daemon could not confirm one) changes nothing.
     fn reconcile(&mut self, snapshot: Option<(Vec<ProviderFolder>, Vec<ProviderRemoval>)>) {
+        if self.registry_fault.is_some() {
+            self.load_registry();
+            if self.registry_fault.is_some() {
+                return;
+            }
+        }
         let Some((folders, removals)) = snapshot else {
             eprintln!(
                 "yadorilink-cfapi-host: could not confirm the provider roots this poll (daemon \
@@ -494,6 +750,19 @@ impl<B: Backend, R: Reports> Host<B, R> {
                 );
                 return;
             }
+            // The record of the root comes first: it is what a restart finds to retry on the
+            // same path, whatever happens to the operating system's registration after it.
+            if !self.registry.contains_key(&key) {
+                if let Err(e) = self.backend.prepare_root(&path) {
+                    eprintln!("yadorilink-cfapi-host: cannot prepare {}: {e}", path.display());
+                    return;
+                }
+                let mut candidate = self.registry.clone();
+                candidate.insert(key.clone(), path.clone());
+                if !self.commit_registry(candidate) {
+                    return;
+                }
+            }
             if let Err(e) = self.backend.register_and_connect(&folder.root_id, &path) {
                 eprintln!(
                     "yadorilink-cfapi-host: failed to register sync root {}: {e}",
@@ -505,9 +774,6 @@ impl<B: Backend, R: Reports> Host<B, R> {
                 "yadorilink-cfapi-host: registered+connected sync root {} for {key}",
                 path.display()
             );
-            if self.registry.insert(key.clone(), path.clone()).as_ref() != Some(&path) {
-                self.save_registry();
-            }
             let watch = self.backend.watch(&key, &path);
             self.served.insert(
                 key.clone(),
@@ -516,20 +782,36 @@ impl<B: Backend, R: Reports> Host<B, R> {
                     path,
                     needs_walk: true,
                     shown: ShownItems::new(),
+                    shown_durable: false,
+                    baseline_untrusted: None,
+                    baseline_held: false,
+                    baseline_judged: false,
                     // The first pass also sends an operation a crash left unanswered.
                     pending: BTreeSet::new(),
                     rescan: false,
                     last_signal: None,
                     retry: BTreeSet::new(),
                     retry_after: None,
+                    reporter: None,
+                    latest_seq: 0,
+                    report_settle_until: None,
+                    last_report: None,
                     _watch: watch,
                 },
             );
             self.reports.domain_state(&folder.root_id, DomainEvidence::Registered, "");
         }
+        if let Some(served) = self.served.get_mut(&key) {
+            served.latest_seq = served.latest_seq.max(folder.latest_evidence_seq);
+        }
+        self.check_baseline(&key);
         if folder.registration_ready {
             let first = self.served.get(&key).is_some_and(|served| served.last_signal.is_none());
-            let judged = first && self.judge_offline_changes(&key);
+            // An untrusted record is read again at every poll (a transient failure heals).
+            let untrusted =
+                self.served.get(&key).is_some_and(|served| served.baseline_untrusted.is_some());
+            let held = self.served.get(&key).is_some_and(|served| served.baseline_held);
+            let judged = (first || untrusted || held) && self.judge_offline_changes(&key);
             self.walk_if_due(&key);
             // The first complete showing of a root is recorded, and whatever the user did in it
             // while the host was not running (and any operation a crash left unanswered) is applied.
@@ -541,6 +823,71 @@ impl<B: Backend, R: Reports> Host<B, R> {
                     self.apply_local(&key, true);
                 }
             }
+            self.report_materialized(&key, false);
+        }
+    }
+
+    /// Before the first judgement of a root (and while its record is untrusted) the record of
+    /// what was shown is looked at even if the namespace is not ready to be shown: a change
+    /// signal or a pushed namespace must not walk over an unreadable record.
+    fn check_baseline(&mut self, key: &str) {
+        let Some(served) = self.served.get_mut(key) else { return };
+        if served.baseline_judged {
+            return;
+        }
+        match self.backend.load_shown(&served.root_id) {
+            LoadedShown::Invalid(reason) => {
+                served.baseline_untrusted = Some(reason);
+                served.needs_walk = true;
+            }
+            LoadedShown::Loaded(_) if served.baseline_untrusted.is_none() => {
+                served.baseline_held = true;
+                served.needs_walk = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Tells the daemon which items the OS holds bytes of, when that is due (or `force`).
+    fn report_materialized(&mut self, key: &str, force: bool) {
+        let now = Instant::now();
+        let Some(served) = self.served.get_mut(key) else { return };
+        // What is shown is what can be named; before the first complete walk nothing is.
+        if served.needs_walk && served.shown.is_empty() {
+            return;
+        }
+        let settling = served.report_settle_until.is_some_and(|until| now < until);
+        let idle_due = served.last_report.is_none_or(|at| now.duration_since(at) >= REPORT_IDLE);
+        if !(force || settling || idle_due) {
+            return;
+        }
+        // The sequence is read BEFORE the set: a report may only claim to have begun after
+        // evidence it had already seen.
+        let observed_after = served.latest_seq;
+        let materialized = self.backend.materialized(&served.shown);
+        served.last_report = Some(now);
+        let reporter = served.reporter.get_or_insert_with(Reporter::new);
+        for report in reporter.reports(&served.root_id, observed_after, &materialized) {
+            self.reports.materialized(report);
+        }
+    }
+
+    /// News from the daemon that a handoff happened: the set is read at every poll for a while.
+    fn on_evidence(&mut self, root: &[u8], seq: u64) {
+        let key = hex(root);
+        let Some(served) = self.served.get_mut(&key) else { return };
+        served.latest_seq = served.latest_seq.max(seq);
+        served.report_settle_until = Some(Instant::now() + REPORT_SETTLE);
+        // Read at the next poll: a burst of handoffs is one report, not one per handoff.
+    }
+
+    /// The daemon refused a report as out of protocol: the next one starts over.
+    fn on_report_ack(&mut self, root: &[u8], epoch: u64, needs_full: bool) {
+        let key = hex(root);
+        let Some(served) = self.served.get_mut(&key) else { return };
+        if let Some(old) = served.reporter.as_ref().filter(|r| r.needs_restart(epoch, needs_full)) {
+            served.reporter = Some(Reporter::after(old.epoch()));
+            self.report_materialized(&key, true);
         }
     }
 
@@ -550,8 +897,41 @@ impl<B: Backend, R: Reports> Host<B, R> {
     /// was never shown, so it is not a deletion. False when there is nothing to judge against.
     fn judge_offline_changes(&mut self, key: &str) -> bool {
         let Some(served) = self.served.get_mut(key) else { return false };
-        let Some(shown) = self.backend.load_shown(&served.root_id) else { return false };
+        let shown = match self.backend.load_shown(&served.root_id) {
+            // A record that vanished after it was found unreadable is still not a first run.
+            LoadedShown::Missing if served.baseline_untrusted.is_some() => {
+                served.needs_walk = true;
+                return false;
+            }
+            // A record read earlier and gone now is as unproven as an unreadable one.
+            LoadedShown::Missing if served.baseline_held => {
+                served.baseline_untrusted = Some("the record disappeared".into());
+                served.needs_walk = true;
+                return false;
+            }
+            LoadedShown::Missing => {
+                served.baseline_held = false;
+                served.baseline_judged = true;
+                return false;
+            }
+            LoadedShown::Invalid(reason) => {
+                if served.baseline_untrusted.as_deref() != Some(reason.as_str()) {
+                    eprintln!(
+                        "yadorilink-cfapi-host: the record of what was shown in {key} cannot be \
+                         read ({reason}); the root is left as it is until it can"
+                    );
+                }
+                served.baseline_untrusted = Some(reason);
+                served.needs_walk = true;
+                return false;
+            }
+            LoadedShown::Loaded(shown) => shown,
+        };
+        served.baseline_untrusted = None;
+        served.baseline_held = false;
+        served.baseline_judged = true;
         served.shown = shown;
+        served.shown_durable = true;
         served.last_signal = Some(Instant::now());
         self.apply_local(key, true);
         true
@@ -579,14 +959,30 @@ impl<B: Backend, R: Reports> Host<B, R> {
 
     fn walk_now(&mut self, key: &str) -> bool {
         let Some(served) = self.served.get_mut(key) else { return false };
+        // An unreadable record of what was shown is not an empty one: nothing is shown over it.
+        if served.baseline_untrusted.is_some() || served.baseline_held {
+            served.needs_walk = true;
+            return false;
+        }
+        // A refused volume is not shown: nothing is walked, nothing is acknowledged.
+        if !self.backend.namespace_available(&served.path) {
+            served.needs_walk = true;
+            return false;
+        }
         // What the user did and has not been reported yet is not touched by the walk: a
         // placeholder deleted there must not be put back before the daemon has been told.
-        let protected: HashSet<String> = served
+        let mut protected: HashSet<String> = served
             .pending
             .iter()
             .chain(served.retry.iter())
             .map(|path| path.to_string_lossy().to_lowercase())
             .collect();
+        // Lost changes are looked at in full later: until then every shown item stays as it is.
+        if served.rescan {
+            protected.extend(
+                served.shown.values().map(|item| item.path.to_string_lossy().to_lowercase()),
+            );
+        }
         match self.backend.sync_namespace(&served.root_id, &served.path, &served.shown, &protected)
         {
             Some(mut shown) => {
@@ -602,10 +998,12 @@ impl<B: Backend, R: Reports> Host<B, R> {
                     shown.len(),
                     served.path.display()
                 );
-                self.backend.save_shown(&served.root_id, &shown);
+                let recorded = self.backend.save_shown(&served.root_id, &shown);
                 served.shown = shown;
-                served.needs_walk = false;
-                true
+                served.shown_durable = recorded;
+                // Not recorded: shown again at the next walk, and not acknowledged until then.
+                served.needs_walk = !recorded;
+                recorded
             }
             None => {
                 served.needs_walk = true;
@@ -672,6 +1070,20 @@ impl<B: Backend, R: Reports> Host<B, R> {
     fn author_local(&mut self, key: &str, everything: bool) {
         let Self { backend, served, .. } = self;
         let Some(root) = served.get_mut(key) else { return };
+        if !root.shown_durable || !backend.namespace_available(&root.path) {
+            // Fail closed: nothing is authored against a base that was not recorded, nor on a
+            // volume the durable-namespace probe refused. The signals, the retries and the shown
+            // baseline stay where they are and are applied once a walk has recorded the
+            // namespace (or the volume is accepted).
+            root.rescan |= everything;
+            root.needs_walk = true;
+            // The next attempt waits for the root to be quiet again instead of spinning.
+            root.last_signal = Some(Instant::now());
+            if !root.retry.is_empty() {
+                root.retry_after = Some(Instant::now() + POLL_INTERVAL);
+            }
+            return;
+        }
         let mut signals = std::mem::take(&mut root.pending);
         signals.append(&mut root.retry);
         root.retry_after = None;
@@ -693,7 +1105,10 @@ impl<B: Backend, R: Reports> Host<B, R> {
         if report.rewalk {
             root.needs_walk = true;
         }
-        backend.save_shown(&root.root_id, &root.shown);
+        root.shown_durable = backend.save_shown(&root.root_id, &root.shown);
+        if !root.shown_durable {
+            root.needs_walk = true;
+        }
         if report.applied > 0 {
             println!("yadorilink-cfapi-host: applied {} local change(s) in {key}", report.applied);
         }
@@ -715,9 +1130,16 @@ impl<B: Backend, R: Reports> Host<B, R> {
             );
             return;
         }
+        // Removed only once the record no longer names the root; until then the removal is asked
+        // for again (unregistering is idempotent) and not acknowledged.
+        // The operating system no longer has the root, so it is not served (and not reported as
+        // registered again) whether or not the record could be updated.
         self.served.remove(&key);
-        self.registry.remove(&key);
-        self.save_registry();
+        let mut candidate = self.registry.clone();
+        candidate.remove(&key);
+        if !self.commit_registry(candidate) {
+            return;
+        }
         println!(
             "yadorilink-cfapi-host: unregistered sync root {} (removal requested)",
             path.display()
@@ -731,6 +1153,8 @@ impl<B: Backend, R: Reports> Host<B, R> {
         for served in self.served.values_mut() {
             self.reports.domain_state(&served.root_id, DomainEvidence::Registered, "");
             served.needs_walk = true;
+            // The daemon dropped what it knew of the previous connection.
+            served.reporter = None;
         }
     }
 
@@ -746,7 +1170,13 @@ impl<B: Backend, R: Reports> Host<B, R> {
         false
     }
 
-    fn on_evict(&mut self, root: &[u8], item: &[u8], request_id: &[u8], require_shown_version: &[u8]) {
+    fn on_evict(
+        &mut self,
+        root: &[u8],
+        item: &[u8],
+        request_id: &[u8],
+        require_shown_version: &[u8],
+    ) {
         let key = hex(root);
         let known = self.served.get(&key).and_then(|s| s.shown.get(item)).map(|s| s.path.clone());
         let mut confirmed = true;
@@ -770,12 +1200,12 @@ impl<B: Backend, R: Reports> Host<B, R> {
                 .and_then(|s| s.shown.get(item))
                 .is_some_and(|s| s.content_version.starts_with(require_shown_version));
         let (result, error) = match path {
-            _ if shown_version_differs => (EvictResult::NotMaterialized, String::new()),
             None if !confirmed => (
                 EvictResult::Error,
                 "the namespace could not be confirmed, so the item could not be located"
                     .to_string(),
             ),
+            _ if shown_version_differs => (EvictResult::NotMaterialized, String::new()),
             None => (EvictResult::NotMaterialized, String::new()),
             Some(path) => match self.backend.evict(&path, item) {
                 Ok(()) => (EvictResult::Evicted, String::new()),
@@ -786,6 +1216,10 @@ impl<B: Backend, R: Reports> Host<B, R> {
             },
         };
         self.reports.evict_done(root, request_id, result, &error);
+        if let Some(served) = self.served.get_mut(&key) {
+            served.report_settle_until = Some(Instant::now() + REPORT_SETTLE);
+        }
+        self.report_materialized(&key, true);
     }
 }
 
@@ -810,7 +1244,7 @@ fn spawn_dehydrate_server() {
 
 fn list_snapshot() -> Option<(Vec<ProviderFolder>, Vec<ProviderRemoval>)> {
     let container = host_paths::container();
-    std::fs::create_dir_all(&container).ok()?;
+    yadorilink_fs_platform::durable_dir::create_dir_all_durably(&container).ok()?;
     yadorilink_shell_ext::ipc_client::list_provider_folders(&container.to_string_lossy())
         .map(|snapshot| (snapshot.folders, snapshot.removals))
 }
@@ -860,6 +1294,12 @@ fn main() {
             })) => {
                 host.on_evict(&root, &item, &request_id, &require_shown_version);
             }
+            Ok(HostEvent::Session(SessionEvent::EvidenceTick { root, seq })) => {
+                host.on_evidence(&root, seq);
+            }
+            Ok(HostEvent::Session(SessionEvent::ReportAck { root, epoch, needs_full })) => {
+                host.on_report_ack(&root, epoch, needs_full);
+            }
             Ok(HostEvent::Local { root, signal }) => host.on_local(&root, signal),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -886,20 +1326,40 @@ mod tests {
         signals: Vec<(Vec<u8>, u64, bool)>,
         evictions: Vec<(Vec<u8>, i32)>,
         fail_walk: bool,
+        fail_register: bool,
+        prepared: Vec<PathBuf>,
+        steps: Vec<&'static str>,
+        fail_save: bool,
+        materialized: HashSet<Vec<u8>>,
+        reports: Vec<ProviderMaterializedReport>,
         evict_result: Option<EvictOutcome>,
         authored: Vec<BTreeSet<PathBuf>>,
         rewalk_next: bool,
         loaded: Option<ShownItems>,
+        load_invalid: Option<String>,
         order: Vec<&'static str>,
         root_missing: bool,
         saved: Vec<ShownItems>,
+        namespace_refused: bool,
     }
 
     #[derive(Clone, Default)]
     struct Fake(Rc<RefCell<Recorded>>);
 
     impl Backend for Fake {
+        fn prepare_root(&mut self, path: &Path) -> Result<(), String> {
+            let mut recorded = self.0.borrow_mut();
+            recorded.steps.push("prepare");
+            recorded.prepared.push(path.to_path_buf());
+            Ok(())
+        }
         fn register_and_connect(&mut self, root_id: &[u8], path: &Path) -> Result<(), String> {
+            let mut recorded = self.0.borrow_mut();
+            recorded.steps.push("register");
+            if recorded.fail_register {
+                return Err("refused".into());
+            }
+            drop(recorded);
             self.0.borrow_mut().registered.push((root_id.to_vec(), path.to_path_buf()));
             Ok(())
         }
@@ -940,11 +1400,26 @@ mod tests {
                 None => Ok(()),
             }
         }
-        fn load_shown(&mut self, _root_id: &[u8]) -> Option<ShownItems> {
-            self.0.borrow().loaded.clone()
+        fn materialized(&mut self, _shown: &ShownItems) -> HashSet<Vec<u8>> {
+            self.0.borrow().materialized.clone()
         }
-        fn save_shown(&mut self, _root_id: &[u8], shown: &ShownItems) {
-            self.0.borrow_mut().saved.push(shown.clone());
+        fn load_shown(&mut self, _root_id: &[u8]) -> LoadedShown {
+            let recorded = self.0.borrow();
+            if let Some(reason) = &recorded.load_invalid {
+                return LoadedShown::Invalid(reason.clone());
+            }
+            recorded.loaded.clone().map_or(LoadedShown::Missing, LoadedShown::Loaded)
+        }
+        fn save_shown(&mut self, _root_id: &[u8], shown: &ShownItems) -> bool {
+            let mut recorded = self.0.borrow_mut();
+            if recorded.fail_save {
+                return false;
+            }
+            recorded.saved.push(shown.clone());
+            true
+        }
+        fn namespace_available(&mut self, _path: &Path) -> bool {
+            !self.0.borrow().namespace_refused
         }
         fn is_dir(&mut self, _path: &Path) -> bool {
             !self.0.borrow().root_missing
@@ -982,6 +1457,9 @@ mod tests {
         }
         fn signal_done(&self, root: &[u8], revision: u64, _id: &[u8], error: Option<&str>) {
             self.0.borrow_mut().signals.push((root.to_vec(), revision, error.is_none()));
+        }
+        fn materialized(&self, report: ProviderMaterializedReport) {
+            self.0.borrow_mut().reports.push(report);
         }
         fn evict_done(&self, root: &[u8], _id: &[u8], result: EvictResult, _error: &str) {
             self.0.borrow_mut().evictions.push((root.to_vec(), result as i32));
@@ -1088,7 +1566,7 @@ mod tests {
         let removed =
             recorded.states.iter().find(|s| s.1 == DomainEvidence::Removed as i32).unwrap();
         assert!(!removed.2.is_empty(), "the preserved location was not reported");
-        assert!(!read_registry_at(&dir.join("roots.txt")).contains_key(&hex(&[1u8; 16])));
+        assert!(!read_registry_at(&dir.join("roots.txt")).unwrap().contains_key(&hex(&[1u8; 16])));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1112,6 +1590,187 @@ mod tests {
 
         // A change naming a root this host does not serve asks for a new listing.
         assert!(host.on_changed(&[9; 16], 1, &[5]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A namespace whose record of shown items could not be made durable is not acknowledged and is
+    /// shown again: an acknowledged but unrecorded item would not be known after a restart.
+    #[test]
+    fn a_namespace_that_could_not_be_recorded_is_not_acknowledged_and_is_shown_again() {
+        let dir = temp_dir("save");
+        let fake = Fake::default();
+        fake.0.borrow_mut().fail_save = true;
+        let mut host = host(&fake, &dir);
+        host.reconcile(Some((vec![folder(1, "Photos", true)], vec![])));
+        assert_eq!(fake.0.borrow().walks.len(), 1);
+        assert!(fake.0.borrow().saved.is_empty());
+
+        host.on_changed(&[1; 16], 7, &[3]);
+        assert_eq!(fake.0.borrow().signals, vec![(vec![1u8; 16], 7, false)]);
+
+        // The next reconcile walks again (the failed record left the walk due) and, once the
+        // record can be made, the change is acknowledged.
+        fake.0.borrow_mut().fail_save = false;
+        host.reconcile(Some((vec![folder(1, "Photos", true)], vec![])));
+        host.on_changed(&[1; 16], 8, &[4]);
+        assert_eq!(fake.0.borrow().signals[1], (vec![1u8; 16], 8, true));
+        assert!(!fake.0.borrow().saved.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A root on a volume the durable-namespace probe refused is neither authored against nor
+    /// walked: the signals, the retries and the shown baseline stay as they were, and nothing is
+    /// acknowledged. Once the volume is accepted they are applied.
+    #[test]
+    fn a_refused_volume_is_neither_authored_against_nor_walked() {
+        let dir = temp_dir("refused");
+        let fake = Fake::default();
+        let mut host = host(&fake, &dir);
+        host.reconcile(Some((vec![folder(1, "Photos", true)], vec![])));
+        let key = hex(&[1u8; 16]);
+        let shown_before = host.served.get(&key).unwrap().shown.clone();
+        fake.0.borrow_mut().namespace_refused = true;
+        fake.0.borrow_mut().order.clear();
+        fake.0.borrow_mut().authored.clear();
+        host.on_local(&key, Signal::Paths(vec![PathBuf::from("a")]));
+        let later = Instant::now() + QUIET + Duration::from_millis(5);
+        host.apply_due_local(later);
+        assert!(!host.on_changed(&[1; 16], 5, &[1]), "acknowledged on a refused volume");
+        assert!(fake.0.borrow().authored.is_empty(), "authored on a refused volume");
+        assert!(fake.0.borrow().order.is_empty(), "{:?}", fake.0.borrow().order);
+        let served = host.served.get(&key).unwrap();
+        assert_eq!(served.pending, BTreeSet::from([PathBuf::from("a")]));
+        assert_eq!(served.shown, shown_before);
+        assert!(served.needs_walk);
+
+        fake.0.borrow_mut().namespace_refused = false;
+        host.apply_due_local(later + QUIET);
+        host.apply_due_local(later + QUIET * 2);
+        assert_eq!(fake.0.borrow().authored, vec![BTreeSet::from([PathBuf::from("a")])]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// While the record of shown items is not durable, what the user did is not authored against
+    /// it: a crash would restore an older baseline. The signals wait; once a record is saved they
+    /// are applied.
+    #[test]
+    fn nothing_is_authored_against_a_shown_baseline_that_could_not_be_saved() {
+        let dir = temp_dir("baseline");
+        let fake = Fake::default();
+        fake.0.borrow_mut().fail_save = true;
+        let mut host = host(&fake, &dir);
+        host.reconcile(Some((vec![folder(1, "Photos", true)], vec![])));
+        let key = hex(&[1u8; 16]);
+        host.on_local(&key, Signal::Paths(vec![PathBuf::from("a")]));
+        let later = Instant::now() + QUIET + Duration::from_millis(5);
+        host.apply_due_local(later);
+        assert!(fake.0.borrow().authored.is_empty(), "authored against an unsaved baseline");
+
+        fake.0.borrow_mut().fail_save = false;
+        host.apply_due_local(later + QUIET);
+        host.apply_due_local(later + QUIET * 2);
+        assert!(!fake.0.borrow().saved.is_empty());
+        assert_eq!(fake.0.borrow().authored, vec![BTreeSet::from([PathBuf::from("a")])]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The daemon learns what the OS holds: a full snapshot first, a delta when the set or the
+    /// evidence moved, a new epoch after a refusal or a new connection.
+    #[test]
+    fn the_materialized_set_is_reported_as_a_snapshot_then_deltas_and_starts_over_when_refused() {
+        let dir = temp_dir("report");
+        let fake = Fake::default();
+        fake.0.borrow_mut().materialized = HashSet::from([vec![4u8; 16]]);
+        let mut host = host(&fake, &dir);
+        let mut folder = folder(1, "Photos", true);
+        folder.latest_evidence_seq = 2;
+        host.reconcile(Some((vec![folder.clone()], vec![])));
+        {
+            let recorded = fake.0.borrow();
+            assert_eq!(recorded.reports.len(), 1);
+            let first = &recorded.reports[0];
+            assert!(first.full && first.report_seq == 1 && first.observed_after_seq == 2);
+            assert_eq!(first.upserts.len(), 1);
+        }
+        let epoch = fake.0.borrow().reports[0].reporter_epoch;
+
+        // A handoff the daemon announced, and a file the OS has finished writing.
+        fake.0.borrow_mut().materialized.insert(vec![5u8; 16]);
+        host.on_evidence(&[1; 16], 3);
+        assert_eq!(fake.0.borrow().reports.len(), 1, "a handoff alone is read at the next poll");
+        host.reconcile(Some((vec![folder.clone()], vec![])));
+        {
+            let recorded = fake.0.borrow();
+            let next = recorded.reports.last().unwrap();
+            // Newer evidence lists every member again, in the next epoch.
+            assert!(next.full && next.report_seq == 1 && next.reporter_epoch == epoch + 1);
+            assert_eq!((next.observed_after_seq, next.upserts.len()), (3, 2));
+        }
+        let epoch = epoch + 1;
+
+        // Out of protocol: a new epoch and a full snapshot of the whole set.
+        host.on_report_ack(&[1; 16], epoch, true);
+        {
+            let recorded = fake.0.borrow();
+            let again = recorded.reports.last().unwrap();
+            assert!(again.full && again.report_seq == 1 && again.reporter_epoch > epoch);
+            assert_eq!(again.upserts.len(), 2);
+        }
+        // An answer for another epoch changes nothing.
+        let count = fake.0.borrow().reports.len();
+        host.on_report_ack(&[1; 16], epoch, true);
+        assert_eq!(fake.0.borrow().reports.len(), count);
+
+        // A new connection: the daemon dropped the snapshot, so the next report is a full one.
+        host.on_connected();
+        host.reconcile(Some((vec![folder], vec![])));
+        assert!(fake.0.borrow().reports.last().unwrap().full);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the OS holds is read from the sync root: only the placeholder of exactly the item,
+    /// with its bytes and unchanged. A dehydrated placeholder is not held; a plain file put where
+    /// the placeholder was is not the daemon's version.
+    #[test]
+    #[ignore = "real Cloud Files state; run on a Windows machine"]
+    fn only_an_item_own_hydrated_unchanged_placeholder_counts_as_materialized() {
+        let dir = temp_dir("materialized");
+        let sync_root = dir.join("root");
+        std::fs::create_dir_all(&sync_root).unwrap();
+        yadorilink_shell_ext::cfapi::register_and_connect(&sync_root).unwrap();
+        let created = yadorilink_shell_ext::cfapi::create_item_placeholder;
+        created(
+            &yadorilink_fs_platform::durable_dir::NoLedger,
+            &sync_root,
+            "a.txt",
+            &[3; 16],
+            5,
+            0,
+            false,
+        )
+        .unwrap();
+        let path = sync_root.join("a.txt");
+        let shown = ShownItems::from([(
+            vec![3u8; 16],
+            ShownItem {
+                path: path.clone(),
+                parent_item_id: vec![],
+                name: "a.txt".into(),
+                directory: false,
+                size: 5,
+                mtime_unix_nanos: 0,
+                content_version: vec![0; 40],
+                parent_generation: 0,
+            },
+        )]);
+        let (events, _inbox) = std::sync::mpsc::channel();
+        let mut backend = RealBackend { events };
+        assert!(backend.materialized(&shown).is_empty(), "a dehydrated placeholder was reported");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"mine!").unwrap();
+        assert!(backend.materialized(&shown).is_empty(), "a plain file was reported as the item");
+        std::fs::remove_file(&path).unwrap();
+        let _ = yadorilink_shell_ext::cfapi::unregister(&sync_root);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1240,6 +1899,184 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn offline_delete_host(fake: &Fake, dir: &Path) -> Host<Fake, Fake> {
+        let mut host = host(fake, dir);
+        host.reconcile(Some((vec![folder(1, "Photos", true)], vec![])));
+        host
+    }
+
+    /// An existing shown record that cannot be trusted is not a first run: nothing is shown,
+    /// authored or acknowledged over it, and it is read again once it can be read.
+    #[test]
+    fn an_unreadable_shown_record_blocks_the_walk_instead_of_reading_as_a_first_run() {
+        let dir = temp_dir("invalid-shown");
+        offline_delete_host(&Fake::default(), &dir);
+        let again = Fake::default();
+        again.0.borrow_mut().load_invalid = Some("corrupt".into());
+        let mut restarted = offline_delete_host(&again, &dir);
+        {
+            let recorded = again.0.borrow();
+            assert!(recorded.walks.is_empty(), "walked over an untrusted record");
+            assert!(recorded.authored.is_empty());
+            assert!(recorded.saved.is_empty(), "acknowledged a baseline over an untrusted record");
+        }
+        let key = hex(&[1u8; 16]);
+        assert!(restarted.served[&key].needs_walk);
+        // A pushed namespace is not shown either, and is not acknowledged.
+        restarted.on_local(&key, Signal::Paths(vec![PathBuf::from("x")]));
+        restarted.on_changed(&[1; 16], 7, &[1]);
+        assert!(again.0.borrow().walks.is_empty());
+        assert_eq!(again.0.borrow().signals.last().map(|s| s.2), Some(false));
+        // The record becomes readable: the offline changes are judged before showing.
+        {
+            let mut recorded = again.0.borrow_mut();
+            recorded.load_invalid = None;
+            recorded.loaded = Some(ShownItems::new());
+        }
+        restarted.reconcile(Some((vec![folder(1, "Photos", true)], vec![])));
+        let recorded = again.0.borrow();
+        assert_eq!(recorded.order.first(), Some(&"author"));
+        assert!(recorded.order.contains(&"walk"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The record stays untrusted when it vanishes after being found unreadable, when the root
+    /// is not ready to be shown, and an eviction lookup that could not be confirmed is an error.
+    #[test]
+    fn an_untrusted_record_holds_for_a_vanished_record_an_unready_root_and_eviction() {
+        let dir = temp_dir("untrusted-holds");
+        offline_delete_host(&Fake::default(), &dir);
+        let again = Fake::default();
+        again.0.borrow_mut().load_invalid = Some("corrupt".into());
+        let mut restarted = host(&again, &dir);
+        // Not ready: the record is still looked at, so a pushed namespace is not shown.
+        restarted.reconcile(Some((vec![folder(1, "Photos", false)], vec![])));
+        restarted.on_changed(&[1; 16], 3, &[1]);
+        let item = [9u8; 16];
+        restarted.on_evict(&[1; 16], &item, &[2], &[7u8; 8]);
+        assert!(again.0.borrow().walks.is_empty());
+        assert_eq!(again.0.borrow().evictions, vec![(vec![1u8; 16], EvictResult::Error as i32)]);
+        // The record disappears: still not a first run.
+        again.0.borrow_mut().load_invalid = None;
+        restarted.reconcile(Some((vec![folder(1, "Photos", true)], vec![])));
+        assert!(again.0.borrow().walks.is_empty(), "walked after the record vanished");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A readable record is judged before anything is shown or saved even when the root is not
+    /// ready yet and a pushed change arrives: the offline delete is seen, the record is kept.
+    #[test]
+    fn a_readable_record_is_judged_before_a_pushed_change_can_walk_over_it() {
+        let dir = temp_dir("held");
+        offline_delete_host(&Fake::default(), &dir);
+        let again = Fake::default();
+        again.0.borrow_mut().loaded = Some(ShownItems::new());
+        let mut restarted = host(&again, &dir);
+        restarted.reconcile(Some((vec![folder(1, "Photos", false)], vec![])));
+        restarted.on_changed(&[1; 16], 3, &[1]);
+        {
+            let recorded = again.0.borrow();
+            assert!(recorded.walks.is_empty(), "walked before the offline changes were judged");
+            assert!(recorded.saved.is_empty(), "overwrote the record before judging");
+            assert_eq!(recorded.signals.last().map(|s| s.2), Some(false));
+        }
+        restarted.reconcile(Some((vec![folder(1, "Photos", true)], vec![])));
+        let recorded = again.0.borrow();
+        assert_eq!(recorded.order.first(), Some(&"author"));
+        assert!(recorded.order.contains(&"walk"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_held_record_that_disappears_is_still_not_a_first_run() {
+        let dir = temp_dir("held-gone");
+        offline_delete_host(&Fake::default(), &dir);
+        let again = Fake::default();
+        again.0.borrow_mut().loaded = Some(ShownItems::new());
+        let mut restarted = host(&again, &dir);
+        restarted.reconcile(Some((vec![folder(1, "Photos", false)], vec![])));
+        again.0.borrow_mut().loaded = None;
+        restarted.reconcile(Some((vec![folder(1, "Photos", true)], vec![])));
+        let recorded = again.0.borrow();
+        assert!(recorded.walks.is_empty());
+        assert!(recorded.saved.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shown_record_is_missing_loaded_or_invalid() {
+        let dir = temp_dir("shown-file");
+        let file = dir.join("shown");
+        let generation_1 = dir.join("shown.1");
+        assert_eq!(read_shown_at(&file), LoadedShown::Missing);
+
+        let item = ShownItem {
+            path: PathBuf::from("a"),
+            parent_item_id: vec![],
+            name: "a".into(),
+            directory: false,
+            size: 1,
+            mtime_unix_nanos: 0,
+            content_version: vec![1; 40],
+            parent_generation: 0,
+        };
+        let mut second = item.clone();
+        second.name = "b".into();
+        let both = ShownItems::from([(vec![1; 16], item.clone()), (vec![2; 16], second)]);
+        let good = encode_shown_record(&both);
+        std::fs::write(&generation_1, &good).unwrap();
+        assert_eq!(read_shown_at(&file), LoadedShown::Loaded(both.clone()));
+
+        // A complete record of nothing shown carries an explicit zero count.
+        std::fs::write(&generation_1, encode_shown_record(&ShownItems::new())).unwrap();
+        assert_eq!(read_shown_at(&file), LoadedShown::Loaded(ShownItems::new()));
+
+        let invalid = |content: &str| {
+            std::fs::write(&generation_1, content).unwrap();
+            matches!(read_shown_at(&file), LoadedShown::Invalid(_))
+        };
+        // An empty file is not a record of nothing shown.
+        assert!(invalid(""));
+        // Cut at a line boundary: the first item line alone, and without the trailer.
+        let first_line_end = good.find('\n').unwrap() + 1;
+        assert!(invalid(&good[..first_line_end]));
+        let trailer_start = good.trim_end().rfind('\n').unwrap() + 1;
+        assert!(invalid(&good[..trailer_start]));
+        // Cut in the middle of a line, and of the trailer.
+        assert!(invalid(&good[..good.len() / 2]));
+        assert!(invalid(&good[..good.len() - 5]));
+        // One malformed line among good ones.
+        assert!(invalid(&good.replacen(&good[..4], "zz", 1)));
+        assert!(invalid(&format!("garbage\n{good}")));
+        // The checksum differs: an item line was changed (same count).
+        assert!(invalid(&good.replacen("\t1\t", "\t2\t", 1)));
+        // The count differs from the lines.
+        let body = &good[..trailer_start];
+        let wrong_count = good[trailer_start..].replacen("\tv1\t2\t", "\tv1\t3\t", 1);
+        assert!(invalid(&format!("{body}{wrong_count}")));
+        // The old format (item lines only) cannot be shown to be complete.
+        assert!(invalid(body));
+        assert!(invalid(&format!("{}\n", encode_shown(&[1; 16], &item))));
+        // The newest generation is torn: the one before it is the record. Nothing complete is
+        // Invalid, not a first run.
+        std::fs::write(&generation_1, &good).unwrap();
+        std::fs::write(dir.join("shown.2"), &good[..good.len() - 5]).unwrap();
+        assert_eq!(read_shown_at(&file), LoadedShown::Loaded(both.clone()));
+        std::fs::write(&generation_1, "").unwrap();
+        assert!(matches!(read_shown_at(&file), LoadedShown::Invalid(_)));
+        // The newest generation is complete (the seal holds) but a line is not understood: it is
+        // the record, and the older generation is not taken in its place.
+        std::fs::write(&generation_1, &good).unwrap();
+        std::fs::write(dir.join("shown.2"), seal("garbage\n")).unwrap();
+        assert!(matches!(read_shown_at(&file), LoadedShown::Invalid(_)));
+        std::fs::remove_file(dir.join("shown.2")).unwrap();
+        // A read error other than "not there" (a directory in the place of the file).
+        std::fs::remove_file(&generation_1).unwrap();
+        std::fs::create_dir(&generation_1).unwrap();
+        assert!(matches!(read_shown_at(&file), LoadedShown::Invalid(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_shown_item_survives_the_journal_unchanged() {
         let item = ShownItem {
@@ -1258,14 +2095,262 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_round_trips_and_ignores_lines_of_another_shape() {
+    fn the_registry_round_trips_and_refuses_corruption() {
         let mut roots = HashMap::new();
         roots.insert(hex(&[1u8; 16]), PathBuf::from(r"C:\Users\a\YadoriLink\Photos"));
         let text = render_registry(&roots);
-        let mut with_legacy = text.clone();
-        with_legacy.push_str("C:\\old\\plain\\folder\nnot-hex\tC:\\x\n");
-        assert_eq!(parse_registry(&with_legacy), roots);
-        let seen: HashSet<_> = parse_registry(&text).into_keys().collect();
+        assert_eq!(parse_registry(&text), Ok(roots.clone()));
+        // A bare path (an earlier format) or a short id is not skipped: it is corruption.
+        assert!(parse_registry(&format!("{text}C:\\old\\plain\\folder\n")).is_err());
+        assert!(parse_registry(&format!("{text}0101\n")).is_err());
+        let seen: HashSet<_> = parse_registry(&text).unwrap().into_keys().collect();
         assert_eq!(seen.len(), 1);
+        // A line that has a tab but is not a root and a path is corruption, not a legacy line.
+        // Not a canonical root id: too short, too long, uppercase.
+        for bad in ["01", "0101010101010101010101010101010101", "0A010101010101010101010101010101"]
+        {
+            assert!(parse_registry(&format!("{text}{bad}\tC:\\x\n")).is_err(), "{bad}");
+        }
+        // A root recorded twice is corruption, whether or not the paths agree.
+        assert!(parse_registry(&format!("{text}{text}")).is_err());
+        assert!(parse_registry(&format!("{text}{}\tC:\\other\n", hex(&[1u8; 16]))).is_err());
+        assert!(parse_registry(&format!("{text}not-hex\tC:\\x\n")).is_err());
+        assert!(parse_registry(&format!("{text}{}\t\n", hex(&[2u8; 16]))).is_err());
+        // A record that lost its tab is corruption too.
+        assert!(parse_registry(&format!("{text}{}C:\\x\n", hex(&[2u8; 16]))).is_err());
+        // One folder for two roots, also when the paths differ only by case or a trailing slash.
+        for other in [
+            r"C:\Users\a\YadoriLink\Photos",
+            r"c:\users\A\yadorilink\PHOTOS\",
+            "C:/Users/a/YadoriLink/Photos",
+        ] {
+            assert!(
+                parse_registry(&format!("{text}{}\t{other}\n", hex(&[2u8; 16]))).is_err(),
+                "{other}"
+            );
+        }
+    }
+
+    /// `--unregister-all` touches only the roots the operating system says are this host's with
+    /// the recorded id, and keeps the record when anything was left.
+    /// Folder names differ only by case in the display names of two roots: they get two folders,
+    /// and the registry that records them is one the parser accepts.
+    #[test]
+    fn roots_named_alike_apart_from_case_get_their_own_folders() {
+        let dir = temp_dir("case");
+        let fake = Fake::default();
+        let mut host = host_with(&fake, &dir);
+        // Sigma and final sigma are one letter to the volume.
+        host.reconcile(Some((
+            vec![
+                folder(1, "Photos", true),
+                folder(2, "photos", true),
+                folder(3, "\u{3c3}", true),
+                folder(4, "\u{3c2}", true),
+            ],
+            vec![],
+        )));
+        assert_eq!(read_registry_at(&dir.join("roots.txt")).unwrap().len(), 4);
+        // Sharp s is not "ss" to the volume: two distinct folders.
+        let sharp = format!("{}\t{}\n", hex(&[7u8; 16]), "C:\\Stra\u{df}e");
+        let double = format!("{}\t{}\n", hex(&[8u8; 16]), "C:\\Strasse");
+        assert!(parse_registry(&format!("{sharp}{double}")).is_ok());
+        let sigma = format!("{}\t{}\n", hex(&[5u8; 16]), "C:\\x\u{3c3}");
+        let final_sigma = format!("{}\t{}\n", hex(&[6u8; 16]), "C:\\x\u{3c2}");
+        assert!(parse_registry(&format!("{sigma}{final_sigma}")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unregister_all_leaves_roots_it_cannot_confirm_alone() {
+        let mine = hex(&[1u8; 16]);
+        let theirs = hex(&[2u8; 16]);
+        let record = format!("{mine}\tC:\\mine\n{theirs}\tC:\\theirs\n");
+        let mut unregistered = Vec::new();
+        let gone = {
+            let mut identity = |path: &Path| -> Result<Option<Vec<u8>>, String> {
+                // C:\theirs is registered for another root id (a mismatch).
+                Ok(Some(if path == Path::new("C:\\mine") { vec![1; 16] } else { vec![9; 16] }))
+            };
+            let mut unregister = |path: &Path| {
+                unregistered.push(path.to_path_buf());
+                Ok(())
+            };
+            unregister_recorded(&record, &mut identity, &mut unregister)
+        };
+        assert_eq!(unregistered, vec![PathBuf::from("C:\\mine")]);
+        assert!(!gone, "the record of a root left behind was dropped");
+
+        // A root the system will not describe (another provider's) is not gone: the record stays.
+        let gone = unregister_recorded(
+            &format!("{mine}\tC:\\mine\n"),
+            &mut |_| Err("registered by another provider".into()),
+            &mut |_| panic!("unregistered a root that was not confirmed"),
+        );
+        assert!(!gone);
+
+        // Everything confirmed: done, the record can go.
+        let mut unregistered = Vec::new();
+        let gone = unregister_recorded(
+            &format!("{mine}\tC:\\mine\n"),
+            &mut |_| Ok(Some(vec![1; 16])),
+            &mut |path| {
+                unregistered.push(path.to_path_buf());
+                Ok(())
+            },
+        );
+        assert!(gone);
+        assert_eq!(unregistered.len(), 1);
+
+        // A record with a corrupt, short-id or bare-path line unregisters nothing.
+        for bad in ["01\tC:\\theirs\n", "C:\\bare\\path\n", &format!("{theirs}\tC:\\MINE\n")] {
+            let mut called = false;
+            let gone = unregister_recorded(
+                &format!("{mine}\tC:\\mine\n{bad}"),
+                &mut |_| Ok(Some(vec![1; 16])),
+                &mut |_| {
+                    called = true;
+                    Ok(())
+                },
+            );
+            assert!(!gone && !called, "{bad}");
+        }
+    }
+
+    /// Registered roots are replayed from the record: it is committed before the operating
+    /// system is asked, a failed commit acknowledges nothing, and a failure after the commit is
+    /// retried on the same path.
+    #[test]
+    fn a_registration_is_acknowledged_only_after_its_record_is_durable() {
+        let dir = temp_dir("reg-ack");
+        let fake = Fake::default();
+        // The record cannot be written: the parent of the file is a regular file.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let mut host =
+            Host::new(fake.clone(), fake.clone(), blocker.join("roots.txt"), dir.join("roots"));
+        host.reconcile(Some((vec![folder(1, "Photos", true)], vec![])));
+        {
+            let recorded = fake.0.borrow();
+            assert!(recorded.registered.is_empty(), "registered without a durable record");
+            assert!(recorded.states.is_empty(), "acknowledged without a durable record");
+            assert!(recorded.walks.is_empty());
+        }
+        assert!(host.registry.is_empty());
+
+        // The OS registration fails after the record was committed: the record stays, and the
+        // retry (also in a restarted host) uses the same path.
+        let fake = Fake::default();
+        fake.0.borrow_mut().fail_register = true;
+        let mut host = host_with(&fake, &dir);
+        host.reconcile(Some((vec![folder(1, "Photos", true)], vec![])));
+        assert!(fake.0.borrow().states.is_empty());
+        assert_eq!(fake.0.borrow().steps, vec!["prepare", "register"]);
+        let path = fake.0.borrow().prepared[0].clone();
+        let on_disk = read_registry_at(&dir.join("roots.txt")).unwrap();
+        assert_eq!(on_disk.get(&hex(&[1u8; 16])), Some(&path));
+
+        let restarted = Fake::default();
+        let mut host = host_with(&restarted, &dir);
+        host.reconcile(Some((vec![folder(1, "Photos", true)], vec![])));
+        let recorded = restarted.0.borrow();
+        assert!(recorded.prepared.is_empty(), "chose or prepared a second path");
+        assert_eq!(recorded.registered, vec![(vec![1u8; 16], path)]);
+        assert_eq!(recorded.states[0].1, DomainEvidence::Registered as i32);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn host_with(fake: &Fake, dir: &Path) -> Host<Fake, Fake> {
+        host(fake, dir)
+    }
+
+    #[test]
+    fn a_removal_is_acknowledged_only_after_its_record_is_durable() {
+        let dir = temp_dir("rm-ack");
+        let fake = Fake::default();
+        let mut host = host_with(&fake, &dir);
+        host.reconcile(Some((vec![folder(1, "Photos", true)], vec![])));
+        fake.0.borrow_mut().states.clear();
+        // The record cannot be written: a file is where its directory should be.
+        let aside = dir.with_extension("aside");
+        std::fs::rename(&dir, &aside).unwrap();
+        std::fs::write(&dir, "in the way").unwrap();
+        let removal = ProviderRemoval { root_id: vec![1; 16], display_name: "Photos".into() };
+        host.reconcile(Some((vec![], vec![removal.clone()])));
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::rename(&aside, &dir).unwrap();
+        assert!(
+            fake.0.borrow().states.iter().all(|s| s.1 != DomainEvidence::Removed as i32),
+            "acknowledged a removal that a restart would not find"
+        );
+        assert!(host.registry.contains_key(&hex(&[1u8; 16])));
+        assert!(!host.served.contains_key(&hex(&[1u8; 16])), "still served after the unregister");
+        assert!(read_registry_at(&dir.join("roots.txt")).unwrap().contains_key(&hex(&[1u8; 16])));
+
+        // Retried once the record can be written.
+        host.reconcile(Some((vec![], vec![removal])));
+        assert!(fake.0.borrow().states.iter().any(|s| s.1 == DomainEvidence::Removed as i32));
+        assert!(read_registry_at(&dir.join("roots.txt")).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Real Cloud Files: unregistering a folder that is not a sync root is a success, so a
+    /// removal whose record update failed can be repeated.
+    #[test]
+    #[ignore = "real Cloud Files state; run on a Windows machine"]
+    fn unregistering_a_folder_that_is_not_a_sync_root_is_a_success() {
+        let dir = temp_dir("not-a-root");
+        let (events, _rx) = std::sync::mpsc::channel();
+        let mut backend = RealBackend { events };
+        assert_eq!(backend.unregister(&dir), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Real Cloud Files: the identity stored at registration is what `--unregister-all` checks.
+    #[test]
+    #[ignore = "real Cloud Files state; run on a Windows machine"]
+    fn a_registered_root_tells_its_identity_and_a_plain_folder_does_not() {
+        let dir = temp_dir("identity");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let plain = dir.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let id = vec![0x5a; 16];
+        yadorilink_shell_ext::cfapi::register_and_connect_provider(&id, &root).unwrap();
+        let seen = yadorilink_shell_ext::cfapi::registered_root_identity(&root);
+        let plain_seen = yadorilink_shell_ext::cfapi::registered_root_identity(&plain);
+        yadorilink_shell_ext::cfapi::unregister(&root).unwrap();
+        assert_eq!(seen, Ok(Some(id)));
+        assert_eq!(plain_seen, Ok(None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_registry_is_not_an_empty_one() {
+        let dir = temp_dir("reg-read");
+        let file = dir.join("roots.txt");
+        assert_eq!(read_registry_at(&file), Ok(HashMap::new()));
+        let generation_1 = dir.join("roots.txt.1");
+        std::fs::write(&generation_1, seal("zz\tC:\\x\n")).unwrap();
+        assert!(read_registry_at(&file).is_err());
+        // Not sealed (cut short, or written by an older version): not a registry.
+        std::fs::write(&generation_1, "zz").unwrap();
+        assert!(read_registry_at(&file).is_err());
+        std::fs::remove_file(&generation_1).unwrap();
+        std::fs::create_dir(&generation_1).unwrap();
+        assert!(read_registry_at(&file).is_err());
+
+        // A host that cannot read its record registers and removes nothing, and starts again
+        // once the record can be read.
+        let fake = Fake::default();
+        let mut host = host_with(&fake, &dir);
+        host.reconcile(Some((vec![folder(1, "Photos", true)], vec![])));
+        assert!(fake.0.borrow().prepared.is_empty());
+        assert!(fake.0.borrow().registered.is_empty());
+        assert!(fake.0.borrow().states.is_empty());
+        std::fs::remove_dir(&generation_1).unwrap();
+        host.reconcile(Some((vec![folder(1, "Photos", true)], vec![])));
+        assert_eq!(fake.0.borrow().registered.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

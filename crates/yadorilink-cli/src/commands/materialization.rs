@@ -18,6 +18,16 @@ fn absolute_path(local_path: &str) -> Result<String, CliError> {
     })
 }
 
+/// Fetches an on-demand placeholder's content; returns once the daemon has
+/// made the file present. Only for a root the daemon hydrates itself: a provider
+/// root is hydrated by the OS when the file is opened, and the daemon refuses
+/// this request there.
+pub async fn hydrate(local_path: String) -> Result<(), CliError> {
+    files::hydrate_file(absolute_path(&local_path)?).await?;
+    println!("Downloaded {local_path}");
+    Ok(())
+}
+
 /// Reads `EvictResponse.dehydrated` and only ever claims success
 /// when it's `true` -- a request that daemon-side silently did nothing
 /// (the file is busy, not yet fully synced, or was just modified)

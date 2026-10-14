@@ -192,17 +192,12 @@ final class LiveYadoriLinkClient: YadoriLinkClient {
         try await mapped { YadoriLinkModel.UpdateStatus(try await core.checkForUpdates()) }
     }
 
-    func installUpdate() async throws -> YadoriLinkModel.UpdateInstallOutcome {
-        try await mapped { YadoriLinkModel.UpdateInstallOutcome(try await core.installUpdate()) }
+    func downloadGuidance() async throws -> YadoriLinkModel.UpdateDownloadGuidance {
+        try await mapped { YadoriLinkModel.UpdateDownloadGuidance(try await core.downloadGuidance()) }
     }
 
-    func setUpdateConfig(automaticChecks: Bool?, installMode: YadoriLinkModel.UpdateInstallMode?) async throws -> YadoriLinkModel.UpdateConfig {
-        try await mapped {
-            YadoriLinkModel.UpdateConfig(try await core.setUpdateConfig(
-                automaticChecks: automaticChecks,
-                installMode: installMode.map { YadoriLinkFFI.UpdateInstallMode($0) }
-            ))
-        }
+    func setAutomaticUpdateChecks(_ enabled: Bool) async throws -> YadoriLinkModel.UpdateConfig {
+        try await mapped { YadoriLinkModel.UpdateConfig(try await core.setAutomaticUpdateChecks(enabled: enabled)) }
     }
 
     // MARK: account

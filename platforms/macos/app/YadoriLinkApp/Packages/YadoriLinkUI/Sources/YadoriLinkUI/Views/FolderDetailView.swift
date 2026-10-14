@@ -29,12 +29,16 @@ public struct FolderDetailView: View {
                 DisclosureGroup("Details", isExpanded: $showsDetails) {
                     LabeledContent("Availability", value: model.folder.fetchAvailability == .availableNow ? "Files can be downloaded now" : "Some files can't be downloaded right now")
                     if let free = model.freeSpace { LabeledContent("Free space", value: free) }
-                    LabeledContent("Location") {
-                        Text(model.folder.localPath).textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+                    if model.folder.provider {
+                        LabeledContent("Location", value: "Finder, under Locations")
+                    } else {
+                        LabeledContent("Location") {
+                            Text(model.folder.localPath).textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+                        }
                     }
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Devices with a complete copy (as configured)").font(.subheadline.weight(.medium))
-                        if model.copies.isEmpty {
+                        if model.showsNoCopies {
                             Text("None yet").foregroundStyle(.secondary)
                         }
                         ForEach(model.copies) { copy in
@@ -59,6 +63,12 @@ public struct FolderDetailView: View {
                     if !model.folder.provider {
                         Button("Show in Finder") { context.revealInFinder(model.folder.localPath) }
                     }
+                }
+            }
+
+            if let failure = model.loadFailure {
+                Section {
+                    RetryRow(LoadWording.folderDetails, notice: failure) { await model.load() }
                 }
             }
 
@@ -121,6 +131,9 @@ public struct FolderDetailView: View {
                     Button("Choose File or Folder…") { picksFile = true }
                         .help("A folder is kept, downloaded or freed up as a whole. A folder kept on this Mac also keeps what is added to it later.")
                 }
+                if let failure = model.historyFailure {
+                    RetryRow(LoadWording.fileHistory, notice: failure) { await model.retryFileHistory() }
+                }
                 if let state = model.fileStateTitle {
                     LabeledContent("Status", value: state)
                 }
@@ -147,6 +160,13 @@ public struct FolderDetailView: View {
                         }
                     }
                 }
+            }
+
+            Section {
+                Button(UnlinkWording.menuTitle, role: .destructive) { context.unlink.request(model.folder) }
+                    .disabled(context.unlink.isWorking)
+            } footer: {
+                Text("Stops syncing this folder on this Mac only. You can link it again later.")
             }
         }
         .formStyle(.grouped)

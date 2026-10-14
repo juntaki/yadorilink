@@ -87,6 +87,10 @@ public final class FolderDetailViewModel {
     public private(set) var availability: FileAvailability?
     public private(set) var versions: [VersionRow] = []
     public private(set) var isLoading = false
+    /// The last read of the folder's details failed; nothing below it is known to be current.
+    public private(set) var loadFailure: Notice?
+    /// The chosen file's status or history could not be read; none of it is known.
+    public private(set) var historyFailure: Notice?
     public private(set) var isWorking = false
     /// One result line for the whole window, whichever section acted.
     public var notice: Notice?
@@ -103,22 +107,29 @@ public final class FolderDetailViewModel {
     public func load() async {
         isLoading = true
         defer { isLoading = false }
-        await loadDeviceNames()
+        let namesFailure = await loadDeviceNames()
         do {
             let detail = try await client.folderDetail(localPath: folder.localPath)
             self.detail = detail
             folder = detail.summary
             conflicts = try await client.listConflicts(localPath: folder.localPath).map(conflictRow)
             trash = try await client.listTrash(localPath: folder.localPath).map(trashRow)
+            loadFailure = namesFailure
         } catch {
-            notice = .failure(error)
+            loadFailure = .failure(error)
         }
     }
 
-    private func loadDeviceNames() async {
-        guard deviceNames == nil else { return }
-        if let devices = try? await client.listFolderDevices() {
+    /// Device names label copies and versions; without them they read "another
+    /// device". Returns the failure so the details can offer Retry.
+    private func loadDeviceNames() async -> Notice? {
+        guard deviceNames == nil else { return nil }
+        do {
+            let devices = try await client.listFolderDevices()
             deviceNames = Dictionary(devices.map { ($0.deviceId, $0.displayName) }, uniquingKeysWith: { a, _ in a })
+            return nil
+        } catch {
+            return .failure(error)
         }
     }
 
@@ -135,6 +146,9 @@ public final class FolderDetailViewModel {
     /// "On-Demand · 312 on this device · 892 online only"
     public var thisDevice: String { Format.localCopyLine(folder) }
     public var freeSpace: String? { folder.volume.map(Format.freeSpace) }
+
+    /// "None yet" is only said once the details were read.
+    public var showsNoCopies: Bool { detail != nil && loadFailure == nil && copies.isEmpty }
 
     public var copies: [CopyRow] {
         (detail?.completeCopies ?? []).map { copy in
@@ -213,8 +227,11 @@ public final class FolderDetailViewModel {
             notice = .failure(error)
         }
         isWorking = false
-        if let trash = try? await client.listTrash(localPath: folder.localPath) {
-            self.trash = trash.map(trashRow)
+        do {
+            trash = try await client.listTrash(localPath: folder.localPath).map(trashRow)
+        } catch {
+            // The rows shown may include entries that were just restored.
+            loadFailure = .failure(error)
         }
     }
 
@@ -254,7 +271,8 @@ public final class FolderDetailViewModel {
         selectedFile = absolutePath
         availability = nil
         versions = []
-        await loadDeviceNames()
+        historyFailure = nil
+        let namesFailure = await loadDeviceNames()
         do {
             let availability = try await client.fileAvailability(absolutePath: absolutePath)
             guard selectedFile == absolutePath else { return }
@@ -262,10 +280,17 @@ public final class FolderDetailViewModel {
             let versions = try await client.listVersions(absolutePath: absolutePath).map(versionRow)
             guard selectedFile == absolutePath else { return }
             self.versions = versions
+            historyFailure = namesFailure
         } catch {
             guard selectedFile == absolutePath else { return }
-            notice = .failure(error)
+            historyFailure = .failure(error)
         }
+    }
+
+    /// Re-reads only the chosen file's availability and history.
+    public func retryFileHistory() async {
+        guard let path = selectedFile else { return }
+        await selectFile(path)
     }
 
     private func versionRow(_ v: FileVersion) -> VersionRow {

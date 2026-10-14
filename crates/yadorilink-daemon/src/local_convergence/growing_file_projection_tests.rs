@@ -1178,7 +1178,7 @@ async fn startup_repair_keeps_the_untouched_older_bytes_under_an_incomplete_cont
     assert_eq!(heads[0].dot.author.device.0, "device-remote");
 }
 
-/// #60: the row ran ahead of the disk (the newer row was recorded, the write
+/// The row ran ahead of the disk (the newer row was recorded, the write
 /// never landed) and the user then edits the older bytes still on disk. The
 /// edit saw the older version, not the row's: it must not supersede the
 /// peer's newer head, which no one here has looked at. Both stay live, as a

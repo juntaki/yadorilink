@@ -29,9 +29,12 @@ struct DevicesContent: View {
                 case .loading:
                     LoadingRow()
                 case .failed(let notice):
-                    EmptyStateText(notice.text).help(notice.detail ?? "")
+                    RetryRow(LoadWording.devices, notice: notice) { await model.load() }
                 case .loaded(let devices):
-                    if devices.isEmpty { EmptyStateText("No devices yet.") }
+                    if let stale = model.staleNotice {
+                        RetryRow(LoadWording.stale("devices"), notice: stale) { await model.load() }
+                    }
+                    if devices.isEmpty && model.staleNotice == nil { EmptyStateText("No devices yet.") }
                     ForEach(devices) { device in
                         HStack(spacing: 10) {
                             OnlineDot(online: device.online)
@@ -125,6 +128,13 @@ struct TransfersContent: View {
                             .help(device.deviceId)
                     }
                 }
+                if let error = model.devicesError {
+                    RetryRow(LoadWording.devices, notice: error) { await model.loadDevices() }
+                } else if let stale = model.devicesStale {
+                    RetryRow(LoadWording.stale("devices"), notice: stale) { await model.loadDevices() }
+                } else if model.showsNoTargetDevices {
+                    EmptyStateText("No other devices yet.")
+                }
                 TextField("Or paste a path", text: $model.sourcePath)
                     .font(.callout)
                 HStack {
@@ -137,7 +147,11 @@ struct TransfersContent: View {
 
             Section("Received") {
                 if model.showsInboxLoading { LoadingRow() }
-                if let error = model.inboxError { EmptyStateText(error) }
+                if let error = model.inboxError {
+                    RetryRow(LoadWording.received, notice: error) { await model.loadInbox() }
+                } else if let stale = model.inboxStale {
+                    RetryRow(LoadWording.stale("received files"), notice: stale) { await model.loadInbox() }
+                }
                 if model.showsInboxEmpty { EmptyStateText("Nothing received yet.") }
                 ForEach(model.inboxRows) { row in
                     VStack(alignment: .leading, spacing: 4) {

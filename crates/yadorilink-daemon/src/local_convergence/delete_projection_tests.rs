@@ -27,16 +27,16 @@ const REMOTE_DEVICE: &str = "device-remote";
 
 /// Another author of the group: its deltas are signed with the fixture
 /// key of its device and admitted through native admission.
-struct Remote;
+pub(super) struct Remote;
 
 impl Remote {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self
     }
 
     /// Signs `ops` as this author's next delta and admits it on `h`; its
     /// puts claim a rank above every rank this device's own changes carry.
-    async fn admit(&mut self, h: &Harness, ops: Vec<RemoteOp>) -> NativeDelta {
+    pub(super) async fn admit(&mut self, h: &Harness, ops: Vec<RemoteOp>) -> NativeDelta {
         let versions: Vec<_> = ops
             .iter()
             .filter_map(|op| match op {
@@ -54,7 +54,7 @@ fn driver(h: &Harness) -> Arc<dyn yadorilink_peer_session::convergence_driver::C
     h.session.clone() as Arc<dyn yadorilink_peer_session::convergence_driver::ConvergenceDriver>
 }
 
-async fn reconcile(h: &Harness, paths: &[&str]) -> ProjectionAttempt {
+pub(super) async fn reconcile(h: &Harness, paths: &[&str]) -> ProjectionAttempt {
     h.convergence
         .reconcile_paths_directly(
             &driver(h),
@@ -392,4 +392,40 @@ async fn a_removal_is_durable_before_the_index_records_absence() {
         "the parent flush must run once, after the unlink and while the index still has the row"
     );
     assert!(h.state.get_file(GROUP, "notes.txt").unwrap().is_none_or(|row| row.deleted));
+}
+
+/// A metadata step that created the `version_seq = 0` scaffold of a path whose head then went away
+/// (the head's content never landed) leaves a row that holds no content and was never authored.
+/// Nothing is owed on disk for it, so a pass over the now-empty path retires it and settles,
+/// rather than waiting on an authoring identity a scaffold can never have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scaffold_row_of_a_path_without_a_head_settles_as_absent() {
+    let h = Harness::new(true);
+    // The group has native history, so an unauthored current row would be refused if it had content.
+    captured(&h, "other.txt", b"gives the group a native head").await;
+    h.state.file_index_repository().ensure_bootstrap_row_for_metadata(GROUP, "ghost.bin").unwrap();
+    assert!(!h.state.has_real_current_row(GROUP, "ghost.bin").unwrap(), "sanity: scaffold only");
+
+    let attempt = reconcile(&h, &["ghost.bin"]).await;
+
+    assert!(attempt.is_settled("ghost.bin"), "a scaffold with no head must not hold the path open");
+    assert!(h.state.get_file(GROUP, "ghost.bin").unwrap().is_none_or(|row| row.deleted));
+}
+
+/// The scaffold is retired only when nothing is on disk: an object there is local state the
+/// removal never observed, and it survives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scaffold_row_never_licenses_unlinking_what_is_on_disk() {
+    let h = Harness::new(true);
+    captured(&h, "other.txt", b"gives the group a native head").await;
+    h.state.file_index_repository().ensure_bootstrap_row_for_metadata(GROUP, "ghost.bin").unwrap();
+    std::fs::write(h.path("ghost.bin"), b"a local file nobody has captured").unwrap();
+
+    reconcile(&h, &["ghost.bin"]).await;
+
+    assert_eq!(
+        std::fs::read(h.path("ghost.bin")).unwrap(),
+        b"a local file nobody has captured".to_vec(),
+        "the removal must not unlink an unrecorded file"
+    );
 }

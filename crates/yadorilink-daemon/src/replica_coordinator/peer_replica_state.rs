@@ -205,6 +205,19 @@ impl ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
+    /// Drops the bootstrap scaffold of `path`, if that is all the path has as its current row.
+    pub fn retire_bootstrap_scaffold(
+        &self,
+        group_id: &str,
+        path: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<bool, PeerSessionError> {
+        self.file_index_repository()
+            .retire_bootstrap_scaffold(group_id, path, permit)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
     /// The payload producer for every caller that has to read its
     /// payload out of this device's own index: every
     /// materialization-relevant column of `path`'s current row, from ONE

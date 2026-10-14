@@ -484,3 +484,165 @@ async fn an_incomplete_snapshot_grants_nothing_and_takes_no_delta() {
     assert!(!fx.report(5, 1, true, 0, &[a], &[]).needs_full);
     assert!(fx.membership.stamp(&fx.root, &a).is_some());
 }
+
+fn delta_departures(
+    fx: &Fx,
+    epoch: u64,
+    seq: u64,
+    listed: &[ItemId],
+    removed: &[ItemId],
+) -> Vec<(ItemId, u64)> {
+    fx.membership
+        .apply_reporting_departures(
+            &ProviderMaterializedReport {
+                root_id: hex::decode(&fx.root).unwrap(),
+                reporter_epoch: epoch,
+                report_seq: seq,
+                full: false,
+                observed_after_seq: 0,
+                upserts: listed
+                    .iter()
+                    .map(|i| ProviderMaterializedItem { item_id: i.to_vec() })
+                    .collect(),
+                removed: removed.iter().map(|i| i.to_vec()).collect(),
+                more: false,
+            },
+            fx.repo().latest_evidence_seq(&fx.root).unwrap().unwrap(),
+        )
+        .1
+}
+
+/// An item an accepted delta takes out of the materialized set has left; one it never listed, one
+/// listed again in the same report, a full snapshot and a refused report leave nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delta_reports_the_items_that_left_the_materialized_set() {
+    let fx = Fx::new();
+    let (a, b, c) = (fx.item("a.txt", 10), fx.item("b.txt", 10), fx.item("c.txt", 10));
+    assert!(!fx.report(4, 1, true, 0, &[a, b, c], &[]).needs_full);
+
+    // `a` leaves, `c` is removed and listed again in one report, `[7; 16]` was never listed.
+    let departed = delta_departures(&fx, 4, 2, &[c], &[a, c, [7u8; 16]]);
+    assert_eq!(departed, vec![(a, 0)]);
+
+    // `a` is already gone: removing it again reports nothing.
+    assert!(delta_departures(&fx, 4, 3, &[], &[a]).is_empty());
+
+    // A refused report (a gap in the sequence) reports nothing and changes nothing.
+    assert!(delta_departures(&fx, 4, 9, &[], &[b]).is_empty());
+    assert!(fx.membership.stamp(&fx.root, &b).is_some());
+
+    // After the connection ended there is nothing to compare a new full snapshot with.
+    fx.membership.clear();
+    let (_, none) = fx.membership.apply_reporting_departures(
+        &ProviderMaterializedReport {
+            root_id: hex::decode(&fx.root).unwrap(),
+            reporter_epoch: 5,
+            report_seq: 1,
+            full: true,
+            observed_after_seq: 0,
+            upserts: Vec::new(),
+            removed: Vec::new(),
+            more: false,
+        },
+        fx.repo().latest_evidence_seq(&fx.root).unwrap().unwrap(),
+    );
+    assert!(none.is_empty());
+}
+
+/// A departure carries the stamp of the report that LISTED the item, not of the one that removed
+/// it: a handoff made between the two is a copy that had not been listed when the old one left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_departure_carries_the_stamp_of_the_listing_that_held_the_item() {
+    let fx = Fx::new();
+    let a = fx.item("a.txt", 10);
+    let first = fx.repo().record_handoff(&fx.root, &a, fx.current(&a)).unwrap().unwrap();
+    assert!(!fx.report(4, 1, true, first, &[a], &[]).needs_full);
+
+    // A newer handoff raises the evidence sequence before the removal is reported.
+    let second = fx.repo().record_handoff(&fx.root, &a, fx.current(&a)).unwrap().unwrap();
+    assert!(second > first);
+    let departed = fx
+        .membership
+        .apply_reporting_departures(
+            &ProviderMaterializedReport {
+                root_id: hex::decode(&fx.root).unwrap(),
+                reporter_epoch: 4,
+                report_seq: 2,
+                full: false,
+                observed_after_seq: second,
+                upserts: Vec::new(),
+                removed: vec![a.to_vec()],
+                more: false,
+            },
+            second,
+        )
+        .1;
+
+    assert_eq!(departed, vec![(a, first)]);
+}
+
+fn full_departures(
+    fx: &Fx,
+    epoch: u64,
+    seq: u64,
+    observed: u64,
+    listed: &[ItemId],
+    more: bool,
+) -> Vec<(ItemId, u64)> {
+    fx.membership
+        .apply_reporting_departures(
+            &ProviderMaterializedReport {
+                root_id: hex::decode(&fx.root).unwrap(),
+                reporter_epoch: epoch,
+                report_seq: seq,
+                full: true,
+                observed_after_seq: observed,
+                upserts: listed
+                    .iter()
+                    .map(|i| ProviderMaterializedItem { item_id: i.to_vec() })
+                    .collect(),
+                removed: Vec::new(),
+                more,
+            },
+            fx.repo().latest_evidence_seq(&fx.root).unwrap().unwrap(),
+        )
+        .1
+}
+
+/// A full snapshot that replaces a complete one in the same connection (the reporter starts a new
+/// epoch when evidence advances) reports what the old one held and the new one does not, with the
+/// stamp of the old listing, once its last page has arrived. Not before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replacing_full_snapshot_reports_the_items_it_dropped_when_complete() {
+    let fx = Fx::new();
+    let (a, b) = (fx.item("a.txt", 10), fx.item("b.txt", 10));
+    let first = fx.repo().record_handoff(&fx.root, &a, fx.current(&a)).unwrap().unwrap();
+    assert!(full_departures(&fx, 4, 1, first, &[a, b], false).is_empty());
+
+    let second = fx.repo().record_handoff(&fx.root, &b, fx.current(&b)).unwrap().unwrap();
+    assert!(second > first);
+    // The replacement arrives in two pages: nothing is decided before the last one.
+    assert!(full_departures(&fx, 5, 1, second, &[b], true).is_empty());
+    assert_eq!(full_departures(&fx, 5, 2, second, &[], false), vec![(a, first)]);
+}
+
+/// A snapshot dropped with the connection says nothing about the OS: a new full snapshot after
+/// `clear` reports no departure. A replacement that never completed leaves the last COMPLETE
+/// snapshot as the one the next replacement is compared with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_snapshot_after_a_reset_manufactures_no_departure() {
+    let fx = Fx::new();
+    let (a, b) = (fx.item("a.txt", 10), fx.item("b.txt", 10));
+    assert!(full_departures(&fx, 4, 1, 0, &[a, b], false).is_empty());
+    fx.membership.clear();
+    assert!(full_departures(&fx, 5, 1, 0, &[b], false).is_empty());
+
+    // An abandoned replacement keeps the last complete snapshot as the one to compare with.
+    assert!(full_departures(&fx, 6, 1, 0, &[a, b], false).is_empty());
+    assert!(full_departures(&fx, 7, 1, 0, &[a], true).is_empty());
+    let mut gone = full_departures(&fx, 8, 1, 0, &[], false);
+    gone.sort();
+    let mut expected = vec![(a, 0), (b, 0)];
+    expected.sort();
+    assert_eq!(gone, expected);
+}

@@ -37,6 +37,12 @@ pub trait TempFileLedger: Send + Sync {
     /// Best effort: a row that outlives its file only names a path that no
     /// longer exists, which recovery clears without touching anything.
     fn release(&self, tmp_path: &Path);
+    /// Records that the directory at `dir_path` was moved aside by a durable
+    /// removal and could not be put back, so it stands there with its
+    /// contents and the user has to be told. The directory is on
+    /// disk either way, but an unreported one is a silent one, so a failure to
+    /// record it is an error for the caller.
+    fn strand(&self, dir_path: &Path) -> Result<(), StorageError>;
 }
 
 /// For writers with no recovery to speak of (a one-shot copy outside any
@@ -48,6 +54,9 @@ impl TempFileLedger for NoTempLedger {
         Ok(())
     }
     fn release(&self, _tmp_path: &Path) {}
+    fn strand(&self, _dir_path: &Path) -> Result<(), StorageError> {
+        Ok(())
+    }
 }
 
 /// Removes a temp file that will not be published and releases its record,
@@ -67,7 +76,9 @@ pub fn discard_temp_file(tmp_path: &Path, ledger: &dyn TempFileLedger) {
 /// could otherwise come back with no record left to find it by. A directory
 /// sync that fails keeps the record.
 fn release_once_gone_is_durable(tmp_path: &Path, ledger: &dyn TempFileLedger) {
-    if sync_parent_directory(tmp_path).is_ok() {
+    // Windows has no documented durability for an unlink (the no-op sync below is not one):
+    // the record stays until a recovery sees the path absent.
+    if cfg!(unix) && sync_parent_directory(tmp_path).is_ok() {
         ledger.release(tmp_path);
     }
 }
@@ -270,7 +281,7 @@ pub fn create_explicit_directory(
 /// caller reports it, and a plain `mkdir` followed by a best-effort parent sync
 /// where it does not.
 fn make_directory(path: &Path, ledger: &dyn StructuralDirectoryLedger) -> std::io::Result<()> {
-    if let Some(ns) = durable_namespace_beside(path) {
+    if let Some(ns) = durable_namespace_beside(path)? {
         return ns.create_dir(path, &LedgerNames(ledger.names())).map_err(std::io::Error::from);
     }
     fs::create_dir(path)?;
@@ -785,7 +796,7 @@ pub fn persist_reconstructed_file_in(
     out_path: &Path,
     ledger: &dyn TempFileLedger,
 ) -> Result<(), StorageError> {
-    if let Some(ns) = durable_namespace_beside(out_path) {
+    if let Some(ns) = durable_namespace_beside(out_path)? {
         // The temp file is flushed; a durable move publishes it and removes the
         // temp name, and the record is released once that name is gone.
         let published = crate::io_diag::time(crate::io_diag::Op::Rename, 0, || {
@@ -1089,7 +1100,7 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         if unsafe { MoveFileExW(f.as_ptr(), t.as_ptr(), 0) } != 0 {
             return Ok(());
         }
-        return Err(std::io::Error::last_os_error());
+        Err(std::io::Error::last_os_error())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
@@ -1668,7 +1679,7 @@ pub fn materialize_symlink_in(
         ledger.release(&tmp_path);
         return Err(e.into());
     }
-    if let Some(ns) = durable_namespace_beside(out_path) {
+    if let Some(ns) = durable_namespace_beside(out_path)? {
         // Published by a durable move: the link is not reported as present
         // before its name is on disk.
         return ns
@@ -1763,7 +1774,7 @@ pub fn materialize_symlink_windows_in(
             ),
         )));
     }
-    if let Some(ns) = durable_namespace_beside(out_path) {
+    if let Some(ns) = durable_namespace_beside(out_path)? {
         return ns
             .publish(&tmp_path, out_path, Replace::Yes, &LedgerNames(ledger))
             .map_err(|error| StorageError::Io(error.into()));

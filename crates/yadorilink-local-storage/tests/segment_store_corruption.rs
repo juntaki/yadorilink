@@ -51,7 +51,7 @@ fn assert_presence_is_consistent(store: &SegmentBlockStore, hash: &str) {
 #[test]
 fn a_flipped_payload_bit_is_detected_and_the_claim_retracted() {
     let dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     let damaged = block("bit-rot-victim", 400);
     let neighbour = block("the-block-next-door", 400);
     store.put_durable_batch(&[damaged.clone(), neighbour.clone()]).unwrap();
@@ -85,7 +85,7 @@ fn an_unverified_read_still_catches_a_damaged_payload() {
     // does not skip the record's own checksum. A caller using the fast
     // path must not be handed bytes the store can already tell are wrong.
     let dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     let damaged = block("fast-path-victim", 400);
     store.put_durable_batch(std::slice::from_ref(&damaged)).unwrap();
 
@@ -101,7 +101,7 @@ fn an_unverified_read_still_catches_a_damaged_payload() {
 #[test]
 fn a_wholesale_payload_overwrite_is_detected() {
     let dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     let damaged = block("overwritten", 400);
     store.put_durable_batch(std::slice::from_ref(&damaged)).unwrap();
 
@@ -118,7 +118,9 @@ fn a_truncated_sealed_segment_drops_exactly_the_mappings_that_no_longer_fit() {
     let blocks: Vec<LocallyHashedBlock> =
         (0..32).map(|i| block(&format!("truncation-victim-{i}"), 200)).collect();
     let (segment_id, keep_bytes) = {
-        let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+        let store = SegmentBlockStore::with_limits(dir.path(), limits())
+            .unwrap()
+            .with_volume_verdict(|_| true);
         store.put_durable_batch(&blocks).unwrap();
         store.seal_active_segment().unwrap();
         let segment_id = store.segment_ids().unwrap()[0];
@@ -129,7 +131,7 @@ fn a_truncated_sealed_segment_drops_exactly_the_mappings_that_no_longer_fit() {
 
     testing::truncate_segment(dir.path(), segment_id, keep_bytes).unwrap();
 
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     let report = store.recovery_report();
     assert_eq!(report.damaged_segments, vec![segment_id]);
     assert!(report.dropped_mappings > 0, "the records past the cut must lose their mappings");
@@ -167,7 +169,9 @@ fn a_missing_segment_file_drops_its_mappings_instead_of_refusing_to_start() {
     let kept: Vec<LocallyHashedBlock> =
         (0..8).map(|i| block(&format!("surviving-segment-block-{i}"), 300)).collect();
     let doomed = {
-        let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+        let store = SegmentBlockStore::with_limits(dir.path(), limits())
+            .unwrap()
+            .with_volume_verdict(|_| true);
         store.put_durable_batch(&lost).unwrap();
         store.seal_active_segment().unwrap();
         let doomed = store.segment_ids().unwrap()[0];
@@ -178,7 +182,7 @@ fn a_missing_segment_file_drops_its_mappings_instead_of_refusing_to_start() {
 
     testing::delete_segment(dir.path(), doomed).unwrap();
 
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     assert_eq!(store.recovery_report().damaged_segments, vec![doomed]);
     assert_eq!(store.recovery_report().dropped_mappings, lost.len() as u64);
 
@@ -200,7 +204,7 @@ fn a_missing_segment_file_drops_its_mappings_instead_of_refusing_to_start() {
 #[test]
 fn a_segment_that_vanishes_under_a_running_store_retracts_its_claims_on_read() {
     let dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     let blocks: Vec<LocallyHashedBlock> =
         (0..4).map(|i| block(&format!("vanishing-{i}"), 300)).collect();
     store.put_durable_batch(&blocks).unwrap();
@@ -232,7 +236,9 @@ fn garbage_appended_past_durable_end_is_truncated_rather_than_interpreted() {
     let blocks: Vec<LocallyHashedBlock> =
         (0..8).map(|i| block(&format!("before-the-garbage-{i}"), 200)).collect();
     let segment_id = {
-        let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+        let store = SegmentBlockStore::with_limits(dir.path(), limits())
+            .unwrap()
+            .with_volume_verdict(|_| true);
         store.put_durable_batch(&blocks).unwrap();
         let id = store.segment_ids().unwrap()[0];
         drop(store);
@@ -241,7 +247,7 @@ fn garbage_appended_past_durable_end_is_truncated_rather_than_interpreted() {
 
     testing::append_uncommitted_bytes(dir.path(), segment_id, &vec![0x5Au8; 777]).unwrap();
 
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     assert_eq!(store.recovery_report().truncated_segments, vec![segment_id]);
     assert_eq!(store.recovery_report().truncated_bytes, 777);
     for b in &blocks {
@@ -261,14 +267,14 @@ fn a_foreign_file_in_the_segments_directory_is_left_alone() {
     // remove anything else: a directory it shares with a stray file is not
     // a licence to delete the stray file.
     let dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     let hash = store.put(b"an ordinary block").unwrap();
     drop(store);
 
     let stray = dir.path().join("segments").join("not-a-segment.txt");
     std::fs::write(&stray, b"someone else's file").unwrap();
 
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     assert!(stray.exists(), "a file the store does not recognise must not be deleted");
     assert_eq!(store.get(&hash).unwrap(), b"an ordinary block");
 }
@@ -276,7 +282,7 @@ fn a_foreign_file_in_the_segments_directory_is_left_alone() {
 #[test]
 fn compaction_drops_a_block_it_cannot_read_rather_than_copying_it_forward() {
     let dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     let blocks: Vec<LocallyHashedBlock> =
         (0..16).map(|i| block(&format!("compaction-corruption-{i}"), 200)).collect();
     store.put_durable_batch(&blocks).unwrap();
@@ -305,7 +311,7 @@ fn compaction_drops_a_block_it_cannot_read_rather_than_copying_it_forward() {
 #[test]
 fn an_offline_scrub_reports_damage_without_changing_anything() {
     let dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     let blocks: Vec<LocallyHashedBlock> =
         (0..8).map(|i| block(&format!("scrub-{i}"), 300)).collect();
     store.put_durable_batch(&blocks).unwrap();
@@ -334,7 +340,7 @@ fn an_offline_scrub_reports_damage_without_changing_anything() {
 #[test]
 fn dead_records_show_up_as_unindexed_rather_than_as_damage() {
     let dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     let blocks: Vec<LocallyHashedBlock> =
         (0..8).map(|i| block(&format!("dead-space-{i}"), 300)).collect();
     store.put_durable_batch(&blocks).unwrap();

@@ -71,6 +71,7 @@ extension YadoriLinkModel.AttentionCategory {
         case .fetchAvailabilityUnknown: self = .fetchAvailabilityUnknown
         case .conflict: self = .conflict
         case .held: self = .held
+        case .strandedDirectory: self = .strandedDirectory
         case .lowDiskCritical: self = .lowDiskCritical
         case .lowDisk: self = .lowDisk
         case .peerDisconnected: self = .peerDisconnected
@@ -746,28 +747,13 @@ extension YadoriLinkModel.UpdateBadge {
 
 extension YadoriLinkModel.UpdateConfig {
     init(_ value: YadoriLinkFFI.UpdateConfig) {
-        self.init(automaticChecks: value.automaticChecks, installMode: YadoriLinkModel.UpdateInstallMode(value.installMode))
+        self.init(automaticChecks: value.automaticChecks)
     }
 }
 
-extension YadoriLinkModel.UpdateInstallMode {
-    init(_ value: YadoriLinkFFI.UpdateInstallMode) {
-        switch value {
-        case .automatic: self = .automatic
-        case .manual: self = .manual
-        case let .other(raw): self = .other(raw: raw)
-        }
-    }
-}
-
-extension YadoriLinkModel.UpdateInstallOutcome {
-    init(_ value: YadoriLinkFFI.UpdateInstallOutcome) {
-        switch value {
-        case .installing: self = .installing
-        case .deferred: self = .deferred
-        case let .storeManaged(guidance): self = .storeManaged(guidance: guidance)
-        case let .other(raw): self = .other(raw: raw)
-        }
+extension YadoriLinkModel.UpdateDownloadGuidance {
+    init(_ value: YadoriLinkFFI.UpdateDownloadGuidance) {
+        self.init(guidance: value.guidance, url: value.url)
     }
 }
 
@@ -793,7 +779,7 @@ extension YadoriLinkModel.UpdateState {
 
 extension YadoriLinkModel.UpdateStatus {
     init(_ value: YadoriLinkFFI.UpdateStatus) {
-        self.init(currentVersion: value.currentVersion, channel: value.channel, installSource: value.installSource, lastCheckedAt: value.lastCheckedAt, state: YadoriLinkModel.UpdateState(value.state), availableVersion: value.availableVersion, releaseNotesUrl: value.releaseNotesUrl, mandatory: value.mandatory, holdbackReason: value.holdbackReason, waitingForSafePoint: value.waitingForSafePoint, lastErrorCategory: value.lastErrorCategory, lastErrorMessage: value.lastErrorMessage, config: YadoriLinkModel.UpdateConfig(value.config))
+        self.init(currentVersion: value.currentVersion, channel: value.channel, installSource: value.installSource, lastCheckedAt: value.lastCheckedAt, state: YadoriLinkModel.UpdateState(value.state), availableVersion: value.availableVersion, releaseNotesUrl: value.releaseNotesUrl, mandatory: value.mandatory, holdbackReason: value.holdbackReason, waitingForSafePoint: value.waitingForSafePoint, lastErrorCategory: value.lastErrorCategory, lastErrorMessage: value.lastErrorMessage, packageManaged: value.packageManaged, config: YadoriLinkModel.UpdateConfig(value.config))
     }
 }
 
@@ -867,6 +853,7 @@ extension YadoriLinkFFI.AttentionCategory {
         case .fetchAvailabilityUnknown: self = .fetchAvailabilityUnknown
         case .conflict: self = .conflict
         case .held: self = .held
+        case .strandedDirectory: self = .strandedDirectory
         case .lowDiskCritical: self = .lowDiskCritical
         case .lowDisk: self = .lowDisk
         case .peerDisconnected: self = .peerDisconnected
@@ -1542,28 +1529,13 @@ extension YadoriLinkFFI.UpdateBadge {
 
 extension YadoriLinkFFI.UpdateConfig {
     init(_ value: YadoriLinkModel.UpdateConfig) {
-        self.init(automaticChecks: value.automaticChecks, installMode: YadoriLinkFFI.UpdateInstallMode(value.installMode))
+        self.init(automaticChecks: value.automaticChecks)
     }
 }
 
-extension YadoriLinkFFI.UpdateInstallMode {
-    init(_ value: YadoriLinkModel.UpdateInstallMode) {
-        switch value {
-        case .automatic: self = .automatic
-        case .manual: self = .manual
-        case let .other(raw): self = .other(raw: raw)
-        }
-    }
-}
-
-extension YadoriLinkFFI.UpdateInstallOutcome {
-    init(_ value: YadoriLinkModel.UpdateInstallOutcome) {
-        switch value {
-        case .installing: self = .installing
-        case .deferred: self = .deferred
-        case let .storeManaged(guidance): self = .storeManaged(guidance: guidance)
-        case let .other(raw): self = .other(raw: raw)
-        }
+extension YadoriLinkFFI.UpdateDownloadGuidance {
+    init(_ value: YadoriLinkModel.UpdateDownloadGuidance) {
+        self.init(guidance: value.guidance, url: value.url)
     }
 }
 
@@ -1589,7 +1561,7 @@ extension YadoriLinkFFI.UpdateState {
 
 extension YadoriLinkFFI.UpdateStatus {
     init(_ value: YadoriLinkModel.UpdateStatus) {
-        self.init(currentVersion: value.currentVersion, channel: value.channel, installSource: value.installSource, lastCheckedAt: value.lastCheckedAt, state: YadoriLinkFFI.UpdateState(value.state), availableVersion: value.availableVersion, releaseNotesUrl: value.releaseNotesUrl, mandatory: value.mandatory, holdbackReason: value.holdbackReason, waitingForSafePoint: value.waitingForSafePoint, lastErrorCategory: value.lastErrorCategory, lastErrorMessage: value.lastErrorMessage, config: YadoriLinkFFI.UpdateConfig(value.config))
+        self.init(currentVersion: value.currentVersion, channel: value.channel, installSource: value.installSource, lastCheckedAt: value.lastCheckedAt, state: YadoriLinkFFI.UpdateState(value.state), availableVersion: value.availableVersion, releaseNotesUrl: value.releaseNotesUrl, mandatory: value.mandatory, holdbackReason: value.holdbackReason, waitingForSafePoint: value.waitingForSafePoint, lastErrorCategory: value.lastErrorCategory, lastErrorMessage: value.lastErrorMessage, packageManaged: value.packageManaged, config: YadoriLinkFFI.UpdateConfig(value.config))
     }
 }
 

@@ -7,7 +7,7 @@ use super::ClientCore;
 use crate::dto::{
     self, AccountDeletionRequest, AccountDeletionStatus, BandwidthLimits, DaemonStartOutcome,
     DiagnosticsCollectionMode, DiagnosticsExport, GcReport, IncomingTransfer, ReceivedTransfer,
-    SentTransfer, UpdateConfig, UpdateInstallMode, UpdateInstallOutcome, UpdateStatus,
+    SentTransfer, UpdateConfig, UpdateDownloadGuidance, UpdateStatus,
 };
 use crate::error::{CoreError, DaemonUnavailableReason, DesktopError};
 use crate::ops;
@@ -166,31 +166,29 @@ impl ClientCore {
         Ok(dto::update_status(&status))
     }
 
-    /// Manual updates (v1): returns where to get the new version as
-    /// `StoreManaged { guidance }`. Nothing is installed by the daemon. The
-    /// name is kept so the generated Swift bindings stay stable.
+    /// Where to get the new version: the official download page, or the
+    /// package-manager command for a package-managed install. YadoriLink
+    /// never downloads or installs an update itself.
+    ///
+    /// # Errors
+    /// Daemon failures, and a daemon reply that claims anything but a manual
+    /// download.
+    pub async fn download_guidance(&self) -> Result<UpdateDownloadGuidance, DesktopError> {
+        let reply = ops::updates::download_guidance().await?;
+        dto::update_download_guidance(&reply)
+            .map_err(|reason| DesktopError::from(CoreError::Other(reason)))
+    }
+
+    /// Turns the automatic check for a newer version on or off. This is the
+    /// only update setting: updates are never installed automatically.
     ///
     /// # Errors
     /// Daemon failures.
-    pub async fn install_update(&self) -> Result<UpdateInstallOutcome, DesktopError> {
-        Ok(dto::update_install_outcome(&ops::updates::download_guidance().await?))
-    }
-
-    /// Changes either setting; `None` leaves it as it is.
-    ///
-    /// # Errors
-    /// Daemon failures, including an install mode the daemon refuses.
-    pub async fn set_update_config(
+    pub async fn set_automatic_update_checks(
         &self,
-        automatic_checks: Option<bool>,
-        install_mode: Option<UpdateInstallMode>,
+        enabled: bool,
     ) -> Result<UpdateConfig, DesktopError> {
-        let mode = install_mode.map(|mode| match mode {
-            UpdateInstallMode::Automatic => "automatic".to_owned(),
-            UpdateInstallMode::Manual => "manual".to_owned(),
-            UpdateInstallMode::Other { raw } => raw,
-        });
-        Ok(dto::update_config(&ops::updates::set_update_config(automatic_checks, mode).await?))
+        Ok(dto::update_config(&ops::updates::set_update_config(Some(enabled), None).await?))
     }
 
     // ---- account -------------------------------------------------------------------

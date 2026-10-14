@@ -75,6 +75,17 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         self.temp_ledger(group_id).release(tmp_path);
     }
 
+    fn record_stranded_directory(
+        &self,
+        group_id: &str,
+        dir_path: &Path,
+    ) -> Result<(), MaterializationExecutionError> {
+        use yadorilink_local_storage::TempFileLedger;
+        self.temp_ledger(group_id).strand(dir_path).map_err(|error| {
+            MaterializationExecutionError::from(SyncError::CorruptState(error.to_string()))
+        })
+    }
+
     fn get_file(
         &self,
         group_id: &str,

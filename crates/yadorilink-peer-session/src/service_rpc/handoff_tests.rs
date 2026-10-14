@@ -34,6 +34,7 @@ fn every_response_kind_round_trips() {
                 lease_id: "lease-1".into(),
                 root_digest: [7u8; 32],
                 expires_at_unix: -1,
+                ttl_seconds: 900,
             }),
         },
         ServiceResponse::HandoffTicket { grant: None },
@@ -45,6 +46,7 @@ fn every_response_kind_round_trips() {
             }),
         },
         ServiceResponse::Released,
+        ServiceResponse::ReleaseNotConfirmed,
     ];
     for response in responses {
         assert_eq!(decode_response(&encode_response(&response)).unwrap(), response);

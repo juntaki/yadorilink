@@ -15,10 +15,11 @@ use yadorilink_ipc_proto::daemonctl::{
     ConflictedFileInfo, FileVersionInfo, GcResponse, InboxTransfer, LimitsSetResponse,
     LimitsShowResponse, MaterializationStatusResponse, ReceiveTransferResponse,
     RestoreTrashOperationResponse, SendFileResponse, TrashedFileInfo, UpdateConfigResponse,
-    UpdateStatusResponse,
+    UpdateInstallResponse, UpdateStatusResponse,
 };
 
 use crate::ipc_client::{self, IpcError};
+pub use crate::status_model::UpdateDownload;
 
 /// "pause/resume... for linked folders": pauses every currently
 /// linked folder — mirrors `yadorilink-cli`'s `commands/daemon::pause`
@@ -202,12 +203,35 @@ pub async fn check_for_updates() -> Result<(), IpcError> {
     Ok(())
 }
 
+/// What a checked download reply asks this app to do.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UpdatePlan {
+    /// Open the official release page.
+    Open(String),
+    /// Show the steps of a package-managed install.
+    Show(String),
+}
+
+/// Applies the client core's checks (manual download only; a page to open
+/// only from the structured official-page field) to a daemon reply.
+pub(crate) fn plan_update_download(reply: &UpdateInstallResponse) -> Result<UpdatePlan, IpcError> {
+    match updates::check_download_reply(reply).map_err(IpcError::DaemonError)? {
+        (_, Some(url)) => Ok(UpdatePlan::Open(url)),
+        (steps, None) => Ok(UpdatePlan::Show(steps)),
+    }
+}
+
 /// "updates": v1 ships manual updates, so "download the new version" opens
-/// the official download page in the browser; nothing is installed by the
-/// daemon or this app.
-pub async fn download_update() -> Result<(), IpcError> {
-    let _ = opener::open(updates::DOWNLOAD_PAGE_URL);
-    Ok(())
+/// the official release page; nothing is installed by the daemon or this
+/// app. A package-managed install gets its steps back to show instead.
+pub async fn download_update() -> Result<UpdateDownload, IpcError> {
+    match plan_update_download(&updates::download_guidance().await?)? {
+        UpdatePlan::Open(url) => {
+            opener::open(url).map_err(|e| IpcError::Io(e.to_string()))?;
+            Ok(UpdateDownload::OpenedPage)
+        }
+        UpdatePlan::Show(steps) => Ok(UpdateDownload::Guidance(steps)),
+    }
 }
 
 /// "resource limit" actions: a small, fixed set of bandwidth

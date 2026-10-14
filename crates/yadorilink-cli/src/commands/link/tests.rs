@@ -22,6 +22,7 @@ fn base_link() -> LinkStatus {
         held_file_count: 0,
         held_files: vec![],
         skipped_symlink_count: 0,
+        stranded_directory_count: 0,
         degraded: false,
         degraded_reason: String::new(),
         has_active_transfer: false,

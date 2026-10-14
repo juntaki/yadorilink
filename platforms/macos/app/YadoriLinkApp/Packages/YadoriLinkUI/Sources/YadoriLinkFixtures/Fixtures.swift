@@ -257,11 +257,14 @@ public enum Fixtures {
         ], totalSize: 18 * mib + 2_048, offeredAt: now.addingTimeInterval(-600), status: .pending),
     ]
 
-    public static func updateStatus(available: String? = nil) -> UpdateStatus {
+    /// What the daemon's download guidance says for a manually installed build.
+    public static let releasesPage = "https://github.com/juntaki/yadorilink/releases"
+
+    public static func updateStatus(available: String? = nil, packageManaged: Bool = false) -> UpdateStatus {
         UpdateStatus(
             currentVersion: "0.4.2",
             channel: "stable",
-            installSource: "pkg",
+            installSource: packageManaged ? "homebrew" : "standalone",
             lastCheckedAt: now.addingTimeInterval(-3_600),
             state: available == nil ? .upToDate : .available,
             availableVersion: available,
@@ -271,7 +274,8 @@ public enum Fixtures {
             waitingForSafePoint: false,
             lastErrorCategory: nil,
             lastErrorMessage: nil,
-            config: UpdateConfig(automaticChecks: true, installMode: .automatic)
+            packageManaged: packageManaged,
+            config: UpdateConfig(automaticChecks: true)
         )
     }
 

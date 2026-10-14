@@ -11,7 +11,10 @@
 
 use std::path::PathBuf;
 
-/// The host's record of its sync roots.
+use yadorilink_fs_platform::generation;
+
+/// The host's record of its sync roots: the base name of its generation files
+/// (`cfapi_sync_roots.txt.<seq>`, see `yadorilink_fs_platform::generation`).
 pub(crate) fn registry_file() -> Option<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")?;
     Some(PathBuf::from(base).join("yadorilink").join("cfapi_sync_roots.txt"))
@@ -20,13 +23,54 @@ pub(crate) fn registry_file() -> Option<PathBuf> {
 /// `(root id hex, path relative to the root with `/` separators)` of an absolute path inside one
 /// of the host's sync roots. `None` when no root holds it, or when it names the root itself.
 pub(crate) fn locate(absolute_path: &str) -> Option<(String, String)> {
-    let text = std::fs::read_to_string(registry_file()?).ok()?;
-    locate_in(&text, absolute_path)
+    locate_at(&registry_file()?, absolute_path)
+}
+
+/// Reads the registry the way the host does: the newest complete generation. Anything that
+/// leaves the record unproven (no generation, unreadable, none complete, or a newer generation
+/// that is torn so the one read may predate a root) finds no root, never a guess.
+fn locate_at(base: &std::path::Path, absolute_path: &str) -> Option<(String, String)> {
+    match generation::read_latest(base, |text| generation::unseal(text).map(str::to_string)) {
+        generation::Latest::Loaded { value, skipped_newer: false, .. } => {
+            well_formed(&value).then(|| locate_in(&value, absolute_path)).flatten()
+        }
+        _ => None,
+    }
+}
+
+/// The host's own rule for a registry it can trust (`cfapi_host::parse_registry`): every line is
+/// a 32 lowercase hex root id and a path, and no root or folder is recorded twice. A record that
+/// breaks it is not partly used: which root a path belongs to would be a guess.
+fn well_formed(registry: &str) -> bool {
+    let mut roots = std::collections::HashSet::new();
+    let mut paths = std::collections::HashSet::new();
+    registry.lines().all(|line| {
+        let Some((root, path)) = line.split_once('\t') else { return false };
+        root.len() == 32
+            && root.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            && !path.trim().is_empty()
+            && roots.insert(root)
+            && paths.insert(components(path.trim()))
+    })
+}
+
+/// A name as the Windows file systems compare it (the host's `windows_name_key`): through a simple
+/// one-to-one upper case mapping, so that `\u{3c3}` and `\u{3c2}` are one letter.
+fn name_key(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            let mut upper = c.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(single), None) => single,
+                _ => c,
+            }
+        })
+        .collect()
 }
 
 fn components(path: &str) -> Vec<String> {
     let path = path.strip_prefix(r"\\?\").unwrap_or(path);
-    path.split(['\\', '/']).filter(|c| !c.is_empty()).map(str::to_lowercase).collect()
+    path.split(['\\', '/']).filter(|c| !c.is_empty()).map(name_key).collect()
 }
 
 fn components_keeping_case(path: &str) -> Vec<String> {
@@ -56,7 +100,63 @@ pub(crate) fn locate_in(registry: &str, absolute_path: &str) -> Option<(String, 
 mod tests {
     use super::*;
 
+    const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const REGISTRY_BODY: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tC:\\Users\\me\\YadoriLink\\Photos\n";
     const REGISTRY: &str = "aaaa\tC:\\Users\\me\\YadoriLink\\Photos\nbbbb\tC:\\Users\\me\\YadoriLink\\Photos (bbbb0001)\n\nbroken line\n";
+
+    fn base(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("cfapi_sync_roots.txt")
+    }
+
+    #[test]
+    fn a_registry_published_as_generation_files_is_located() {
+        let dir = tempfile::tempdir().unwrap();
+        generation::publish_next(&base(dir.path()), &generation::seal("zzzz\tD:\\old\n")).unwrap();
+        generation::publish_next(&base(dir.path()), &generation::seal(REGISTRY_BODY)).unwrap();
+        assert_eq!(
+            locate_at(&base(dir.path()), r"C:\Users\me\YadoriLink\Photos\docs\a.txt"),
+            Some((ID_A.into(), "docs/a.txt".into()))
+        );
+    }
+
+    #[test]
+    fn a_registry_the_host_would_refuse_is_not_partly_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = r"C:\Users\me\YadoriLink\Photos\a.txt";
+        let sigma = "C:\\Users\\me\\Photos\u{3c3}\\a.txt";
+        let b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        for body in [
+            format!("{REGISTRY_BODY}broken line\n"),
+            format!("{REGISTRY_BODY}{b}\tc:/users/me/yadorilink/photos/\n"),
+            format!("{ID_A}\tC:\\Users\\me\\Photos\u{3c3}\n{b}\tC:\\Users\\me\\Photos\u{3c2}\n"),
+            format!("{REGISTRY_BODY}{ID_A}\tC:\\other\n"),
+            format!("{REGISTRY_BODY}ABCD\tC:\\other\n"),
+        ] {
+            let base = base(&tempfile::tempdir_in(dir.path()).unwrap().keep());
+            generation::publish_next(&base, &generation::seal(&body)).unwrap();
+            assert_eq!(locate_at(&base, p), None, "{body}");
+            assert_eq!(locate_at(&base, sigma), None, "{body}");
+        }
+    }
+
+    #[test]
+    fn the_unsuffixed_file_and_a_missing_record_are_not_a_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = r"C:\Users\me\YadoriLink\Photos\a.txt";
+        assert_eq!(locate_at(&base(dir.path()), p), None);
+        std::fs::write(base(dir.path()), REGISTRY_BODY).unwrap();
+        assert_eq!(locate_at(&base(dir.path()), p), None);
+    }
+
+    #[test]
+    fn a_damaged_newest_generation_does_not_fall_back_to_an_older_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = r"C:\Users\me\YadoriLink\Photos\a.txt";
+        generation::publish_next(&base(dir.path()), &generation::seal(REGISTRY_BODY)).unwrap();
+        std::fs::write(dir.path().join("cfapi_sync_roots.txt.2"), "aaaa\tC:\\torn").unwrap();
+        assert_eq!(locate_at(&base(dir.path()), p), None);
+    }
 
     #[test]
     fn a_path_inside_a_sync_root_is_split_into_the_root_and_the_namespace_path() {

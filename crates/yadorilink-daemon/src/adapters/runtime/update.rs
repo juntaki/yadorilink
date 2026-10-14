@@ -33,6 +33,13 @@ impl UpdateCommandPort for DaemonUpdateCommandAdapter {
         )
     }
 
+    fn download_page_url(&self) -> Option<String> {
+        crate::update::install_source::manual_update_page(
+            &self.state.update_manager.platform_info().install_source,
+        )
+        .map(str::to_owned)
+    }
+
     fn config(&self, command: UpdateConfigCommand) -> Result<UpdatePolicyView, String> {
         let install_mode = match command.automatic_install_mode {
             Some(raw) => Some(

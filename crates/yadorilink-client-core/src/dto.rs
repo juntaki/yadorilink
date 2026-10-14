@@ -22,7 +22,7 @@ pub use convert::{
     handoff_summary, incoming_transfer, invite_summary, member_summary, membership_outcome,
     pending_approval_summary, pending_invite_summary, preflight_result, received_transfer,
     sent_transfer, share_summary, status_snapshot, trashed_file, update_config,
-    update_install_outcome, update_status,
+    update_download_guidance, update_status,
 };
 
 // ---- construction -------------------------------------------------------
@@ -198,6 +198,7 @@ pub enum AttentionCategory {
     FetchAvailabilityUnknown,
     Conflict,
     Held,
+    StrandedDirectory,
     LowDiskCritical,
     LowDisk,
     PeerDisconnected,
@@ -972,19 +973,13 @@ pub enum DaemonStartOutcome {
     Started,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
-pub enum UpdateInstallMode {
-    Automatic,
-    Manual,
-    Other { raw: String },
-}
-
+/// Update preferences. Updates are installed by the user (or a package
+/// manager or store), never by YadoriLink, so the only setting is whether it
+/// checks for a newer version by itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "ffi", derive(uniffi::Record))]
 pub struct UpdateConfig {
     pub automatic_checks: bool,
-    pub install_mode: UpdateInstallMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1002,22 +997,21 @@ pub struct UpdateStatus {
     pub waiting_for_safe_point: bool,
     pub last_error_category: Option<String>,
     pub last_error_message: Option<String>,
+    /// A package manager or store owns this install, so the new version
+    /// comes with steps to follow, not a page to open.
+    pub package_managed: bool,
     pub config: UpdateConfig,
 }
 
+/// How to get the new version. Nothing is downloaded or installed by
+/// YadoriLink: `guidance` is the sentence to show (the download page, or the
+/// package-manager steps for a package-managed install), and `url` is the
+/// official page to open, only when there is one to open.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
-pub enum UpdateInstallOutcome {
-    Installing,
-    Deferred,
-    /// Updates are installed manually (or by a package manager / store);
-    /// `guidance` says where to get the new version.
-    StoreManaged {
-        guidance: String,
-    },
-    Other {
-        raw: String,
-    },
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct UpdateDownloadGuidance {
+    pub guidance: String,
+    pub url: Option<String>,
 }
 
 #[cfg(test)]

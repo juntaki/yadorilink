@@ -15,8 +15,8 @@ use tokio::sync::mpsc;
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
-    DomainEvidence, EvictResult, ProviderDomainState, ProviderEvictDone, ProviderSignalDone,
-    ShellIpcMessage,
+    DomainEvidence, EvictResult, ProviderDomainState, ProviderEvictDone,
+    ProviderMaterializedReport, ProviderSignalDone, ShellIpcMessage,
 };
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -32,6 +32,10 @@ pub enum SessionEvent {
     Changed { root: Vec<u8>, revision: u64, request_id: Vec<u8> },
     /// Drop the operating system's copy of `item`.
     Evict { root: Vec<u8>, item: Vec<u8>, request_id: Vec<u8>, require_shown_version: Vec<u8> },
+    /// The latest handoff sequence of `root` changed.
+    EvidenceTick { root: Vec<u8>, seq: u64 },
+    /// The daemon's answer to a materialized-set report.
+    ReportAck { root: Vec<u8>, epoch: u64, needs_full: bool },
 }
 
 /// The sending half: what the host's loop tells the daemon.
@@ -71,6 +75,11 @@ impl Session {
         }));
     }
 
+    /// Reports the materialized set (see `provider_report`).
+    pub fn materialized(&self, report: ProviderMaterializedReport) {
+        self.send(Payload::ProviderMaterializedReport(report));
+    }
+
     fn send(&self, payload: Payload) {
         let _ = self.commands.send(ShellIpcMessage { payload: Some(payload) });
     }
@@ -89,6 +98,14 @@ pub(crate) fn event_of(payload: Payload) -> Option<SessionEvent> {
             item: evict.item_id,
             request_id: evict.request_id,
             require_shown_version: evict.require_shown_version,
+        }),
+        Payload::ProviderEvidenceTick(tick) => {
+            Some(SessionEvent::EvidenceTick { root: tick.root_id, seq: tick.evidence_seq })
+        }
+        Payload::ProviderReportAck(ack) => Some(SessionEvent::ReportAck {
+            root: ack.root_id,
+            epoch: ack.reporter_epoch,
+            needs_full: ack.needs_full,
         }),
         _ => None,
     }
@@ -201,6 +218,26 @@ mod tests {
                 request_id: vec![3],
                 require_shown_version: vec![]
             })
+        );
+        assert_eq!(
+            event_of(Payload::ProviderEvidenceTick(
+                yadorilink_ipc_proto::shellipc::ProviderEvidenceTick {
+                    root_id: vec![1],
+                    evidence_seq: 9
+                }
+            )),
+            Some(SessionEvent::EvidenceTick { root: vec![1], seq: 9 })
+        );
+        assert_eq!(
+            event_of(Payload::ProviderReportAck(
+                yadorilink_ipc_proto::shellipc::ProviderReportAck {
+                    root_id: vec![1],
+                    reporter_epoch: 4,
+                    accepted_seq: 2,
+                    needs_full: true
+                }
+            )),
+            Some(SessionEvent::ReportAck { root: vec![1], epoch: 4, needs_full: true })
         );
         assert_eq!(event_of(Payload::StatusPush(Default::default())), None);
     }

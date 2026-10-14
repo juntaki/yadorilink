@@ -676,7 +676,10 @@ fn the_barrier_holds_and_leaves_the_replica_untouched() {
     let intent = RecoveryArea::open_dir(&preserved.dir).unwrap().read_intent().unwrap();
     assert_eq!(intent.deltas.len(), 1);
     assert_eq!(intent.deltas[0].1, w.undelivered.to_wire_bytes());
-    assert_eq!(intent.versions.values().collect::<Vec<_>>(), vec![&vec![2u8]]);
+    let held: Vec<_> = intent.manifest.versions.iter().filter(|v| v.has_bytes).collect();
+    assert_eq!(held.len(), 1);
+    let area = RecoveryArea::open_dir(&preserved.dir).unwrap();
+    assert_eq!(area.read_version(&held[0].version).unwrap(), vec![2u8]);
     assert_eq!(intent.manifest.target_checkpoint_hash, preserved.checkpoint_hash);
     assert!(intent.manifest.items.iter().all(|item| item.reassertable));
 }

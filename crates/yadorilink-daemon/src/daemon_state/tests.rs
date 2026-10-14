@@ -134,6 +134,19 @@ fn upsert_file(state: &DaemonState, group_id: &str, path: &str) {
         .unwrap();
 }
 
+/// Records `peer` as holding a granted custody hold on `version` of `a.bin`.
+fn grant_hold(state: &DaemonState, peer: &str, version: &VersionHash) {
+    let key = yadorilink_sync_sqlite::remote_custody_hold::HoldKey {
+        group_id: "group-a".into(),
+        path: "a.bin".into(),
+        version_hash: version.0,
+        peer_id: peer.into(),
+    };
+    let holds = state.replica_coordinator.remote_custody_hold_repository();
+    holds.record_requested(&key, 0, [0; 16]).unwrap();
+    holds.mark_granted(&key).unwrap();
+}
+
 #[tokio::test]
 async fn custody_stamp_revalidation_rejects_wrong_peer_generation_change_and_demotion() {
     let state = test_state();
@@ -141,20 +154,41 @@ async fn custody_stamp_revalidation_rejects_wrong_peer_generation_change_and_dem
     state.authority.set_peer_group_full_replica("peer-b", "group-a", true);
     let confirmer = crate::adapters::runtime::custody::P2pCustodyConfirmer::new(&state);
     let stamp = CustodyStamp::new("peer-b".into(), state.authority.membership_generation());
+    let version = VersionHash([1; 32]);
+    grant_hold(&state, "peer-b", &version);
+    grant_hold(&state, "peer-c", &version);
+    let valid = |stamp: &CustodyStamp| {
+        confirmer.confirmation_still_valid("group-a", "a.bin", &version, stamp)
+    };
 
-    assert!(confirmer.confirmation_still_valid("group-a", &stamp));
-    assert!(!confirmer.confirmation_still_valid(
-        "group-a",
-        &CustodyStamp::new("peer-c".into(), stamp.membership_generation())
-    ));
+    assert!(valid(&stamp));
+    assert!(!valid(&CustodyStamp::new("peer-c".into(), stamp.membership_generation())));
 
     state.set_peer_group_writer("peer-c", "unrelated-group", true);
-    assert!(!confirmer.confirmation_still_valid("group-a", &stamp));
+    assert!(!valid(&stamp));
 
     let current_stamp = CustodyStamp::new("peer-b".into(), state.authority.membership_generation());
-    assert!(confirmer.confirmation_still_valid("group-a", &current_stamp));
+    assert!(valid(&current_stamp));
     state.authority.set_peer_group_full_replica("peer-b", "group-a", false);
-    assert!(!confirmer.confirmation_still_valid("group-a", &current_stamp));
+    assert!(!valid(&current_stamp));
+}
+
+/// A stamp backed by no granted hold (never recorded, or only requested, or
+/// for another version) is not valid, whatever the peer's authorization.
+#[tokio::test]
+async fn custody_stamp_revalidation_requires_a_granted_hold_for_that_version() {
+    let state = test_state();
+    state.set_peer_group_writer("peer-b", "group-a", true);
+    state.authority.set_peer_group_full_replica("peer-b", "group-a", true);
+    let confirmer = crate::adapters::runtime::custody::P2pCustodyConfirmer::new(&state);
+    let stamp = CustodyStamp::new("peer-b".into(), state.authority.membership_generation());
+    let version = VersionHash([1; 32]);
+
+    assert!(!confirmer.confirmation_still_valid("group-a", "a.bin", &version, &stamp), "no row");
+    grant_hold(&state, "peer-b", &version);
+    assert!(confirmer.confirmation_still_valid("group-a", "a.bin", &version, &stamp));
+    assert!(!confirmer.confirmation_still_valid("group-a", "a.bin", &VersionHash([2; 32]), &stamp));
+    assert!(!confirmer.confirmation_still_valid("group-a", "other.bin", &version, &stamp));
 }
 
 // --- Custody-confirmation cache mechanics ----
@@ -465,6 +499,7 @@ fn handoff_lease_grant_digest_match_yields_the_lease_id() {
         lease_id: "lease-abc".to_string(),
         root_digest: digest,
         expires_at_unix: 12345,
+        ttl_seconds: 900,
     };
     assert_eq!(handoff_lease_grant_matches_digest(&grant, digest), Some("lease-abc".to_string()));
 }
@@ -481,6 +516,7 @@ fn handoff_lease_grant_digest_mismatch_declines() {
         lease_id: "lease-abc".to_string(),
         root_digest: other_digest,
         expires_at_unix: 12345,
+        ttl_seconds: 900,
     };
     assert_eq!(handoff_lease_grant_matches_digest(&grant, [7u8; 32]), None);
 }
@@ -647,12 +683,14 @@ async fn release_owned_handoff_lease_releases_local_pin_and_worker_lease() {
         .unwrap();
     Mock::given(method("POST"))
         .and(path("/shares/groups/group-release/handoff/lease/lease-release/release"))
-        .respond_with(ResponseTemplate::new(204))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "state": "released" })),
+        )
         .expect(1)
         .mount(&server)
         .await;
 
-    state.release_owned_handoff_lease("group-release", "lease-release").await;
+    assert!(state.release_owned_handoff_lease("group-release", "lease-release").await);
 
     let leases = state
         .replica_coordinator
@@ -1224,4 +1262,127 @@ async fn the_governance_headroom_override_reaches_the_convergence_executor() {
     );
 
     std::env::remove_var("YADORILINK_CONFIG_DIR");
+}
+
+/// The release is acknowledged only when the coordination service ended its
+/// lease too: a service that answers with an error leaves the lease usable.
+#[tokio::test]
+async fn a_release_the_coordination_service_rejects_is_not_acknowledged() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let state = test_state();
+    let server = MockServer::start().await;
+    state.set_coordination_client_config(
+        server.uri(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
+    Mock::given(method("POST"))
+        .and(path("/shares/groups/group-release/handoff/lease/lease-release/release"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    assert!(!state.release_owned_handoff_lease("group-release", "lease-release").await);
+}
+
+/// A release for a lease this device never granted is not acknowledged, even
+/// though the coordination service answers such a release with success.
+#[tokio::test]
+async fn a_release_for_a_lease_this_device_never_granted_is_not_acknowledged() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let state = test_state();
+    let server = MockServer::start().await;
+    state.set_coordination_client_config(
+        server.uri(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
+    Mock::given(method("POST"))
+        .and(path("/shares/groups/group-release/handoff/lease/someone-elses/release"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    assert!(!state.release_owned_handoff_lease("group-release", "someone-elses").await);
+}
+
+fn pinned_version(path: &str) -> (String, i64) {
+    (path.to_string(), 1)
+}
+
+/// The ordering that makes the ACK safe: the local retention pin is dropped
+/// only after the coordination plane reports the lease ended. A lease a
+/// running removal still holds keeps its pin, and the peer is not acknowledged;
+/// a retry once the plane has released it drops the pin and acknowledges.
+#[tokio::test]
+async fn a_lease_the_plane_leaves_reserved_keeps_its_local_pin_until_a_retry_releases_it() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let state = test_state();
+    let server = MockServer::start().await;
+    state.set_coordination_client_config(
+        server.uri(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
+    let repo = state.replica_coordinator.handoff_lease_repository();
+    repo.record_handoff_lease(
+        "group-release",
+        "lease-release",
+        [9u8; 32],
+        &[pinned_version("a.txt")],
+        now_unix(),
+        now_unix() + 900,
+    )
+    .unwrap();
+    let release_path = "/shares/groups/group-release/handoff/lease/lease-release/release";
+    Mock::given(method("POST"))
+        .and(path(release_path))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "state": "reserved-not-released" })),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    assert!(!state.release_owned_handoff_lease("group-release", "lease-release").await);
+    assert!(
+        repo.leased_version_keys_for_group("group-release", now_unix())
+            .unwrap()
+            .contains(&pinned_version("a.txt")),
+        "the pin must outlive a lease the plane still holds"
+    );
+
+    Mock::given(method("POST"))
+        .and(path(release_path))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "state": "gone" })),
+        )
+        .mount(&server)
+        .await;
+    assert!(state.release_owned_handoff_lease("group-release", "lease-release").await);
+    assert!(repo.leased_version_keys_for_group("group-release", now_unix()).unwrap().is_empty());
+}
+
+/// A failed or unconfigured release leaves the pin too: the plane's lease may
+/// still be live.
+#[tokio::test]
+async fn a_release_that_does_not_reach_the_plane_keeps_the_local_pin() {
+    let state = test_state();
+    let repo = state.replica_coordinator.handoff_lease_repository();
+    repo.record_handoff_lease(
+        "group-release",
+        "lease-release",
+        [9u8; 32],
+        &[pinned_version("a.txt")],
+        now_unix(),
+        now_unix() + 900,
+    )
+    .unwrap();
+
+    assert!(!state.release_owned_handoff_lease("group-release", "lease-release").await);
+    assert!(!repo.leased_version_keys_for_group("group-release", now_unix()).unwrap().is_empty());
 }

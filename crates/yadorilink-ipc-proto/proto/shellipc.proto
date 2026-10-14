@@ -447,6 +447,15 @@ message MaterializeToTempRequest {
   bytes item_id = 3;
   // Empty = current. Set and not current => VERSION_OUT_OF_DATE (old bytes are never returned).
   bytes requested_version_hash = 4;
+  // Set: only the bytes [range_offset, range_offset + range_length) of that exact version are
+  // wanted, and `requested_version_hash` must be set too. The daemon fetches and verifies only the
+  // blocks covering the window and answers with a handoff file holding exactly those bytes (the
+  // end clamped to the file size). A ranged answer never makes the item present: the OS holds a
+  // window, not the file. A daemon that predates this field ignores it and answers with the whole
+  // file and `ranged` unset, which a caller must treat as the whole file.
+  bool ranged = 5;
+  uint64 range_offset = 6;
+  uint64 range_length = 7;
 }
 
 enum MaterializeFailure {
@@ -459,6 +468,8 @@ enum MaterializeFailure {
   MATERIALIZE_FAILURE_CANCELLED = 6;
   // The publication fence is on for the item: the extension answers .cannotSynchronize.
   MATERIALIZE_FAILURE_PUBLICATION_PENDING = 7;
+  // A ranged request whose offset is past the end of the version, or that did not name a version.
+  MATERIALIZE_FAILURE_RANGE_NOT_SATISFIABLE = 8;
 }
 
 message MaterializeToTempResponse {
@@ -477,6 +488,13 @@ message MaterializeToTempResponse {
   // with the bytes and echoes it as the base of a later edit or delete; it must never combine a
   // hash and a generation taken at different moments.
   bytes content_version = 8;
+  // Set when the handoff file holds only the window [range_offset, range_offset + range_length)
+  // of the version (the request's range clamped to the file size). `size` is then still the size
+  // of the whole version, `content_version` is empty (only a whole-version handoff is paired with
+  // an item generation), and the item is NOT recorded as handed over to the OS or as served.
+  bool ranged = 9;
+  uint64 range_offset = 10;
+  uint64 range_length = 11;
 }
 
 // Cancels one in-flight request, by request_id only.

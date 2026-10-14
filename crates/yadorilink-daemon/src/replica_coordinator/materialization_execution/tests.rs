@@ -15,14 +15,9 @@ use yadorilink_replica_engine::custody::{CustodyStamp, FullReplicaCustody};
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_root_authority::root_identity::VerifiedRoot;
 
-/// A custody oracle that never confirms anything. Note: with today's `REMOTE_CUSTODY_LEASES_SUPPORTED =
-/// false` global kill switch, `verify_reclaim_custody` returns `None`
-/// unconditionally BEFORE ever consulting any oracle -- so a test using
-/// this stub cannot, by itself, distinguish "the oracle said no" from
-/// "custody leases are globally unsupported today." Kept for the
-/// day `REMOTE_CUSTODY_LEASES_SUPPORTED` flips (at which point this
-/// stub starts actually being consulted), and to make the test using
-/// it self-documenting about which case is real right now.
+/// A custody oracle that never confirms anything. With `REMOTE_CUSTODY_LEASES_SUPPORTED` on,
+/// `verify_reclaim_custody` consults it (on Windows the platform gate answers `None` first), so a
+/// test using this stub shows that an unconfirmed custody never authorizes a block purge.
 struct NeverConfirms;
 
 impl FullReplicaCustody for NeverConfirms {
@@ -36,7 +31,13 @@ impl FullReplicaCustody for NeverConfirms {
         None
     }
 
-    fn confirmation_still_valid(&self, _: &str, _: &CustodyStamp) -> bool {
+    fn confirmation_still_valid(
+        &self,
+        _: &str,
+        _: &str,
+        _: &VersionHash,
+        _: &CustodyStamp,
+    ) -> bool {
         false
     }
 }
@@ -56,20 +57,22 @@ impl FullReplicaCustody for PanicsIfConsulted {
         panic!("custody must not be consulted for this eviction");
     }
 
-    fn confirmation_still_valid(&self, _: &str, _: &CustodyStamp) -> bool {
+    fn confirmation_still_valid(
+        &self,
+        _: &str,
+        _: &str,
+        _: &VersionHash,
+        _: &CustodyStamp,
+    ) -> bool {
         panic!("custody must not be consulted for this eviction");
     }
 }
 
 /// On an on-demand (non-full-replica) device, an evicted file's
 /// content-addressed blocks are NEVER purged from the local block
-/// store while `REMOTE_CUSTODY_LEASES_SUPPORTED` stays `false` --
-/// `verify_reclaim_custody` returns `None` unconditionally at that
-/// gate, before ever consulting an oracle (`NeverConfirms` is not actually
-/// exercised here today -- see its own doc comment). This test pins the CURRENT, observable
-/// production invariant (nothing is ever purged without a durable
-/// custody lease, and none exist yet) rather than claiming to prove
-/// oracle-specific handling this build cannot actually reach.
+/// store unless the custody oracle confirms: `NeverConfirms` is consulted and refuses, so
+/// `verify_reclaim_custody` yields nothing and no block is purged. This pins the fail-closed
+/// invariant (nothing is purged without a durable custody lease).
 ///
 /// `#[cfg(not(windows))]`: this is the only test in this module that
 /// drives a `Present` row all the way through `evict_file` to a
@@ -102,7 +105,10 @@ impl FullReplicaCustody for PanicsIfConsulted {
 /// support this test harness does not provide).
 #[cfg(not(windows))]
 #[test]
-fn evict_on_an_on_demand_device_frees_the_file_but_never_purges_its_blocks_today() {
+fn evict_on_an_on_demand_device_frees_the_file_but_never_purges_its_blocks_without_confirmed_custody(
+) {
+    let _exclusion =
+        yadorilink_filesystem_sync::materialization_eviction::assume_write_exclusion_for_test();
     let state = ReplicaCoordinator::open_in_memory().unwrap();
     let root = tempfile::tempdir().unwrap();
     adopt_root(&state, "group-a", root.path());
@@ -149,6 +155,153 @@ fn evict_on_an_on_demand_device_frees_the_file_but_never_purges_its_blocks_today
     );
 }
 
+/// Eviction removes the sync root's bytes (Windows: dehydrates the placeholder), so a sync root
+/// whose volume is not known durable is left exactly as it was: nothing dehydrated, no block
+/// reclaimed, the row still `Present`.
+#[test]
+fn evict_on_a_sync_root_volume_that_is_not_known_durable_touches_nothing() {
+    let _exclusion =
+        yadorilink_filesystem_sync::materialization_eviction::assume_write_exclusion_for_test();
+    let state = ReplicaCoordinator::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    adopt_root(&state, "group-a", root.path());
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+    let content = b"content on a volume that is not known durable";
+    let record = store_and_record(&store, "a.bin", content);
+    let hash = hex::encode(&record.blocks[0].hash);
+    let permit = RootCommitPermit::for_tests();
+    upsert_hydrated_file(&state, "group-a", &record, &permit);
+    std::fs::write(root.path().join("a.bin"), content).unwrap();
+    let sync_root = root.path().to_path_buf();
+    let _verdict =
+        yadorilink_filesystem_sync::materialization_eviction::set_volume_verdict_for_test(
+            move |dir| dir != Some(sync_root.as_path()),
+        );
+
+    let outcome = evict_file(
+        MaterializationContext {
+            state: &state,
+            liveness_gate: &BlockLivenessGate::default(),
+            store: &store,
+            root: root.path(),
+            permit: &permit,
+        },
+        "group-a",
+        "a.bin",
+        false,
+        &NeverConfirms,
+    )
+    .unwrap();
+
+    assert!(!outcome.dehydrated, "no bytes may be removed without a positive verdict");
+    assert!(outcome.blocks_retained);
+    assert!(store.exists(&hash).unwrap());
+    assert_eq!(std::fs::read(root.path().join("a.bin")).unwrap(), content);
+    assert_eq!(
+        state
+            .materialization_state_repository()
+            .get_materialization_state("group-a", "a.bin")
+            .unwrap(),
+        Some(MaterializationState::Present)
+    );
+}
+
+/// Confirms every version, and while doing so (under the path lock, like the real custody
+/// request) starts a block-reference writer that holds its write while it waits for that lock:
+/// what a local-change flush does when it races an eviction.
+struct ConfirmsWithAWriterWaitingOnThePathLock {
+    gate: std::sync::Arc<BlockLivenessGate>,
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    writer: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl FullReplicaCustody for ConfirmsWithAWriterWaitingOnThePathLock {
+    fn confirm_exact_version(
+        &self,
+        _: &str,
+        _: &str,
+        _: &VersionHash,
+        _: &[yadorilink_replica_domain::file::VersionBlock],
+    ) -> Option<CustodyStamp> {
+        let (holding, held) = std::sync::mpsc::channel();
+        let (gate, lock) = (self.gate.clone(), self.lock.clone());
+        let writer = std::thread::spawn(move || {
+            let _write = gate.begin_reference_write();
+            holding.send(()).unwrap();
+            drop(lock.blocking_lock());
+        });
+        held.recv().unwrap();
+        *self.writer.lock().unwrap() = Some(writer);
+        Some(CustodyStamp::new("full-peer".into(), 1))
+    }
+
+    fn confirmation_still_valid(
+        &self,
+        _: &str,
+        _: &str,
+        _: &VersionHash,
+        _: &CustodyStamp,
+    ) -> bool {
+        true
+    }
+}
+
+/// A writer that holds its block-reference write while it waits for the path lock must not
+/// deadlock with the eviction that holds the lock and wants the writers gone: the eviction lets
+/// the lock go, the writer finishes, and the blocks are then reclaimed.
+#[cfg(not(windows))]
+#[test]
+fn an_eviction_does_not_deadlock_with_a_writer_waiting_for_the_path_lock() {
+    let state = ReplicaCoordinator::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    adopt_root(&state, "group-a", root.path());
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+    let content = b"content an eviction must not deadlock over";
+    let record = store_and_record(&store, "a.bin", content);
+    let hash = hex::encode(&record.blocks[0].hash);
+    let permit = RootCommitPermit::for_tests();
+    upsert_hydrated_file(&state, "group-a", &record, &permit);
+    std::fs::write(root.path().join("a.bin"), content).unwrap();
+    let gate = std::sync::Arc::new(BlockLivenessGate::default());
+    let custody = ConfirmsWithAWriterWaitingOnThePathLock {
+        gate: gate.clone(),
+        lock: state.path_lock_registry().path_lock("group-a", "a.bin"),
+        writer: std::sync::Mutex::new(None),
+    };
+
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _exclusion =
+                yadorilink_filesystem_sync::materialization_eviction::assume_write_exclusion_for_test();
+            let outcome = evict_file(
+                MaterializationContext {
+                    state: &state,
+                    liveness_gate: &gate,
+                    store: &store,
+                    root: root.path(),
+                    permit: &permit,
+                },
+                "group-a",
+                "a.bin",
+                false,
+                &custody,
+            )
+            .unwrap();
+            done.send(outcome).unwrap();
+        });
+        let outcome = finished
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the eviction deadlocked with a writer waiting for the path lock");
+        assert!(outcome.dehydrated);
+        assert_eq!(outcome.blocks_reclaimed, 1);
+    });
+    custody.writer.lock().unwrap().take().unwrap().join().unwrap();
+    assert!(!store.exists(&hash).unwrap());
+}
+
 /// A full replica is the group's durable holder: evicting a file there frees
 /// the working-tree copy but never reclaims a block, and never even asks
 /// whether another replica holds the version (`PanicsIfConsulted`).
@@ -157,6 +310,8 @@ fn evict_on_an_on_demand_device_frees_the_file_but_never_purges_its_blocks_today
 #[cfg(not(windows))]
 #[test]
 fn evict_on_a_full_replica_keeps_every_block_without_consulting_custody() {
+    let _exclusion =
+        yadorilink_filesystem_sync::materialization_eviction::assume_write_exclusion_for_test();
     let state = ReplicaCoordinator::open_in_memory().unwrap();
     let root = tempfile::tempdir().unwrap();
     adopt_root(&state, "group-a", root.path());
@@ -195,6 +350,103 @@ fn evict_on_a_full_replica_keeps_every_block_without_consulting_custody() {
             .unwrap(),
         Some(MaterializationState::Remote)
     );
+}
+
+/// Hydrated `a.bin` on a linked root, plus a probe recording, each time
+/// eviction asks for custody, whether the path lock is held and what the row
+/// says. Custody must be asked for under the lock the custody reconciler
+/// needs, before the row leaves `Present`.
+/// (path lock held, the row's state) when custody was asked for.
+#[cfg(not(windows))]
+type CustodyAsk = (bool, Option<MaterializationState>);
+
+#[cfg(not(windows))]
+struct CustodyProbeFixture {
+    state: std::rc::Rc<ReplicaCoordinator>,
+    root: tempfile::TempDir,
+    store: SegmentBlockStore,
+    _store_dir: tempfile::TempDir,
+    seen: std::rc::Rc<std::cell::RefCell<Vec<CustodyAsk>>>,
+    _probe: yadorilink_filesystem_sync::materialization_eviction::CustodyProbeGuardForTest,
+}
+
+#[cfg(not(windows))]
+impl CustodyProbeFixture {
+    fn new() -> Self {
+        let state = std::rc::Rc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-a", root.path());
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+        let content = b"content whose custody is confirmed under the lock";
+        let record = store_and_record(&store, "a.bin", content);
+        upsert_hydrated_file(&state, "group-a", &record, &RootCommitPermit::for_tests());
+        std::fs::write(root.path().join("a.bin"), content).unwrap();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let probe =
+            yadorilink_filesystem_sync::materialization_eviction::set_custody_probe_for_test({
+                let state = state.clone();
+                let seen = seen.clone();
+                move || {
+                    let locked = state.path_lock("group-a", "a.bin").try_lock().is_err();
+                    let row = state
+                        .materialization_state_repository()
+                        .get_materialization_state("group-a", "a.bin")
+                        .unwrap();
+                    seen.borrow_mut().push((locked, row));
+                }
+            });
+        Self { state, root, store, _store_dir: store_dir, seen, _probe: probe }
+    }
+
+    fn evict(&self, is_full_replica: bool, custody: &dyn FullReplicaCustody) {
+        evict_file(
+            MaterializationContext {
+                state: &*self.state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &self.store,
+                root: self.root.path(),
+                permit: &RootCommitPermit::for_tests(),
+            },
+            "group-a",
+            "a.bin",
+            is_full_replica,
+            custody,
+        )
+        .unwrap();
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn custody_is_asked_for_under_the_path_lock_before_the_row_leaves_present() {
+    let fixture = CustodyProbeFixture::new();
+    fixture.evict(false, &NeverConfirms);
+    assert_eq!(*fixture.seen.borrow(), vec![(true, Some(MaterializationState::Present))]);
+}
+
+/// A path that fails revalidation never reaches the custody confirmation, so
+/// no hold is committed for an eviction that cannot proceed.
+#[cfg(not(windows))]
+#[test]
+fn a_dirty_path_never_asks_for_custody() {
+    let fixture = CustodyProbeFixture::new();
+    let permit = RootCommitPermit::for_tests();
+    fixture
+        .state
+        .dirty_path_repository()
+        .record_dirty_path("group-a", "a.bin", "created_or_modified", 1, &permit)
+        .unwrap();
+    fixture.evict(false, &NeverConfirms);
+    assert!(fixture.seen.borrow().is_empty());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_full_replica_never_asks_for_custody() {
+    let fixture = CustodyProbeFixture::new();
+    fixture.evict(true, &PanicsIfConsulted);
+    assert!(fixture.seen.borrow().is_empty());
 }
 
 /// Content that already diverged from the indexed version
@@ -326,7 +578,13 @@ impl FullReplicaCustody for AlwaysConfirmed {
         Some(CustodyStamp::new("test-peer".to_owned(), 0))
     }
 
-    fn confirmation_still_valid(&self, _: &str, _: &CustodyStamp) -> bool {
+    fn confirmation_still_valid(
+        &self,
+        _: &str,
+        _: &str,
+        _: &VersionHash,
+        _: &CustodyStamp,
+    ) -> bool {
         true
     }
 }
@@ -3343,9 +3601,22 @@ mod eviction_race_tests {
         store: SegmentBlockStore,
         _store_dir: tempfile::TempDir,
         permit: RootCommitPermit<'static>,
+        _assumed: Option<
+            yadorilink_filesystem_sync::materialization_eviction::AssumedExclusionGuardForTest,
+        >,
     }
 
+    /// Eviction as on a platform that grants the write exclusion.
     fn setup(content: &[u8]) -> Setup {
+        let mut s = setup_real(content);
+        s._assumed = Some(
+            yadorilink_filesystem_sync::materialization_eviction::assume_write_exclusion_for_test(),
+        );
+        s
+    }
+
+    /// Eviction on this host's real exclusion: a Linux write lease, none on macOS.
+    fn setup_real(content: &[u8]) -> Setup {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         let root = tempfile::tempdir().unwrap();
         adopt_root(&state, "group-a", root.path());
@@ -3355,7 +3626,7 @@ mod eviction_race_tests {
         let permit = RootCommitPermit::for_tests();
         upsert_hydrated_file(&state, "group-a", &record, &permit);
         std::fs::write(root.path().join("a.bin"), content).unwrap();
-        Setup { state, root, store, _store_dir: store_dir, permit }
+        Setup { state, root, store, _store_dir: store_dir, permit, _assumed: None }
     }
 
     fn evict(s: &Setup) -> yadorilink_filesystem_sync::materialization_eviction::EvictionOutcome {
@@ -3565,6 +3836,100 @@ mod eviction_race_tests {
             assert!(result.is_err(), "barrier {failing}: the error must be returned");
             assert_eq!(state_of(&s), Some(MaterializationState::Evicting), "barrier {failing}");
         }
+    }
+
+    /// A program opened the file for writing before eviction detached it and writes after the
+    /// object was verified. The unlink would make those bytes unreachable, so it must not happen:
+    /// without a proof that no writer exists the object goes back to its path, the row stays
+    /// `Present`, and nothing is reported as freed.
+    #[test]
+    fn bytes_written_through_a_pre_opened_handle_after_verification_are_never_lost() {
+        use std::io::{Seek, Write};
+        let s = setup_real(b"content a program has open for writing");
+        let out = s.root.path().join("a.bin");
+        let writer = std::fs::OpenOptions::new().write(true).open(&out).unwrap();
+        let writer = std::rc::Rc::new(std::cell::RefCell::new(writer));
+        let late = writer.clone();
+        let _hook =
+            yadorilink_filesystem_sync::materialization_eviction::set_pre_unlink_hook_for_test(
+                move |_| {
+                    let mut w = late.borrow_mut();
+                    w.rewind().unwrap();
+                    w.write_all(b"WRITTEN AFTER VERIFY, MUST SURVIVE").unwrap();
+                    w.sync_all().unwrap();
+                },
+            );
+
+        let outcome = evict(&s);
+
+        assert!(!outcome.dehydrated, "an eviction over a possible writer must not report success");
+        assert_eq!(state_of(&s), Some(MaterializationState::Present));
+        let kept = std::fs::read(&out).unwrap();
+        assert!(kept.starts_with(b"WRITTEN AFTER VERIFY"), "the late write was lost: {kept:?}");
+        assert_eq!(
+            entries(&s),
+            vec!["a.bin".to_string()],
+            "nothing may be left under a quarantine name"
+        );
+        // The handle still reaches the object that is at the path.
+        writer.borrow_mut().write_all(b"+more").unwrap();
+        assert!(std::fs::read(&out).unwrap().ends_with(b"+more"));
+    }
+
+    /// With the exclusion guaranteed nothing can be writing, and the file is removed as before.
+    #[test]
+    fn a_guaranteed_exclusion_lets_the_eviction_unlink() {
+        let s = setup(b"content nobody has open");
+        assert!(evict(&s).dehydrated);
+        assert!(!s.root.path().join("a.bin").exists());
+        assert_eq!(state_of(&s), Some(MaterializationState::Remote));
+    }
+
+    /// Without any program holding the file open, Linux grants the write lease and the file is
+    /// removed; macOS has no such primitive and never claims the exclusion, so the file stays.
+    #[test]
+    fn an_unheld_file_is_removed_only_where_the_os_proves_it() {
+        let s = setup_real(b"content nobody has open");
+        let outcome = evict(&s);
+        let present = s.root.path().join("a.bin").exists();
+        if cfg!(target_os = "linux") {
+            assert!(outcome.dehydrated && !present);
+            assert_eq!(state_of(&s), Some(MaterializationState::Remote));
+        } else {
+            assert!(!outcome.dehydrated && present);
+            assert_eq!(state_of(&s), Some(MaterializationState::Present));
+        }
+    }
+
+    /// A crash between the verification and the unlink leaves the object under its quarantine
+    /// name. A writer that is still alive writes to it there; startup recovery gives it back to
+    /// its path with those bytes.
+    #[test]
+    fn a_crash_before_the_unlink_keeps_a_late_write_and_recovery_restores_it() {
+        use std::io::{Seek, Write};
+        let s = setup(b"content a program has open for writing");
+        let out = s.root.path().join("a.bin");
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&out).unwrap();
+        let _hook =
+            yadorilink_filesystem_sync::materialization_eviction::set_pre_unlink_hook_for_test(
+                |_| panic!("injected crash between verification and unlink"),
+            );
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| evict(&s)));
+        assert!(crashed.is_err());
+        assert!(!out.exists(), "the crash leaves the object detached");
+
+        writer.rewind().unwrap();
+        writer.write_all(b"WRITTEN AFTER THE CRASH").unwrap();
+        yadorilink_filesystem_sync::materialization_eviction::recover_eviction_quarantine(
+            &s.state,
+            s.root.path(),
+            "group-a",
+            "a.bin",
+        )
+        .unwrap();
+
+        assert!(std::fs::read(&out).unwrap().starts_with(b"WRITTEN AFTER THE CRASH"));
+        assert_eq!(entries(&s), vec!["a.bin".to_string()]);
     }
 
     /// A crash after eviction detached the object and before it removed it
@@ -3799,6 +4164,9 @@ mod temp_file_crash_matrix {
             self.0.record(tmp)
         }
         fn release(&self, _tmp: &Path) {}
+        fn strand(&self, dir: &Path) -> Result<(), yadorilink_local_storage::StorageError> {
+            self.0.strand(dir)
+        }
     }
 
     struct Fixture {

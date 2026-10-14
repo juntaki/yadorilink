@@ -22,6 +22,8 @@ public final class FakeYadoriLinkClient: YadoriLinkClient, @unchecked Sendable {
     private var _approvals: [PendingApprovalSummary]
     private var _invites: [PendingInviteSummary]
     private var _availability: [String: FileAvailability] = [:]
+    private var _downloadURL: String? = Fixtures.releasesPage
+    private var _downloadGuidance = "Download the new version from \(Fixtures.releasesPage)"
     private var _failures: [String: DesktopError] = [:]
     private var _calls: [String] = []
     private var _durabilityBlocksRemoval: Bool
@@ -462,18 +464,29 @@ public final class FakeYadoriLinkClient: YadoriLinkClient, @unchecked Sendable {
         return lock.withLock { _update.lastCheckedAt = Fixtures.now; return _update }
     }
 
-    public func installUpdate() async throws -> UpdateInstallOutcome {
+    public func downloadGuidance() async throws -> UpdateDownloadGuidance {
         try await enter()
-        return .installing
+        let guidance = lock.withLock { _downloadGuidance }
+        // The page is structured, never read out of the sentence.
+        return UpdateDownloadGuidance(guidance: guidance, url: lock.withLock { _downloadURL })
     }
 
-    public func setUpdateConfig(automaticChecks: Bool?, installMode: UpdateInstallMode?) async throws -> UpdateConfig {
+    public func setAutomaticUpdateChecks(_ enabled: Bool) async throws -> UpdateConfig {
         try await enter()
         return lock.withLock {
-            if let automaticChecks { _update.config.automaticChecks = automaticChecks }
-            if let installMode { _update.config.installMode = installMode }
+            _update.config.automaticChecks = enabled
             return _update.config
         }
+    }
+
+    /// What `downloadGuidance` answers: a download page URL, or a package-manager command.
+    public func setDownloadGuidance(_ guidance: String, url: String? = nil) {
+        lock.withLock { _downloadGuidance = guidance; _downloadURL = url }
+    }
+
+    /// Replace the update status the next read reports.
+    public func setUpdateStatus(_ status: UpdateStatus) {
+        lock.withLock { _update = status }
     }
 
     // MARK: account

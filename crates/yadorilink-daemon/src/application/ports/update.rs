@@ -32,5 +32,8 @@ pub(crate) trait UpdateCommandPort: Send + Sync {
     /// nothing is downloaded or installed by the daemon).
     fn download_guidance(&self) -> String;
 
+    /// The official page to open, when this install is not package-managed.
+    fn download_page_url(&self) -> Option<String>;
+
     fn config(&self, command: UpdateConfigCommand) -> Result<UpdatePolicyView, String>;
 }

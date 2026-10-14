@@ -53,31 +53,39 @@ impl MaterializationPort for DaemonMaterializationAdapter {
     ) -> BoxFuture<'a, Result<(), SyncError>> {
         Box::pin(async move {
             let path = path.trim_end_matches('/');
-            if directory::is_indexed_directory(&self.state, group_id, path)? {
-                return directory::hydrate_directory(&self.state, group_id, path).await;
-            }
-            hydration::materialize_path(&self.state, group_id, path, hydration::Sink::InPlace)
-                .await
-                .map(|_| ())
+            let result = if directory::is_indexed_directory(&self.state, group_id, path)? {
+                directory::hydrate_directory(&self.state, group_id, path).await
+            } else {
+                hydration::materialize_path(&self.state, group_id, path, hydration::Sink::InPlace)
+                    .await
+                    .map(|_| ())
+            };
+            // A rehydrated path no longer depends on a custody lease.
+            self.state.nudge_custody_hold_reconciler();
+            result
         })
     }
 
     fn evict(&self, group_id: &str, path: &str) -> Result<EvictOutcome, SyncError> {
         let path = path.trim_end_matches('/');
-        if directory::is_indexed_directory(&self.state, group_id, path)? {
-            return directory::evict_directory(&self.state, group_id, path).map(|outcome| {
-                EvictOutcome {
-                    dehydrated: outcome.evicted_files > 0,
-                    blocks_reclaimed: outcome.blocks_reclaimed,
-                    bytes_reclaimed: outcome.bytes_reclaimed,
-                }
-            });
-        }
-        hydration::evict(&self.state, group_id, path).map(|outcome| EvictOutcome {
-            dehydrated: outcome.dehydrated,
-            blocks_reclaimed: outcome.blocks_reclaimed,
-            bytes_reclaimed: outcome.bytes_reclaimed,
-        })
+        let result = if directory::is_indexed_directory(&self.state, group_id, path)? {
+            directory::evict_directory(&self.state, group_id, path).map(|outcome| EvictOutcome {
+                dehydrated: outcome.evicted_files > 0,
+                blocks_reclaimed: outcome.blocks_reclaimed,
+                bytes_reclaimed: outcome.bytes_reclaimed,
+            })
+        } else {
+            hydration::evict(&self.state, group_id, path).map(|outcome| EvictOutcome {
+                dehydrated: outcome.dehydrated,
+                blocks_reclaimed: outcome.blocks_reclaimed,
+                bytes_reclaimed: outcome.bytes_reclaimed,
+            })
+        };
+        // The path has settled, whatever the outcome (completed, aborted, or
+        // failed): a lease acquired for an eviction that did not complete is
+        // released by the reconciler now rather than at the next restart.
+        self.state.nudge_custody_hold_reconciler();
+        result
     }
 
     fn status(

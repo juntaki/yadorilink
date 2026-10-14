@@ -1124,3 +1124,63 @@ async fn with_no_host_acknowledgement_our_own_timer_advances_the_publication() {
     let unresolved = fx.repo().unresolved_publications(&fx.root, i64::MAX / 4).unwrap();
     assert_eq!(unresolved.count, 1, "a release by the timer was reported as delivered");
 }
+
+/// A root signal whose pending-change read fails is not "nothing to announce": it is not
+/// acknowledged, so it is retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_change_read_does_not_acknowledge_the_root_signal() {
+    let fx = Fx::new();
+    let host = FakeHost::new();
+    let driver = fx.driver(&host);
+    let fault = crate::provider_read_fault::Fault::inject(
+        &fx.state.replica_coordinator,
+        "provider_roots",
+        "announced_change_seq",
+    );
+    assert!(!driver.shared.signal_root(&fx.root).await, "an unreadable read was acknowledged");
+    fault.restore();
+    assert!(driver.shared.signal_root(&fx.root).await, "nothing to announce is acknowledged");
+}
+
+/// A runner whose pending-change read fails does not conclude it has nothing to do and exit: it
+/// keeps retrying, and leaves only once a read can say nothing is unannounced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_change_read_keeps_the_runner_alive() {
+    let fx = Fx::new();
+    let host = FakeHost::new();
+    let driver = fx.driver(&host);
+    let fault = crate::provider_read_fault::Fault::inject(
+        &fx.state.replica_coordinator,
+        "provider_roots",
+        "announced_change_seq",
+    );
+    driver.kick(&fx.root);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        driver.shared.runners.lock().unwrap().contains_key(&fx.root),
+        "the runner left on an unreadable change count"
+    );
+    fault.restore();
+    settle(&driver).await;
+}
+
+/// A read error that is not corruption never replaces the root: the runner retries, and the root
+/// is still the declared one once the read works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_pending_read_does_not_rebootstrap_the_root() {
+    let fx = Fx::new();
+    let host = FakeHost::new();
+    let driver = fx.driver(&host);
+    let fault = crate::provider_read_fault::Fault::inject(
+        &fx.state.replica_coordinator,
+        "provider_items",
+        "published_version_hash",
+    );
+    driver.kick(&fx.root);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fault.restore();
+    settle(&driver).await;
+    let roots = fx.repo().list_declared_roots().unwrap();
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].root_id, fx.root, "a read error replaced the root");
+}

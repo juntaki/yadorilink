@@ -30,7 +30,7 @@ public struct FolderRow: Identifiable, Equatable, Sendable {
         summary = parts.joined(separator: " · ")
         summaryIsWarning = folder.volume.map { Format.freeSpaceIsWarning($0.state) } ?? false
         detail = folder.durability.detail
-        pathTooltip = folder.localPath
+        pathTooltip = folder.provider ? "" : folder.localPath
         if let t = folder.transfer, t.bytesTotal > 0 {
             progress = Double(t.bytesDone) / Double(t.bytesTotal)
             var text = "\(Format.bytes(t.bytesDone)) of \(Format.bytes(t.bytesTotal))"
@@ -95,6 +95,8 @@ public enum FetchPhase<Value: Equatable & Sendable>: Equatable, Sendable {
 public final class HomeViewModel {
     public let app: AppModel
     public private(set) var devices: FetchPhase<[DeviceSummary]> = .notLoaded
+    /// A refresh failed while an earlier list is still shown.
+    public private(set) var devicesStale: Notice?
     @ObservationIgnored private let now: () -> Date
 
     public init(app: AppModel, now: @escaping () -> Date = Date.init) {
@@ -149,21 +151,36 @@ public final class HomeViewModel {
     }
 
     public var showsNoDevicesMessage: Bool {
-        app.snapshot != nil && devices.value?.contains { !$0.isThisDevice } == false
+        app.snapshot != nil && devicesStale == nil && devices.value?.contains { !$0.isThisDevice } == false
     }
 
-    public var devicesError: String? {
-        if case .failed(let notice) = devices { return notice.text }
+    /// The first read failed: nothing to show, so the section offers Retry.
+    public var devicesError: Notice? {
+        if case .failed(let notice) = devices { return notice }
         return nil
     }
 
     public func loadDevices() async {
+        // Another account may sign in next; never carry this roster over.
+        if !app.isSignedIn {
+            devices = .notLoaded
+            devicesStale = nil
+        }
         guard app.isSignedIn, !app.isDaemonUnavailable else { return }
         if devices.value == nil { devices = .loading }
         do {
-            devices = .loaded(try await app.client.listFolderDevices())
+            let list = try await app.client.listFolderDevices()
+            // Signed out while the read was in flight: that roster belongs to the old account.
+            guard app.isSignedIn else { return }
+            devices = .loaded(list)
+            devicesStale = nil
         } catch {
-            devices = .failed(.failure(error))
+            guard app.isSignedIn else { return }
+            if devices.value == nil {
+                devices = .failed(.failure(error))
+            } else {
+                devicesStale = .failure(error)
+            }
         }
     }
 }

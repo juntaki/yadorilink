@@ -2543,6 +2543,53 @@ fn a_file_delete_destroys_only_when_every_condition_holds() {
     assert_eq!(result.outcome, OutcomeKind::Deleted);
 }
 
+/// C12: a provider DELETE of an item that is already gone, sent with a stale base, changes
+/// nothing: it is answered `Deleted`, no other file is touched, and a file that survived a
+/// retired item's delete is not removed by a repeat of it.
+#[test]
+fn a_delete_of_an_already_removed_item_with_a_stale_base_changes_nothing() {
+    let fx = Fx::new();
+    let gone = fx.create(None, "gone", b"g").item_id;
+    let gone_base = fx.row_version("gone").unwrap();
+    let gone_generation = item_generation_of(&fx, &gone);
+    let keep = fx.create(None, "keep", b"k").item_id;
+    let keep_version = fx.row_version("keep").unwrap();
+    // A peer deleted `gone`; the OS still shows it at the old base.
+    fx.peer_deletes("gone");
+    let result =
+        delete_raw(&fx, gone, BaseVersion::Opaque(gone_base), Some(gone_generation)).unwrap();
+    assert_eq!(result.outcome, OutcomeKind::Deleted);
+    assert_eq!(fx.live_paths(), ["keep"]);
+    assert_eq!(fx.row_version("keep"), Some(keep_version));
+    // A repeat (or a stale replay with a bogus base and generation) is the same answer.
+    for (base, generation) in [
+        (BaseVersion::Opaque(gone_base), Some(gone_generation)),
+        (BaseVersion::Opaque(VersionHash([9; 32])), Some(gone_generation + 5)),
+        (BaseVersion::Unknown, None),
+    ] {
+        let again = delete_raw(&fx, gone, base, generation).unwrap();
+        assert_eq!(again.outcome, OutcomeKind::Deleted);
+    }
+    // An item id the daemon never minted is the same.
+    let unknown = delete_raw(&fx, [0xEE; 16], BaseVersion::Unknown, None).unwrap();
+    assert_eq!(unknown.outcome, OutcomeKind::Deleted);
+    assert_eq!(fx.live_paths(), ["keep"]);
+
+    // A delete that left a file (stale base) retires the item; its repeat deletes nothing.
+    let survived = delete_raw(&fx, keep, BaseVersion::Opaque(VersionHash([9; 32])), None).unwrap();
+    assert_eq!(survived.outcome, OutcomeKind::FileSurvived);
+    let repeat = delete_raw(
+        &fx,
+        keep,
+        BaseVersion::Opaque(keep_version),
+        Some(item_generation_of(&fx, &keep)),
+    )
+    .unwrap();
+    assert_eq!(repeat.outcome, OutcomeKind::Deleted);
+    assert_eq!(fx.live_paths(), ["keep"], "a repeat of a retired item's delete removed the file");
+    assert_eq!(fx.row_version("keep"), Some(keep_version));
+}
+
 // ---- a rename or move acts only on the version the user saw ----
 
 /// (a) A peer commits a new version that is not announced yet: a rename that echoes the old hash,

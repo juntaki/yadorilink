@@ -382,6 +382,18 @@ impl HandoffRoot {
             .push(name.to_owned());
     }
 
+    /// Stops tracking handoff file `name` of `item` (its file was removed by the caller).
+    pub(crate) fn forget_delivered(&self, root_id: &str, item: &[u8; 16], name: &str) {
+        let mut delivered = self.delivered.lock().unwrap_or_else(|p| p.into_inner());
+        let key = (root_id.to_owned(), *item);
+        if let Some(names) = delivered.get_mut(&key) {
+            names.retain(|tracked| tracked != name);
+            if names.is_empty() {
+                delivered.remove(&key);
+            }
+        }
+    }
+
     /// Deletes every delivered handoff file of `item` the OS has not taken (a file it did take
     /// is gone from `handoff/` already). A newer version of the item calls this BEFORE it
     /// evicts: otherwise the OS could take the old file after the eviction found nothing to

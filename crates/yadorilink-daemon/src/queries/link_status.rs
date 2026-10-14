@@ -122,6 +122,9 @@ pub(crate) struct LinkStatusView {
     pub(crate) hydrating_count: u64,
     pub(crate) held_files: Vec<HeldFileView>,
     pub(crate) skipped_symlink_count: u64,
+    /// Directories a removal moved aside and could not put back; each still
+    /// stands, with its contents, under a reserved name beside its old place.
+    pub(crate) stranded_directory_count: u64,
     pub(crate) degraded: Option<DegradedLinkView>,
     pub(crate) transfer: Option<LinkTransferView>,
     pub(crate) durability_status: GroupDurabilityStatus,

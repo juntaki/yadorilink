@@ -55,6 +55,9 @@ public struct ShareView: View {
                 }
 
                 Section("People with access") {
+                    if let failure = model.loadFailure {
+                        RetryRow(model.hasLoaded ? LoadWording.stale("who has access") : LoadWording.members, notice: failure) { await model.load() }
+                    }
                     ForEach(model.members) { member in
                         HStack {
                             OnlineDot(online: member.online)

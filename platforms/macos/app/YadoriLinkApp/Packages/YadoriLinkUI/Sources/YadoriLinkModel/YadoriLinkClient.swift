@@ -64,8 +64,8 @@ public protocol YadoriLinkClient: AnyObject, Sendable {
     // updates
     func updateStatus() async throws -> UpdateStatus
     func checkForUpdates() async throws -> UpdateStatus
-    func installUpdate() async throws -> UpdateInstallOutcome
-    func setUpdateConfig(automaticChecks: Bool?, installMode: UpdateInstallMode?) async throws -> UpdateConfig
+    func downloadGuidance() async throws -> UpdateDownloadGuidance
+    func setAutomaticUpdateChecks(_ enabled: Bool) async throws -> UpdateConfig
 
     // account
     func accountDeletionStatus() async throws -> AccountDeletionStatus

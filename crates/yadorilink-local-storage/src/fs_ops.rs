@@ -16,27 +16,49 @@ use yadorilink_fs_platform::durable_dir::{DurableNamespace, NameLedger, NsError}
 use crate::error::StorageError;
 use crate::materialize_write::TempFileLedger;
 
-/// The handle for durable namespace changes beside `path`, or `None` where the
-/// volume does not offer them (Windows while its gate is closed, a file system
-/// the probe rejects). Callers then keep the plain rename they always had, with
-/// no durability claim beyond it.
-pub(crate) fn durable_namespace_beside(path: &Path) -> Option<DurableNamespace> {
+/// The handle for durable namespace changes beside `path`. `Ok(None)` means only
+/// that the global Windows gate is still closed: callers then keep the plain
+/// rename they always had, with no durability claim beyond it. A volume the
+/// probe refused (`Unsupported`, `Unknown`) is an `Err` the caller propagates
+/// with the visible target left unchanged; it is never turned into that plain
+/// path.
+pub(crate) fn durable_namespace_beside(
+    path: &Path,
+) -> Result<Option<DurableNamespace>, std::io::Error> {
     // The writers' own tests run the durable shapes on every platform, Windows
     // included, where the gate is closed; the gate and the probe are tested
     // where they live.
     #[cfg(any(test, feature = "test-support"))]
     {
         let _ = path;
-        Some(DurableNamespace::unchecked_for_tests())
+        if let Some(reason) = TEST_REFUSAL.with(std::cell::Cell::get) {
+            return Err(NsError::Unavailable(reason).into());
+        }
+        Ok(Some(DurableNamespace::unchecked_for_tests()))
     }
     #[cfg(not(any(test, feature = "test-support")))]
     durable_namespace_checked(path)
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TEST_REFUSAL: std::cell::Cell<Option<yadorilink_fs_platform::durable_dir::UnavailableReason>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test seam: for this thread, `DurableNamespace::open` refuses every directory with `reason`
+/// (a ReFS, exFAT or SMB volume, or a probe that could not run).
+#[cfg(test)]
+pub(crate) fn set_test_namespace_refusal(
+    reason: Option<yadorilink_fs_platform::durable_dir::UnavailableReason>,
+) {
+    TEST_REFUSAL.with(|cell| cell.set(reason));
+}
+
 #[cfg(not(any(test, feature = "test-support")))]
-fn durable_namespace_checked(path: &Path) -> Option<DurableNamespace> {
+fn durable_namespace_checked(path: &Path) -> Result<Option<DurableNamespace>, std::io::Error> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    DurableNamespace::open(dir).ok()
+    DurableNamespace::open_unless_gate_closed(dir).map_err(std::io::Error::from)
 }
 
 /// A [`TempFileLedger`] as the [`NameLedger`] a durable operation records its
@@ -107,7 +129,7 @@ pub fn remove_empty_dir_in(
         }
         Err(e) => return Err(e.into()),
     }
-    if let Some(ns) = durable_namespace_beside(path) {
+    if let Some(ns) = durable_namespace_beside(path)? {
         return durable_remove_empty_dir(&ns, path, ledger);
     }
     match fs::remove_dir(path) {
@@ -136,6 +158,32 @@ pub fn remove_empty_dir_in(
     }
 }
 
+/// A directory that gained a child while it was being removed and whose name
+/// was taken meanwhile stays under its reserved name. Nothing is deleted; the
+/// ledger is told so the user can be (an error log alone leaves no state to
+/// report).
+/// Whether the directory moved aside still holds an entry, or cannot be read
+/// to tell (then it is not claimed to be gone).
+pub(crate) fn holds_entries_or_unreadable(aside: &Path) -> bool {
+    fs::read_dir(aside).map_or(true, |mut entries| entries.next().is_some())
+}
+
+pub(crate) fn stranded(
+    path: &Path,
+    aside: std::path::PathBuf,
+    ledger: &dyn TempFileLedger,
+) -> Result<EmptyDirectoryRemoval, StorageError> {
+    tracing::error!(
+        path = %path.display(),
+        aside = %aside.display(),
+        "a directory gained a child while it was being removed and something else now \
+         stands at its name; it was not put back and nothing was deleted: it stays \
+         under a reserved name beside it and needs the user's attention"
+    );
+    ledger.strand(&aside)?;
+    Ok(EmptyDirectoryRemoval::Stranded(aside))
+}
+
 fn durable_remove_empty_dir(
     ns: &DurableNamespace,
     path: &Path,
@@ -145,21 +193,20 @@ fn durable_remove_empty_dir(
     match ns.remove_empty_dir(path, &LedgerNames(ledger)) {
         Ok(DiscardOutcome::Removed) => Ok(EmptyDirectoryRemoval::Removed),
         // Moved aside, which is the removal; the record stays and the next start
-        // finishes it.
-        Ok(DiscardOutcome::Retained { reason: RetainReason::RemovalFailed, .. }) => {
-            Ok(EmptyDirectoryRemoval::Removed)
+        // finishes it. But a directory that gained a child and could not be put
+        // back (for a reason other than its name being taken) is as stranded as
+        // one whose name was: it still holds that child.
+        Ok(DiscardOutcome::Retained { path: aside, reason: RetainReason::RemovalFailed }) => {
+            if holds_entries_or_unreadable(&aside) {
+                stranded(path, aside, ledger)
+            } else {
+                Ok(EmptyDirectoryRemoval::Removed)
+            }
         }
         // A child appeared meanwhile: put back, untouched.
         Ok(DiscardOutcome::Restored) => Ok(EmptyDirectoryRemoval::NotEmpty),
         Ok(DiscardOutcome::Retained { path: aside, reason: RetainReason::OriginalOccupied }) => {
-            tracing::error!(
-                path = %path.display(),
-                aside = %aside.display(),
-                "a directory gained a child while it was being removed and something else now \
-                 stands at its name; it was not put back and nothing was deleted: it stays \
-                 under a reserved name beside it and needs the user's attention"
-            );
-            Ok(EmptyDirectoryRemoval::Stranded(aside))
+            stranded(path, aside, ledger)
         }
         // Gone, but the sync that makes it durable failed: the visible state has
         // changed and the caller advances its index state to match; a
@@ -213,7 +260,7 @@ pub(crate) fn sync_directory(_path: &Path) -> Result<(), StorageError> {
 /// one (Windows); a volume without durable moves keeps a plain unlink followed
 /// by a sync of the parent where the platform has one.
 pub fn remove_durably(path: &Path, ledger: &dyn TempFileLedger) -> Result<(), StorageError> {
-    if let Some(ns) = durable_namespace_beside(path) {
+    if let Some(ns) = durable_namespace_beside(path)? {
         return match ns.remove_file(path, &LedgerNames(ledger)) {
             Ok(_) | Err(NsError::NotFound) => Ok(()),
             Err(error) => Err(StorageError::Io(error.into())),
@@ -237,7 +284,7 @@ pub fn remove_durably(path: &Path, ledger: &dyn TempFileLedger) -> Result<(), St
 /// `to`'s directory where the platform has one.
 pub fn move_no_replace_durably(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(any(test, feature = "test-support"))]
-    if let Some(ns) = durable_namespace_beside(to) {
+    if let Some(ns) = durable_namespace_beside(to)? {
         return ns
             .durable_move(from, to, yadorilink_fs_platform::durable_dir::Replace::No)
             .map_err(std::io::Error::from);
@@ -254,7 +301,10 @@ pub fn move_no_replace_durably(from: &Path, to: &Path) -> std::io::Result<()> {
 /// exists is trusted as it is), otherwise with a plain `create_dir_all`.
 pub(crate) fn create_dir_all_durably(path: &Path) -> Result<(), StorageError> {
     let existing = path.ancestors().find(|dir| dir.is_dir());
-    let ns = existing.and_then(|dir| durable_namespace_beside(&dir.join("x")));
+    let ns = match existing {
+        Some(dir) => durable_namespace_beside(&dir.join("x"))?,
+        None => None,
+    };
     match ns {
         Some(ns) => ns
             .create_dir_all(path, &yadorilink_fs_platform::durable_dir::NoLedger)

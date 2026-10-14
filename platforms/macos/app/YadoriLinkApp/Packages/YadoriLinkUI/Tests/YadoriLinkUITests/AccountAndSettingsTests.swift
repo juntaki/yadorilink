@@ -97,13 +97,112 @@ struct SettingsTests {
         await a.load()
         #expect(a.headline == "YadoriLink 0.4.2 is up to date")
         #expect(a.lastChecked == "Last checked 1 hour ago")
-        #expect(a.canInstall == false)
+        #expect(a.canDownload == false)
+        #expect(a.lookupFailed == false)
 
         let (available, _) = try await startedApp(.updateAvailable)
         let b = UpdatesModel(client: available.client, now: { Fixtures.now })
         await b.load()
         #expect(b.headline == "Update 0.4.3 available")
-        #expect(b.canInstall)
+        #expect(b.canDownload)
+    }
+
+    @Test func downloadOpensTheOfficialPageAndNeverClaimsAnInstall() async throws {
+        let (app, client) = try await startedApp(.updateAvailable)
+        var opened: [URL] = []
+        let model = UpdatesModel(client: app.client, openURL: { opened.append($0); return true }, now: { Fixtures.now })
+        await model.load()
+        await model.download()
+        #expect(opened == [URL(string: Fixtures.releasesPage)!], "the structured official page")
+        let text = try #require(model.notice?.text)
+        #expect(text == UpdateWording.openedDownloadPage)
+        #expect(text.localizedCaseInsensitiveContains("installed") == false)
+        #expect(text.contains("install it yourself"))
+        #expect(client.calls.contains("downloadGuidance"))
+    }
+
+    @Test func aBrowserThatCannotOpenThePageIsNotReportedAsOpened() async throws {
+        let (app, _) = try await startedApp(.updateAvailable)
+        let model = UpdatesModel(client: app.client, openURL: { _ in false }, now: { Fixtures.now })
+        await model.load()
+        await model.download()
+        #expect(model.notice?.kind == .failure)
+        #expect(model.notice?.text == UpdateWording.couldNotOpenDownloadPage)
+    }
+
+    @Test func aPackageManagedInstallIsShownStepsNotSentToAPage() async throws {
+        let (app, client) = try await startedApp(.updateAvailable)
+        client.setUpdateStatus(Fixtures.updateStatus(available: "0.4.3", packageManaged: true))
+        // The sentence may mention a link; only the structured field is ever opened.
+        client.setDownloadGuidance("Run `brew upgrade --cask yadorilink` (see https://evil.test)", url: nil)
+        var opened = 0
+        let model = UpdatesModel(client: app.client, openURL: { _ in opened += 1; return true }, now: { Fixtures.now })
+        await model.load()
+        #expect(model.downloadButtonTitle == "Show Update Steps…")
+        await model.download()
+        #expect(opened == 0)
+        #expect(model.notice?.kind == .success)
+        #expect(model.notice?.text == "Run `brew upgrade --cask yadorilink` (see https://evil.test)")
+    }
+
+    @Test func aStandaloneInstallIsOfferedTheDownloadPage() async throws {
+        let (app, _) = try await startedApp(.updateAvailable)
+        let model = UpdatesModel(client: app.client, now: { Fixtures.now })
+        await model.load()
+        #expect(model.downloadButtonTitle == "Download Update…")
+    }
+
+    @Test func lookupFailureIsALookupFailureWithRetryNotAnInstallFailure() async throws {
+        let (app, client) = try await startedApp(.healthy)
+        var status = Fixtures.updateStatus()
+        status.state = .failed
+        status.lastErrorCategory = "network"
+        status.lastErrorMessage = "release manifest unreachable"
+        client.setUpdateStatus(status)
+        let model = UpdatesModel(client: app.client, now: { Fixtures.now })
+        await model.load()
+        #expect(model.lookupFailed)
+        #expect(model.canDownload == false)
+        #expect(model.headline == "Couldn't check for updates.")
+        #expect(model.headline.localizedCaseInsensitiveContains("install") == false)
+        #expect(model.notes == ["release manifest unreachable"])
+
+        // Checking again is the retry; it asks for a new status and nothing else.
+        status.state = .upToDate
+        status.lastErrorCategory = nil
+        client.setUpdateStatus(status)
+        await model.check()
+        #expect(model.lookupFailed == false)
+        #expect(model.headline == "YadoriLink 0.4.2 is up to date")
+    }
+
+    @Test func everyStateWithAVersionIsADownloadNeverAnInstallInProgress() async throws {
+        let (app, client) = try await startedApp(.updateAvailable)
+        for state in [UpdateState.available, .downloading, .downloaded, .verified, .installing, .deferred] {
+            var status = Fixtures.updateStatus(available: "0.4.3")
+            status.state = state
+            status.waitingForSafePoint = true
+            client.setUpdateStatus(status)
+            let model = UpdatesModel(client: app.client, now: { Fixtures.now })
+            await model.load()
+            #expect(model.canDownload, "\(state)")
+            #expect(model.headline == "Update 0.4.3 available", "\(state)")
+            #expect(model.notes.allSatisfy { !$0.localizedCaseInsensitiveContains("install") }, "\(state)")
+        }
+    }
+
+    @Test func homeAttentionForAFailedUpdateCheckDoesNotSayInstall() {
+        #expect(AttentionCategory.updateFailed.sentence(subject: nil) == "Couldn't check for updates.")
+    }
+
+    @Test func automaticChecksIsTheOnlyUpdateSetting() async throws {
+        let (app, _) = try await startedApp(.healthy)
+        let model = UpdatesModel(client: app.client, now: { Fixtures.now })
+        await model.load()
+        #expect(model.automaticChecks)
+        await model.setAutomaticChecks(false)
+        #expect(model.automaticChecks == false)
+        #expect(UpdateWording.checksOnlyNote.contains("You download and install them yourself"))
     }
 
     @Test func loginItemReflectsStatusAndRoutesApprovalToSystemSettings() {

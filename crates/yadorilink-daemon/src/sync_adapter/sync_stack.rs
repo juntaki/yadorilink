@@ -47,6 +47,13 @@ pub struct SyncStack {
     endpoint: IrohEndpoint,
     state: Arc<DaemonState>,
     serving: yadorilink_sync_runtime::ServeHandle,
+    /// Test-only: makes every outbound dial of the link cache run to its
+    /// deadline (never finish), as one toward an unreachable address does.
+    #[cfg(test)]
+    pub(crate) dials_hang: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only: makes every outbound dial fail at once (a refused connect).
+    #[cfg(test)]
+    pub(crate) dials_fail: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SyncStack {
@@ -85,7 +92,16 @@ impl SyncStack {
         let runtime = Arc::new(SyncRuntime::new(endpoint.node()));
         let serving = runtime.serve(inbound);
 
-        Ok(Self { runtime, endpoint, state, serving })
+        Ok(Self {
+            runtime,
+            endpoint,
+            state,
+            serving,
+            #[cfg(test)]
+            dials_hang: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            dials_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
     }
 
     /// This device's transport identity, which is also its signing key's
@@ -281,9 +297,32 @@ impl SyncStack {
     /// observers as a reconciliation's own; cached by the endpoint.
     pub async fn link_to(&self, device_id: &str) -> Result<Arc<PeerLink>, SyncStackError> {
         self.endpoint
-            .link_to(device_id, |peer| async move {
-                self.runtime.connect(peer).await.map_err(SyncStackError::from)
-            })
+            .link_to_adopting(
+                device_id,
+                // The peer may open its lanes on this connection (its link
+                // cache can pick the connection this side dialled), so it is
+                // served like an accepted one -- once the endpoint holds it.
+                {
+                    let runtime = self.runtime.clone();
+                    move |link| runtime.serve_dialed(link)
+                },
+                {
+                    let runtime = self.runtime.clone();
+                    #[cfg(test)]
+                    let (hang, fail) = (self.dials_hang.clone(), self.dials_fail.clone());
+                    move |peer| async move {
+                        #[cfg(test)]
+                        if hang.load(std::sync::atomic::Ordering::SeqCst) {
+                            std::future::pending::<()>().await;
+                        }
+                        #[cfg(test)]
+                        if fail.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Err(SyncStackError::Unreachable("refused".to_string()));
+                        }
+                        runtime.connect(peer).await.map_err(SyncStackError::from)
+                    }
+                },
+            )
             .await?
             .ok_or_else(|| SyncStackError::Unreachable(device_id.to_string()))
     }

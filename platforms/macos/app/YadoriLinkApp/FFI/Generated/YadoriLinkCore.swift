@@ -4118,15 +4118,18 @@ public func FfiConverterTypeUpdateBadge_lower(_ value: UpdateBadge) -> RustBuffe
 }
 
 
+/**
+ * Update preferences. Updates are installed by the user (or a package
+ * manager or store), never by YadoriLink, so the only setting is whether it
+ * checks for a newer version by itself.
+ */
 public struct UpdateConfig: Equatable, Hashable {
     public var automaticChecks: Bool
-    public var installMode: UpdateInstallMode
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(automaticChecks: Bool, installMode: UpdateInstallMode) {
+    public init(automaticChecks: Bool) {
         self.automaticChecks = automaticChecks
-        self.installMode = installMode
     }
 
     
@@ -4145,14 +4148,12 @@ public struct FfiConverterTypeUpdateConfig: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UpdateConfig {
         return
             try UpdateConfig(
-                automaticChecks: FfiConverterBool.read(from: &buf), 
-                installMode: FfiConverterTypeUpdateInstallMode.read(from: &buf)
+                automaticChecks: FfiConverterBool.read(from: &buf)
         )
     }
 
     public static func write(_ value: UpdateConfig, into buf: inout [UInt8]) {
         FfiConverterBool.write(value.automaticChecks, into: &buf)
-        FfiConverterTypeUpdateInstallMode.write(value.installMode, into: &buf)
     }
 }
 
@@ -4172,6 +4173,66 @@ public func FfiConverterTypeUpdateConfig_lower(_ value: UpdateConfig) -> RustBuf
 }
 
 
+/**
+ * How to get the new version. Nothing is downloaded or installed by
+ * YadoriLink: `guidance` is the sentence to show (the download page, or the
+ * package-manager steps for a package-managed install), and `url` is the
+ * official page to open, only when there is one to open.
+ */
+public struct UpdateDownloadGuidance: Equatable, Hashable {
+    public var guidance: String
+    public var url: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(guidance: String, url: String?) {
+        self.guidance = guidance
+        self.url = url
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension UpdateDownloadGuidance: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUpdateDownloadGuidance: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UpdateDownloadGuidance {
+        return
+            try UpdateDownloadGuidance(
+                guidance: FfiConverterString.read(from: &buf), 
+                url: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: UpdateDownloadGuidance, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.guidance, into: &buf)
+        FfiConverterOptionString.write(value.url, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUpdateDownloadGuidance_lift(_ buf: RustBuffer) throws -> UpdateDownloadGuidance {
+    return try FfiConverterTypeUpdateDownloadGuidance.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUpdateDownloadGuidance_lower(_ value: UpdateDownloadGuidance) -> RustBuffer {
+    return FfiConverterTypeUpdateDownloadGuidance.lower(value)
+}
+
+
 public struct UpdateStatus: Equatable, Hashable {
     public var currentVersion: String
     public var channel: String
@@ -4185,11 +4246,20 @@ public struct UpdateStatus: Equatable, Hashable {
     public var waitingForSafePoint: Bool
     public var lastErrorCategory: String?
     public var lastErrorMessage: String?
+    /**
+     * A package manager or store owns this install, so the new version
+     * comes with steps to follow, not a page to open.
+     */
+    public var packageManaged: Bool
     public var config: UpdateConfig
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(currentVersion: String, channel: String, installSource: String, lastCheckedAt: Date?, state: UpdateState, availableVersion: String?, releaseNotesUrl: String?, mandatory: Bool, holdbackReason: String?, waitingForSafePoint: Bool, lastErrorCategory: String?, lastErrorMessage: String?, config: UpdateConfig) {
+    public init(currentVersion: String, channel: String, installSource: String, lastCheckedAt: Date?, state: UpdateState, availableVersion: String?, releaseNotesUrl: String?, mandatory: Bool, holdbackReason: String?, waitingForSafePoint: Bool, lastErrorCategory: String?, lastErrorMessage: String?, 
+        /**
+         * A package manager or store owns this install, so the new version
+         * comes with steps to follow, not a page to open.
+         */packageManaged: Bool, config: UpdateConfig) {
         self.currentVersion = currentVersion
         self.channel = channel
         self.installSource = installSource
@@ -4202,6 +4272,7 @@ public struct UpdateStatus: Equatable, Hashable {
         self.waitingForSafePoint = waitingForSafePoint
         self.lastErrorCategory = lastErrorCategory
         self.lastErrorMessage = lastErrorMessage
+        self.packageManaged = packageManaged
         self.config = config
     }
 
@@ -4233,6 +4304,7 @@ public struct FfiConverterTypeUpdateStatus: FfiConverterRustBuffer {
                 waitingForSafePoint: FfiConverterBool.read(from: &buf), 
                 lastErrorCategory: FfiConverterOptionString.read(from: &buf), 
                 lastErrorMessage: FfiConverterOptionString.read(from: &buf), 
+                packageManaged: FfiConverterBool.read(from: &buf), 
                 config: FfiConverterTypeUpdateConfig.read(from: &buf)
         )
     }
@@ -4250,6 +4322,7 @@ public struct FfiConverterTypeUpdateStatus: FfiConverterRustBuffer {
         FfiConverterBool.write(value.waitingForSafePoint, into: &buf)
         FfiConverterOptionString.write(value.lastErrorCategory, into: &buf)
         FfiConverterOptionString.write(value.lastErrorMessage, into: &buf)
+        FfiConverterBool.write(value.packageManaged, into: &buf)
         FfiConverterTypeUpdateConfig.write(value.config, into: &buf)
     }
 }
@@ -4574,6 +4647,7 @@ public enum AttentionCategory: Equatable, Hashable {
     case fetchAvailabilityUnknown
     case conflict
     case held
+    case strandedDirectory
     case lowDiskCritical
     case lowDisk
     case peerDisconnected
@@ -4615,17 +4689,19 @@ public struct FfiConverterTypeAttentionCategory: FfiConverterRustBuffer {
         
         case 7: return .held
         
-        case 8: return .lowDiskCritical
+        case 8: return .strandedDirectory
         
-        case 9: return .lowDisk
+        case 9: return .lowDiskCritical
         
-        case 10: return .peerDisconnected
+        case 10: return .lowDisk
         
-        case 11: return .recentError
+        case 11: return .peerDisconnected
         
-        case 12: return .updateFailed
+        case 12: return .recentError
         
-        case 13: return .unrecognized
+        case 13: return .updateFailed
+        
+        case 14: return .unrecognized
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -4663,28 +4739,32 @@ public struct FfiConverterTypeAttentionCategory: FfiConverterRustBuffer {
             writeInt(&buf, Int32(7))
         
         
-        case .lowDiskCritical:
+        case .strandedDirectory:
             writeInt(&buf, Int32(8))
         
         
-        case .lowDisk:
+        case .lowDiskCritical:
             writeInt(&buf, Int32(9))
         
         
-        case .peerDisconnected:
+        case .lowDisk:
             writeInt(&buf, Int32(10))
         
         
-        case .recentError:
+        case .peerDisconnected:
             writeInt(&buf, Int32(11))
         
         
-        case .updateFailed:
+        case .recentError:
             writeInt(&buf, Int32(12))
         
         
-        case .unrecognized:
+        case .updateFailed:
             writeInt(&buf, Int32(13))
+        
+        
+        case .unrecognized:
+            writeInt(&buf, Int32(14))
         
         }
     }
@@ -7709,171 +7789,6 @@ public func FfiConverterTypeUnreachableCategory_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeUnreachableCategory_lower(_ value: UnreachableCategory) -> RustBuffer {
     return FfiConverterTypeUnreachableCategory.lower(value)
-}
-
-
-
-
-public enum UpdateInstallMode: Equatable, Hashable {
-    
-    case automatic
-    case manual
-    case other(raw: String
-    )
-
-
-
-
-
-}
-
-#if compiler(>=6)
-extension UpdateInstallMode: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeUpdateInstallMode: FfiConverterRustBuffer {
-    typealias SwiftType = UpdateInstallMode
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UpdateInstallMode {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-        
-        case 1: return .automatic
-        
-        case 2: return .manual
-        
-        case 3: return .other(raw: try FfiConverterString.read(from: &buf)
-        )
-        
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: UpdateInstallMode, into buf: inout [UInt8]) {
-        switch value {
-        
-        
-        case .automatic:
-            writeInt(&buf, Int32(1))
-        
-        
-        case .manual:
-            writeInt(&buf, Int32(2))
-        
-        
-        case let .other(raw):
-            writeInt(&buf, Int32(3))
-            FfiConverterString.write(raw, into: &buf)
-            
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeUpdateInstallMode_lift(_ buf: RustBuffer) throws -> UpdateInstallMode {
-    return try FfiConverterTypeUpdateInstallMode.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeUpdateInstallMode_lower(_ value: UpdateInstallMode) -> RustBuffer {
-    return FfiConverterTypeUpdateInstallMode.lower(value)
-}
-
-
-
-
-public enum UpdateInstallOutcome: Equatable, Hashable {
-    
-    case installing
-    case deferred
-    /**
-     * Updates come from a store; `guidance` says where.
-     */
-    case storeManaged(guidance: String
-    )
-    case other(raw: String
-    )
-
-
-
-
-
-}
-
-#if compiler(>=6)
-extension UpdateInstallOutcome: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeUpdateInstallOutcome: FfiConverterRustBuffer {
-    typealias SwiftType = UpdateInstallOutcome
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UpdateInstallOutcome {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-        
-        case 1: return .installing
-        
-        case 2: return .deferred
-        
-        case 3: return .storeManaged(guidance: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 4: return .other(raw: try FfiConverterString.read(from: &buf)
-        )
-        
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: UpdateInstallOutcome, into buf: inout [UInt8]) {
-        switch value {
-        
-        
-        case .installing:
-            writeInt(&buf, Int32(1))
-        
-        
-        case .deferred:
-            writeInt(&buf, Int32(2))
-        
-        
-        case let .storeManaged(guidance):
-            writeInt(&buf, Int32(3))
-            FfiConverterString.write(guidance, into: &buf)
-            
-        
-        case let .other(raw):
-            writeInt(&buf, Int32(4))
-            FfiConverterString.write(raw, into: &buf)
-            
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeUpdateInstallOutcome_lift(_ buf: RustBuffer) throws -> UpdateInstallOutcome {
-    return try FfiConverterTypeUpdateInstallOutcome.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeUpdateInstallOutcome_lower(_ value: UpdateInstallOutcome) -> RustBuffer {
-    return FfiConverterTypeUpdateInstallOutcome.lower(value)
 }
 
 

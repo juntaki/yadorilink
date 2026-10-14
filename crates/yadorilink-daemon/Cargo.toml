@@ -239,6 +239,9 @@ iroh = "1.1"
 # mid-transfer abort seam (`SendService::test_abort_after_n_chunks`), same
 # override shape as the two entries above.
 yadorilink-send = { path = "../yadorilink-send", features = ["test-support"] }
+# The provider reclaim tests drive a reclaim through `verify_reclaim_custody_for_test`, the only
+# way to exercise the paths behind the lease flag before it ships.
+yadorilink-replica-engine = { path = "../yadorilink-replica-engine", features = ["test-support"] }
 tempfile = "3"
 rand = "0.10.2"
 # `tests/peer_hydration.rs` builds a real zstd payload to prove the

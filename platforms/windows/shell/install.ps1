@@ -194,7 +194,7 @@ if ($Uninstall) {
 
     # Unregister every Cloud Filter API sync root this host has ever
     # Registered — this call reads its own on-disk record of
-    # registered roots (%LOCALAPPDATA%\yadorilink\cfapi_sync_roots.txt) and
+    # registered roots (%LOCALAPPDATA%\yadorilink\cfapi_sync_roots.txt.<seq> generation files) and
     # does not require yadorilink-daemon to be running.
     if ($cfapiHost) {
         Write-Output "Unregistering Cloud Filter API sync roots..."

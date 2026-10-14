@@ -135,7 +135,7 @@ public enum OverallState: Sendable, Equatable, Hashable { case healthy, attentio
 
 public enum AttentionCategory: Sendable, Equatable, Hashable, CaseIterable {
     case degraded, durabilityAtRisk, durabilityUnknown, fetchUnavailable, fetchAvailabilityUnknown,
-         conflict, held, lowDiskCritical, lowDisk, peerDisconnected, recentError, updateFailed,
+         conflict, held, strandedDirectory, lowDiskCritical, lowDisk, peerDisconnected, recentError, updateFailed,
          unrecognized
 }
 
@@ -776,16 +776,13 @@ public struct DiagnosticsExport: Sendable, Equatable, Hashable {
 
 public enum DaemonStartOutcome: Sendable, Equatable, Hashable { case alreadyRunning, started }
 
-public enum UpdateInstallMode: Sendable, Equatable, Hashable {
-    case automatic, manual
-    case other(raw: String)
-}
-
+/// Update preferences. Updates are installed by the user (or a package
+/// manager or store), never by YadoriLink, so the only setting is whether it
+/// checks for a newer version by itself.
 public struct UpdateConfig: Sendable, Equatable, Hashable {
     public var automaticChecks: Bool
-    public var installMode: UpdateInstallMode
-    public init(automaticChecks: Bool, installMode: UpdateInstallMode) {
-        self.automaticChecks = automaticChecks; self.installMode = installMode
+    public init(automaticChecks: Bool) {
+        self.automaticChecks = automaticChecks
     }
 }
 
@@ -802,18 +799,26 @@ public struct UpdateStatus: Sendable, Equatable, Hashable {
     public var waitingForSafePoint: Bool
     public var lastErrorCategory: String?
     public var lastErrorMessage: String?
+    /// A package manager or store owns this install, so the new version
+    /// comes with steps to follow, not a page to open.
+    public var packageManaged: Bool
     public var config: UpdateConfig
-    public init(currentVersion: String, channel: String, installSource: String, lastCheckedAt: Date?, state: UpdateState, availableVersion: String?, releaseNotesUrl: String?, mandatory: Bool, holdbackReason: String?, waitingForSafePoint: Bool, lastErrorCategory: String?, lastErrorMessage: String?, config: UpdateConfig) {
+    public init(currentVersion: String, channel: String, installSource: String, lastCheckedAt: Date?, state: UpdateState, availableVersion: String?, releaseNotesUrl: String?, mandatory: Bool, holdbackReason: String?, waitingForSafePoint: Bool, lastErrorCategory: String?, lastErrorMessage: String?, packageManaged: Bool, config: UpdateConfig) {
         self.currentVersion = currentVersion; self.channel = channel; self.installSource = installSource
         self.lastCheckedAt = lastCheckedAt; self.state = state; self.availableVersion = availableVersion
         self.releaseNotesUrl = releaseNotesUrl; self.mandatory = mandatory; self.holdbackReason = holdbackReason
         self.waitingForSafePoint = waitingForSafePoint; self.lastErrorCategory = lastErrorCategory
-        self.lastErrorMessage = lastErrorMessage; self.config = config
+        self.lastErrorMessage = lastErrorMessage; self.packageManaged = packageManaged; self.config = config
     }
 }
 
-public enum UpdateInstallOutcome: Sendable, Equatable, Hashable {
-    case installing, deferred
-    case storeManaged(guidance: String)
-    case other(raw: String)
+/// How to get the new version: the official download page, or the
+/// package-manager command for a package-managed install. Nothing is
+/// downloaded or installed by YadoriLink.
+public struct UpdateDownloadGuidance: Sendable, Equatable, Hashable {
+    /// The sentence to show: the page it names, or the steps of a package-managed install.
+    public var guidance: String
+    /// The official page to open; `nil` when there are steps to follow instead.
+    public var url: String?
+    public init(guidance: String, url: String?) { self.guidance = guidance; self.url = url }
 }

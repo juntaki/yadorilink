@@ -439,6 +439,26 @@ impl EnrollmentService {
         &self,
         command: JoinAndLinkCommand,
     ) -> Result<EnrollmentOutcome, EnrollmentError> {
+        // Measurement only: the join-to-first-file timeline covers eager,
+        // non-provider joins (the ones that end in a committed file) and is
+        // dropped again as soon as the attempt turns out not to sync.
+        let group_id = command.group_id.clone();
+        let tracked = !command.on_demand && command.provider.is_none();
+        let attempt = tracked
+            .then(|| yadorilink_fs_platform::join_timeline::begin(&self.device_id, &group_id));
+        let result = self.join_and_link_inner(command).await;
+        if let Some(attempt) = attempt {
+            if !matches!(&result, Ok(o) if !o.awaiting_approval && !o.already_linked) {
+                yadorilink_fs_platform::join_timeline::abandon(&self.device_id, &group_id, attempt);
+            }
+        }
+        result
+    }
+
+    async fn join_and_link_inner(
+        &self,
+        command: JoinAndLinkCommand,
+    ) -> Result<EnrollmentOutcome, EnrollmentError> {
         if !self.coordination.is_configured() {
             return Err(EnrollmentError::LocalIdentityUnavailable);
         }
@@ -611,6 +631,25 @@ impl EnrollmentService {
         &self,
         command: AcceptInviteCommand,
     ) -> Result<EnrollmentOutcome, EnrollmentError> {
+        // Measurement only: see `join_and_link`. The group id is known once
+        // the invite is prepared, so the inner call reports it back.
+        let tracked = !command.on_demand;
+        let mut begun = None;
+        let result = self.accept_invite_and_link_inner(command, tracked, &mut begun).await;
+        if let Some((group_id, attempt)) = begun {
+            if !matches!(&result, Ok(o) if !o.awaiting_approval) {
+                yadorilink_fs_platform::join_timeline::abandon(&self.device_id, &group_id, attempt);
+            }
+        }
+        result
+    }
+
+    async fn accept_invite_and_link_inner(
+        &self,
+        command: AcceptInviteCommand,
+        tracked: bool,
+        begun: &mut Option<(String, u64)>,
+    ) -> Result<EnrollmentOutcome, EnrollmentError> {
         if !self.coordination.is_configured() {
             return Err(EnrollmentError::LocalIdentityUnavailable);
         }
@@ -633,6 +672,10 @@ impl EnrollmentService {
                 return Err(EnrollmentError::PreparationAmbiguous { operation_id, detail });
             }
         };
+        if tracked {
+            let attempt = yadorilink_fs_platform::join_timeline::begin(&self.device_id, &group_id);
+            *begun = Some((group_id.clone(), attempt));
+        }
 
         let local_path = command.absolute_path.clone();
         match self.links.commit_plain(&group_id, &command.absolute_path, command.on_demand).await {

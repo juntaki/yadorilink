@@ -189,3 +189,16 @@ pub(crate) trait LinkRuntimePort: Send + Sync {
 pub(crate) trait OnDemandCapabilityPort: Send + Sync {
     fn allows_on_demand(&self, group_id: &str) -> bool;
 }
+
+/// The custody leases this device holds for other devices, at the moments it
+/// gives up being a group's full replica.
+pub(crate) trait CustodyLeaseHandoffPort: Send + Sync {
+    /// Stops taking new leases for the group and moves every lease it holds
+    /// to another full replica. `Ok` keeps the group closed to new leases
+    /// until the returned guard is dropped; `Err` is the refusal to show the
+    /// user (some lease has nowhere to go yet), and the role must not be lost.
+    fn hand_off_leases<'a>(
+        &'a self,
+        group_id: &'a str,
+    ) -> BoxFuture<'a, Result<Box<dyn Send>, String>>;
+}

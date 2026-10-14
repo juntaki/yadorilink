@@ -79,7 +79,7 @@ Requires, on the build machine:
 - Xcode (for `xcodebuild`) and `xcodegen` (`brew install xcodegen`, or a
   release binary on `$PATH`/in `~/xcodegen-bin/`)
 - A real "Apple Development" or "Apple Distribution" codesigning identity
-  in the login keychain (`security find-identity -v -p codesigning`) —
+  in the login keychain (a release build needs a Developer ID Application one) (`security find-identity -v -p codesigning`) —
   see "Signing and notarization" below
 - Rust/cargo, for `cargo build --workspace --release`
 
@@ -135,21 +135,55 @@ an unsigned package will show Gatekeeper's "unidentified developer" warning;
 that's expected for local unsigned builds. Use Finder's right-click Open flow
 if you need to run an unsigned local build.
 
-The `YadoriLink.app` bundled *inside* the pkg, however, is
-built with Xcode's automatic signing using a real "Apple Development"/
+### Signing `YadoriLink.app` and its extensions
+
+Development builds (no `YADORILINK_RELEASE_BUILD`) sign `YadoriLink.app`
+through Xcode's automatic signing with a real "Apple Development" or
 "Apple Distribution" identity (`project.yml`: `CODE_SIGN_STYLE: Automatic`,
-`DEVELOPMENT_TEAM: 594UQF7QX3`) — deliberately, not by oversight. This
-repo's own build history (see
-`platforms/macos/app/YadoriLinkFinderSync/Extension/Extension.entitlements`'s doc
-comment) already proved that an **ad-hoc-signed** (`codesign --sign -`)
-build of this exact FinderSync/File Provider extension pair does not
-actually launch under App Sandbox: PlugInKit discovers it fine, but the
-sandboxed process dies silently right after `AppSandbox` init, before any
-of the extension's own code runs. Shipping an ad-hoc-signed `.app` inside
-any installer would therefore produce something that visibly doesn't work
-at all. If you build this on a machine with no such identity available,
-`xcodebuild` will fail with a signing error rather than silently falling
-back to ad-hoc.
+`DEVELOPMENT_TEAM: 594UQF7QX3`) and `-allowProvisioningUpdates`. An
+**ad-hoc-signed** build of this FinderSync/File Provider extension pair does not
+launch under App Sandbox (PlugInKit discovers it, but the sandboxed process
+dies right after `AppSandbox` init; see `Extension.entitlements`), so a build
+machine without a real identity fails at `xcodebuild` instead of falling back.
+
+Release builds (`YADORILINK_RELEASE_BUILD=1`) use Manual Developer ID
+Application signing with a secure timestamp (`xcode-signing-args.sh`) and no
+Xcode account. Only the two extensions declare a restricted entitlement (the
+App Group `group.com.juntaki.yadorilink.shared`), so only they get a
+provisioning profile; the host app holds no restricted entitlement and gets
+none. Give the build the two installed Developer ID profiles:
+
+```bash
+YADORILINK_FINDERSYNC_PROFILE_FILE="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/<uuid>.provisionprofile" \
+YADORILINK_FILEPROVIDER_PROFILE_FILE="...<uuid>.provisionprofile" \
+  ./build-pkg.sh   # plus the release variables above
+```
+
+- `validate-macos-profiles.py` decodes each profile before any build starts
+  and requires the team, the exact application identifier of that extension,
+  the App Group, an unexpired Developer ID shape; after the Xcode build it
+  checks the built app: each extension embeds a valid profile for its own
+  bundle id, and the host app embeds no profile and signs no App Group or
+  `get-task-allow`. An added restricted entitlement on the host therefore
+  forces an explicit profile change. Signatures, entitlements and
+  notarization of the shipped bytes are verified by `verify-pkg.sh --release`.
+- `ensure-macos-profiles.py` obtains the profiles through the App Store
+  Connect API (needs a Team API key allowed to manage certificates and
+  profiles): it matches the Developer ID Application certificate imported
+  into the keychain byte for byte, reuses or creates a `MAC_APP_DIRECT` profile
+  for each extension bundle id, installs them under their UUIDs and prints
+  only non-secret metadata. `ensure-macos-profiles.py cleanup` removes
+  exactly the files it installed. Profiles are build inputs, not stored
+  secrets.
+- `YADORILINK_XCODE_PROFILE_EXPERIMENT=1` instead lets `xcodebuild` create the
+  profiles itself (`-allowProvisioningUpdates` with
+  `-authenticationKeyPath/-authenticationKeyID/-authenticationKeyIssuerID`
+  taken from `YADORILINK_NOTARY_KEY` / `_KEY_ID` / `_ISSUER`). It exists to
+  find out whether Xcode picks the right profiles on a clean runner; the
+  built app is validated the same way afterwards.
+
+Tests (no credentials or network): `python3 -m unittest discover -s
+platforms/macos/package/tests` and `tests/*.test.sh`.
 
 ## What the installer does beyond copying files
 
@@ -191,6 +225,7 @@ of the above; see its header comment.
 ## Files
 
 - `build-pkg.sh` — builds everything and produces the final `.pkg`
+- `xcode-signing-args.sh`, `validate-macos-profiles.py`, `ensure-macos-profiles.py` — release signing of the app and extensions (see above)
 - `Distribution.xml` — `productbuild` distribution definition (product
   title, single component choice)
 - `scripts/preinstall`, `scripts/postinstall` — component pkg scripts

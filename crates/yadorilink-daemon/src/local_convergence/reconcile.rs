@@ -272,22 +272,45 @@ impl super::LocalConvergenceExecutor {
             if !vanished {
                 continue;
             }
-            let explicit = self
-                .state
-                .file_index_repository()
-                .canonical_current_row(group_id, &ancestor)
-                .ok()
-                .flatten()
-                .is_some_and(|row| {
-                    !row.snapshot.deleted
-                        && row.snapshot.record_kind
-                            == yadorilink_replica_domain::file::RecordKind::Directory
-                });
-            let in_flight = self
+            // A row that cannot be read is not "not explicit": writing below the
+            // vanished ancestor would recreate a directory the user may have
+            // removed, so the pass is retried instead.
+            let row =
+                match self.state.file_index_repository().canonical_current_row(group_id, &ancestor)
+                {
+                    Ok(row) => row,
+                    Err(error) => {
+                        tracing::warn!(
+                            group_id,
+                            ancestor,
+                            %error,
+                            "cannot read an ancestor that vanished from disk; retrying the path"
+                        );
+                        return PendingLocalFlushOutcome::RetryRequired;
+                    }
+                };
+            let explicit = row.is_some_and(|row| {
+                !row.snapshot.deleted
+                    && row.snapshot.record_kind
+                        == yadorilink_replica_domain::file::RecordKind::Directory
+            });
+            let in_flight = match self
                 .state
                 .materialization_intent_repository()
                 .has_materialization_intent(group_id, &ancestor)
-                .unwrap_or(true);
+            {
+                Ok(in_flight) => in_flight,
+                Err(error) => {
+                    tracing::warn!(
+                        group_id,
+                        ancestor,
+                        %error,
+                        "cannot read the intent of an ancestor that vanished from disk; \
+                         retrying the path"
+                    );
+                    return PendingLocalFlushOutcome::RetryRequired;
+                }
+            };
             if explicit && !in_flight {
                 outcome = outcome.and(
                     self.pending_local_change_flush

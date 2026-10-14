@@ -23,7 +23,7 @@
 //! shipping binary is one `Option` check per boundary, against a field
 //! nothing ever sets.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::error::StorageError;
 
@@ -86,6 +86,9 @@ pub struct FaultPlan {
     /// ENOSPC/EIO shape, where the process keeps running and the store must
     /// stay usable and honest.
     survivable: bool,
+    /// Whether the rollback's segment-index lookup fails once, modelling a
+    /// transient index read error during cleanup of a failed commit.
+    fail_rollback_index_read: AtomicBool,
 }
 
 impl FaultPlan {
@@ -96,6 +99,7 @@ impl FaultPlan {
             partial_append_bytes: None,
             remaining: AtomicUsize::new(1),
             survivable: false,
+            fail_rollback_index_read: AtomicBool::new(false),
         }
     }
 
@@ -103,7 +107,13 @@ impl FaultPlan {
     /// fails, nothing is reported durable, and the store must remain
     /// correct and usable afterwards.
     pub fn io_failure_at(point: CommitPoint) -> Self {
-        Self { point, partial_append_bytes: None, remaining: AtomicUsize::new(1), survivable: true }
+        Self {
+            point,
+            partial_append_bytes: None,
+            remaining: AtomicUsize::new(1),
+            survivable: true,
+            fail_rollback_index_read: AtomicBool::new(false),
+        }
     }
 
     /// How much of the group's record buffer reaches disk before a
@@ -112,6 +122,18 @@ impl FaultPlan {
     pub fn with_partial_append_bytes(mut self, bytes: usize) -> Self {
         self.partial_append_bytes = Some(bytes);
         self
+    }
+
+    /// Also makes the rollback's segment-index lookup fail once, so a test
+    /// can prove that an index read error never grants deletion authority.
+    #[must_use]
+    pub fn with_rollback_index_read_failure(self) -> Self {
+        self.fail_rollback_index_read.store(true, Ordering::Relaxed);
+        self
+    }
+
+    pub(crate) fn take_rollback_index_read_failure(&self) -> bool {
+        self.fail_rollback_index_read.swap(false, Ordering::AcqRel)
     }
 
     /// Arms this plan for `count` commits rather than one.

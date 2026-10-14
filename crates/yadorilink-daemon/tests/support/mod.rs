@@ -549,6 +549,58 @@ pub async fn connect_two_daemons_with_channels(
     device_b_id: &str,
     shared_group_ids: &[String],
 ) -> ([tokio::task::JoinHandle<()>; 2], [Arc<QuicPeerChannel>; 2]) {
+    connect_two_daemons_with_channels_inner(
+        state_a,
+        device_a_id,
+        state_b,
+        device_b_id,
+        shared_group_ids,
+        NativeDial::Explicit,
+    )
+    .await
+}
+
+/// `connect_two_daemons_with_channels` without the harness's own native
+/// dial: the production session keeper is the only dialer, as in a real
+/// daemon. An explicit dial racing the keeper's makes both sides attach
+/// crossed connections, each replacing the other, and the keeper then
+/// sleeps its full 5 s before redialling.
+#[allow(dead_code)]
+pub async fn connect_two_daemons_with_channels_keeper_dials(
+    state_a: &Arc<DaemonState>,
+    device_a_id: &str,
+    state_b: &Arc<DaemonState>,
+    device_b_id: &str,
+    shared_group_ids: &[String],
+) -> ([tokio::task::JoinHandle<()>; 2], [Arc<QuicPeerChannel>; 2]) {
+    connect_two_daemons_with_channels_inner(
+        state_a,
+        device_a_id,
+        state_b,
+        device_b_id,
+        shared_group_ids,
+        NativeDial::KeeperOnly,
+    )
+    .await
+}
+
+/// Who starts native replication for a pairing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeDial {
+    /// The harness dials once the pairing is up.
+    Explicit,
+    /// Left to the production keeper.
+    KeeperOnly,
+}
+
+async fn connect_two_daemons_with_channels_inner(
+    state_a: &Arc<DaemonState>,
+    device_a_id: &str,
+    state_b: &Arc<DaemonState>,
+    device_b_id: &str,
+    shared_group_ids: &[String],
+    native_dial: NativeDial,
+) -> ([tokio::task::JoinHandle<()>; 2], [Arc<QuicPeerChannel>; 2]) {
     // Under checkpoint admission, a Pending Change also needs a real `AuthorizationCheckpoint`
     // to become Published and reach the peer at all -- `checkpoint_fake_for`
     // wires both states to a shared in-process `FakeCoordination` (reused
@@ -566,6 +618,7 @@ pub async fn connect_two_daemons_with_channels(
         state_b,
         device_b_id,
         shared_group_ids,
+        native_dial,
     )
     .await
 }
@@ -582,6 +635,7 @@ async fn connect_two_daemons_with_shared_fake(
     state_b: &Arc<DaemonState>,
     device_b_id: &str,
     shared_group_ids: &[String],
+    native_dial: NativeDial,
 ) -> ([tokio::task::JoinHandle<()>; 2], [Arc<QuicPeerChannel>; 2]) {
     // Each side must pin the other's key so incoming DAG changes verify (the
     // receiver checks every change's signature against the author's pinned
@@ -662,7 +716,7 @@ async fn connect_two_daemons_with_shared_fake(
         addr_a,
     )
     .await;
-    let (_session_a, handle_a) = spawn_paired_session(
+    let (_session_a, handle_a, keeper_owns_a) = spawn_paired_session_reporting_replaced(
         state_a,
         device_a_id,
         device_b_id,
@@ -670,7 +724,7 @@ async fn connect_two_daemons_with_shared_fake(
         shared_group_ids,
         verifying_b,
     );
-    let (_session_b, handle_b) = spawn_paired_session(
+    let (_session_b, handle_b, keeper_owns_b) = spawn_paired_session_reporting_replaced(
         state_b,
         device_b_id,
         device_a_id,
@@ -682,8 +736,19 @@ async fn connect_two_daemons_with_shared_fake(
     // Native replication rides beside the sync session, as a session keeper
     // starts it: the dialing side (the smaller endpoint id) opens it, the
     // other accepts. Peers' keys are pinned by now.
-    state_a.dial_native_replication_for_test(device_b_id).await;
-    state_b.dial_native_replication_for_test(device_a_id).await;
+    //
+    // `KeeperOnly` dials for a side only when no keeper session stood there:
+    // a keeper that registered first has a `keep_dialed` of its own running,
+    // and a second dial from here would race it into crossed, mutually
+    // replacing connections. Where this side's registration came first, the
+    // keeper's `open_session` finds it and starts no native keeper, so this
+    // dial is the only one.
+    if native_dial == NativeDial::Explicit || !keeper_owns_a {
+        state_a.dial_native_replication_for_test(device_b_id).await;
+    }
+    if native_dial == NativeDial::Explicit || !keeper_owns_b {
+        state_b.dial_native_replication_for_test(device_a_id).await;
+    }
 
     ([handle_a, handle_b], [channel_a, channel_b])
 }
@@ -815,11 +880,14 @@ pub fn install_bootstrap_policy(state: &DaemonState, group_ids: &[String]) {
 /// fixture is held for the whole test body), so pointer identity is a safe,
 /// process-unique key here despite living in a `static`: two concurrently
 /// running tests can never collide on the same pointer value while both are
-/// still using it, and a stale entry from an already-finished test is
-/// simply never looked up again.
-static DEVICE_CHECKPOINT_FAKES: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<usize, FakeCoordination>>,
-> = std::sync::OnceLock::new();
+/// still using it. Each entry also holds a `Weak` to its state: that keeps the
+/// allocation (not the state) alive, so the address of a finished test's state
+/// is never handed to a later test's state, which would otherwise inherit the
+/// finished test's dead coordination fake.
+type CheckpointFakeRegistry =
+    std::sync::Mutex<HashMap<usize, (std::sync::Weak<DaemonState>, FakeCoordination)>>;
+static DEVICE_CHECKPOINT_FAKES: std::sync::OnceLock<CheckpointFakeRegistry> =
+    std::sync::OnceLock::new();
 
 /// Returns the shared `FakeCoordination` either `state_a` or `state_b` is
 /// already registered with, or starts and registers a fresh one if neither
@@ -855,7 +923,7 @@ static DEVICE_CHECKPOINT_FAKES: std::sync::OnceLock<
 pub fn checkpoint_fake_of(state: &Arc<DaemonState>) -> Option<FakeCoordination> {
     let registry = DEVICE_CHECKPOINT_FAKES.get()?;
     let key = Arc::as_ptr(state) as usize;
-    registry.lock().unwrap().get(&key).cloned()
+    registry.lock().unwrap().get(&key).map(|(_, fake)| fake.clone())
 }
 
 async fn checkpoint_fake_for(
@@ -866,8 +934,8 @@ async fn checkpoint_fake_for(
     let key_a = Arc::as_ptr(state_a) as usize;
     let key_b = Arc::as_ptr(state_b) as usize;
 
-    let fake_a = registry.lock().unwrap().get(&key_a).cloned();
-    let fake_b = registry.lock().unwrap().get(&key_b).cloned();
+    let fake_a = registry.lock().unwrap().get(&key_a).map(|(_, fake)| fake.clone());
+    let fake_b = registry.lock().unwrap().get(&key_b).map(|(_, fake)| fake.clone());
 
     let fake = match (fake_a, fake_b) {
         (Some(fa), Some(fb)) => {
@@ -895,8 +963,8 @@ async fn checkpoint_fake_for(
     };
 
     let mut map = registry.lock().unwrap();
-    map.entry(key_a).or_insert_with(|| fake.clone());
-    map.entry(key_b).or_insert_with(|| fake.clone());
+    map.entry(key_a).or_insert_with(|| (Arc::downgrade(state_a), fake.clone()));
+    map.entry(key_b).or_insert_with(|| (Arc::downgrade(state_b), fake.clone()));
     fake
 }
 
@@ -964,6 +1032,7 @@ impl TestPeerMesh {
             state_b,
             device_b_id,
             shared_group_ids,
+            NativeDial::Explicit,
         )
         .await;
         handles
@@ -1549,6 +1618,28 @@ pub fn spawn_paired_session(
     shared_group_ids: &[String],
     peer_verifying_key: [u8; 32],
 ) -> (Arc<PeerSyncSession>, tokio::task::JoinHandle<()>) {
+    let (session, handle, _replaced) = spawn_paired_session_reporting_replaced(
+        state,
+        local_device_id,
+        peer_device_id,
+        channel,
+        shared_group_ids,
+        peer_verifying_key,
+    );
+    (session, handle)
+}
+
+/// `spawn_paired_session`, also reporting whether the registration replaced
+/// a session already registered for the peer -- which, outside a harness
+/// that registers its own, is one the production session keeper opened.
+fn spawn_paired_session_reporting_replaced(
+    state: &Arc<DaemonState>,
+    local_device_id: &str,
+    peer_device_id: &str,
+    channel: Arc<QuicPeerChannel>,
+    shared_group_ids: &[String],
+    peer_verifying_key: [u8; 32],
+) -> (Arc<PeerSyncSession>, tokio::task::JoinHandle<()>, bool) {
     // Mirror the netmap-derived authorization the real orchestrator installs
     // (`record_peer_change_authz`): pin the peer's actual change-signing key so
     // its changes' signatures verify, and mark it a writer for every shared
@@ -1604,6 +1695,7 @@ pub fn spawn_paired_session(
         PeerSyncSessionDeps {
             handoff_lease_responder: state.clone(),
             handoff_ticket_responder: state.clone(),
+            custody_rehome_responder: state.clone(),
             ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
         },
     );
@@ -1626,7 +1718,14 @@ pub fn spawn_paired_session(
     // this same device appears in, so setting it again per-pairing is
     // harmless.
     state.set_materialization_repair_sweep_interval(std::time::Duration::from_secs(1));
-    state.register_peer_session(peer_device_id, session.clone(), sync_roots);
+    let replaced = state
+        .peers
+        .register_session(
+            peer_device_id.to_string(),
+            session.clone(),
+            state.local_convergence_with_roots(sync_roots),
+        )
+        .is_some();
     if state.disk_headroom_enforcement_enabled() {
         // The knob moved from the session to the executor beside it, so it is
         // set after registration, on the executor that registration built.
@@ -1653,7 +1752,7 @@ pub fn spawn_paired_session(
         // this entry, and removing *that* one would be wrong.
         state_for_task.peers.remove_if_current(&peer_id, &identity_session);
     });
-    (session, handle)
+    (session, handle, replaced)
 }
 
 /// The local materialization root for each of `group_ids`, read from this

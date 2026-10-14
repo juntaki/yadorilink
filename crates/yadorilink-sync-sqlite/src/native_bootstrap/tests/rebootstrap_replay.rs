@@ -19,7 +19,7 @@ use crate::native_rebootstrap_recovery::RecoveryArea;
 use crate::native_rebootstrap_replay::{
     catch_up, outstanding_steps, replay_own_intent, retry_replay_unit, unreplayed_units,
     CatchUpEnd, CatchUpLimits, CatchUpPass, CatchUpReport, CatchUpSource, MachinePoint,
-    ReplayContext, ReplayError, ReplayReport, RetryError,
+    ReplayContext, ReplayError, ReplayReport, RetryError, UnitImport,
 };
 use yadorilink_replica_domain::local_op::Op;
 
@@ -1255,6 +1255,17 @@ fn retry_with(
     authority: &dyn ReassertAuthority,
     hook: &mut dyn FnMut(MachinePoint) -> Result<(), Crash>,
 ) -> Result<ReplayReport, RetryError> {
+    retry_importing(local, m, unit, authority, &mut |_, _| Ok(()), hook)
+}
+
+fn retry_importing(
+    local: &Connection,
+    m: &Machine,
+    unit: usize,
+    authority: &dyn ReassertAuthority,
+    import: &mut UnitImport<'_>,
+    hook: &mut dyn FnMut(MachinePoint) -> Result<(), Crash>,
+) -> Result<ReplayReport, RetryError> {
     let author = crate::author_incarnation::current_author(local).unwrap();
     let key = device_key(device_seed(author.device.as_str()));
     let signer = LocalAuthor { author, signing_key: &key, capture: None };
@@ -1269,6 +1280,7 @@ fn retry_with(
         &group(),
         &m.recovery_id,
         unit,
+        import,
         hook,
     )
 }
@@ -1364,4 +1376,107 @@ fn a_crash_between_authoring_and_resolving_never_authors_twice() {
 
     assert_eq!(frontier_seq(&w.b, &new), Some(2), "authored once");
     assert_eq!(held(&w.b), 0);
+}
+
+/// The bytes of the unit's put versions are imported, each once, before anything is authored.
+#[test]
+fn a_retried_unit_imports_its_preserved_bytes_before_authoring() {
+    let w = put_then_delete();
+    let m = held_machine(&w);
+    let new = current(&w.b);
+    let imported = std::cell::RefCell::new(Vec::new());
+    let mut import = |record: &yadorilink_replica_domain::file::FileVersion, bytes: &[u8]| {
+        assert_eq!(frontier_seq(&w.b, &new), None, "nothing is authored yet");
+        imported.borrow_mut().push((record.version_hash, bytes.to_vec()));
+        Ok(())
+    };
+    let mut seen_after_import = false;
+    let mut hook = |point| {
+        if point == MachinePoint::AfterImport(0) {
+            seen_after_import = true;
+            assert_eq!(imported.borrow().len(), 1, "imported before the point");
+        }
+        Ok(())
+    };
+
+    retry_importing(&w.b, &m, 0, &Writer, &mut import, &mut hook).unwrap();
+
+    assert!(seen_after_import);
+    assert_eq!(*imported.borrow(), vec![(version(2).version_hash, vec![2u8])]);
+    assert_eq!(held(&w.b), 0);
+}
+
+/// An import that fails ends the retry with nothing authored and the unit held; the next retry
+/// imports again and authors it.
+#[test]
+fn a_failed_import_authors_nothing_and_keeps_the_unit_held() {
+    let w = put_then_delete();
+    let m = held_machine(&w);
+    let new = current(&w.b);
+
+    let failed = retry_importing(
+        &w.b,
+        &m,
+        0,
+        &Writer,
+        &mut |_, _| Err("the block store is full".into()),
+        &mut never,
+    );
+
+    assert!(matches!(failed, Err(RetryError::Import(_))), "{failed:?}");
+    assert_eq!(held(&w.b), 1);
+    assert_eq!(frontier_seq(&w.b, &new), None);
+    retry_with(&w.b, &m, 0, &Writer, &mut never).unwrap();
+    assert_eq!(frontier_seq(&w.b, &new), Some(2));
+    assert_eq!(held(&w.b), 0);
+}
+
+/// A crash after the import and before the authoring leaves the unit held; the retry that
+/// follows imports again and authors once.
+#[test]
+fn a_crash_after_the_import_leaves_the_unit_held_and_the_next_retry_succeeds() {
+    let w = put_then_delete();
+    let m = held_machine(&w);
+    let new = current(&w.b);
+    let calls = Cell::new(0);
+    let mut import = |_: &yadorilink_replica_domain::file::FileVersion, _: &[u8]| {
+        calls.set(calls.get() + 1);
+        Ok(())
+    };
+    let mut stop = |point| if point == MachinePoint::AfterImport(0) { Err(Crash) } else { Ok(()) };
+
+    let halted = retry_importing(&w.b, &m, 0, &Writer, &mut import, &mut stop);
+
+    assert!(matches!(halted, Err(RetryError::Crashed)), "{halted:?}");
+    assert_eq!((calls.get(), held(&w.b), frontier_seq(&w.b, &new)), (1, 1, None));
+    retry_importing(&w.b, &m, 0, &Writer, &mut import, &mut never).unwrap();
+    assert_eq!((calls.get(), held(&w.b), frontier_seq(&w.b, &new)), (2, 0, Some(2)));
+}
+
+/// A preserved copy that no longer matches the manifest is never imported, and the unit is not
+/// authored over it.
+#[test]
+fn a_preserved_copy_that_does_not_match_the_manifest_is_not_imported() {
+    let w = put_then_delete();
+    let m = held_machine(&w);
+    let new = current(&w.b);
+    let area =
+        RecoveryArea::open_existing(m.recovery_root.path(), &group(), &m.recovery_id).unwrap();
+    area.write_version(&version(2).version_hash, b"tampered").unwrap();
+    let calls = Cell::new(0);
+
+    let refused = retry_importing(
+        &w.b,
+        &m,
+        0,
+        &Writer,
+        &mut |_, _| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        },
+        &mut never,
+    );
+
+    assert!(matches!(refused, Err(RetryError::Blocked(_))), "{refused:?}");
+    assert_eq!((calls.get(), held(&w.b), frontier_seq(&w.b, &new)), (0, 1, None));
 }

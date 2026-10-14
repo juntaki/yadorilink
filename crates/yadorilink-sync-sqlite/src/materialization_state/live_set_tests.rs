@@ -86,3 +86,105 @@ fn a_block_moving_from_a_row_to_a_head_mid_computation_stays_live() {
 
     assert!(live.contains(&hex::encode(BLOCK)), "the block was referenced throughout: {live:?}");
 }
+
+fn insert_head(db: &SyncDatabase, group: &str, path: &str, version: &[u8; 32], incarnation: u8) {
+    db.write::<_, SyncSqliteError>(|conn| {
+        conn.execute(
+            "INSERT INTO native_heads \
+             (group_id, path, author, incarnation, seq, version, provenance) \
+             VALUES (?1, ?2, 'device', ?3, 1, ?4, ?5)",
+            rusqlite::params![group, path, vec![incarnation; 16], version.to_vec(), vec![0u8; 32]],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn stored_version(db: &SyncDatabase, group: &str, version: &FileVersion) {
+    db.write::<_, SyncSqliteError>(|conn| {
+        crate::dag_store::put_file_version(conn, group, version)?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn referenced(db: Arc<SyncDatabase>, version: &FileVersion) -> std::collections::HashSet<String> {
+    MaterializationStateRepository::new(db)
+        .blocks_referenced_outside_current_file(GROUP, "cur.txt", &version.version_hash)
+        .unwrap()
+}
+
+/// Cache reclamation of one file must not free a block a committed native head at ANOTHER path
+/// names, in the window before that head is projected into any `files` row.
+#[test]
+fn per_file_reclamation_treats_an_unprojected_native_head_at_another_path_as_a_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_file_db(&dir);
+    let version = version_with_block();
+    stored_version(&db, GROUP, &version);
+    insert_head(&db, GROUP, "new.txt", &version.version_hash.0, 1);
+    assert!(referenced(db, &version).contains(&hex::encode(BLOCK)));
+}
+
+/// The head of the version being reclaimed is that file's own reference, like its current row:
+/// with only it left the block is reclaimable.
+#[test]
+fn per_file_reclamation_ignores_the_native_head_of_the_version_it_decides_about() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_file_db(&dir);
+    let version = version_with_block();
+    stored_version(&db, GROUP, &version);
+    insert_head(&db, GROUP, "cur.txt", &version.version_hash.0, 1);
+    assert!(!referenced(db, &version).contains(&hex::encode(BLOCK)));
+}
+
+/// A head at the same path but another version, or in another group at the same path and
+/// version, still roots the blocks it names.
+#[test]
+fn per_file_reclamation_roots_a_same_path_head_of_another_version_or_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_file_db(&dir);
+    let current = version_with_block();
+    // Another version naming the same block.
+    let other = FileVersion::new(
+        current.blocks.clone(),
+        current.size,
+        FileMeta { mtime_unix_nanos: 2, ..current.meta.clone() },
+    );
+    assert_ne!(other.version_hash, current.version_hash);
+    stored_version(&db, GROUP, &other);
+    insert_head(&db, GROUP, "cur.txt", &other.version_hash.0, 1);
+    assert!(referenced(db.clone(), &current).contains(&hex::encode(BLOCK)));
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let db2 = open_file_db(&dir2);
+    stored_version(&db2, "other-group", &current);
+    insert_head(&db2, "other-group", "cur.txt", &current.version_hash.0, 1);
+    assert!(referenced(db2, &current).contains(&hex::encode(BLOCK)));
+}
+
+/// A block a recovery item retains may be the only local copy of unsaved content: per-file
+/// reclamation must keep it even when it is also the evicted version's block.
+#[test]
+fn per_file_reclamation_roots_the_blocks_a_recovery_item_retains() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_file_db(&dir);
+    let version = version_with_block();
+    db.write::<_, SyncSqliteError>(|conn| {
+        conn.execute(
+            "INSERT INTO native_recovery_item \
+             (group_id, item_id, kind, path, version_hash, content, size, content_sha256, \
+              retained_blocks, source_recovery_id, created_at) \
+             VALUES (?1, 'item', 'late_edit', 'x.txt', ?2, 'complete', 4, ?3, ?4, 'src', 1)",
+            rusqlite::params![
+                GROUP,
+                version.version_hash.0.to_vec(),
+                vec![0u8; 32],
+                serde_json::to_string(&[hex::encode(BLOCK)]).unwrap()
+            ],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(referenced(db, &version).contains(&hex::encode(BLOCK)));
+}

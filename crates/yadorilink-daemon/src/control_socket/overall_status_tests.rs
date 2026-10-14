@@ -32,6 +32,19 @@ fn empty_status_is_healthy() {
     assert!(reasons.is_empty());
 }
 
+/// A directory a removal moved aside and could not put back needs attention,
+/// naming the affected group.
+#[test]
+fn a_stranded_directory_is_attention() {
+    let response = StatusResponse {
+        links: vec![LinkStatus { stranded_directory_count: 1, ..protected_link("group-1") }],
+        ..Default::default()
+    };
+    let (state, reasons) = overall_status(&response);
+    assert_eq!(state, OverallState::Attention);
+    assert_eq!(reasons, vec!["stranded_directory:group-1".to_string()]);
+}
+
 /// A merely-paused link with nothing else wrong stays healthy — pause
 /// is a deliberate user action, not an error state.
 #[test]

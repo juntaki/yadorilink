@@ -41,6 +41,10 @@ public final class ShareViewModel {
     public private(set) var invite: InviteSummary?
     public private(set) var warnings: [MembershipWarning] = []
     public private(set) var isWorking = false
+    /// The last read of members, requests and invites failed. Whatever was
+    /// loaded before stays on screen, but it is not current.
+    public private(set) var loadFailure: Notice?
+    public private(set) var hasLoaded = false
     public var inviteRole: AssignableRole = .viewer
     public var inviteRequiresApproval = true
     /// After a link exists, the form folds into "Create another invite link".
@@ -61,16 +65,21 @@ public final class ShareViewModel {
 
     public func load() async {
         do {
-            members = try await client.listMembers(groupId: groupId).map(memberRow)
-            requests = try await client.listPendingApprovals().filter { $0.groupId == groupId }.map { request in
+            let members = try await client.listMembers(groupId: groupId).map(memberRow)
+            let requests = try await client.listPendingApprovals().filter { $0.groupId == groupId }.map { request in
                 let role = request.requestedRole.map { " as \($0.title.lowercased())" } ?? ""
                 return RequestRow(title: "A new device wants to join\(role)", tooltip: request.deviceId)
             }
-            invites = try await client.listInvites().filter { $0.groupId == groupId }.map {
+            let invites = try await client.listInvites().filter { $0.groupId == groupId }.map {
                 InviteRow(id: $0.inviteId, title: "\($0.role.title) · expires \(Format.relative($0.expiresAt, now: now()))")
             }
+            self.members = members
+            self.requests = requests
+            self.invites = invites
+            hasLoaded = true
+            loadFailure = nil
         } catch {
-            notice = .failure(error)
+            loadFailure = .failure(error)
         }
     }
 
@@ -202,7 +211,11 @@ public struct InboxRow: Identifiable, Equatable, Sendable {
 public final class TransfersViewModel {
     public let app: AppModel
     public private(set) var inbox: FetchPhase<[IncomingTransfer]> = .notLoaded
-    public private(set) var devices: [DeviceSummary] = []
+    /// Target devices. A failed read is not "no devices": the picker says so and offers Retry.
+    public private(set) var devicesPhase: FetchPhase<[DeviceSummary]> = .notLoaded
+    public var devices: [DeviceSummary] { devicesPhase.value ?? [] }
+    public private(set) var devicesStale: Notice?
+    public private(set) var inboxStale: Notice?
     public private(set) var isSending = false
     public var sourcePath = ""
     public var targetDeviceId: String?
@@ -233,11 +246,17 @@ public final class TransfersViewModel {
     }
 
     public var showsInboxLoading: Bool { inbox == .loading }
-    public var showsInboxEmpty: Bool { inbox.value?.isEmpty == true }
-    public var inboxError: String? {
-        if case .failed(let n) = inbox { return n.text }
+    public var showsInboxEmpty: Bool { inbox.value?.isEmpty == true && inboxStale == nil }
+    public var inboxError: Notice? {
+        if case .failed(let n) = inbox { return n }
         return nil
     }
+    public var devicesError: Notice? {
+        if case .failed(let n) = devicesPhase { return n }
+        return nil
+    }
+    /// "No other devices" is only said after the read succeeded.
+    public var showsNoTargetDevices: Bool { devicesPhase.value != nil && targetDevices.isEmpty && devicesStale == nil }
 
     public var inboxRows: [InboxRow] {
         (inbox.value ?? []).map { t in
@@ -260,16 +279,41 @@ public final class TransfersViewModel {
     public var targetDevices: [DeviceSummary] { devices.filter { !$0.isThisDevice } }
 
     public func loadDevices() async {
+        // Another account may sign in next; never carry this roster over.
+        if !app.isSignedIn {
+            devicesPhase = .notLoaded
+            devicesStale = nil
+            targetDeviceId = nil
+        }
         guard app.isSignedIn, !app.isDaemonUnavailable else { return }
-        devices = (try? await app.client.listFolderDevices()) ?? devices
+        if devicesPhase.value == nil { devicesPhase = .loading }
+        do {
+            let list = try await app.client.listFolderDevices()
+            // Signed out while the read was in flight: that roster belongs to the old account.
+            guard app.isSignedIn else { return }
+            devicesPhase = .loaded(list)
+            devicesStale = nil
+        } catch {
+            guard app.isSignedIn else { return }
+            if devicesPhase.value == nil {
+                devicesPhase = .failed(.failure(error))
+            } else {
+                devicesStale = .failure(error)
+            }
+        }
     }
 
     public func loadInbox() async {
         if inbox.value == nil { inbox = .loading }
         do {
             inbox = .loaded(try await app.client.listInbox())
+            inboxStale = nil
         } catch {
-            inbox = .failed(.failure(error))
+            if inbox.value == nil {
+                inbox = .failed(.failure(error))
+            } else {
+                inboxStale = .failure(error)
+            }
         }
     }
 

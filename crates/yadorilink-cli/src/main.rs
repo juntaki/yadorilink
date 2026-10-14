@@ -115,6 +115,8 @@ enum Command {
         #[arg(long)]
         to: Option<String>,
     },
+    /// Download a file that is stored on demand, so it is available offline.
+    Hydrate { local_path: String },
     /// Free local disk space by removing a downloaded file's contents. The file stays listed.
     Evict { local_path: String },
     /// Show whether a file is stored locally or fetched on demand.
@@ -785,6 +787,7 @@ async fn run(command: Command) -> Result<(), CliError> {
         }
         Command::Inbox => commands::send::inbox().await,
         Command::Receive { transfer_id, to } => commands::send::receive(transfer_id, to).await,
+        Command::Hydrate { local_path } => commands::materialization::hydrate(local_path).await,
         Command::Evict { local_path } => commands::materialization::evict(local_path).await,
         Command::MaterializationStatus { local_path } => {
             commands::materialization::status(local_path).await

@@ -37,7 +37,7 @@ impl PendingStore {
     /// process and in any other (the CLI and the app share one file).
     fn locked<T>(&self, body: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            yadorilink_fs_platform::durable_dir::create_dir_all_durably(parent)?;
         }
         let lock = std::fs::OpenOptions::new()
             .create(true)

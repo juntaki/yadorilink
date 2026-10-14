@@ -36,7 +36,10 @@ pub(crate) use scan::ReconcileMode;
 pub use semantic_delete::SemanticDelete;
 
 #[cfg(any(test, feature = "test-support"))]
-pub use record_builder::{arm_content_read_race_hook, disarm_content_read_race_hook};
+pub use record_builder::{
+    arm_content_read_race_hook, arm_post_capture_race_hook, arm_post_identity_race_hook,
+    disarm_content_read_race_hook, disarm_post_capture_race_hook, disarm_post_identity_race_hook,
+};
 
 // The in-module tests below reach helpers from every submodule through
 // `use super::*`.

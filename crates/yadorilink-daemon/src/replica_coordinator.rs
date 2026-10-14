@@ -113,6 +113,8 @@ pub struct ReplicaCoordinator {
     held_path_repository: yadorilink_sync_sqlite::HeldPathRepository,
     restore_operation_repository: yadorilink_sync_sqlite::RestoreOperationRepository,
     handoff_lease_repository: yadorilink_sync_sqlite::HandoffLeaseRepository,
+    remote_custody_lease_repository: yadorilink_sync_sqlite::RemoteCustodyLeaseRepository,
+    remote_custody_hold_repository: yadorilink_sync_sqlite::RemoteCustodyHoldRepository,
     role_loss_operation_repository: yadorilink_sync_sqlite::RoleLossOperationRepository,
     membership_operation_repository: yadorilink_sync_sqlite::MembershipOperationRepository,
     recovery_snapshot_reader: RecoverySnapshotReader,
@@ -120,6 +122,16 @@ pub struct ReplicaCoordinator {
     /// against peer reconciliation for the same path (`crate::sync_runtime::
     /// path_locks`).
     path_lock_registry: Arc<PathLockRegistry>,
+    /// Orders the creation of new references to stored blocks (writes,
+    /// hydration, custody leases) against physical block deletion. Owned here,
+    /// next to the index every live set is read from.
+    block_liveness_gate: yadorilink_filesystem_sync::block_liveness::BlockLivenessGate,
+    /// Groups this device is handing its custody leases off in: while one is
+    /// listed it takes no new lease for it.
+    custody_closing: crate::custody_handoff::CustodyClosing,
+    /// Wakes the custody-hold reconciler: set when a path settled in a way
+    /// that may make a hold obsolete (see `DaemonState::nudge_custody_hold_reconciler`).
+    custody_hold_wake: Arc<tokio::sync::Notify>,
     /// Tracks per-group startup readiness so peer-apply (and other
     /// post-startup mutators) can wait until the group's startup
     /// reconciliation has published its results before touching that
@@ -223,9 +235,19 @@ impl ReplicaCoordinator {
         database: Arc<SyncDatabase>,
         path_lock_registry: Arc<PathLockRegistry>,
         startup_readiness: Arc<StartupReadinessRegistry>,
-    ) -> Self {
+    ) -> Result<Self, yadorilink_sqlite_runtime::DatabaseError> {
         let sqlite = Arc::new(yadorilink_sync_sqlite::SqliteSyncStore::new(database.clone()));
-        Self {
+        // Closes that outstanding removal tickets hold, back in place before
+        // anything can ask for a custody lease.
+        let custody_closing = crate::custody_handoff::CustodyClosing::open(
+            yadorilink_sync_sqlite::RemoteCustodyLeaseRepository::new(database.clone()),
+        )
+        .map_err(|error| {
+            yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(format!(
+                "could not read the custody ticket closes: {error}"
+            ))
+        })?;
+        Ok(Self {
             sqlite,
             link_repository: yadorilink_sync_sqlite::link::LinkRepository::new(database.clone()),
             provider_repository: yadorilink_sync_sqlite::provider::ProviderRepository::new(
@@ -262,6 +284,10 @@ impl ReplicaCoordinator {
             handoff_lease_repository: yadorilink_sync_sqlite::HandoffLeaseRepository::new(
                 database.clone(),
             ),
+            remote_custody_lease_repository:
+                yadorilink_sync_sqlite::RemoteCustodyLeaseRepository::new(database.clone()),
+            remote_custody_hold_repository:
+                yadorilink_sync_sqlite::RemoteCustodyHoldRepository::new(database.clone()),
             role_loss_operation_repository:
                 yadorilink_sync_sqlite::RoleLossOperationRepository::new(database.clone()),
             membership_operation_repository:
@@ -270,6 +296,9 @@ impl ReplicaCoordinator {
             database,
             path_lock_registry,
             startup_readiness,
+            block_liveness_gate: Default::default(),
+            custody_closing,
+            custody_hold_wake: Arc::new(tokio::sync::Notify::new()),
             local_policy_head_provider: Mutex::new(None),
             local_author: Mutex::new(None),
             capture_passes: Mutex::new(std::collections::HashMap::new()),
@@ -279,7 +308,7 @@ impl ReplicaCoordinator {
             materialization_wake: MaterializationWake::new(),
             hazard_recheck_wake: GroupWake::new(),
             held_path_wake: tokio::sync::watch::Sender::new(0),
-        }
+        })
     }
 
     /// Opens a standalone, freshly-schema'd in-memory database and builds a
@@ -290,11 +319,11 @@ impl ReplicaCoordinator {
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_in_memory() -> Result<Self, yadorilink_sqlite_runtime::DatabaseError> {
         let database = Arc::new(SyncDatabase::open_in_memory(schema_init)?);
-        Ok(Self::from_database(
+        Self::from_database(
             database,
             Arc::new(PathLockRegistry::new()),
             Arc::new(StartupReadinessRegistry::new()),
-        ))
+        )
     }
 
     /// Opens (or creates) a real on-disk database at `path` and builds a
@@ -307,11 +336,11 @@ impl ReplicaCoordinator {
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self, yadorilink_sqlite_runtime::DatabaseError> {
         let database = Arc::new(SyncDatabase::open(path, schema_init)?);
-        Ok(Self::from_database(
+        Self::from_database(
             database,
             Arc::new(PathLockRegistry::new()),
             Arc::new(StartupReadinessRegistry::new()),
-        ))
+        )
     }
 
     // --- Accessors needed by the port impls below, so callers can reach
@@ -588,6 +617,42 @@ impl ReplicaCoordinator {
 
     pub fn handoff_lease_repository(&self) -> &yadorilink_sync_sqlite::HandoffLeaseRepository {
         &self.handoff_lease_repository
+    }
+
+    pub fn block_liveness_gate(
+        &self,
+    ) -> &yadorilink_filesystem_sync::block_liveness::BlockLivenessGate {
+        &self.block_liveness_gate
+    }
+
+    /// Which groups' custody leases this device is currently moving away.
+    pub(crate) fn custody_closing(&self) -> &crate::custody_handoff::CustodyClosing {
+        &self.custody_closing
+    }
+
+    /// Wakes the custody-hold reconciler. Cheap and coalescing: callers that
+    /// settled a path (a newer version arrived, the file was deleted) call it
+    /// without checking whether any hold exists.
+    pub fn nudge_custody_hold_reconciler(&self) {
+        self.custody_hold_wake.notify_one();
+    }
+
+    pub(crate) fn custody_hold_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.custody_hold_wake.clone()
+    }
+
+    /// The custody leases this device holds for other devices.
+    pub fn remote_custody_lease_repository(
+        &self,
+    ) -> &yadorilink_sync_sqlite::RemoteCustodyLeaseRepository {
+        &self.remote_custody_lease_repository
+    }
+
+    /// The custody this device asked other devices to hold for it.
+    pub fn remote_custody_hold_repository(
+        &self,
+    ) -> &yadorilink_sync_sqlite::RemoteCustodyHoldRepository {
+        &self.remote_custody_hold_repository
     }
 
     pub fn role_loss_operation_repository(

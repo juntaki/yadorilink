@@ -93,6 +93,13 @@ pub struct TopologyNode {
     signing_key: ed25519_dalek::SigningKey,
 }
 
+impl TopologyNode {
+    /// The root directory of this node's block store.
+    pub fn store_root(&self) -> &std::path::Path {
+        self.store_dir.path()
+    }
+}
+
 pub fn new_node(device_id: &str) -> TopologyNode {
     // Every node this fixture builds is one a daemon will start a
     // reconciliation stack for, so the process must already be off public

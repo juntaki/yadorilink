@@ -235,6 +235,12 @@ impl SegmentWriter {
     /// state where its next append lands exactly at the index's
     /// `durable_end`. Used on the error path of a group commit and by
     /// startup recovery.
+    /// Whether `judge` accepts the volume this open file is on (see
+    /// [`yadorilink_fs_platform::durable_dir::judge_open_file`]).
+    pub(crate) fn judge_volume(&self, path: &Path, judge: impl FnOnce(&Path) -> bool) -> bool {
+        yadorilink_fs_platform::durable_dir::judge_open_file(&self.file, path, judge).is_ok()
+    }
+
     pub(crate) fn truncate(&mut self, len: u64) -> Result<(), StorageError> {
         self.file.set_len(len)?;
         self.file.sync_data()?;

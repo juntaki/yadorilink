@@ -316,7 +316,8 @@ fn reason_subject(status: &StatusResponse, code: &str, arg: &str, verbose: bool)
         | "fetch_availability_unknown"
         | "conflict"
         | "volume_changed"
-        | "held" => group_label(status, arg),
+        | "held"
+        | "stranded_directory" => group_label(status, arg),
         "provider_not_ready" | "provider_stuck" | "kept_edits" => status
             .provider_roots
             .iter()

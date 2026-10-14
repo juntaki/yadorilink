@@ -18,7 +18,7 @@ public struct SettingsView: View {
         TabView {
             GeneralSettingsView(extensions: extensions)
                 .tabItem { Label("General", systemImage: "gearshape") }
-            UpdatesSettingsView(client: context.app.client)
+            UpdatesSettingsView(client: context.app.client, openURL: { NSWorkspace.shared.open($0) })
                 .tabItem { Label("Updates", systemImage: "arrow.down.circle") }
             BandwidthSettingsView(client: context.app.client)
                 .tabItem { Label("Bandwidth", systemImage: "speedometer") }
@@ -107,7 +107,7 @@ struct UpdatesSettingsView: View {
     @State private var model: UpdatesModel
     @State private var showsVersionDetails = false
 
-    init(client: any YadoriLinkClient) { _model = State(initialValue: UpdatesModel(client: client)) }
+    init(client: any YadoriLinkClient, openURL: @escaping (URL) -> Bool) { _model = State(initialValue: UpdatesModel(client: client, openURL: openURL)) }
 
     var body: some View {
         DaemonGate {
@@ -116,18 +116,22 @@ struct UpdatesSettingsView: View {
                     HStack {
                         Text(model.headline).font(.headline)
                         Spacer()
-                        if model.canInstall {
-                            Button("Download the new version") { Task { await model.install() } }.disabled(model.isWorking)
+                        if model.canDownload {
+                            Button(model.downloadButtonTitle) { Task { await model.download() } }.disabled(model.isWorking)
                         } else {
-                            Button("Check Now") { Task { await model.check() } }.disabled(model.isWorking)
+                            Button(model.lookupFailed ? UpdateWording.checkAgainButton : UpdateWording.checkButton) { Task { await model.check() } }.disabled(model.isWorking)
                         }
                     }
                     ForEach(model.notes, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
+                    if model.canDownload, let notes = model.releaseNotesURL {
+                        Link(UpdateWording.releaseNotesButton, destination: notes).font(.caption)
+                    }
                     Text(model.lastChecked).font(.caption).foregroundStyle(.secondary)
-                    Toggle("Check for updates automatically", isOn: Binding(
+                    Toggle(UpdateWording.automaticChecks, isOn: Binding(
                         get: { model.automaticChecks },
                         set: { on in Task { await model.setAutomaticChecks(on) } }
                     ))
+                    Text(UpdateWording.checksOnlyNote).font(.caption).foregroundStyle(.secondary)
                     if let status = model.status {
                         DisclosureGroup("Version details", isExpanded: $showsVersionDetails) {
                             LabeledContent("Version", value: status.currentVersion)
@@ -245,7 +249,15 @@ struct AccountSettingsView: View {
             }
             Group {
                 Section("Devices on your account") {
-                    if model.devices.isEmpty && model.sectionsEnabled { LoadingRow() }
+                    switch model.devicesPhase {
+                    case .loading: LoadingRow()
+                    case .failed(let failure):
+                        RetryRow(LoadWording.devices, notice: failure) { await model.load() }
+                    case .notLoaded, .loaded: EmptyView()
+                    }
+                    if let stale = model.devicesStale {
+                        RetryRow(LoadWording.stale("devices"), notice: stale) { await model.load() }
+                    }
                     ForEach(model.devices) { device in
                         HStack {
                             Text(device.name).help(device.tooltip)

@@ -12,7 +12,10 @@ use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_sync_sqlite::SyncSqliteError;
 
 use super::dirty_journal::dirty_kind_str;
-use super::disk_observation::disk_matches_prepare;
+use super::disk_observation::{
+    disk_matches_prepare, error_means_absent, exact_leaf_exists_as_directory,
+    try_exact_leaf_exists_as_file_or_symlink,
+};
 use super::event_ingest::EventOutcome;
 use super::path_policy::relative_key;
 use super::{FlushOutcome, LocalChangeOutcome, LocalChangeProcessor};
@@ -456,7 +459,7 @@ impl LocalChangeProcessor {
                     }
                     if pending_batch.len() >= AUTHORITATIVE_COMMIT_BATCH_SIZE {
                         for (record, key, observed_at) in
-                            self.flush_pending_batch(group_id, &mut pending_batch).await?
+                            self.flush_pending_batch(group_id, root, &mut pending_batch).await?
                         {
                             records.push(record);
                             pending_clears.push((key, observed_at));
@@ -467,7 +470,7 @@ impl LocalChangeProcessor {
                     }
                 }
                 for (record, key, observed_at) in
-                    self.flush_pending_batch(group_id, &mut pending_batch).await?
+                    self.flush_pending_batch(group_id, root, &mut pending_batch).await?
                 {
                     records.push(record);
                     pending_clears.push((key, observed_at));
@@ -506,7 +509,7 @@ impl LocalChangeProcessor {
         flush: DebounceFlush,
         ignore_set: &EffectiveIgnoreSet,
         emit_tombstones: bool,
-        on_chunk_committed: &mut (dyn FnMut(&[FileRecord]) + Send),
+        on_chunk_committed: &mut (dyn FnMut(&[FileRecord]) -> Result<(), LocalCaptureError> + Send),
     ) -> Result<FlushOutcome, LocalCaptureError> {
         match flush {
             DebounceFlush::Paths(_) => {
@@ -581,6 +584,7 @@ impl LocalChangeProcessor {
     pub(super) async fn flush_pending_batch(
         &self,
         group_id: &str,
+        root: &Path,
         pending: &mut Vec<PendingBatchedCommit>,
     ) -> Result<Vec<(FileRecord, String, i64)>, LocalCaptureError> {
         if pending.is_empty() {
@@ -633,7 +637,7 @@ impl LocalChangeProcessor {
                 Some(witness) => self.state.native_capture_is_fresh(group_id, witness)?,
                 None => true,
             };
-            let still_current = disk_matches_prepare(
+            let mut still_current = disk_matches_prepare(
                 &pending_commit.event_path,
                 &pending_commit.disk_fingerprint_at_prepare,
             ) && native_fresh
@@ -647,6 +651,65 @@ impl LocalChangeProcessor {
                         ..
                     } => false,
                 };
+            use yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence as Evidence;
+            let mut evidence = None;
+            if still_current {
+                match &pending_commit.mutation {
+                    yadorilink_replica_domain::session_state::PreparedLocalMutation::Upsert {
+                        ..
+                    } => {
+                        // The identity is observed INSIDE a bracket that the
+                        // fingerprint re-check then closes: a write landing
+                        // between the check above and this observation would
+                        // otherwise be vouched for as the bytes the stale
+                        // record describes.
+                        let observed = FileIdentity::observe_path(&pending_commit.event_path).ok();
+                        #[cfg(any(test, feature = "test-support"))]
+                        super::record_builder::fire_post_identity_race_hook(
+                            &pending_commit.event_path,
+                        );
+                        match observed {
+                            Some(filesystem_identity)
+                                if disk_matches_prepare(
+                                    &pending_commit.event_path,
+                                    &pending_commit.disk_fingerprint_at_prepare,
+                                ) =>
+                            {
+                                evidence = Some(Evidence::Present { filesystem_identity });
+                            }
+                            _ => still_current = false,
+                        }
+                    }
+                    yadorilink_replica_domain::session_state::PreparedLocalMutation::Delete {
+                        ..
+                    } => {
+                        // The prepared fingerprint may be that of a case- or
+                        // normalization-folded sibling (the exact leaf was
+                        // what was observed absent). `Absent` is published
+                        // for the exact name, so it is re-confirmed here: an
+                        // exact leaf that exists, or cannot be looked at,
+                        // is not an absence.
+                        match try_exact_leaf_exists_as_file_or_symlink(
+                            root,
+                            &pending_commit.rel_path,
+                        ) {
+                            Ok(false)
+                                if !exact_leaf_exists_as_directory(
+                                    root,
+                                    &pending_commit.rel_path,
+                                ) =>
+                            {
+                                evidence = Some(Evidence::Absent);
+                            }
+                            // The parent itself is gone: the leaf is too.
+                            Err(error) if error_means_absent(&error) => {
+                                evidence = Some(Evidence::Absent);
+                            }
+                            _ => still_current = false,
+                        }
+                    }
+                }
+            }
             if !still_current {
                 tracing::info!(
                     path = %pending_commit.rel_path,
@@ -655,21 +718,6 @@ impl LocalChangeProcessor {
                      preparation and commit; left journaled dirty for normal re-drive"
                 );
             }
-            use yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence as Evidence;
-            let evidence = if still_current {
-                match &pending_commit.mutation {
-                    yadorilink_replica_domain::session_state::PreparedLocalMutation::Upsert {
-                        ..
-                    } => FileIdentity::observe_path(&pending_commit.event_path)
-                        .ok()
-                        .map(|filesystem_identity| Evidence::Present { filesystem_identity }),
-                    yadorilink_replica_domain::session_state::PreparedLocalMutation::Delete {
-                        ..
-                    } => Some(Evidence::Absent),
-                }
-            } else {
-                None
-            };
             keep.push(still_current);
             evidence_if_kept.push(evidence);
         }
