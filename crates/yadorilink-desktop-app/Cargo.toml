@@ -61,7 +61,7 @@ tao = "0.37"
 # Cross-platform "reveal this path in the native file manager" helper for
 # the Open Folder / reveal-diagnostics-bundle actions -- avoids
 # hand-rolling `open`/`explorer.exe` invocations per platform.
-opener = { version = "0.8", features = ["reveal"] }
+opener = { version = "0.9", features = ["reveal"] }
 # Parses the OAuth loopback callback's query string (`google_login.rs`)
 # -- deliberately not hand-
 # rolled percent-decoding; `url` is the same widely-used, battle-tested
