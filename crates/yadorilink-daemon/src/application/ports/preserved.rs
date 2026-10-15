@@ -2,7 +2,8 @@
 //! an item, and the summary `status` carries.
 
 use super::common::BoxFuture;
-use crate::preserved_items::{PreservedError, PreservedItem, PreservedSummary};
+use crate::preserved_items::{PreservedError, PreservedItem, PreservedSummary, RetainedItem};
+use yadorilink_sync_sqlite::native_rebootstrap_retained::RetainedOutcome;
 
 pub(crate) trait PreservedPort: Send + Sync {
     fn list(&self) -> BoxFuture<'_, Result<Vec<PreservedItem>, PreservedError>>;
@@ -24,6 +25,15 @@ pub(crate) trait PreservedPort: Send + Sync {
         group_id: String,
         item_id: String,
     ) -> BoxFuture<'_, Result<(), PreservedError>>;
+
+    /// The originals a rebootstrap kept under a claim.
+    fn list_retained(&self) -> BoxFuture<'_, Result<Vec<RetainedItem>, PreservedError>>;
+
+    /// Tries to release the retained originals of one group, one outcome per path.
+    fn release_retained(
+        &self,
+        group_id: String,
+    ) -> BoxFuture<'_, Result<Vec<(String, RetainedOutcome)>, PreservedError>>;
 
     fn summary(&self) -> PreservedSummary;
 

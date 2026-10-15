@@ -969,7 +969,7 @@ mod offline_group_policy {
     }
 
     fn authority() -> SigningKey {
-        SigningKey::from_bytes(&[7u8; 32])
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
     }
 
     /// Applies one netmap frame's policy through the real live path.
@@ -1052,7 +1052,7 @@ mod offline_group_policy {
         }
 
         let restarted = device.start();
-        let impostor = SigningKey::from_bytes(&[9u8; 32]);
+        let impostor = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         restore_group_policy_states_verified_by(&restarted, impostor.verifying_key().to_bytes());
 
         assert!(
@@ -1196,5 +1196,198 @@ mod offline_group_policy {
             ),
             "nothing about a signed-out device's groups may survive on disk"
         );
+    }
+}
+
+/// A checkpoint source that counts the requests it receives, so a test can
+/// tell a flush that was attempted from one that never ran.
+struct CountingSource {
+    inner: crate::test_support::sync_stack_fixture::FixtureCheckpointSource,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::checkpoint_source::CheckpointSource for CountingSource {
+    fn request_authorization_checkpoint<'a>(
+        &'a self,
+        group_id: &'a str,
+        device_id: &'a str,
+        request_id: &'a str,
+        merkle_root: [u8; 32],
+        leaf_count: u64,
+        purpose: crate::checkpoint_source::CheckpointPurpose,
+    ) -> crate::checkpoint_source::CheckpointFuture<'a> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        self.inner.request_authorization_checkpoint(
+            group_id,
+            device_id,
+            request_id,
+            merkle_root,
+            leaf_count,
+            purpose,
+        )
+    }
+}
+
+fn pending_native_count(state: &DaemonState, group: &str) -> usize {
+    state
+        .replica_coordinator
+        .database()
+        .read(|conn| {
+            yadorilink_sync_sqlite::native_publication::pending_native_deltas_for_device(
+                conn,
+                &yadorilink_replica_domain::ids::FolderGroupId(group.into()),
+                &state.device_id,
+            )
+        })
+        .unwrap()
+        .len()
+}
+
+async fn wait_until_nothing_pending(state: &DaemonState, group: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while pending_native_count(state, group) > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+const POLICY_ENDPOINT: &str = "https://coordination.test";
+
+/// A batch whose checkpoint pins a policy head ahead of this device's verified
+/// chain cannot be verified, and stays pending. The frame that brings the
+/// chain forward is what makes it publishable, with no further local edit:
+/// the first flush is attempted and refused, and a second one is started by
+/// the frame itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_policy_frame_that_catches_up_publishes_the_batch_that_could_not_verify() {
+    use crate::change_policy::policy_signing::signed_writer_grant_log;
+    use crate::native_test_support::{author_delta, DEVICE, GROUP};
+    use crate::test_support::sync_stack_fixture::{
+        authority_key, device, link_folder, FixtureCheckpointSource,
+    };
+
+    let (state, _dir) = device(DEVICE, 9);
+    let root = tempfile::tempdir().unwrap();
+    let _canonical = link_folder(&state, root.path());
+
+    let authority = authority_key();
+    let service_key = authority.verifying_key().to_bytes();
+    let own_key = state.device_signing_key().unwrap().verifying_key().to_bytes();
+    let behind = signed_writer_grant_log(&authority, GROUP, &[(DEVICE, own_key)]);
+    let ahead =
+        signed_writer_grant_log(&authority, GROUP, &[(DEVICE, own_key), ("device-b", [3; 32])]);
+    let mut pins = HashMap::from([(POLICY_ENDPOINT.to_string(), hex::encode(service_key))]);
+
+    // Installed directly: a live frame would spawn a flush of its own that
+    // could run after the delta below exists and publish it.
+    let installed = crate::change_policy::verify_group_policy_log(&service_key, &behind).unwrap();
+    state.authority.replace_group_policy_states(HashMap::from([(GROUP.to_string(), installed)]));
+    author_delta(&state.replica_coordinator.database(), 1, "a.txt");
+    let head: [u8; 32] = ahead.policy_head.as_slice().try_into().unwrap();
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    *state.test_seal_checkpoint_source.lock().unwrap() = Some(Arc::new(CountingSource {
+        inner: FixtureCheckpointSource::for_device(&state).at_policy_point(2, head),
+        requests: requests.clone(),
+    }));
+
+    state.flush_pending_native_checkpoint_for_group_for_test(GROUP).await;
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "the first flush was attempted");
+    assert_eq!(
+        pending_native_count(&state, GROUP),
+        1,
+        "the checkpoint names a head this device has not verified yet"
+    );
+
+    record_group_policy_states(&state, POLICY_ENDPOINT, &mut pins, &service_key, &[ahead]).unwrap();
+    wait_until_nothing_pending(&state, GROUP).await;
+    assert_eq!(pending_native_count(&state, GROUP), 0, "the frame publishes the batch");
+    assert_eq!(requests.load(Ordering::SeqCst), 2, "by a second flush the frame started");
+}
+
+/// A device restarted with a batch still pending, whose plane connection comes
+/// back, publishes it with no local edit. Two orders are possible and both
+/// are proved: the restored policy chain is already verified when the
+/// connection flush runs (the flush itself publishes), or it is not (the
+/// flush finds no verified policy and does nothing, and the first live frame
+/// carrying the chain, which advances it from nothing, starts the flush).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_pending_across_a_restart_is_published_once_the_plane_is_back() {
+    use crate::change_policy::policy_signing::signed_writer_grant_log;
+    use crate::native_test_support::{author_delta, DEVICE, GROUP};
+    use crate::test_support::sync_stack_fixture::{authority_key, FixtureCheckpointSource};
+
+    let authority = authority_key();
+    let service_key = authority.verifying_key().to_bytes();
+    let own_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes();
+    let chain = signed_writer_grant_log(&authority, GROUP, &[(DEVICE, own_key)]);
+    let head: [u8; 32] = chain.policy_head.as_slice().try_into().unwrap();
+
+    for restored_before_connect in [true, false] {
+        let database = tempfile::tempdir().unwrap();
+        let blocks = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let start = || {
+            let coordinator =
+                Arc::new(ReplicaCoordinator::open(database.path().join("sync.sqlite3")).unwrap());
+            let store = Arc::new(SegmentBlockStore::new(blocks.path()).unwrap());
+            let state = DaemonState::new(DEVICE.into(), coordinator, store);
+            state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]));
+            state
+        };
+
+        // Before the restart: the chain was verified and stored, the folder is
+        // linked, and a local change was authored but never published.
+        let first = start();
+        let _linked = crate::test_support::sync_stack_fixture::link_folder(&first, folder.path());
+        let mut pins = HashMap::from([(POLICY_ENDPOINT.to_string(), hex::encode(service_key))]);
+        record_group_policy_states(
+            &first,
+            POLICY_ENDPOINT,
+            &mut pins,
+            &service_key,
+            std::slice::from_ref(&chain),
+        )
+        .unwrap();
+        author_delta(&first.replica_coordinator.database(), 1, "a.txt");
+        first.stop_background_tasks_for_tests();
+        first.release_reference_cycles_for_tests();
+        drop(first);
+
+        // After the restart.
+        let second = start();
+        assert_eq!(pending_native_count(&second, GROUP), 1, "the batch survived the restart");
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        *second.test_seal_checkpoint_source.lock().unwrap() = Some(Arc::new(CountingSource {
+            inner: FixtureCheckpointSource::for_device(&second).at_policy_point(1, head),
+            requests: requests.clone(),
+        }));
+        if restored_before_connect {
+            restore_group_policy_states_verified_by(&second, service_key);
+        }
+        // What the reconnect hook runs for each linked group, awaited so
+        // nothing is left to race the frame below.
+        second.flush_pending_native_checkpoint_for_group_for_test(GROUP).await;
+        if !restored_before_connect {
+            assert_eq!(pending_native_count(&second, GROUP), 1, "no verified policy, no flush");
+            assert_eq!(requests.load(Ordering::SeqCst), 0);
+            // The first live frame carries the whole chain again.
+            let mut pins = HashMap::from([(POLICY_ENDPOINT.to_string(), hex::encode(service_key))]);
+            record_group_policy_states(
+                &second,
+                POLICY_ENDPOINT,
+                &mut pins,
+                &service_key,
+                std::slice::from_ref(&chain),
+            )
+            .unwrap();
+        }
+        wait_until_nothing_pending(&second, GROUP).await;
+        assert_eq!(
+            pending_native_count(&second, GROUP),
+            0,
+            "published with no local edit (restored before connect: {restored_before_connect})"
+        );
+        assert!(requests.load(Ordering::SeqCst) >= 1);
+        second.stop_background_tasks_for_tests();
+        second.release_reference_cycles_for_tests();
     }
 }

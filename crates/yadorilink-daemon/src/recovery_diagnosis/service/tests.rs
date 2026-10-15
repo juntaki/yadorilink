@@ -705,8 +705,8 @@ mod wire {
     }
 
     #[test]
-    fn control_protocol_version_is_15() {
-        // 15 removed the `pin`/`unpin` variants and two pin/cap fields; 14
+    fn control_protocol_version_is_17() {
+        // 17 added `LinkStatus.requested_content_count`; 16 added `list_retained_originals`/`release_retained_originals`; 15 removed the `pin`/`unpin` variants and two pin/cap fields; 14
         // added `LinkStatus.durability_check_pending`; 13 added `retry_preserved`. Bumped from 10 -- LAN discovery's read-only
         // `list_lan_discovered_candidates` request/response oneof
         // variants were REMOVED with the legacy LAN broadcast discovery
@@ -719,6 +719,6 @@ mod wire {
         // Rewind's `rewind_preview` variants over 8, and 8 the one-shot
         // transfer `send_file`/`list_inbox`/`receive_transfer` variants
         // over 7, for the identical reason.)
-        assert_eq!(yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION, 15);
+        assert_eq!(yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION, 17);
     }
 }

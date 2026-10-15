@@ -48,7 +48,7 @@ pub(super) fn read(path: &Path) -> StoreResult<Option<String>> {
 /// copy-then-delete on a host where the config directory is a different mount.
 pub(super) fn write(path: &Path, contents: &str) -> StoreResult<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent).map_err(io(parent))?;
+    yadorilink_fs_platform::durable_dir::create_dir_all_durably(parent).map_err(io(parent))?;
 
     let temporary = temporary_path(path);
     // A leftover from a crashed write would otherwise make `create_new` fail

@@ -6,16 +6,22 @@
 //! dropped with files queued applies nothing for them.
 
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
+#[cfg(unix)]
 use yadorilink_local_capture::LocalChangeOutcome;
+#[cfg(unix)]
 use yadorilink_replica_domain::ids::VersionHash;
 
 use super::growing_file_projection_tests::{Harness, GROUP};
 use super::receive_window_concurrency_tests::{
-    names, pin_concurrency, publish, publish_new_files, put, reconcile, run_workload_with, source,
+    names, pin_concurrency, publish_new_files, reconcile, run_workload_with,
 };
+#[cfg(unix)]
+use super::receive_window_concurrency_tests::{publish, put, source};
 
 const BATCH: u8 = 1;
 const PER_FILE: u8 = 2;
@@ -81,11 +87,13 @@ fn spawn_reconcile(
 /// Parks the committing task just before a batched metadata transaction, with
 /// every file of the batch queued (each holding its path lock) and nothing of
 /// the batch written.
+#[cfg(unix)]
 struct Gate {
     state: Mutex<(bool, bool)>,
     changed: Condvar,
 }
 
+#[cfg(unix)]
 impl Gate {
     fn arm(h: &Harness) -> Arc<Self> {
         let gate = Arc::new(Self { state: Mutex::new((false, false)), changed: Condvar::new() });

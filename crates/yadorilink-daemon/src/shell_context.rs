@@ -54,8 +54,14 @@ pub struct ShellContext {
     /// Which Eager downloads the host app should request next, and the daemon-wide limit on
     /// concurrent assemblies.
     pub(crate) eager: Arc<crate::provider_eager::EagerDriver>,
+    /// Opens in flight per group, from request to answer (shared with `DaemonState`).
+    pub(crate) requested_opens: Arc<crate::requested_opens::RequestedOpens>,
     /// The idle-only breadth-first prefetch of provider roots.
     pub(crate) prefetch: Arc<crate::provider_prefetch::PrefetchScheduler>,
+    /// Native evictions waiting for the daemon to free its cached blocks.
+    pub(crate) reclaim_queue: Arc<crate::provider_reclaim::ReclaimQueue>,
+    /// Automatic space management: Off unless the setting says otherwise.
+    pub(crate) auto_reclaim: Arc<crate::provider_auto_reclaim::AutoReclaim>,
     /// The author identity, block store and authoring lease the provider write path uses.
     pub(crate) writer: Arc<crate::provider_writer::ProviderWriter>,
 }
@@ -78,6 +84,31 @@ impl crate::provider_eager::EagerEnvironment for DaemonEagerEnvironment {
 
     fn peers_available(&self, group_id: &str) -> bool {
         !crate::hydration::candidate_sessions(&self.state, group_id).is_empty()
+    }
+}
+
+/// The machine facts automatic space management reads.
+struct DaemonReclaimEnvironment {
+    state: Arc<crate::daemon_state::DaemonState>,
+    host: Arc<crate::provider_host_link::ProviderHostLink>,
+}
+
+impl crate::provider_auto_reclaim::ReclaimEnvironment for DaemonReclaimEnvironment {
+    fn host_connected(&self) -> bool {
+        self.host.host_connected()
+    }
+
+    fn peers_available(&self, group_id: &str) -> bool {
+        !crate::hydration::candidate_sessions(&self.state, group_id).is_empty()
+    }
+
+    fn free_space(&self) -> Option<yadorilink_local_storage::free_space::FreeSpaceState> {
+        let headroom_override =
+            self.state.governance_config.load_or_default().headroom_override_bytes;
+        let root = self.state.block_store.storage_root()?;
+        yadorilink_local_storage::free_space::classify_volume(root, headroom_override)
+            .ok()
+            .map(|space| space.classify())
     }
 }
 
@@ -105,18 +136,27 @@ impl ShellContext {
             let extras_coordinator = coordinator.clone();
             let extras_host = host.clone();
             control.provider_status.install_extras(Arc::new(move || {
-                let removals = extras_coordinator
-                    .provider_repository()
-                    .removals()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|r| yadorilink_ipc_proto::daemonctl::ProviderRemovalStatus {
-                        root_id: r.root_id.chars().take(8).collect(),
-                        display_name: r.display_name,
-                        removed: !r.requested,
-                        preserved_location: r.preserved_location.unwrap_or_default(),
-                    })
-                    .collect();
+                let removals = match extras_coordinator.provider_repository().removals() {
+                    Ok(removals) => removals
+                        .into_iter()
+                        .map(|r| yadorilink_ipc_proto::daemonctl::ProviderRemovalStatus {
+                            root_id: r.root_id.chars().take(8).collect(),
+                            display_name: r.display_name,
+                            removed: !r.requested,
+                            preserved_location: r.preserved_location.unwrap_or_default(),
+                            unreadable: false,
+                        })
+                        .collect(),
+                    // An unreadable list is not "no removals": one line says so.
+                    Err(error) => {
+                        tracing::warn!(%error, "could not read the provider removals for status");
+                        vec![yadorilink_ipc_proto::daemonctl::ProviderRemovalStatus {
+                            display_name: format!("removals unreadable: {error}"),
+                            unreadable: true,
+                            ..Default::default()
+                        }]
+                    }
+                };
                 let orphans = extras_host
                     .orphans()
                     .into_iter()
@@ -145,10 +185,27 @@ impl ShellContext {
                 crate::provider_status::provider_root_lines(&coordinator, &eager, &inputs, now_ms)
             }));
         }
-        control.provider_evict.install(Arc::new(crate::provider_evict::ProviderEvictor::new(
+        let reclaim = Arc::new(crate::provider_reclaim::ProviderReclaim::new(state.clone()));
+        let evictor = Arc::new(crate::provider_evict::ProviderEvictor::new(
             state.clone(),
             provider_host.clone(),
-        )));
+            reclaim.clone(),
+            membership.clone(),
+        ));
+        control.provider_evict.install(evictor.clone());
+        let auto_reclaim = Arc::new(crate::provider_auto_reclaim::AutoReclaim::new(
+            state.clone(),
+            evictor,
+            membership.clone(),
+            Arc::new(DaemonReclaimEnvironment {
+                state: state.clone(),
+                host: provider_host.clone(),
+            }),
+            crate::space_management_config::SpaceManagementStore::new(
+                crate::device_config::config_dir(),
+            ),
+        ));
+        control.auto_reclaim.install(auto_reclaim.clone());
         Self {
             application: control.application.clone(),
             queries: control.queries.clone(),
@@ -162,9 +219,15 @@ impl ShellContext {
             )),
             provider_host,
             membership,
+            reclaim_queue: Arc::new(crate::provider_reclaim::ReclaimQueue::new(
+                state.clone(),
+                reclaim,
+            )),
             handoff: crate::provider_handoff::HandoffSlot::empty(),
             writer: Arc::new(crate::provider_writer::ProviderWriter::new(state.clone())),
             eager,
+            auto_reclaim,
+            requested_opens: state.requested_opens.clone(),
             prefetch: Arc::new(crate::provider_prefetch::PrefetchScheduler::new(
                 crate::provider_prefetch::PrefetchConfig::default(),
             )),
@@ -175,6 +238,16 @@ impl ShellContext {
     #[cfg(test)]
     pub(crate) fn with_eager(mut self, eager: Arc<crate::provider_eager::EagerDriver>) -> Self {
         self.eager = eager;
+        self
+    }
+
+    /// Replaces the reclaim queue (tests give it a fake custody source).
+    #[cfg(test)]
+    pub(crate) fn with_reclaim_queue(
+        mut self,
+        queue: Arc<crate::provider_reclaim::ReclaimQueue>,
+    ) -> Self {
+        self.reclaim_queue = queue;
         self
     }
 

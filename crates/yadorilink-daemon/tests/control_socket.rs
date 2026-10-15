@@ -20,6 +20,9 @@ mod unix_socket_tests {
         MaterializationStatusRequest, PauseRequest, PendingEnrollmentKind, RestoreTrashRequest,
         RestoreVersionRequest, ResumeRequest, StatusRequest, UnlinkRequest,
     };
+    use yadorilink_ipc_proto::daemonctl::{
+        PinItemRequest, RetentionPolicy, RetentionState, UnpinItemRequest,
+    };
     use yadorilink_ipc_proto::framing::{read_message, write_message};
     use yadorilink_local_storage::SegmentBlockStore;
 
@@ -229,9 +232,14 @@ mod unix_socket_tests {
         .await;
 
         let local_path = folder.to_string_lossy().to_string();
-        let resp =
-            send(&socket_path, ReqPayload::Pause(PauseRequest { local_path: local_path.clone() }))
-                .await;
+        let resp = send(
+            &socket_path,
+            ReqPayload::Pause(PauseRequest {
+                local_path: local_path.clone(),
+                ..Default::default()
+            }),
+        )
+        .await;
         assert!(matches!(resp.payload, Some(RespPayload::Pause(_))));
 
         let resp = send(&socket_path, ReqPayload::Status(StatusRequest {})).await;
@@ -248,6 +256,89 @@ mod unix_socket_tests {
             panic!("wrong response variant")
         };
         assert!(!status.links[0].paused);
+    }
+
+    /// A timed pause reports its deadline in status, a longer pause replaces it, and
+    /// pausing until resumed or resuming clears it.
+    #[tokio::test]
+    async fn timed_pause_reports_its_deadline_until_replaced_or_resumed() {
+        use yadorilink_ipc_proto::daemonctl::PauseDuration;
+        let (socket_path, dir) = start_daemon().await;
+        let folder = dir.path().join("docs");
+        std::fs::create_dir_all(&folder).unwrap();
+        send(
+            &socket_path,
+            ReqPayload::Link(LinkRequest {
+                local_path: folder.to_string_lossy().to_string(),
+                group_id: "group-t".into(),
+                on_demand: false,
+                acknowledge_risks: true,
+                pending_enrollment_operation_id: String::new(),
+                pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
+                pending_enrollment_device_id: String::new(),
+            }),
+        )
+        .await;
+        let local_path = folder.to_string_lossy().to_string();
+        let status = |socket_path: std::path::PathBuf| async move {
+            let resp = send(&socket_path, ReqPayload::Status(StatusRequest {})).await;
+            let Some(RespPayload::Status(status)) = resp.payload else {
+                panic!("wrong response variant")
+            };
+            (status.links[0].paused, status.links[0].paused_until_unix)
+        };
+        let pause = |duration: PauseDuration| {
+            let socket_path = socket_path.clone();
+            let local_path = local_path.clone();
+            async move {
+                let resp = send(
+                    &socket_path,
+                    ReqPayload::Pause(PauseRequest { local_path, duration: duration as i32 }),
+                )
+                .await;
+                assert!(matches!(resp.payload, Some(RespPayload::Pause(_))));
+            }
+        };
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+                as i64;
+
+        pause(PauseDuration::ThirtyMinutes).await;
+        let (paused, until) = status(socket_path.clone()).await;
+        assert!(paused);
+        assert!((now + 1790..=now + 1810).contains(&until), "30 minutes, got {until} at {now}");
+
+        // One hour, not until tomorrow: midnight can be nearer than 30 minutes.
+        pause(PauseDuration::OneHour).await;
+        let (_, later) = status(socket_path.clone()).await;
+        assert!((now + 3590..=now + 3610).contains(&later), "1 hour, got {later} at {now}");
+
+        pause(PauseDuration::Unspecified).await;
+        assert_eq!(status(socket_path.clone()).await, (true, 0));
+
+        pause(PauseDuration::UntilTomorrow).await;
+        let resp = send(
+            &socket_path,
+            ReqPayload::Resume(ResumeRequest { local_path: local_path.clone() }),
+        )
+        .await;
+        assert!(matches!(resp.payload, Some(RespPayload::Resume(_))));
+        assert_eq!(status(socket_path.clone()).await, (false, 0));
+    }
+
+    /// Cancel and retry answer with an error, not a hang or a fake success, for a transfer
+    /// this device does not have.
+    #[tokio::test]
+    async fn cancel_and_retry_of_an_unknown_transfer_are_errors() {
+        use yadorilink_ipc_proto::daemonctl::{CancelTransferRequest, RetryTransferRequest};
+        let (socket_path, _dir) = start_daemon().await;
+        for payload in [
+            ReqPayload::CancelTransfer(CancelTransferRequest { transfer_id: "nope".into() }),
+            ReqPayload::RetryTransfer(RetryTransferRequest { transfer_id: "nope".into() }),
+        ] {
+            let resp = send(&socket_path, payload).await;
+            assert!(matches!(resp.payload, Some(RespPayload::Error(_))), "{:?}", resp.payload);
+        }
     }
 
     /// cli spec: unlinking removes the folder from subsequent listings.
@@ -1168,6 +1259,10 @@ mod unix_socket_tests {
     /// file turns it into a correctly-sized placeholder, over the control
     /// socket end to end.
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "removing an evicted file needs the Linux write lease"
+    )]
     async fn evict_via_control_socket_succeeds_for_an_indexed_hydrated_file() {
         let (socket_path, dir, state) = start_daemon_with_state().await;
         // This test is about the eviction gate's own success path, not the
@@ -1314,6 +1409,10 @@ mod unix_socket_tests {
     /// Evicting a folder over the control socket frees every hydrated file
     /// below it, and only those.
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "removing an evicted file needs the Linux write lease"
+    )]
     async fn evict_via_control_socket_frees_every_hydrated_file_below_a_folder() {
         use yadorilink_replica_domain::session_state::MaterializationState;
         let (socket_path, dir, state) = start_daemon_with_state().await;
@@ -1958,6 +2057,235 @@ mod unix_socket_tests {
             .unwrap();
         assert!(!current.deleted, "the file must be live again after a trash restore");
     }
+    /// A retained original is listed over the control socket, counted in `status`, and a release
+    /// for a group the device knows nothing of is an error, not an empty answer.
+    #[tokio::test]
+    async fn retained_originals_are_listed_and_a_release_for_an_unknown_group_is_refused() {
+        use yadorilink_ipc_proto::daemonctl::{
+            ListRetainedOriginalsRequest, ReleaseRetainedOriginalsRequest,
+        };
+        let (socket_path, _dir, state) = start_daemon_with_state().await;
+        state
+            .replica_coordinator
+            .database()
+            .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
+                tx.execute(
+                    "INSERT INTO native_rebootstrap_quarantine \
+                     (group_id, recovery_id, path, status, removal_claim) \
+                     VALUES ('gone-group', 'rid', 'a.txt', 'retained', '0123456789abcdef')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let resp =
+            send(&socket_path, ReqPayload::ListRetainedOriginals(ListRetainedOriginalsRequest {}))
+                .await;
+        let Some(RespPayload::ListRetainedOriginals(list)) = resp.payload else {
+            panic!("wrong response variant: {:?}", resp.payload)
+        };
+        assert_eq!(list.items.len(), 1);
+        let item = &list.items[0];
+        assert_eq!((item.group_id.as_str(), item.path.as_str()), ("gone-group", "a.txt"));
+        assert!(item.group_removed && !item.reachable);
+
+        let resp = send(&socket_path, ReqPayload::Status(StatusRequest {})).await;
+        let Some(RespPayload::Status(status)) = resp.payload else { panic!("wrong variant") };
+        assert_eq!(status.preserved.unwrap().retained_originals, 1);
+
+        let resp = send(
+            &socket_path,
+            ReqPayload::ReleaseRetainedOriginals(ReleaseRetainedOriginalsRequest {
+                group_id: "no-such-group".into(),
+            }),
+        )
+        .await;
+        assert!(matches!(resp.payload, Some(RespPayload::Error(_))), "{:?}", resp.payload);
+    }
+
+    /// The release the storage window asks for, over the real control socket, against a linked
+    /// folder: an original kept under its claim with its recorded fingerprint is removed where
+    /// the platform proves no writer can hold it (Linux), and reported as still retained where
+    /// it cannot; the answer names the outcome the window turns into its message.
+    #[tokio::test]
+    async fn a_kept_original_is_released_over_the_socket_where_the_platform_can_prove_it() {
+        use yadorilink_fs_platform::reserved_namespace::{artefact_component_name, ArtefactKind};
+        use yadorilink_ipc_proto::daemonctl::ReleaseRetainedOriginalsRequest;
+        use yadorilink_sync_sqlite::native_rebootstrap_install::observe_regular_file;
+        use yadorilink_sync_sqlite::native_rebootstrap_retained::kept_fingerprint;
+        let (socket_path, dir, state) = start_daemon_with_state().await;
+        let folder = dir.path().join("kept-folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        link_folder(&socket_path, &folder, "group-kept").await;
+        let claim = "0123456789abcdef";
+        let kept = folder.join(artefact_component_name(ArtefactKind::Preimage, claim).unwrap());
+        std::fs::write(&kept, b"the old bytes").unwrap();
+        let fingerprint =
+            kept_fingerprint(&observe_regular_file(std::fs::File::open(&kept).unwrap()).unwrap())
+                .unwrap();
+        state
+            .replica_coordinator
+            .database()
+            .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
+                tx.execute(
+                    "INSERT INTO native_rebootstrap_quarantine \
+                     (group_id, recovery_id, path, status, removal_claim) \
+                     VALUES ('group-kept', 'rid', 'old.txt', 'retained', ?1)",
+                    [claim],
+                )?;
+                tx.execute(
+                    "INSERT INTO native_rebootstrap_retained_digest \
+                     (group_id, recovery_id, path, fingerprint) \
+                     VALUES ('group-kept', 'rid', 'old.txt', ?1)",
+                    [fingerprint.as_slice()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // The group's startup continuation holds its machine claim for a moment; the daemon
+        // answers "try again" until it is done.
+        let mut resp;
+        let mut tries = 0;
+        loop {
+            resp = send(
+                &socket_path,
+                ReqPayload::ReleaseRetainedOriginals(ReleaseRetainedOriginalsRequest {
+                    group_id: "group-kept".into(),
+                }),
+            )
+            .await;
+            tries += 1;
+            if !matches!(&resp.payload, Some(RespPayload::Error(e)) if e.contains("try again"))
+                || tries > 100
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let Some(RespPayload::ReleaseRetainedOriginals(done)) = resp.payload else {
+            panic!("wrong response variant: {:?}", resp.payload)
+        };
+        let proved = cfg!(any(target_os = "linux", windows));
+        let outcomes: Vec<_> =
+            done.releases.iter().map(|r| (r.path.as_str(), r.outcome.as_str())).collect();
+        if proved {
+            // The folder's own startup continuation may already have released it, which
+            // leaves nothing for this request to report.
+            assert!(outcomes == [("old.txt", "removed")] || outcomes.is_empty(), "{outcomes:?}");
+        } else {
+            assert_eq!(outcomes, [("old.txt", "still_retained")]);
+        }
+        let expected = if proved { "removed" } else { "still_retained" };
+        assert_eq!(kept.exists(), expected == "still_retained");
+        let resp = send(&socket_path, ReqPayload::Status(StatusRequest {})).await;
+        let Some(RespPayload::Status(status)) = resp.payload else { panic!("wrong variant") };
+        assert_eq!(status.preserved.unwrap().retained_originals, u32::from(kept.exists()));
+    }
+
+    async fn link_folder(socket_path: &std::path::Path, folder: &std::path::Path, group: &str) {
+        let resp = send(
+            socket_path,
+            ReqPayload::Link(LinkRequest {
+                local_path: folder.to_string_lossy().to_string(),
+                group_id: group.into(),
+                on_demand: false,
+                acknowledge_risks: true,
+                pending_enrollment_operation_id: String::new(),
+                pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
+                pending_enrollment_device_id: String::new(),
+            }),
+        )
+        .await;
+        assert!(matches!(resp.payload, Some(RespPayload::Link(_))), "{resp:?}");
+    }
+
+    async fn retention_of(socket_path: &std::path::Path, path: &std::path::Path) -> RetentionState {
+        let resp = send(
+            socket_path,
+            ReqPayload::MaterializationStatus(MaterializationStatusRequest {
+                absolute_path: path.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let Some(RespPayload::MaterializationStatus(status)) = resp.payload else {
+            panic!("expected a MaterializationStatus response, got {resp:?}")
+        };
+        status.retention.expect("a path under a linked folder reports its retention")
+    }
+
+    fn pinned(explicit: bool) -> RetentionState {
+        RetentionState { policy: RetentionPolicy::Pinned as i32, explicit }
+    }
+
+    fn reclaimable() -> RetentionState {
+        RetentionState { policy: RetentionPolicy::Reclaimable as i32, explicit: false }
+    }
+
+    /// The retention policy is a standing choice, reported apart from the
+    /// materialization state, and a folder's pin is inherited beneath it.
+    #[tokio::test]
+    async fn pin_and_unpin_over_the_control_socket_set_the_policy_and_inherit_by_folder() {
+        let (socket_path, dir) = start_daemon().await;
+        let folder = dir.path().join("shared");
+        std::fs::create_dir_all(folder.join("album")).unwrap();
+        link_folder(&socket_path, &folder, "group-pin").await;
+        let album = folder.join("album");
+        let photo = album.join("one.jpg");
+
+        assert_eq!(retention_of(&socket_path, &photo).await, reclaimable());
+
+        // The path is not indexed, so there is nothing to download; the pin stands regardless.
+        let resp = send(
+            &socket_path,
+            ReqPayload::PinItem(PinItemRequest {
+                absolute_path: album.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let Some(RespPayload::PinItem(pin)) = resp.payload else { panic!("{resp:?}") };
+        assert_eq!(pin.retention, Some(pinned(true)));
+        assert_eq!(retention_of(&socket_path, &album).await, pinned(true));
+        assert_eq!(retention_of(&socket_path, &photo).await, pinned(false), "inherited");
+
+        // No per-child override: the child stays pinned and the answer says so.
+        let resp = send(
+            &socket_path,
+            ReqPayload::UnpinItem(UnpinItemRequest {
+                absolute_path: photo.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let Some(RespPayload::UnpinItem(unpin)) = resp.payload else { panic!("{resp:?}") };
+        assert_eq!(unpin.retention, Some(pinned(false)));
+
+        let resp = send(
+            &socket_path,
+            ReqPayload::UnpinItem(UnpinItemRequest {
+                absolute_path: album.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let Some(RespPayload::UnpinItem(unpin)) = resp.payload else { panic!("{resp:?}") };
+        assert_eq!(unpin.retention, Some(reclaimable()));
+        assert_eq!(retention_of(&socket_path, &photo).await, reclaimable());
+    }
+
+    /// A path outside every linked folder has no policy to set.
+    #[tokio::test]
+    async fn pinning_a_path_outside_every_linked_folder_is_an_error() {
+        let (socket_path, dir) = start_daemon().await;
+        let resp = send(
+            &socket_path,
+            ReqPayload::PinItem(PinItemRequest {
+                absolute_path: dir.path().join("elsewhere.txt").to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        assert!(matches!(resp.payload, Some(RespPayload::Error(_))), "{resp:?}");
+    }
 } // mod unix_socket_tests
 
 /// the same control protocol exercised
@@ -2088,9 +2416,14 @@ mod windows_pipe_tests {
         .await;
 
         let local_path = folder.to_string_lossy().to_string();
-        let resp =
-            send(&pipe_name, ReqPayload::Pause(PauseRequest { local_path: local_path.clone() }))
-                .await;
+        let resp = send(
+            &pipe_name,
+            ReqPayload::Pause(PauseRequest {
+                local_path: local_path.clone(),
+                ..Default::default()
+            }),
+        )
+        .await;
         assert!(matches!(resp.payload, Some(RespPayload::Pause(_))));
 
         let resp = send(&pipe_name, ReqPayload::Status(StatusRequest {})).await;

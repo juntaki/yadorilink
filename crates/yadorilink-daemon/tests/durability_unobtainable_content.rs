@@ -249,8 +249,15 @@ async fn unobtainable_content_converges_to_at_risk_not_stuck_protecting() {
     n.state.set_test_on_demand_allowed(true);
     let mut fully_removed = false;
     for _ in 0..10 {
-        yadorilink_daemon::hydration::evict(&n.state, &group_id, unique_path)
-            .expect("evicting x's content on n (a full replica) must not be custody-gated");
+        {
+            // Eviction unlinks the working-tree copy only where the OS proves no writer can
+            // exist (the Linux write lease); elsewhere (macOS) it keeps the file by design, so
+            // stand in for the exclusion there. Armed per call on this thread (thread-local).
+            #[cfg(not(target_os = "linux"))]
+            let _exclusion = yadorilink_filesystem_sync::materialization_eviction::assume_write_exclusion_for_test();
+            yadorilink_daemon::hydration::evict(&n.state, &group_id, unique_path)
+                .expect("evicting x's content on n (a full replica) must not be custody-gated");
+        }
         for hash in &block_hashes {
             let _ = n.state.block_store.delete(hash);
         }

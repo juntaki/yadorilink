@@ -100,6 +100,9 @@ NATIVE_LIBS="$(echo "$NATIVE_LIBS" | sed -E 's/(^| )-lm( |$)/\1/g')"
 echo "native-static-libs: $NATIVE_LIBS"
 
 # --- 2. FinderSync extension binary -----------------
+# Two source files make this a multi-file module, which (unlike the single file it used to be)
+# no longer gets an implicit `_main`; an extension is entered through `_NSExtensionMain`, as
+# in a real extension build, so name it as the entry point.
 echo "-- compiling FinderSync extension --"
 APPEX_BUNDLE="$BUILD_DIR/$EXT_NAME.appex"
 mkdir -p "$APPEX_BUNDLE/Contents/MacOS"
@@ -114,9 +117,12 @@ mkdir -p "$APPEX_BUNDLE/Contents/Resources"
     -lyadorilink_shell_core \
     -framework Cocoa \
     -framework FinderSync \
+    -Xlinker -e -Xlinker _NSExtensionMain \
     $NATIVE_LIBS \
     -o "$APPEX_BUNDLE/Contents/MacOS/$EXT_NAME" \
-    "$EXT_DIR/FinderSync.swift"
+    "$EXT_DIR/FinderSync.swift" \
+    "$ROOT_DIR/../FileProviderCore/Sources/FileProviderCore/EagerRoots.swift" \
+    "$ROOT_DIR/../FileProviderCore/Sources/FileProviderCore/FinderMenu.swift"
 
 cp "$EXT_DIR/Info.plist" "$APPEX_BUNDLE/Contents/Info.plist"
 

@@ -19,6 +19,7 @@ pub mod report;
 pub mod rewind;
 pub mod send;
 pub mod share;
+pub mod space;
 pub mod status;
 pub mod update;
 pub mod version_history;

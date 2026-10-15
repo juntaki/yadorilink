@@ -120,7 +120,9 @@ public final class SignInModel {
 @Observable
 public final class AccountViewModel {
     public let app: AppModel
-    public private(set) var devices: [DeviceRow] = []
+    public private(set) var devicesPhase: FetchPhase<[DeviceRow]> = .notLoaded
+    public var devices: [DeviceRow] { devicesPhase.value ?? [] }
+    public private(set) var devicesStale: Notice?
     public private(set) var deletion: AccountDeletionStatus?
     public private(set) var deletionToken: String?
     public private(set) var isWorking = false
@@ -152,11 +154,21 @@ public final class AccountViewModel {
 
     public func load() async {
         guard sectionsEnabled else {
-            devices = []
+            devicesPhase = .notLoaded
             return
         }
+        if devicesPhase.value == nil { devicesPhase = .loading }
         do {
-            devices = try await app.client.listAccountDevices().map { DeviceRow($0, now: now()) }
+            devicesPhase = .loaded(try await app.client.listAccountDevices().map { DeviceRow($0, now: now()) })
+            devicesStale = nil
+        } catch {
+            if devicesPhase.value == nil {
+                devicesPhase = .failed(.failure(error))
+            } else {
+                devicesStale = .failure(error)
+            }
+        }
+        do {
             deletion = try await app.client.accountDeletionStatus()
         } catch {
             notice = .failure(error)
@@ -167,7 +179,7 @@ public final class AccountViewModel {
         await work {
             _ = try await self.app.client.signOut()
             await self.app.refreshAccount()
-            self.devices = []
+            self.devicesPhase = .notLoaded
             return "Signed out."
         }
     }
@@ -274,6 +286,8 @@ public struct ManagedDevice: Identifiable, Equatable, Sendable {
 public final class DevicesViewModel {
     public let app: AppModel
     public private(set) var phase: FetchPhase<[ManagedDevice]> = .notLoaded
+    /// A refresh failed while an earlier list is still shown.
+    public private(set) var staleNotice: Notice?
     public private(set) var warnings: [MembershipWarning] = []
     public var pendingOverride: OverridePrompt?
     public var notice: Notice?
@@ -295,7 +309,11 @@ public final class DevicesViewModel {
     public var devices: [ManagedDevice] { phase.value ?? [] }
 
     public func load() async {
-        guard app.isSignedIn else { return }
+        guard app.isSignedIn else {
+            phase = .notLoaded
+            staleNotice = nil
+            return
+        }
         if phase.value == nil { phase = .loading }
         do {
             // Folder devices carry online state but need the daemon; the
@@ -305,8 +323,13 @@ public final class DevicesViewModel {
                 let row = DeviceRow(d, now: now())
                 return ManagedDevice(id: d.deviceId, name: d.displayName, detail: row.detail, online: row.online, isThisDevice: d.isThisDevice)
             })
+            staleNotice = nil
         } catch {
-            phase = .failed(.failure(error))
+            if phase.value == nil {
+                phase = .failed(.failure(error))
+            } else {
+                staleNotice = .failure(error)
+            }
         }
     }
 

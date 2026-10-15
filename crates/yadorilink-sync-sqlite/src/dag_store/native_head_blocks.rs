@@ -19,17 +19,32 @@ use crate::error::SyncSqliteError;
 pub fn native_head_retained_block_hashes_all_groups(
     conn: &Connection,
 ) -> Result<HashSet<String>, SyncSqliteError> {
-    let mut stmt = conn.prepare("SELECT DISTINCT group_id, version FROM native_heads")?;
+    native_head_retained_block_hashes_except(conn, &[])
+}
+
+/// [`native_head_retained_block_hashes_all_groups`] without the heads at exactly one of `except`
+/// (group, path, version): the versions a caller is itself deciding about, whose own heads must
+/// not keep them alive. A head at another path, in another group, or at another version still counts.
+pub fn native_head_retained_block_hashes_except(
+    conn: &Connection,
+    except: &[(&str, &str, &VersionHash)],
+) -> Result<HashSet<String>, SyncSqliteError> {
+    let mut stmt = conn.prepare("SELECT DISTINCT group_id, path, version FROM native_heads")?;
     let heads = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut live = HashSet::new();
-    for (group_id, version) in heads {
+    for (group_id, path, version) in heads {
         let Ok(hash) = <[u8; 32]>::try_from(version.as_slice()) else {
             return Err(SyncSqliteError::CorruptState(format!(
                 "a native head of group {group_id} names a version that is not 32 bytes"
             )));
         };
+        if except.iter().any(|(g, p, v)| *g == group_id && *p == path && v.0 == hash) {
+            continue;
+        }
         if let Some(version) = super::serving_authorization_index::get_file_version(
             conn,
             &group_id,

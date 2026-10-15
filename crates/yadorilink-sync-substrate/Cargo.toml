@@ -41,7 +41,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
 # This crate's own tests use the in-process relay, which lives behind
 # `test-support`. Gating that code on the feature alone (rather than on
 # `cfg(test)` too) keeps the optional `iroh-relay` dependency genuinely

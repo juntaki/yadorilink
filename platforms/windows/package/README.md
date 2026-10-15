@@ -141,8 +141,22 @@ profile:
 ```powershell
 powershell -ExecutionPolicy Bypass -File platforms\windows\package\build-installer.ps1 `
   -Release `
-  -SignToolName yadorilink-release
+  -SignToolName yadorilink-release `
+  -SignToolCommand '"C:\path\signtool.exe" sign /fd sha256 /sha1 <thumbprint> /tr <timestamp-url> /td sha256 $f'
 ```
+
+`-SignToolCommand` is the single swappable signing step (`$f` = the file to
+sign): a PFX/thumbprint signtool command today, a cloud HSM client later. It
+signs every PE file listed in `shipped-binaries.txt` in a staging directory
+(`target\installer-payload`, via `sign-payload.ps1`) before Inno Setup packs
+them, then Inno's SignTool signs the installer and uninstaller. The build then
+runs `verify-installer.ps1 -Release -PayloadDir` and fails if any shipped PE
+file is missing or not validly signed. `-PayloadDir` also accepts an unpacked
+binary archive or an installed `%ProgramFiles%\yadorilink`. Adding a shipped
+PE file means adding it to `shipped-binaries.txt`;
+`.github/checks/check-windows-signed-payload.py` fails otherwise. Unsigned
+(`-Unsigned`) builds stage the files unchanged and are still never advertised
+in the update manifest.
 
 ## What the installer does
 

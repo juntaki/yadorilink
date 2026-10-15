@@ -192,9 +192,90 @@ mod unix_socket_tests {
         );
     }
 
+    async fn status_of(
+        stream: &mut UnixStream,
+        path: std::path::PathBuf,
+    ) -> yadorilink_ipc_proto::shellipc::StatusResponse {
+        let query = ShellIpcMessage {
+            payload: Some(Payload::StatusQuery(StatusQuery {
+                path: path.to_string_lossy().into_owned(),
+            })),
+        };
+        write_message(stream, &query).await.unwrap();
+        let resp = read_message::<ShellIpcMessage>(stream).await.unwrap().unwrap();
+        let Some(Payload::StatusResponse(r)) = resp.payload else {
+            panic!("expected a StatusResponse")
+        };
+        r
+    }
+
+    /// The status answer says whether the user paused exactly this item (Resume applies), or an
+    /// item above it did (neither action applies: resuming the child would not resume anything).
+    #[tokio::test]
+    async fn status_response_tells_an_own_pause_from_an_inherited_one() {
+        let (socket_path, state, dir) = start_daemon().await;
+        state.replica_coordinator.paused_item_repository().pause("group-1", "vacation").unwrap();
+        // The queried path's parent must exist so the tempdir's own symlinked
+        // prefix (macOS `/var` -> `/private/var`) resolves like the link root's.
+        std::fs::create_dir_all(dir.path().join("photos/vacation")).unwrap();
+        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let mut answers = Vec::new();
+        for rel in ["photos/vacation", "photos/vacation/a.jpg", "photos/other.jpg"] {
+            let r = status_of(&mut stream, dir.path().join(rel)).await;
+            answers.push((r.item_paused, r.paused_by_ancestor));
+        }
+        assert_eq!(answers, vec![(true, false), (false, true), (false, false)]);
+    }
+
+    /// A child paused under a paused parent: resuming the child would lift nothing, so the
+    /// parent's pause is what the menu must report.
+    #[tokio::test]
+    async fn a_child_paused_under_a_paused_parent_is_still_governed_by_the_parent() {
+        let (socket_path, state, dir) = start_daemon().await;
+        let pauses = state.replica_coordinator.paused_item_repository();
+        pauses.pause("group-1", "vacation").unwrap();
+        pauses.pause("group-1", "vacation/a.jpg").unwrap();
+        // The queried path's parent must exist so the tempdir's own symlinked
+        // prefix (macOS `/var` -> `/private/var`) resolves like the link root's.
+        std::fs::create_dir_all(dir.path().join("photos/vacation")).unwrap();
+        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let child = status_of(&mut stream, dir.path().join("photos/vacation/a.jpg")).await;
+        assert_eq!((child.item_paused, child.paused_by_ancestor), (true, true));
+    }
+
+    /// A paused link root: the root itself is paused, everything beneath it inherits.
+    #[tokio::test]
+    async fn a_paused_root_is_paused_and_its_children_inherit() {
+        let (socket_path, state, dir) = start_daemon().await;
+        state.replica_coordinator.paused_item_repository().pause("group-1", "").unwrap();
+        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let root = status_of(&mut stream, dir.path().join("photos")).await;
+        let child = status_of(&mut stream, dir.path().join("photos/a.jpg")).await;
+        assert_eq!((root.item_paused, root.paused_by_ancestor), (true, false));
+        assert_eq!((child.item_paused, child.paused_by_ancestor), (false, true));
+    }
+
+    /// Free Up Space is advertised only where the daemon's own eviction gate would accept it:
+    /// in production a plain linked folder never may, so the menu must not promise it.
+    #[tokio::test]
+    async fn status_response_reports_whether_reclaim_is_supported_for_the_root() {
+        let (socket_path, state, dir) = start_daemon().await;
+        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let file = dir.path().join("photos/a.jpg");
+        assert!(!status_of(&mut stream, file.clone()).await.reclaim_supported);
+        state.set_test_on_demand_allowed(true);
+        assert!(status_of(&mut stream, file).await.reclaim_supported);
+        let outside = status_of(&mut stream, dir.path().join("elsewhere/a.jpg")).await;
+        assert!(!outside.reclaim_supported, "not under a linked folder");
+    }
+
     /// Evicting a hydrated file via the shell extension's
     /// context menu turns it back into a placeholder.
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "removing an evicted file needs the Linux write lease"
+    )]
     async fn evict_item_context_action_turns_a_hydrated_file_into_a_placeholder() {
         let (socket_path, state, dir) = start_daemon().await;
         // This test is about the eviction gate's own success path, not the

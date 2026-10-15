@@ -34,6 +34,8 @@ pub mod materialize_write;
 pub mod segment_store;
 mod traits;
 
+#[cfg(target_os = "linux")]
+pub use chunker::read_replicated_xattrs_strict;
 pub use chunker::{
     block_size_for, chunk_file, chunk_file_content_defined,
     chunk_file_content_defined_with_callback, chunk_file_fixed_with_callback, chunk_open_file,
@@ -44,8 +46,8 @@ pub use chunker::{
 pub use content_ports::{BlockContentStore, BlockReclamationStore};
 pub use disk_verification::{
     check_disk_headroom, disk_bytes_match_indexed_blocks, disk_content_comparison,
-    disk_matches_expected_object, intent_target_hash, intent_target_hash_for_bytes,
-    DiskContentComparison, ExpectedObject,
+    disk_matches_expected_object, file_content_comparison, intent_target_hash,
+    intent_target_hash_for_bytes, DiskContentComparison, ExpectedObject,
 };
 pub use error::StorageError;
 pub use free_space::{FreeSpaceState, VolumeFreeSpace};

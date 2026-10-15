@@ -27,6 +27,8 @@ pub fn init(conn: &Connection) -> Result<(), ReplicaSchemaError> {
     // Sealing: per-checkpoint seal evidence (native_checkpoint_authorization.rs).
     crate::native_checkpoint_authorization::init_native_checkpoint_authorization_tables(conn)?;
     crate::native_recursive_operation::init_tables(conn)?;
+    crate::remote_custody_lease::init_tables(conn)?;
+    crate::remote_custody_hold::init_tables(conn)?;
     yadorilink_sqlite_runtime::init_schema(conn)?;
     Ok(())
 }

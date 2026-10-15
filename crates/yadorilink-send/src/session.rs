@@ -28,7 +28,7 @@ use yadorilink_sync_substrate::{
 
 use crate::error::{Result, SendError};
 use crate::manifest::{build_outbound_manifest, chunk_byte_size};
-use crate::store::{OutboundStatus, SendStore};
+use crate::store::{InboundStatus, OutboundStatus, SendStore};
 use crate::wire::{read_message, write_message};
 
 /// One same-account device this daemon already knows about, as resolved
@@ -234,8 +234,27 @@ mod close_code {
     pub const PROTOCOL_ERROR: u32 = 2;
 }
 
+/// How many finished (completed, failed or canceled) inbound transfers the
+/// inbox lists; every unfinished one is always listed.
+pub const FINISHED_HISTORY_LIMIT: usize = 20;
+
+/// Removes a receive from the running set however it ends.
+struct ActiveReceive<'a> {
+    running: &'a std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
+    transfer_id: String,
+}
+
+impl Drop for ActiveReceive<'_> {
+    fn drop(&mut self) {
+        self.running.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.transfer_id);
+    }
+}
+
 pub struct SendService {
     node: SubstrateNode,
+    /// Receives running in this process, by transfer id, each with the
+    /// signal that cancels exactly that one.
+    running_receives: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
     store: SendStore,
     block_store: SegmentBlockStore,
     directory: Arc<dyn DeviceDirectory>,
@@ -273,9 +292,14 @@ impl SendService {
         std::fs::create_dir_all(block_store_root.as_ref())?;
         let default_inbox_dir = default_inbox_dir.into();
         std::fs::create_dir_all(&default_inbox_dir)?;
+        let store = SendStore::open(store_db_path)?;
+        // A receive only runs inside the process that started it, so any
+        // row still marked in progress was cut off by the previous exit.
+        store.interrupt_in_progress_inbound()?;
         Ok(Self {
             node,
-            store: SendStore::open(store_db_path)?,
+            running_receives: std::sync::Mutex::default(),
+            store,
             block_store: SegmentBlockStore::new(block_store_root.as_ref())?,
             directory,
             default_inbox_dir,
@@ -455,7 +479,7 @@ impl SendService {
     // ---- receiver side --------------------------------------------------
 
     pub fn list_inbox(&self) -> Result<Vec<InboxEntry>> {
-        let rows = self.store.list_inbound()?;
+        let rows = self.store.list_inbound_recent(FINISHED_HISTORY_LIMIT)?;
         Ok(rows
             .into_iter()
             .map(|row| InboxEntry {
@@ -485,16 +509,50 @@ impl SendService {
         transfer_id: &str,
         destination_dir: Option<&Path>,
     ) -> Result<ReceiveOutcome> {
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut running = self.running_receives.lock().unwrap_or_else(|p| p.into_inner());
+            if running.contains_key(transfer_id) {
+                return Err(SendError::AlreadyReceiving(transfer_id.to_string()));
+            }
+            running.insert(transfer_id.to_string(), cancel.clone());
+        }
+        let _active =
+            ActiveReceive { running: &self.running_receives, transfer_id: transfer_id.to_string() };
+
+        let result = tokio::select! {
+            result = self.receive_inner(transfer_id, destination_dir) => result,
+            () = cancel.notified() => Err(SendError::TransferCanceled(transfer_id.to_string())),
+        };
+        if result.is_err() {
+            // Only a row still in progress becomes failed: a canceled one
+            // stays canceled.
+            if let Err(error) = self.store.fail_inbound(transfer_id) {
+                tracing::warn!(%error, transfer_id, "Track Send: could not record a failed receive");
+            }
+        }
+        result
+    }
+
+    async fn receive_inner(
+        &self,
+        transfer_id: &str,
+        destination_dir: Option<&Path>,
+    ) -> Result<ReceiveOutcome> {
         let inbound = self
             .store
             .get_inbound(transfer_id)?
             .ok_or_else(|| SendError::UnknownTransfer(transfer_id.to_string()))?;
+        if inbound.status == InboundStatus::Canceled {
+            return Err(SendError::TransferCanceled(transfer_id.to_string()));
+        }
 
         let requested_dir = match destination_dir {
             Some(dir) => dir.to_string_lossy().into_owned(),
             None => self.default_inbox_dir.join(transfer_id).to_string_lossy().into_owned(),
         };
         let destination_dir = self.store.claim_inbound_destination(transfer_id, &requested_dir)?;
+        self.store.resume_inbound(transfer_id)?;
         let destination_dir = PathBuf::from(destination_dir);
         std::fs::create_dir_all(&destination_dir)?;
 
@@ -539,6 +597,66 @@ impl SendService {
 
         self.store.mark_inbound_completed(transfer_id)?;
         Ok(ReceiveOutcome { destination_dir, files_received, bytes_received })
+    }
+
+    /// Stops the running receive of `transfer_id`, if any, and marks the
+    /// transfer canceled. Idempotent: an already canceled or completed
+    /// transfer is left as it is. Only this transfer is affected. Blocks
+    /// already pulled stay in the block store for a retry.
+    pub fn cancel_transfer(&self, transfer_id: &str) -> Result<()> {
+        self.store
+            .get_inbound(transfer_id)?
+            .ok_or_else(|| SendError::UnknownTransfer(transfer_id.to_string()))?;
+        self.store.cancel_inbound(transfer_id)?;
+        if let Some(cancel) =
+            self.running_receives.lock().unwrap_or_else(|p| p.into_inner()).get(transfer_id)
+        {
+            cancel.notify_one();
+        }
+        Ok(())
+    }
+
+    /// Resumes a failed or canceled inbound transfer. Before anything is
+    /// changed it re-checks that the sender is still a known device, that the
+    /// recorded manifest is still consistent and stays inside the
+    /// destination, and that the destination is still usable. Any failed
+    /// check leaves the transfer exactly as it was.
+    pub async fn retry_transfer(&self, transfer_id: &str) -> Result<ReceiveOutcome> {
+        let inbound = self
+            .store
+            .get_inbound(transfer_id)?
+            .ok_or_else(|| SendError::UnknownTransfer(transfer_id.to_string()))?;
+        if !matches!(inbound.status, InboundStatus::Failed | InboundStatus::Canceled) {
+            return Err(SendError::NotRetryable {
+                transfer_id: transfer_id.to_string(),
+                status: inbound.status.as_str(),
+            });
+        }
+        self.directory
+            .resolve(&inbound.sender_device_id)
+            .ok_or_else(|| SendError::NoKnownAddress(inbound.sender_device_id.clone()))?;
+        crate::manifest::validate_offered_manifest(&inbound.manifest)
+            .map_err(SendError::Protocol)?;
+        if let Some(destination) = inbound.destination_dir.as_deref() {
+            let path = Path::new(destination);
+            if !path.is_absolute() {
+                return Err(SendError::BadDestination(
+                    destination.to_string(),
+                    "it is not an absolute path".to_string(),
+                ));
+            }
+            if path.exists() && !path.is_dir() {
+                return Err(SendError::BadDestination(
+                    destination.to_string(),
+                    "it is not a directory".to_string(),
+                ));
+            }
+            for entry in &inbound.manifest.files {
+                safe_join(path, &entry.relative_path)?;
+            }
+        }
+        self.store.uncancel_inbound(transfer_id)?;
+        self.receive_transfer(transfer_id, None).await
     }
 
     async fn pull_file(

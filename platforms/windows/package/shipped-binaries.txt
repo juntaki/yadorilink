@@ -1,0 +1,11 @@
+# Every PE file the installer ships. One per line: <source> <file name>.
+# source "bin" = the cargo workspace output dir, "shell" = the shell
+# extension output dir. sign-payload.ps1 stages and signs exactly these,
+# verify-installer.ps1 checks exactly these, and
+# .github/checks/check-windows-signed-payload.py fails if yadorilink.iss
+# ships a PE that is not listed here.
+bin yadorilink.exe
+bin yadorilink-daemon.exe
+bin yadorilink-status-app.exe
+shell yadorilink_shell_ext.dll
+shell yadorilink-cfapi-host.exe

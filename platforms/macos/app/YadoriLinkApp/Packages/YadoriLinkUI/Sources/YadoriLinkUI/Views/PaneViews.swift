@@ -17,6 +17,10 @@ struct DevicesContent: View {
 
     init(app: AppModel) { _model = State(initialValue: DevicesViewModel(app: app)) }
 
+    private func removeButton(_ device: ManagedDevice) -> some View {
+        Button("Remove Device…", role: .destructive) { confirmRemoval = device }
+    }
+
     var body: some View {
         List {
             if !model.warnings.isEmpty {
@@ -29,9 +33,12 @@ struct DevicesContent: View {
                 case .loading:
                     LoadingRow()
                 case .failed(let notice):
-                    EmptyStateText(notice.text).help(notice.detail ?? "")
+                    RetryRow(LoadWording.devices, notice: notice) { await model.load() }
                 case .loaded(let devices):
-                    if devices.isEmpty { EmptyStateText("No devices yet.") }
+                    if let stale = model.staleNotice {
+                        RetryRow(LoadWording.stale("devices"), notice: stale) { await model.load() }
+                    }
+                    if devices.isEmpty && model.staleNotice == nil { EmptyStateText("No devices yet.") }
                     ForEach(devices) { device in
                         HStack(spacing: 10) {
                             OnlineDot(online: device.online)
@@ -41,16 +48,15 @@ struct DevicesContent: View {
                             }
                             .help(device.id)
                             Spacer()
+                            if device.canRemove {
+                                RowActionsMenu(label: "Actions for \(device.name)") { removeButton(device) }
+                            }
                         }
                         .contextMenu {
-                            if device.canRemove {
-                                Button("Remove Device…", role: .destructive) { confirmRemoval = device }
-                            }
+                            if device.canRemove { removeButton(device) }
                         }
                     }
                 }
-            } footer: {
-                Text("Right-click a device to remove it.").font(.caption).foregroundStyle(.secondary)
             }
         }
         .noticeBar($model.notice)
@@ -105,7 +111,20 @@ struct TransfersContent: View {
                 if model.syncRows.isEmpty {
                     EmptyStateText("Nothing is transferring.")
                 }
+                if let rate = model.rateLine {
+                    Text(rate).font(.callout).foregroundStyle(.secondary).help("Current speed across all folders and devices")
+                }
                 ForEach(model.syncRows) { SyncRowView(row: $0) }
+            }
+
+            if !model.recentProblemLines.isEmpty {
+                Section("Recent problems") {
+                    ForEach(model.recentProblemLines) { line in
+                        Label(line.text, systemImage: "clock.badge.exclamationmark")
+                            .foregroundStyle(.secondary)
+                            .help(line.tooltip)
+                    }
+                }
             }
 
             Section("Send to a device") {
@@ -125,6 +144,13 @@ struct TransfersContent: View {
                             .help(device.deviceId)
                     }
                 }
+                if let error = model.devicesError {
+                    RetryRow(LoadWording.devices, notice: error) { await model.loadDevices() }
+                } else if let stale = model.devicesStale {
+                    RetryRow(LoadWording.stale("devices"), notice: stale) { await model.loadDevices() }
+                } else if model.showsNoTargetDevices {
+                    EmptyStateText("No other devices yet.")
+                }
                 TextField("Or paste a path", text: $model.sourcePath)
                     .font(.callout)
                 HStack {
@@ -137,7 +163,11 @@ struct TransfersContent: View {
 
             Section("Received") {
                 if model.showsInboxLoading { LoadingRow() }
-                if let error = model.inboxError { EmptyStateText(error) }
+                if let error = model.inboxError {
+                    RetryRow(LoadWording.received, notice: error) { await model.loadInbox() }
+                } else if let stale = model.inboxStale {
+                    RetryRow(LoadWording.stale("received files"), notice: stale) { await model.loadInbox() }
+                }
                 if model.showsInboxEmpty { EmptyStateText("Nothing received yet.") }
                 ForEach(model.inboxRows) { row in
                     VStack(alignment: .leading, spacing: 4) {
@@ -147,6 +177,12 @@ struct TransfersContent: View {
                             Text(row.status).foregroundStyle(.secondary)
                             if row.canReceive {
                                 Button("Save to Downloads") { Task { await model.receive(row, into: nil) } }
+                            }
+                            if row.canRetry {
+                                Button("Retry") { Task { await model.retry(row) } }
+                            }
+                            if row.canCancel {
+                                Button("Cancel") { Task { await model.cancel(row) } }
                             }
                         }
                         if row.files.count > 3 {
@@ -185,22 +221,30 @@ public struct StorageView: View {
 struct StorageContent: View {
     @State private var model: StorageViewModel
     @State private var showsDetails = false
+    @State private var confirmsCleanUp = false
 
     init(app: AppModel) { _model = State(initialValue: StorageViewModel(app: app)) }
 
     var body: some View {
         Form {
-            if let stored = model.storedData {
-                Section("Stored data") {
-                    LabeledContent("Total usage", value: stored)
-                    LabeledContent("Reclaimable", value: model.reclaimable ?? "")
-                        .help("Space used by old versions that are no longer needed. Reclaiming never removes anything you can still restore, and never touches files in your folders.")
-                    Text("Space used by old versions no longer needed. Never removes anything you can still restore.")
+            if model.storedData != nil {
+                Section(StorageViewModel.filesSectionTitle) {
+                    if let totals = model.localFilesTotals { LabeledContent("Synced files", value: totals) }
+                    Text(StorageViewModel.filesExplanation).font(.caption).foregroundStyle(.secondary)
+                    if model.folderLines.isEmpty { EmptyStateText("No folders yet.") }
+                    ForEach(model.folderLines) { line in
+                        FolderStorageRow(line: line)
+                    }
+                }
+                Section(StorageViewModel.internalSectionTitle) {
+                    LabeledContent(StorageViewModel.internalTotalLabel, value: model.storedData ?? "")
+                    LabeledContent(StorageViewModel.cleanableLabel, value: model.reclaimable ?? "")
+                    Text(StorageViewModel.cleanUpExplanation)
                         .font(.caption).foregroundStyle(.secondary)
                     HStack {
-                        Button("Check Reclaimable Space") { Task { await model.checkReclaimable() } }
-                        Button("Reclaim Space Now") { Task { await model.reclaim() } }
-                        if model.isWorking { ProgressView().controlSize(.small) }
+                        Button(StorageViewModel.checkActionTitle) { Task { await model.checkReclaimable() } }
+                        Button(StorageViewModel.cleanUpActionTitle) { confirmsCleanUp = true }
+                        if model.isWorking { ProgressView().controlSize(.small).accessibilityLabel("Working") }
                     }
                     .disabled(model.isWorking)
                     DisclosureGroup("Details", isExpanded: $showsDetails) {
@@ -208,17 +252,33 @@ struct StorageContent: View {
                         LabeledContent("Last cleanup", value: model.lastCleanup ?? "")
                     }
                 }
-                Section("Folders") {
-                    if model.folderLines.isEmpty { EmptyStateText("No folders yet.") }
-                    ForEach(model.folderLines) { line in
-                        FolderStorageRow(line: line)
+                Section(StorageViewModel.diskSectionTitle) {
+                    if let summary = model.diskSummary { Text(summary) }
+                    ForEach(model.diskRows) { row in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(row.name)
+                                Text(row.text).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if let trailing = row.trailing {
+                                Text(trailing).font(.caption).foregroundStyle(row.trailingIsWarning ? .orange : .secondary)
+                            }
+                        }
                     }
+                    Text(StorageViewModel.diskExplanation).font(.caption).foregroundStyle(.secondary)
                 }
             }
         }
         .formStyle(.grouped)
         .noticeBar($model.notice)
         .navigationTitle("Storage")
+        .confirmationDialog(StorageViewModel.cleanUpActionTitle + "?", isPresented: $confirmsCleanUp) {
+            Button("Cancel", role: .cancel) {}
+            Button(StorageViewModel.cleanUpActionTitle) { Task { await model.reclaim() } }
+        } message: {
+            Text(StorageViewModel.cleanUpExplanation)
+        }
     }
 }
 

@@ -108,6 +108,63 @@ async fn on_demand_link_is_on_demand_regardless_of_hydration() {
     assert_eq!(views[0].local_storage_state, LocalStorageState::OnDemand);
 }
 
+fn set_state(state: &DaemonState, path: &str, target: MaterializationState) {
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    state
+        .replica_coordinator
+        .materialization_state_repository()
+        .set_materialization_state(GROUP, path, target, &permit)
+        .unwrap();
+}
+
+fn on_demand_state() -> Arc<DaemonState> {
+    let state = test_state();
+    state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .set_materialization_policy(PATH, MaterializationPolicy::OnDemand)
+        .unwrap();
+    state
+}
+
+/// An idle On-Demand folder (placeholders only) requests nothing; a file being hydrated and an
+/// open queued for an assembly slot each are one request; a file being evicted is not.
+#[tokio::test]
+async fn requested_content_counts_fetches_and_queued_opens_but_not_eviction() {
+    let state = on_demand_state();
+    upsert_file(&state, "idle.bin", false);
+    upsert_file(&state, "evict.bin", true);
+    set_state(&state, "evict.bin", MaterializationState::Evicting);
+    let requested = |state: &Arc<DaemonState>| {
+        reader_for(state.clone()).list_links().unwrap()[0].requested_content_count
+    };
+    assert_eq!(requested(&state), 0);
+
+    let queued = state.requested_opens.begin(GROUP);
+    assert_eq!(requested(&state), 1);
+    drop(queued);
+    assert_eq!(requested(&state), 0);
+
+    upsert_file(&state, "open.bin", false);
+    set_state(&state, "open.bin", MaterializationState::Hydrating);
+    let views = reader_for(state.clone()).list_links().unwrap();
+    assert_eq!(views[0].requested_content_count, 1);
+    assert_eq!(views[0].hydrating_count, 1, "evicting is not hydrating");
+}
+
+/// An Eager folder asks for every file it does not have yet.
+#[tokio::test]
+async fn eager_requested_content_is_the_unmaterialized_files() {
+    let state = test_state();
+    state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+    upsert_file(&state, "a.bin", true);
+    upsert_file(&state, "b.bin", false);
+    upsert_file(&state, "c.bin", false);
+    let views = reader_for(state).list_links().unwrap();
+    assert_eq!(views[0].requested_content_count, 2);
+}
+
 /// A file not yet hydrated locally, with NO reachable full-replica
 /// peer, is `UnavailableNow` -- not merely "durability unknown," a
 /// distinct claim.
@@ -383,4 +440,21 @@ async fn policy_stale_group_reports_fetch_availability_unknown() {
 
     let views = reader_for(state).list_links().unwrap();
     assert_eq!(views[0].fetch_availability, FetchAvailability::Unknown);
+}
+
+/// A paused Eager folder requests nothing new, and an open that already has a `Hydrating` row
+/// is one request, not two.
+#[tokio::test]
+async fn paused_eager_requests_nothing_and_a_hydrating_open_is_counted_once() {
+    let state = test_state();
+    state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+    upsert_file(&state, "b.bin", false);
+    state.replica_coordinator.link_repository().set_paused(PATH, true).unwrap();
+    assert_eq!(reader_for(state.clone()).list_links().unwrap()[0].requested_content_count, 0);
+
+    let state = on_demand_state();
+    upsert_file(&state, "open.bin", false);
+    set_state(&state, "open.bin", MaterializationState::Hydrating);
+    let _open = state.requested_opens.begin(GROUP);
+    assert_eq!(reader_for(state).list_links().unwrap()[0].requested_content_count, 1);
 }

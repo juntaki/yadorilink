@@ -35,7 +35,7 @@ enum Event {
     LimitsSaved(Result<LimitsShowResponse, String>),
     UpdateStatusFetched(Result<Box<UpdateStatusResponse>, String>),
     UpdateCheckDone(Result<(), String>),
-    UpdateDownloadDone(Result<(), String>),
+    UpdateDownloadDone(Result<crate::actions::UpdateDownload, String>),
     UpdateConfigSaved(Result<(), String>),
     DiagnosticsExported(Result<String, String>),
 }
@@ -135,14 +135,11 @@ fn spawn_update_download(sink: EventSink<Event>) {
     );
 }
 
-fn spawn_update_config_save(sink: EventSink<Event>, checks: Option<bool>, install: Option<String>) {
+fn spawn_update_config_save(sink: EventSink<Event>, checks: Option<bool>) {
     spawn_task(
         sink,
         async move {
-            crate::actions::set_update_config(checks, install)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            crate::actions::set_update_config(checks).await.map(|_| ()).map_err(|e| e.to_string())
         },
         Event::UpdateConfigSaved,
     );
@@ -292,8 +289,12 @@ impl eframe::App for SettingsApp {
                 }
                 Event::UpdateDownloadDone(result) => {
                     self.update_action_in_flight = false;
-                    self.update_message =
-                        Some(result.map(|()| "Opened the download page.".to_string()));
+                    self.update_message = Some(result.map(|done| match done {
+                        crate::actions::UpdateDownload::OpenedPage => {
+                            "Opened the download page.".to_string()
+                        }
+                        crate::actions::UpdateDownload::Guidance(text) => text,
+                    }));
                     self.update_fetch_in_flight = true;
                     spawn_update_status_fetch(self.sink.clone());
                 }
@@ -495,7 +496,20 @@ impl SettingsApp {
                 spawn_update_check(self.sink.clone());
             }
             if !status.available_version.is_empty()
-                && ui.add_enabled(!busy, egui::Button::new("Download new version")).clicked()
+                && ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(
+                            if yadorilink_client_core::ops::updates::is_package_managed(
+                                &status.install_source,
+                            ) {
+                                "Show update steps"
+                            } else {
+                                "Open download page"
+                            },
+                        ),
+                    )
+                    .clicked()
             {
                 self.update_action_in_flight = true;
                 self.update_message = None;
@@ -517,7 +531,7 @@ impl SettingsApp {
         {
             self.update_action_in_flight = true;
             self.update_message = None;
-            spawn_update_config_save(self.sink.clone(), Some(checks_on), None);
+            spawn_update_config_save(self.sink.clone(), Some(checks_on));
         }
         if let Some(msg) = &self.update_message {
             render_result_label(ui, msg);

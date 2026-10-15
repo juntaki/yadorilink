@@ -75,7 +75,7 @@ fn trashed_file_line_renders_every_field() {
 }
 
 #[test]
-fn conflicted_file_line_renders_every_field() {
+fn conflicted_file_line_says_what_happened_in_plain_words() {
     let f = ConflictedFileInfo {
         local_path: "/tmp/photos".into(),
         path: "vacation (conflicted copy, 2026-01-01-000000, device-b).jpg".into(),
@@ -84,14 +84,17 @@ fn conflicted_file_line_renders_every_field() {
         kind: EntryKind::File as i32,
         reason: 0,
     };
+    let line = conflicted_file_line(&f);
     assert_eq!(
-        conflicted_file_line(&f),
+        line,
         format!(
-            "/tmp/photos/vacation (conflicted copy, 2026-01-01-000000, device-b).jpg  size=1234  \
-             modified={}",
+            "/tmp/photos/vacation (conflicted copy, 2026-01-01-000000, device-b).jpg\n  \
+             Edited on two devices; both versions were kept. This is the other version.\n  \
+             1.2 KiB, saved {}",
             format_local_time(5678)
         )
     );
+    assert!(!line.contains("size=") && !line.contains("modified="));
 }
 
 /// A directory version has no size or mtime of its own (both are
@@ -138,10 +141,10 @@ fn conflicted_directory_line_does_not_print_size() {
         kind: EntryKind::Directory as i32,
         reason: 0,
     };
-    assert_eq!(
-        conflicted_file_line(&f),
-        "/tmp/photos/album (conflicted copy, 2026-01-01-000000, device-b)/  directory"
-    );
+    let line = conflicted_file_line(&f);
+    assert!(line.starts_with("/tmp/photos/album (conflicted copy, 2026-01-01-000000, device-b)/\n"));
+    assert!(!line.contains("KiB") && !line.contains(" B"));
+    assert!(!is_resolvable(&f));
 }
 
 /// An entry a recursive delete removed says so, with a short form of the
@@ -175,14 +178,8 @@ fn conflicted_file_line_names_a_folder_at_its_path() {
         kind: EntryKind::File as i32,
         reason: yadorilink_ipc_proto::daemonctl::ConflictReason::FolderAtPath as i32,
     };
-    assert_eq!(
-        conflicted_file_line(&f),
-        format!(
-            "/tmp/photos/album (conflicted copy, 2026-01-01-000000, device-b)  size=3  \
-             modified={}  reason=folder_at_path",
-            format_local_time(4)
-        )
-    );
+    assert!(conflicted_file_line(&f).contains("Its name is a folder now"));
+    assert!(!is_resolvable(&f));
 }
 
 #[test]
@@ -199,5 +196,6 @@ fn local_time_formats_calendar_fields_for_an_offset() {
 
 #[test]
 fn conflict_hint_says_how_to_resolve() {
-    assert!(CONFLICT_RESOLVE_HINT.contains("delete the other copy"));
+    assert!(CONFLICT_RESOLVE_HINT.contains("conflicts keep <copy>"));
+    assert!(CONFLICT_RESOLVE_HINT.contains("conflicts keep-both <copy>"));
 }

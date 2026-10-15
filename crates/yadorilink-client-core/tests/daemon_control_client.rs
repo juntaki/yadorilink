@@ -3,6 +3,7 @@
 //! over a real socket rather than by building `CoreError` values directly.
 #![cfg(unix)]
 
+use yadorilink_client_core::dto::PauseDuration;
 use yadorilink_client_core::error::CoreError;
 use yadorilink_client_core::ops::folders::pause_folder;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
@@ -50,7 +51,7 @@ async fn a_success_answer_from_a_daemon_of_another_protocol_generation_is_refuse
             daemon_protocol_version: daemon,
             payload: Some(RespPayload::Pause(PauseResponse {})),
         },
-        pause_folder("/folder".into()),
+        pause_folder("/folder".into(), PauseDuration::UntilResumed),
     )
     .await;
     assert_eq!(request.protocol_version, CONTROL_PROTOCOL_VERSION);
@@ -71,7 +72,7 @@ async fn a_plain_error_answer_is_a_rejection_with_the_daemons_message() {
             daemon_protocol_version: CONTROL_PROTOCOL_VERSION,
             payload: Some(RespPayload::Error("no such link".into())),
         },
-        pause_folder("/folder".into()),
+        pause_folder("/folder".into(), PauseDuration::UntilResumed),
     )
     .await;
     assert!(
@@ -89,7 +90,7 @@ async fn a_matching_success_answer_succeeds() {
             daemon_protocol_version: CONTROL_PROTOCOL_VERSION,
             payload: Some(RespPayload::Pause(PauseResponse {})),
         },
-        pause_folder("/folder".into()),
+        pause_folder("/folder".into(), PauseDuration::UntilResumed),
     )
     .await;
     assert!(result.is_ok(), "{result:?}");

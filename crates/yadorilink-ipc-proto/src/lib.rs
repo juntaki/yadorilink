@@ -70,7 +70,12 @@ pub mod daemonctl {
     /// `15`: removes the `pin`/`unpin` requests,
     /// `LinkRequest.max_local_size_bytes` and
     /// `MaterializationStatusResponse.pinned`.
-    pub const CONTROL_PROTOCOL_VERSION: u32 = 15;
+    ///
+    /// `16`: adds `list_retained_originals` / `release_retained_originals` and the retained
+    /// counts of the `preserved` summary.
+    /// `17`: adds `LinkStatus.requested_content_count`, the sole "content requested" signal;
+    /// `hydrating_count` no longer counts evicting files.
+    pub const CONTROL_PROTOCOL_VERSION: u32 = 17;
 }
 
 #[cfg(test)]

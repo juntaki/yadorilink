@@ -6,8 +6,9 @@ use yadorilink_ipc_proto::daemonctl::{
     GroupDurabilityStatus, HandoffResult, HeldFile as WireHeldFile, InboxFileSummary,
     InboxTransfer, LinkStatus, LocalState as WireLocalState, LocalStorageState as WireLocal,
     LocalTransition as WireTransition, MaterializationStatusResponse, MembershipHandoffResult,
-    MintedInviteInfo, PeerReachability as WireReach, PeerStatus, RecentSyncError,
-    ReplicaMembershipCommandOutcome, RouteKind as WireRoute, StatusResponse, TrashedFileInfo,
+    MintedInviteInfo, PeerReachability as WireReach, PeerStatus, PinItemResponse, RecentSyncError,
+    ReplicaMembershipCommandOutcome, RetentionPolicy as WireRetention,
+    RetentionState as WireRetentionState, RouteKind as WireRoute, StatusResponse, TrashedFileInfo,
     UnreachableCategory as WireUnreach, UpdateConfigResponse, UpdateInstallResponse,
     UpdateStatusResponse, VolumeFreeSpace,
 };
@@ -55,6 +56,9 @@ fn attention_reason_is_split_into_category_and_subject() {
             subject: "g1".into(),
             folder_local_path: Some("/Users/a/Docs".into()),
             raw: "conflict:g1".into(),
+            kind: AttentionKind::Permanent,
+            primary_action: ProductAction::ReviewConflict,
+            secondary_action: None,
         }
     );
     // Only the first colon splits: a subject may itself contain one.
@@ -79,11 +83,19 @@ fn every_rollup_category_is_recognized_and_an_unknown_one_is_kept_raw() {
         ("fetch_availability_unknown", AttentionCategory::FetchAvailabilityUnknown),
         ("conflict", AttentionCategory::Conflict),
         ("held", AttentionCategory::Held),
+        ("stranded_directory", AttentionCategory::StrandedDirectory),
         ("low_disk_critical", AttentionCategory::LowDiskCritical),
         ("low_disk", AttentionCategory::LowDisk),
         ("peer_disconnected", AttentionCategory::PeerDisconnected),
         ("recent_error", AttentionCategory::RecentError),
         ("update_failed", AttentionCategory::UpdateFailed),
+        ("ambiguous", AttentionCategory::Ambiguous),
+        ("ownership_lost", AttentionCategory::OwnershipLost),
+        ("volume_changed", AttentionCategory::VolumeChanged),
+        ("provider_not_ready", AttentionCategory::ProviderNotReady),
+        ("provider_stuck", AttentionCategory::ProviderStuck),
+        ("kept_edits", AttentionCategory::KeptEdits),
+        ("provider_orphan_domain", AttentionCategory::ProviderOrphanDomain),
     ];
     for (name, category) in expected {
         assert_eq!(attention_reason(&format!("{name}:x"), &[]).category, category, "{name}");
@@ -275,7 +287,6 @@ fn status_snapshot_maps_every_section_of_the_daemon_status() {
             state: UpdateState::HeldBack,
             available_version: None,
             mandatory: false,
-            waiting_for_safe_point: false,
             last_error_category: None,
             channel: "beta".into(),
             install_source: "pkg".into(),
@@ -395,8 +406,11 @@ fn trash_file_and_materialization_turn_unset_values_into_none() {
     });
     assert_eq!(in_folder.deleted_by_operation.as_deref(), Some("device-a:0a0b"));
 
-    let unknown =
-        file_availability(&MaterializationStatusResponse { known: false, local_state: None });
+    let unknown = file_availability(&MaterializationStatusResponse {
+        known: false,
+        local_state: None,
+        retention: None,
+    });
     assert_eq!(unknown, FileAvailability { tracked: false, state: MaterializationState::Unknown });
     let hydrating = file_availability(&MaterializationStatusResponse {
         known: true,
@@ -405,6 +419,7 @@ fn trash_file_and_materialization_turn_unset_values_into_none() {
             current_content_present: false,
             transition: WireTransition::Hydrating as i32,
         }),
+        retention: None,
     });
     assert_eq!(
         hydrating,
@@ -418,6 +433,7 @@ fn trash_file_and_materialization_turn_unset_values_into_none() {
             current_content_present: false,
             transition: WireTransition::None as i32,
         }),
+        retention: None,
     });
     assert_eq!(stale.state, MaterializationState::Placeholder);
     let current = file_availability(&MaterializationStatusResponse {
@@ -427,6 +443,7 @@ fn trash_file_and_materialization_turn_unset_values_into_none() {
             current_content_present: true,
             transition: WireTransition::None as i32,
         }),
+        retention: None,
     });
     assert_eq!(current.state, MaterializationState::Hydrated);
 }
@@ -632,23 +649,15 @@ fn updates_map_states_modes_and_outcomes() {
         state: "kill_switched".into(),
         last_check_unix: 20,
         automatic_checks_enabled: true,
-        automatic_install_mode: "manual".into(),
         ..Default::default()
     });
     assert_eq!(status.state, UpdateState::KillSwitched);
     assert_eq!(status.last_checked_at, Some(secs(20)));
     assert_eq!(status.available_version, None);
+    assert_eq!(status.config, UpdateConfig { automatic_checks: true });
     assert_eq!(
-        status.config,
-        UpdateConfig { automatic_checks: true, install_mode: UpdateInstallMode::Manual }
-    );
-    assert_eq!(
-        update_config(&UpdateConfigResponse {
-            automatic_checks_enabled: false,
-            automatic_install_mode: "sometimes".into()
-        })
-        .install_mode,
-        UpdateInstallMode::Other { raw: "sometimes".into() }
+        update_config(&UpdateConfigResponse { automatic_checks_enabled: false }),
+        UpdateConfig { automatic_checks: false }
     );
     let states = [
         ("idle", UpdateState::Idle),
@@ -670,16 +679,83 @@ fn updates_map_states_modes_and_outcomes() {
             update_status(&UpdateStatusResponse { state: raw.into(), ..Default::default() });
         assert_eq!(status.state, state, "{raw}");
     }
-    let outcome = |o: &str, g: &str| {
-        update_install_outcome(&UpdateInstallResponse { outcome: o.into(), guidance: g.into() })
+    let reply = |o: &str, g: &str, u: &str| UpdateInstallResponse {
+        outcome: o.into(),
+        guidance: g.into(),
+        download_url: u.into(),
     };
-    assert_eq!(outcome("installing", ""), UpdateInstallOutcome::Installing);
-    assert_eq!(outcome("deferred", ""), UpdateInstallOutcome::Deferred);
+    // A page to open comes only from the structured field, never from the sentence.
     assert_eq!(
-        outcome("store_managed", "use the store"),
-        UpdateInstallOutcome::StoreManaged { guidance: "use the store".into() }
+        update_download_guidance(&reply(
+            "manual_download",
+            "Download the new version from https://github.com/juntaki/yadorilink/releases",
+            "https://github.com/juntaki/yadorilink/releases",
+        )),
+        Ok(UpdateDownloadGuidance {
+            guidance:
+                "Download the new version from https://github.com/juntaki/yadorilink/releases"
+                    .into(),
+            url: Some("https://github.com/juntaki/yadorilink/releases".into()),
+        })
     );
-    assert_eq!(outcome("later", ""), UpdateInstallOutcome::Other { raw: "later".into() });
+    // Steps for a package-managed install: a URL inside the sentence is not trusted.
+    assert_eq!(
+        update_download_guidance(&reply(
+            "manual_download",
+            "Run `brew upgrade` (see https://evil.test/x)",
+            ""
+        )),
+        Ok(UpdateDownloadGuidance {
+            guidance: "Run `brew upgrade` (see https://evil.test/x)".into(),
+            url: None,
+        })
+    );
+    for outcome in ["installing", "deferred", "store_managed", "later", ""] {
+        assert!(update_download_guidance(&reply(outcome, "x", "")).is_err(), "{outcome}");
+    }
+    assert!(update_download_guidance(&reply("manual_download", "", "")).is_err());
+}
+
+#[test]
+fn only_the_official_release_page_is_ever_offered_to_open() {
+    let ok = |url: &str| {
+        update_download_guidance(&UpdateInstallResponse {
+            outcome: "manual_download".into(),
+            guidance: "g".into(),
+            download_url: url.into(),
+        })
+    };
+    assert!(ok("https://github.com/juntaki/yadorilink/releases/tag/v0.4.3").is_ok());
+    for bad in [
+        "http://github.com/juntaki/yadorilink/releases",
+        "https://evil.test/juntaki/yadorilink/releases",
+        "https://github.com/juntaki/yadorilink/releases.evil.test",
+        "https://github.com/juntaki/yadorilink/releasesx",
+        "https://github.com/juntaki/yadorilink/releases ",
+        "https://github.com/juntaki/yadorilink/releases https://evil.test",
+        "https://github.com/juntaki/yadorilink/releases.",
+        "https://github.com/juntaki/yadorilink/releases?next=https://evil.test",
+        "https://github.com/juntaki/yadorilink/releases/../../evil",
+        "file:///etc/passwd",
+    ] {
+        assert!(ok(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn package_managed_installs_are_recognised_by_install_source() {
+    use crate::ops::updates::is_package_managed;
+    for managed in ["homebrew", "apt", "winget", "microsoft_store"] {
+        assert!(is_package_managed(managed), "{managed}");
+    }
+    for other in ["standalone", "", "pkg", "unknown"] {
+        assert!(!is_package_managed(other), "{other}");
+    }
+    let status = update_status(&UpdateStatusResponse {
+        install_source: "homebrew".into(),
+        ..Default::default()
+    });
+    assert!(status.package_managed);
 }
 
 #[test]
@@ -719,6 +795,8 @@ fn account_deletion_and_transfers_parse_their_states() {
     for (raw, status) in [
         ("pending", IncomingTransferStatus::Pending),
         ("completed", IncomingTransferStatus::Completed),
+        ("failed", IncomingTransferStatus::Failed),
+        ("canceled", IncomingTransferStatus::Canceled),
         ("paused", IncomingTransferStatus::Other { raw: "paused".into() }),
     ] {
         let t = incoming_transfer(&InboxTransfer { status: raw.into(), ..Default::default() });
@@ -787,4 +865,196 @@ fn conflict_summary_says_when_a_folder_took_the_name() {
     });
     assert_eq!(summary.current_path, "album");
     assert_eq!(summary.reason, ConflictReason::FolderAtPath);
+}
+
+#[test]
+fn retention_is_reported_apart_from_the_materialization_state() {
+    // Nothing says the path is kept.
+    assert_eq!(
+        file_retention(None),
+        FileRetention { policy: RetentionPolicy::Reclaimable, inherited: false }
+    );
+    let explicit = WireRetentionState { policy: WireRetention::Pinned as i32, explicit: true };
+    assert_eq!(
+        file_retention(Some(&explicit)),
+        FileRetention { policy: RetentionPolicy::Pinned, inherited: false }
+    );
+    let inherited = WireRetentionState { policy: WireRetention::Pinned as i32, explicit: false };
+    assert_eq!(
+        file_retention(Some(&inherited)),
+        FileRetention { policy: RetentionPolicy::Pinned, inherited: true }
+    );
+    // An unreadable value is not "kept".
+    let unknown = WireRetentionState { policy: 99, explicit: true };
+    assert_eq!(file_retention(Some(&unknown)).policy, RetentionPolicy::Reclaimable);
+}
+
+#[test]
+fn a_pin_outcome_carries_the_download_failure_without_dropping_the_pin() {
+    let kept = WireRetentionState { policy: WireRetention::Pinned as i32, explicit: true };
+    let failed = pin_outcome(&PinItemResponse {
+        retention: Some(kept),
+        download_error: "no peer has the content".into(),
+    });
+    assert_eq!(failed.retention.policy, RetentionPolicy::Pinned);
+    assert_eq!(failed.download_error.as_deref(), Some("no peer has the content"));
+    let done =
+        pin_outcome(&PinItemResponse { retention: Some(kept), download_error: String::new() });
+    assert_eq!(done.download_error, None, "an empty wire string is no error");
+}
+
+#[test]
+fn the_two_dimensions_reach_the_folder_and_the_snapshot_and_unset_reads_unknown() {
+    use yadorilink_ipc_proto::daemonctl::{DataProtection, ProductAvailability};
+
+    let waiting = LinkStatus {
+        availability: ProductAvailability::WaitingForPeer as i32,
+        availability_offline_device_ids: vec!["mini".into()],
+        protection: DataProtection::Protected as i32,
+        protection_device_ids: vec!["mini".into()],
+        ..link("/f/Docs", "g1")
+    };
+    let folder = folder_summary(&waiting, &[]);
+    assert_eq!(folder.availability.availability, Availability::WaitingForPeer);
+    assert_eq!(folder.availability.offline_device_ids, ["mini"]);
+    assert_eq!(folder.protection.protection, Protection::Protected);
+
+    let unset = link("/f/Other", "g2");
+    let response = StatusResponse { links: vec![waiting, unset], ..Default::default() };
+    let snapshot = status_snapshot(&response, None, secs(1));
+    assert_eq!(snapshot.folders[1].availability.availability, Availability::Unknown);
+    assert_eq!(snapshot.availability.availability, Availability::WaitingForPeer);
+    assert_eq!(snapshot.protection.protection, Protection::Unknown);
+}
+
+#[test]
+fn dimensions_json_carries_both_dimensions_per_folder_and_overall() {
+    use yadorilink_ipc_proto::daemonctl::{DataProtection, ProductAvailability};
+
+    let status = StatusResponse {
+        overall_state: "healthy".into(),
+        links: vec![
+            LinkStatus {
+                availability: ProductAvailability::WaitingForPeer as i32,
+                availability_offline_device_ids: vec!["dev-b".into()],
+                protection: DataProtection::Protected as i32,
+                protection_device_ids: vec!["dev-b".into()],
+                ..link("/tmp/photos", "group-1")
+            },
+            LinkStatus {
+                local_path: "/tmp/docs".into(),
+                group_id: "group-2".into(),
+                protection: DataProtection::AtRisk as i32,
+                availability: ProductAvailability::Available as i32,
+                ..link("/tmp/photos", "group-1")
+            },
+        ],
+        ..Default::default()
+    };
+    let json = status_dimensions_json(&status);
+    assert_eq!(json["overall_state"], "healthy");
+    assert_eq!(json["availability"]["state"], "waiting_for_peer");
+    assert_eq!(json["availability"]["offline_device_ids"][0], "dev-b");
+    assert_eq!(json["protection"]["state"], "at_risk");
+    let folders = json["folders"].as_array().unwrap();
+    assert_eq!(folders.len(), 2);
+    assert_eq!(folders[0]["local_path"], "/tmp/photos");
+    assert_eq!(folders[0]["availability"]["state"], "waiting_for_peer");
+    assert_eq!(folders[0]["protection"]["state"], "protected");
+    assert_eq!(folders[0]["protection"]["device_ids"][0], "dev-b");
+    assert_eq!(folders[1]["protection"]["state"], "at_risk");
+}
+
+#[test]
+fn dimensions_json_of_an_older_daemon_reads_unknown_never_protected() {
+    let status = StatusResponse { links: vec![LinkStatus::default()], ..Default::default() };
+    let json = status_dimensions_json(&status);
+    assert_eq!(json["folders"][0]["protection"]["state"], "unknown");
+    assert_eq!(json["folders"][0]["availability"]["state"], "unknown");
+}
+
+#[test]
+fn a_pending_conflict_reads_as_a_conflict_in_its_folder() {
+    let reason = attention_reason("conflict_pending:g1", &[]);
+    assert_eq!(reason.category, AttentionCategory::Conflict);
+    assert_eq!(reason.subject, "g1");
+}
+
+#[test]
+fn attention_reason_carries_kind_and_actions_from_the_shared_item() {
+    let waiting = attention_reason("peer_disconnected:dev", &[]);
+    assert_eq!(waiting.kind, AttentionKind::Waiting);
+    let disk = attention_reason("low_disk_critical:/v", &[]);
+    assert_eq!(disk.primary_action, ProductAction::FreeUpSpace);
+    let retry = attention_reason("update_failed:net", &[]);
+    assert_eq!(retry.kind, AttentionKind::Retryable);
+    assert_eq!(retry.primary_action, ProductAction::Retry);
+    assert_eq!(retry.secondary_action, Some(ProductAction::ViewDetails));
+}
+
+#[test]
+fn a_timed_pause_deadline_is_shown_only_while_paused() {
+    let timed = LinkStatus { paused: true, paused_until_unix: 5_000, ..link("/f/A", "g") };
+    assert_eq!(folder_summary(&timed, &[]).paused_until, Some(secs(5_000)));
+    let until_resumed = LinkStatus { paused: true, ..link("/f/A", "g") };
+    assert_eq!(folder_summary(&until_resumed, &[]).paused_until, None);
+    let stale = LinkStatus { paused_until_unix: 5_000, ..link("/f/A", "g") };
+    assert_eq!(folder_summary(&stale, &[]).paused_until, None);
+}
+
+#[test]
+fn space_management_and_its_preview_never_read_unknown_as_on_or_eligible() {
+    use yadorilink_ipc_proto::daemonctl::{
+        PreviewSpaceReclaimResponse, SpaceManagementSettings, SpaceReclaimPreviewItem,
+        SpaceReclaimVerdict as Wire,
+    };
+
+    assert_eq!(space_management(None), SpaceManagement { enabled: false });
+    assert_eq!(
+        space_management(Some(&SpaceManagementSettings { enabled: true })),
+        SpaceManagement { enabled: true }
+    );
+    let item = |verdict: Wire| SpaceReclaimPreviewItem {
+        group_id: "g".into(),
+        path: "a.bin".into(),
+        verdict: verdict as i32,
+    };
+    let preview = space_reclaim_preview(&PreviewSpaceReclaimResponse {
+        items: vec![item(Wire::Eligible), item(Wire::Pinned), item(Wire::Unspecified)],
+        unreadable_roots: 1,
+    });
+    assert_eq!(preview.unreadable_roots, 1);
+    let verdicts: Vec<_> = preview.items.iter().map(|i| i.verdict).collect();
+    assert_eq!(
+        verdicts,
+        [
+            SpaceReclaimVerdict::Eligible,
+            SpaceReclaimVerdict::Pinned,
+            SpaceReclaimVerdict::SafetyBlocked
+        ]
+    );
+}
+
+#[test]
+fn retained_originals_and_releases_keep_their_meaning_and_unknown_outcomes_stay_unknown() {
+    use yadorilink_ipc_proto::daemonctl::{RetainedOriginal as Wire, RetainedRelease as Rel};
+    let item = retained_original(&Wire {
+        group_id: "g".into(),
+        path: "a.txt".into(),
+        size: 9,
+        reachable: true,
+        group_removed: false,
+        ..Default::default()
+    });
+    assert_eq!((item.size, item.reachable, item.group_removed), (9, true, false));
+    for (raw, outcome) in [
+        ("removed", RetainedReleaseOutcome::Removed),
+        ("left", RetainedReleaseOutcome::Left),
+        ("saved_still_retained", RetainedReleaseOutcome::SavedStillRetained),
+        ("something_new", RetainedReleaseOutcome::Unknown),
+    ] {
+        let done =
+            retained_release(&Rel { path: "a".into(), outcome: raw.into(), detail: "why".into() });
+        assert_eq!((done.outcome, done.detail.as_str()), (outcome, "why"));
+    }
 }

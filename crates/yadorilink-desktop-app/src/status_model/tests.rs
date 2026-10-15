@@ -55,7 +55,11 @@ fn reason_lines_hide_internal_codes() {
     let mut status = base_status();
     status.attention_reasons = vec!["conflict:group-1".into(), "low_disk:/data".into()];
     assert_eq!(reason_lines(&status), vec!["A file conflict needs review", "Disk space is low"]);
-    assert_eq!(reason_sentence("durability_unknown:g1:x"), "Something needs attention");
+    assert_eq!(
+        reason_sentence("durability_unknown:g1:x"),
+        "Files may not have a safe second copy yet"
+    );
+    assert_eq!(reason_sentence("brand_new:x"), "Something needs attention");
 }
 
 #[test]
@@ -196,4 +200,26 @@ fn tray_state_maps_status_and_icons_differ() {
             assert_ne!(tray_icon_rgba(*a, 16), tray_icon_rgba(*b, 16));
         }
     }
+}
+
+#[test]
+fn package_manager_update_guidance_is_a_message_not_an_error() {
+    let page = update_download_notice(Ok(UpdateDownload::OpenedPage));
+    assert_eq!((page.text.as_str(), page.is_error), ("Opened the download page", false));
+
+    let guidance = "Update with your package manager: brew upgrade yadorilink";
+    let shown = update_download_notice(Ok(UpdateDownload::Guidance(guidance.into())));
+    assert_eq!((shown.text.as_str(), shown.is_error), (guidance, false));
+    assert_eq!(shown.details, None);
+
+    let failed = update_download_notice(Err("io error: no browser".into()));
+    assert!(failed.is_error);
+    assert_eq!(failed.text, "Could not open the download page");
+}
+
+#[test]
+fn the_update_action_is_named_for_what_it_does() {
+    assert_eq!(update_download_label("0.4.3", "standalone"), "Download Update (0.4.3)");
+    assert_eq!(update_download_label("0.4.3", "homebrew"), "Show Update Steps (0.4.3)");
+    assert_eq!(update_download_label("0.4.3", "winget"), "Show Update Steps (0.4.3)");
 }

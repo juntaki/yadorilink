@@ -45,14 +45,8 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
 /// var) and so must not run concurrently with each other.
 static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// on-demand-sync spec "Evicting a hydrated file frees local disk space".
-#[tokio::test]
-async fn evict_command_removes_a_present_file_and_leaves_its_row_remote() {
-    let _guard = TEST_MUTEX.lock().await;
-    // `evict` refuses outright unless a placeholder provider is connected
-    // -- see `hydration::evict`'s own doc comment; this test exercises the
-    // actual eviction mechanics, so it forces that gate open for its own
-    // thread, the same way `yadorilink-daemon`'s own eviction tests do.
+/// A linked folder holding one indexed, hydrated file `notes.txt`.
+async fn seeded_hydrated_file() -> (tempfile::TempDir, Arc<DaemonState>, std::path::PathBuf) {
     let (dir, state) = start_daemon().await;
     state.set_test_on_demand_allowed(true);
     let folder = dir.path().join("shared");
@@ -122,7 +116,22 @@ async fn evict_command_removes_a_present_file_and_leaves_its_row_remote() {
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
+    (dir, state, folder)
+}
 
+/// on-demand-sync spec "Evicting a hydrated file frees local disk space".
+#[tokio::test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "removing an evicted file needs the Linux write lease"
+)]
+async fn evict_command_removes_a_present_file_and_leaves_its_row_remote() {
+    let _guard = TEST_MUTEX.lock().await;
+    // `evict` refuses outright unless a placeholder provider is connected
+    // -- see `hydration::evict`'s own doc comment; this test exercises the
+    // actual eviction mechanics, so it forces that gate open for its own
+    // thread, the same way `yadorilink-daemon`'s own eviction tests do.
+    let (_dir, state, folder) = seeded_hydrated_file().await;
     yadorilink_cli::commands::materialization::evict(
         folder.join("notes.txt").to_string_lossy().to_string(),
     )
@@ -140,5 +149,33 @@ async fn evict_command_removes_a_present_file_and_leaves_its_row_remote() {
     assert!(
         std::fs::symlink_metadata(folder.join("notes.txt")).is_err(),
         "an evicted file must no longer stand in the user tree"
+    );
+}
+
+/// `yadorilink pin` keeps a file: Free Up Space is refused while it is kept, the file stays
+/// whole, and unpinning removes nothing.
+#[tokio::test]
+async fn pin_command_makes_evict_refuse_and_unpin_removes_nothing() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (_dir, state, folder) = seeded_hydrated_file().await;
+    let file = folder.join("notes.txt").to_string_lossy().to_string();
+
+    yadorilink_cli::commands::materialization::pin(file.clone()).await.unwrap();
+    let refused = yadorilink_cli::commands::materialization::evict(file.clone()).await;
+
+    let message = refused.expect_err("a kept file must not be freed").to_string();
+    assert!(message.contains("kept on this device"), "{message}");
+    assert!(folder.join("notes.txt").exists());
+    let materialization = state.replica_coordinator.materialization_state_repository();
+    assert_eq!(
+        materialization.get_materialization_state("group-1", "notes.txt").unwrap(),
+        Some(MaterializationState::Present)
+    );
+
+    yadorilink_cli::commands::materialization::unpin(file).await.unwrap();
+    assert!(folder.join("notes.txt").exists(), "unpinning never removes content");
+    assert_eq!(
+        materialization.get_materialization_state("group-1", "notes.txt").unwrap(),
+        Some(MaterializationState::Present)
     );
 }

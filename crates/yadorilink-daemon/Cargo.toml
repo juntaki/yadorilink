@@ -77,6 +77,8 @@ test-support = [
 
 [dependencies]
 async-trait = "0.1"
+# Local midnight for a timed pause that lasts until tomorrow.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 bytes.workspace = true
 yadorilink-local-capture = { path = "../yadorilink-local-capture" }
 yadorilink-sync-sqlite = { path = "../yadorilink-sync-sqlite" }
@@ -190,6 +192,8 @@ tokio.workspace = true
 turmoil = "0.7.2"
 
 [dev-dependencies]
+# The canonical product summary the daemon's status rollup must agree with (a test pins it).
+yadorilink-product-view = { path = "../yadorilink-product-view" }
 # The offline `CoordinationAuth` the tests below build. Enabling the feature
 # here rather than in `[dependencies]` keeps it out of the shipped binary: it
 # is a composition of the crate's public API (see its `test_support` module),
@@ -239,6 +243,9 @@ iroh = "1.1"
 # mid-transfer abort seam (`SendService::test_abort_after_n_chunks`), same
 # override shape as the two entries above.
 yadorilink-send = { path = "../yadorilink-send", features = ["test-support"] }
+# The provider reclaim tests drive a reclaim through `verify_reclaim_custody_for_test`, the only
+# way to exercise the paths behind the lease flag before it ships.
+yadorilink-replica-engine = { path = "../yadorilink-replica-engine", features = ["test-support"] }
 tempfile = "3"
 rand = "0.10.2"
 # `tests/peer_hydration.rs` builds a real zstd payload to prove the

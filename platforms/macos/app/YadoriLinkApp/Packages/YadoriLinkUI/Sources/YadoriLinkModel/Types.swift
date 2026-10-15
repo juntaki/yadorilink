@@ -135,19 +135,81 @@ public enum OverallState: Sendable, Equatable, Hashable { case healthy, attentio
 
 public enum AttentionCategory: Sendable, Equatable, Hashable, CaseIterable {
     case degraded, durabilityAtRisk, durabilityUnknown, fetchUnavailable, fetchAvailabilityUnknown,
-         conflict, held, lowDiskCritical, lowDisk, peerDisconnected, recentError, updateFailed,
+         conflict, held, strandedDirectory, lowDiskCritical, lowDisk, peerDisconnected, recentError, updateFailed,
+         ambiguous, ownershipLost, volumeChanged, providerNotReady, providerStuck, keptEdits, providerOrphanDomain,
          unrecognized
 }
+
+/// Whether time alone can fix an attention item.
+public enum AttentionKind: Sendable, Equatable, Hashable { case waiting, retryable, permanent }
+
+/// What the user can be offered to do about an attention item.
+public enum ProductAction: Sendable, Equatable, Hashable { case retry, reviewConflict, freeUpSpace, revealPath, openSettings, downloadUpdate, viewDetails }
 
 public struct AttentionReason: Sendable, Equatable, Hashable {
     public var category: AttentionCategory
     public var subject: String
     public var folderLocalPath: String?
     public var raw: String
-    public init(category: AttentionCategory, subject: String, folderLocalPath: String?, raw: String) {
+    public var kind: AttentionKind
+    public var primaryAction: ProductAction
+    public var secondaryAction: ProductAction?
+    public init(category: AttentionCategory, subject: String, folderLocalPath: String?, raw: String, kind: AttentionKind = .permanent, primaryAction: ProductAction = .viewDetails, secondaryAction: ProductAction? = nil) {
         self.category = category; self.subject = subject; self.folderLocalPath = folderLocalPath; self.raw = raw
+        self.kind = kind; self.primaryAction = primaryAction; self.secondaryAction = secondaryAction
     }
 }
+
+/// What to do with a kept copy of a file that was edited on two devices.
+public enum ConflictChoice: Sendable, Equatable, Hashable, CaseIterable { case keepThis, keepBoth }
+
+/// An original file kept after a reset replaced it, until the user releases it.
+public struct RetainedOriginal: Sendable, Equatable, Hashable {
+    public var groupId: String
+    public var path: String
+    public var size: UInt64
+    public var reachable: Bool
+    public var groupRemoved: Bool
+    public init(groupId: String, path: String, size: UInt64, reachable: Bool, groupRemoved: Bool) {
+        self.groupId = groupId; self.path = path; self.size = size; self.reachable = reachable; self.groupRemoved = groupRemoved
+    }
+}
+
+public enum RetainedReleaseOutcome: Sendable, Equatable, Hashable, CaseIterable { case removed, gone, stillRetained, savedThenRemoved, savedStillRetained, left, unknown }
+
+public struct RetainedRelease: Sendable, Equatable, Hashable {
+    public var path: String
+    public var outcome: RetainedReleaseOutcome
+    public var detail: String
+    public init(path: String, outcome: RetainedReleaseOutcome, detail: String) { self.path = path; self.outcome = outcome; self.detail = detail }
+}
+
+/// Automatic space management for provider folders: while free disk space is low, downloaded files that are safe to give back are given back.
+public struct SpaceManagement: Sendable, Equatable, Hashable {
+    public var enabled: Bool
+    public init(enabled: Bool) { self.enabled = enabled }
+}
+
+public enum SpaceReclaimVerdict: Sendable, Equatable, Hashable, CaseIterable {
+    case eligible, pinned, unsupportedRoot, custodyUnavailable, busy, changed, safetyBlocked
+}
+
+public struct SpaceReclaimPreviewItem: Sendable, Equatable, Hashable {
+    public var groupId: String
+    public var path: String
+    public var verdict: SpaceReclaimVerdict
+    public init(groupId: String, path: String, verdict: SpaceReclaimVerdict) { self.groupId = groupId; self.path = path; self.verdict = verdict }
+}
+
+/// The dry run: nothing was removed.
+public struct SpaceReclaimPreview: Sendable, Equatable, Hashable {
+    public var items: [SpaceReclaimPreviewItem]
+    public var unreadableRoots: UInt32
+    public init(items: [SpaceReclaimPreviewItem], unreadableRoots: UInt32) { self.items = items; self.unreadableRoots = unreadableRoots }
+}
+
+/// How long a pause lasts; the daemon computes the deadline.
+public enum PauseDuration: Sendable, Equatable, Hashable, CaseIterable { case untilResumed, thirtyMinutes, oneHour, untilTomorrow }
 
 public enum FolderMode: Sendable, Equatable, Hashable, CaseIterable { case keepAll, onDemand }
 public enum FolderState: Sendable, Equatable, Hashable, CaseIterable { case upToDate, syncing, paused, blocked, attention }
@@ -155,6 +217,31 @@ public enum DurabilityStatus: Sendable, Equatable, Hashable, CaseIterable { case
 public enum DurabilityEvidence: Sendable, Equatable, Hashable { case none, corroboratedIndex, verifiedPayload, unknown }
 public enum LocalStorageState: Sendable, Equatable, Hashable, CaseIterable { case fullCopy, partiallyMaterialized, onDemand, unknown }
 public enum FetchAvailability: Sendable, Equatable, Hashable { case availableNow, unavailableNow, unknown }
+
+/// Whether the exact content needed can be fetched now. Independent of `Protection`.
+public enum Availability: Sendable, Equatable, Hashable { case available, waitingForPeer, waitingForExactContent, unknown }
+
+public struct AvailabilitySummary: Sendable, Equatable, Hashable {
+    public var availability: Availability
+    public var reachableDeviceIds: [String]
+    public var offlineDeviceIds: [String]
+    public init(availability: Availability, reachableDeviceIds: [String], offlineDeviceIds: [String]) {
+        self.availability = availability; self.reachableDeviceIds = reachableDeviceIds; self.offlineDeviceIds = offlineDeviceIds
+    }
+    public static let unknown = AvailabilitySummary(availability: .unknown, reachableDeviceIds: [], offlineDeviceIds: [])
+}
+
+/// Whether the data is still elsewhere if this device is lost. Independent of `Availability`.
+public enum Protection: Sendable, Equatable, Hashable { case protected, atRisk, pending, unknown }
+
+public struct ProtectionSummary: Sendable, Equatable, Hashable {
+    public var protection: Protection
+    public var deviceIds: [String]
+    public init(protection: Protection, deviceIds: [String]) {
+        self.protection = protection; self.deviceIds = deviceIds
+    }
+    public static let unknown = ProtectionSummary(protection: .unknown, deviceIds: [])
+}
 
 public struct FolderTransferProgress: Sendable, Equatable, Hashable {
     public var bytesDone: UInt64
@@ -187,6 +274,8 @@ public struct FolderSummary: Sendable, Equatable, Hashable {
     public var mode: FolderMode
     public var state: FolderState
     public var paused: Bool
+    /// When a timed pause ends by itself; nil when not paused or paused until resumed.
+    public var pausedUntil: Date?
     public var conflictCount: UInt64
     public var hydratedFileCount: UInt64
     public var placeholderFileCount: UInt64
@@ -198,6 +287,8 @@ public struct FolderSummary: Sendable, Equatable, Hashable {
     public var durabilityEvidence: DurabilityEvidence
     public var localStorage: LocalStorageState
     public var fetchAvailability: FetchAvailability
+    public var availability: AvailabilitySummary
+    public var protection: ProtectionSummary
     public var fullReplicaDeviceIds: [String]
     public var policyStale: Bool
     public var ambiguous: Bool
@@ -209,14 +300,15 @@ public struct FolderSummary: Sendable, Equatable, Hashable {
     /// identity key and nothing may reveal, open or restore into it as a path.
     public var provider: Bool
 
-    public init(localPath: String, groupId: String, name: String, mode: FolderMode, state: FolderState, paused: Bool, conflictCount: UInt64, hydratedFileCount: UInt64, placeholderFileCount: UInt64, hydratingFileCount: UInt64, heldFileCount: UInt64, skippedSymlinkCount: UInt64, transfer: FolderTransferProgress?, durability: DurabilityStatus, durabilityEvidence: DurabilityEvidence, localStorage: LocalStorageState, fetchAvailability: FetchAvailability, fullReplicaDeviceIds: [String], policyStale: Bool, ambiguous: Bool, ambiguousLocalPaths: [String], degraded: Bool, degradedReason: String?, volume: VolumeSummary?, provider: Bool = false) {
+    public init(localPath: String, groupId: String, name: String, mode: FolderMode, state: FolderState, paused: Bool, pausedUntil: Date? = nil, conflictCount: UInt64, hydratedFileCount: UInt64, placeholderFileCount: UInt64, hydratingFileCount: UInt64, heldFileCount: UInt64, skippedSymlinkCount: UInt64, transfer: FolderTransferProgress?, durability: DurabilityStatus, durabilityEvidence: DurabilityEvidence, localStorage: LocalStorageState, fetchAvailability: FetchAvailability, availability: AvailabilitySummary = .unknown, protection: ProtectionSummary = .unknown, fullReplicaDeviceIds: [String], policyStale: Bool, ambiguous: Bool, ambiguousLocalPaths: [String], degraded: Bool, degradedReason: String?, volume: VolumeSummary?, provider: Bool = false) {
         self.localPath = localPath; self.groupId = groupId; self.name = name; self.mode = mode
-        self.state = state; self.paused = paused; self.conflictCount = conflictCount
+        self.state = state; self.paused = paused; self.pausedUntil = pausedUntil; self.conflictCount = conflictCount
         self.hydratedFileCount = hydratedFileCount; self.placeholderFileCount = placeholderFileCount
         self.hydratingFileCount = hydratingFileCount; self.heldFileCount = heldFileCount
         self.skippedSymlinkCount = skippedSymlinkCount; self.transfer = transfer
         self.durability = durability; self.durabilityEvidence = durabilityEvidence
         self.localStorage = localStorage; self.fetchAvailability = fetchAvailability
+        self.availability = availability; self.protection = protection
         self.fullReplicaDeviceIds = fullReplicaDeviceIds; self.policyStale = policyStale
         self.ambiguous = ambiguous; self.ambiguousLocalPaths = ambiguousLocalPaths
         self.degraded = degraded; self.degradedReason = degradedReason; self.volume = volume
@@ -296,14 +388,13 @@ public struct UpdateBadge: Sendable, Equatable, Hashable {
     public var state: UpdateState
     public var availableVersion: String?
     public var mandatory: Bool
-    public var waitingForSafePoint: Bool
     public var lastErrorCategory: String?
     public var channel: String
     public var installSource: String
     public var holdbackReason: String?
-    public init(state: UpdateState, availableVersion: String?, mandatory: Bool, waitingForSafePoint: Bool, lastErrorCategory: String?, channel: String, installSource: String, holdbackReason: String?) {
+    public init(state: UpdateState, availableVersion: String?, mandatory: Bool, lastErrorCategory: String?, channel: String, installSource: String, holdbackReason: String?) {
         self.state = state; self.availableVersion = availableVersion; self.mandatory = mandatory
-        self.waitingForSafePoint = waitingForSafePoint; self.lastErrorCategory = lastErrorCategory
+        self.lastErrorCategory = lastErrorCategory
         self.channel = channel; self.installSource = installSource; self.holdbackReason = holdbackReason
     }
 }
@@ -323,6 +414,8 @@ public struct StatusSnapshot: Sendable, Equatable, Hashable {
     public var attentionReasons: [AttentionReason]
     public var thisDeviceId: String?
     public var folders: [FolderSummary]
+    public var availability: AvailabilitySummary
+    public var protection: ProtectionSummary
     public var peers: [PeerSummary]
     public var transfers: [TransferSummary]
     public var bandwidth: BandwidthStatus
@@ -330,9 +423,10 @@ public struct StatusSnapshot: Sendable, Equatable, Hashable {
     public var storage: StorageSummary
     public var update: UpdateBadge
     public var recentErrors: [RecentError]
-    public init(capturedAt: Date, overall: OverallState, attentionReasons: [AttentionReason], thisDeviceId: String?, folders: [FolderSummary], peers: [PeerSummary], transfers: [TransferSummary], bandwidth: BandwidthStatus, volumes: [VolumeSummary], storage: StorageSummary, update: UpdateBadge, recentErrors: [RecentError]) {
+    public init(capturedAt: Date, overall: OverallState, attentionReasons: [AttentionReason], thisDeviceId: String?, folders: [FolderSummary], availability: AvailabilitySummary = .unknown, protection: ProtectionSummary = .unknown, peers: [PeerSummary], transfers: [TransferSummary], bandwidth: BandwidthStatus, volumes: [VolumeSummary], storage: StorageSummary, update: UpdateBadge, recentErrors: [RecentError]) {
         self.capturedAt = capturedAt; self.overall = overall; self.attentionReasons = attentionReasons
         self.thisDeviceId = thisDeviceId; self.folders = folders; self.peers = peers
+        self.availability = availability; self.protection = protection
         self.transfers = transfers; self.bandwidth = bandwidth; self.volumes = volumes
         self.storage = storage; self.update = update; self.recentErrors = recentErrors
     }
@@ -461,6 +555,28 @@ public struct FileAvailability: Sendable, Equatable, Hashable {
     public var state: MaterializationState
     public init(tracked: Bool, state: MaterializationState) {
         self.tracked = tracked; self.state = state
+    }
+}
+
+/// Whether local space for a file or folder may be reclaimed, apart from whether its content is on
+/// this device now. Local to this device.
+public enum RetentionPolicy: Sendable, Equatable, Hashable, CaseIterable { case reclaimable, pinned }
+
+public struct FileRetention: Sendable, Equatable, Hashable {
+    public var policy: RetentionPolicy
+    /// Pinned only because a folder above is; unpinning this path alone changes nothing.
+    public var inherited: Bool
+    public init(policy: RetentionPolicy, inherited: Bool) {
+        self.policy = policy; self.inherited = inherited
+    }
+}
+
+public struct PinOutcome: Sendable, Equatable, Hashable {
+    public var retention: FileRetention
+    /// Why the content could not be downloaded just now; the pin stands regardless.
+    public var downloadError: String?
+    public init(retention: FileRetention, downloadError: String?) {
+        self.retention = retention; self.downloadError = downloadError
     }
 }
 
@@ -728,7 +844,7 @@ public struct IncomingFile: Sendable, Equatable, Hashable {
 }
 
 public enum IncomingTransferStatus: Sendable, Equatable, Hashable {
-    case pending, inProgress, completed
+    case pending, inProgress, completed, failed, canceled
     case other(raw: String)
 }
 
@@ -776,16 +892,13 @@ public struct DiagnosticsExport: Sendable, Equatable, Hashable {
 
 public enum DaemonStartOutcome: Sendable, Equatable, Hashable { case alreadyRunning, started }
 
-public enum UpdateInstallMode: Sendable, Equatable, Hashable {
-    case automatic, manual
-    case other(raw: String)
-}
-
+/// Update preferences. Updates are installed by the user (or a package
+/// manager or store), never by YadoriLink, so the only setting is whether it
+/// checks for a newer version by itself.
 public struct UpdateConfig: Sendable, Equatable, Hashable {
     public var automaticChecks: Bool
-    public var installMode: UpdateInstallMode
-    public init(automaticChecks: Bool, installMode: UpdateInstallMode) {
-        self.automaticChecks = automaticChecks; self.installMode = installMode
+    public init(automaticChecks: Bool) {
+        self.automaticChecks = automaticChecks
     }
 }
 
@@ -799,21 +912,28 @@ public struct UpdateStatus: Sendable, Equatable, Hashable {
     public var releaseNotesUrl: String?
     public var mandatory: Bool
     public var holdbackReason: String?
-    public var waitingForSafePoint: Bool
     public var lastErrorCategory: String?
     public var lastErrorMessage: String?
+    /// A package manager or store owns this install, so the new version
+    /// comes with steps to follow, not a page to open.
+    public var packageManaged: Bool
     public var config: UpdateConfig
-    public init(currentVersion: String, channel: String, installSource: String, lastCheckedAt: Date?, state: UpdateState, availableVersion: String?, releaseNotesUrl: String?, mandatory: Bool, holdbackReason: String?, waitingForSafePoint: Bool, lastErrorCategory: String?, lastErrorMessage: String?, config: UpdateConfig) {
+    public init(currentVersion: String, channel: String, installSource: String, lastCheckedAt: Date?, state: UpdateState, availableVersion: String?, releaseNotesUrl: String?, mandatory: Bool, holdbackReason: String?, lastErrorCategory: String?, lastErrorMessage: String?, packageManaged: Bool, config: UpdateConfig) {
         self.currentVersion = currentVersion; self.channel = channel; self.installSource = installSource
         self.lastCheckedAt = lastCheckedAt; self.state = state; self.availableVersion = availableVersion
         self.releaseNotesUrl = releaseNotesUrl; self.mandatory = mandatory; self.holdbackReason = holdbackReason
-        self.waitingForSafePoint = waitingForSafePoint; self.lastErrorCategory = lastErrorCategory
-        self.lastErrorMessage = lastErrorMessage; self.config = config
+        self.lastErrorCategory = lastErrorCategory
+        self.lastErrorMessage = lastErrorMessage; self.packageManaged = packageManaged; self.config = config
     }
 }
 
-public enum UpdateInstallOutcome: Sendable, Equatable, Hashable {
-    case installing, deferred
-    case storeManaged(guidance: String)
-    case other(raw: String)
+/// How to get the new version: the official download page, or the
+/// package-manager command for a package-managed install. Nothing is
+/// downloaded or installed by YadoriLink.
+public struct UpdateDownloadGuidance: Sendable, Equatable, Hashable {
+    /// The sentence to show: the page it names, or the steps of a package-managed install.
+    public var guidance: String
+    /// The official page to open; `nil` when there are steps to follow instead.
+    public var url: String?
+    public init(guidance: String, url: String?) { self.guidance = guidance; self.url = url }
 }

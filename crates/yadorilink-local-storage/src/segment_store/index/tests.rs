@@ -102,6 +102,45 @@ fn removing_a_block_debits_its_segment_without_touching_physical_bytes() {
 }
 
 #[test]
+fn removing_a_block_at_a_location_leaves_a_mapping_that_moved_since() {
+    let (index, _dir) = index();
+    let plan = |segment_id: u64| GroupCommitPlan {
+        appends: vec![SegmentAppend {
+            segment_id,
+            created: true,
+            durable_end: SEGMENT_HEADER_LEN + 100,
+            blocks: vec![NewBlockRow {
+                hash: hash(1),
+                record_offset: SEGMENT_HEADER_LEN,
+                payload_len: 48,
+                record_len: 100,
+                added_at_nanos: 1,
+            }],
+        }],
+        sealed: Vec::new(),
+        next_segment_id: segment_id + 1,
+    };
+    index.commit_group(&plan(1), &no_injected_fault).unwrap();
+    let stale = index.lookup(&hash(1)).unwrap().unwrap();
+    assert_eq!(stale.segment_id, 1);
+
+    // The mapping is replaced (retracted and rewritten into segment 2) after the caller looked.
+    index.remove_blocks(&[hash(1)]).unwrap();
+    index.commit_group(&plan(2), &no_injected_fault).unwrap();
+
+    // Retracting by the stale location must not drop, or debit, the repaired mapping.
+    index.remove_block_at(&hash(1), &stale).unwrap();
+    assert_eq!(index.lookup(&hash(1)).unwrap().map(|l| l.segment_id), Some(2));
+    assert_eq!(index.segment(2).unwrap().unwrap().live_blocks, 1);
+
+    // By its current location it is retracted and the segment debited.
+    let current = index.lookup(&hash(1)).unwrap().unwrap();
+    index.remove_block_at(&hash(1), &current).unwrap();
+    assert_eq!(index.lookup(&hash(1)).unwrap(), None);
+    assert_eq!(index.segment(2).unwrap().unwrap().live_blocks, 0);
+}
+
+#[test]
 fn a_hex_prefix_becomes_an_exact_raw_key_range() {
     let (low, high) = raw_key_range_for_hex_prefix("").unwrap();
     assert_eq!(low, [0x00; RAW_HASH_LEN]);

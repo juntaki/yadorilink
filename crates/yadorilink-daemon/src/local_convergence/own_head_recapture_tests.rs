@@ -687,3 +687,208 @@ async fn a_file_still_changing_during_its_recapture_is_captured_once_it_holds_st
         assert!(now.invalidation_generation > open.invalidation_generation);
     }
 }
+
+/// `materialize_own_head`, but handing back the error a failed pass returns.
+async fn try_materialize_own_head(
+    h: &Harness,
+    rel: &str,
+) -> Result<MaterializeResult, PeerSessionError> {
+    let node = h
+        .state
+        .native_plan_level(GROUP, super::namespace_steps::parent_of(rel))
+        .unwrap()
+        .nodes
+        .get(&yadorilink_replica_domain::ids::SyncPath(rel.to_owned()))
+        .cloned()
+        .unwrap_or_else(|| panic!("the plan places an entry at {rel}"));
+    h.convergence
+        .materialize_native_entry(
+            GROUP,
+            rel,
+            &node,
+            yadorilink_replica_domain::session_state::MaterializationPolicy::Eager,
+            None,
+            None,
+        )
+        .await
+}
+
+/// The evidence that a vanished file was once here is the row's `Present`
+/// materialization state. When that cannot be read, nothing proves the
+/// absence is not the user's delete, so the pass stops: it neither writes the
+/// old head back nor captures anything, and the next pass, once the read
+/// works, treats the absence as the deletion it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_materialization_state_never_brings_back_a_deleted_file() {
+    let rel = "unreadable-state-166.txt";
+    let h = Harness::new(true);
+    let file = h.path(rel);
+    std::fs::write(&file, b"captured, then deleted by the user").unwrap();
+    assert!(matches!(h.capture(rel).await, LocalChangeOutcome::FileChanged(_)));
+    let captured = h.own_head(rel);
+    let open = reopen_obligation(&h, rel);
+    std::fs::remove_file(&file).unwrap();
+
+    yadorilink_sync_sqlite::fail_state_reads_for_path(rel, true);
+    let failed = try_materialize_own_head(&h, rel).await;
+    yadorilink_sync_sqlite::fail_state_reads_for_path(rel, false);
+
+    assert!(failed.is_err(), "an unreadable state must stop the pass, got {failed:?}");
+    assert!(
+        std::fs::symlink_metadata(&file).is_err(),
+        "the old head must not be written back over the user's delete"
+    );
+    assert_eq!(h.own_head(rel).change_hash, captured.change_hash, "nothing was authored either");
+
+    // The read works again: the same absence is now the deletion it is.
+    let retry = try_materialize_own_head(&h, rel).await.unwrap();
+    assert!(matches!(retry, MaterializeResult::RetryRequired), "got {retry:?}");
+    let (remover, device) = remover_of(&h, rel, &captured);
+    assert_ne!(remover.0, captured.change_hash, "the deletion must be captured");
+    assert_eq!(device, LOCAL_DEVICE);
+    assert_superseded_and_settles(&h, rel, &open).await;
+    assert!(std::fs::symlink_metadata(&file).is_err());
+}
+
+/// A state that is readable and says the file was never hydrated keeps its
+/// existing handling: nothing proves a file was here, so the projection is not
+/// blocked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_definitely_not_present_row_still_projects_over_an_absent_path() {
+    let rel = "remote-state-166.txt";
+    let h = Harness::new(true);
+    let file = h.path(rel);
+    std::fs::write(&file, b"captured, never hydrated").unwrap();
+    assert!(matches!(h.capture(rel).await, LocalChangeOutcome::FileChanged(_)));
+    h.state
+        .database()
+        .write(|conn| {
+            conn.execute(
+                "UPDATE files SET materialization_state = 'remote' WHERE group_id = ?1 AND path = ?2",
+                rusqlite::params![GROUP, rel],
+            )?;
+            Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>(())
+        })
+        .unwrap();
+    std::fs::remove_file(&file).unwrap();
+
+    let result = try_materialize_own_head(&h, rel).await.expect("a readable state does not fail");
+
+    assert!(!matches!(result, MaterializeResult::RetryRequired), "got {result:?}");
+}
+
+/// A path that cannot be examined at all (an interior NUL is refused by every
+/// platform with an error that is not "not found") is not an absent path:
+/// both guards must fail rather than conclude there is nothing to protect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stat_error_other_than_absence_stops_the_write_and_removal_guards() {
+    let rel = "stat-error-189.txt";
+    let h = Harness::new(true);
+    std::fs::write(h.path(rel), b"user bytes").unwrap();
+    assert!(matches!(h.capture(rel).await, LocalChangeOutcome::FileChanged(_)));
+    let unexaminable = h.path("bad\0name.txt");
+
+    let write_guard =
+        h.convergence.disk_holds_uncaptured_local_bytes(GROUP, rel, &unexaminable, None);
+    let removal_guard =
+        h.convergence.removal_would_destroy_unrecorded_state(GROUP, rel, &unexaminable);
+
+    assert!(write_guard.is_err(), "got {write_guard:?}");
+    assert!(removal_guard.is_err(), "got {removal_guard:?}");
+    // A genuinely absent path is still nothing to protect.
+    let absent = h.path("never-here-189.txt");
+    assert!(!h.convergence.disk_holds_uncaptured_local_bytes(GROUP, rel, &absent, None).unwrap());
+}
+
+#[cfg(windows)]
+mod remote_row_guards {
+    use super::*;
+
+    /// A `Remote` row for `rel` whose path holds `user_bytes` the row does not
+    /// describe, with the given recorded placeholder generation (`None` =
+    /// none recorded).
+    async fn remote_row_over_user_bytes(
+        h: &Harness,
+        rel: &str,
+        generation: Option<(i64, i64, &str)>,
+    ) -> std::path::PathBuf {
+        let file = h.path(rel);
+        std::fs::write(&file, b"captured by the device").unwrap();
+        assert!(matches!(h.capture(rel).await, LocalChangeOutcome::FileChanged(_)));
+        h.state
+            .database()
+            .write(|conn| {
+                conn.execute(
+                    "UPDATE files SET materialization_state = 'remote', placeholder_dev = ?3, \
+                     placeholder_ino = ?4, placeholder_provider_kind = ?5 \
+                     WHERE group_id = ?1 AND path = ?2",
+                    rusqlite::params![
+                        GROUP,
+                        rel,
+                        generation.map(|g| g.0),
+                        generation.map(|g| g.1),
+                        generation.map(|g| g.2),
+                    ],
+                )?;
+                Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>(())
+            })
+            .unwrap();
+        std::fs::write(&file, b"bytes the user wrote after, not recorded anywhere").unwrap();
+        file
+    }
+
+    /// Every path that asks "is this an untouched placeholder" fails closed
+    /// when the generation cannot be read: the write guard (local edit
+    /// check), the removal guard, and the own-capture check behind a
+    /// projection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreadable_placeholder_generation_stops_all_three_paths() {
+        let rel = "unreadable-generation-189.txt";
+        let h = Harness::new(false);
+        let file = remote_row_over_user_bytes(&h, rel, None).await;
+
+        yadorilink_sync_sqlite::fail_placeholder_reads_for_path(rel, true);
+        let write_guard = h.convergence.disk_holds_uncaptured_local_bytes(GROUP, rel, &file, None);
+        let removal_guard = h.convergence.removal_would_destroy_unrecorded_state(GROUP, rel, &file);
+        let projection = try_materialize_own_head(&h, rel).await;
+        yadorilink_sync_sqlite::fail_placeholder_reads_for_path(rel, false);
+
+        assert!(write_guard.is_err(), "write guard: {write_guard:?}");
+        assert!(removal_guard.is_err(), "removal guard: {removal_guard:?}");
+        assert!(projection.is_err(), "projection: {projection:?}");
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"bytes the user wrote after, not recorded anywhere",
+            "nothing was written over the user's bytes"
+        );
+    }
+
+    /// No recorded generation, or another provider's, is not a confirmation
+    /// that this device wrote the object: the user's bytes are protected by
+    /// every path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missing_or_foreign_generation_never_vouches_for_user_bytes() {
+        for (rel, generation) in [
+            ("missing-generation-189.txt", None),
+            ("foreign-generation-189.txt", Some((1_i64, 2_i64, "another-provider"))),
+        ] {
+            let h = Harness::new(false);
+            let file = remote_row_over_user_bytes(&h, rel, generation).await;
+
+            assert!(
+                h.convergence.disk_holds_uncaptured_local_bytes(GROUP, rel, &file, None).unwrap(),
+                "{rel}: write guard"
+            );
+            assert!(
+                h.convergence.removal_would_destroy_unrecorded_state(GROUP, rel, &file).unwrap(),
+                "{rel}: removal guard"
+            );
+            let _ = try_materialize_own_head(&h, rel).await.unwrap();
+            assert_eq!(
+                std::fs::read(&file).unwrap(),
+                b"bytes the user wrote after, not recorded anywhere",
+                "{rel}: nothing was written over the user's bytes"
+            );
+        }
+    }
+}

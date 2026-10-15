@@ -87,6 +87,25 @@ async fn a_refused_folder_eviction_changes_nothing() {
     );
 }
 
+/// Free Up Space on an ordinary linked folder is refused for a stated reason, the same one for a
+/// file and a folder, and the shell menu is not offered it: only a File Provider folder can
+/// give space back, because an ordinary folder has no placeholder to leave in the file's place.
+#[tokio::test]
+async fn an_ordinary_folder_says_why_free_up_space_is_not_available() {
+    let state = state_with_link();
+    file(&state, "trips/beach.jpg", MaterializationState::Present);
+    let port = DaemonMaterializationAdapter::new(state.clone());
+
+    assert!(!port.evict_supported(GROUP));
+    for path in ["trips", "trips/beach.jpg"] {
+        let Err(SyncError::EvictionRejected(why)) = port.evict(GROUP, path) else {
+            panic!("{path}: an ordinary folder was freed");
+        };
+        assert!(why.contains("File Provider"), "{why}");
+        assert!(!why.contains("in this build"), "{why}");
+    }
+}
+
 /// Evicting a folder with nothing hydrated below it frees nothing and is
 /// not an error.
 #[tokio::test]

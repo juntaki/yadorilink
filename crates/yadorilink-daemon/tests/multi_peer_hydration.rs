@@ -1146,7 +1146,17 @@ async fn retained_last_local_copy_remains_user_accessible_offline() {
     // `hydration::evict`'s own per-root on-demand gate,
     // checked before the custody gate).
     device.state.set_test_on_demand_allowed(true);
-    hydration::evict(&device.state, GROUP, PATH).unwrap();
+    //
+    // Eviction unlinks the working-tree copy only where the OS proves no writer can exist (the
+    // Linux write lease); elsewhere (macOS) it keeps the file by design, so stand in for the
+    // exclusion there. Armed on this thread, around the synchronous call only (the flag is
+    // thread-local).
+    {
+        #[cfg(not(target_os = "linux"))]
+        let _exclusion =
+            yadorilink_filesystem_sync::materialization_eviction::assume_write_exclusion_for_test();
+        hydration::evict(&device.state, GROUP, PATH).unwrap();
+    }
     assert_eq!(
         device
             .state

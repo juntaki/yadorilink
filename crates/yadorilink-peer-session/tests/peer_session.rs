@@ -1239,11 +1239,14 @@ mod service_rpc_wire_tests {
             &'a self,
             group_id: &'a str,
             lease_id: &'a str,
-        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
             let tx = self.releases.clone();
             let values = (group_id.to_string(), lease_id.to_string());
+            // A lease named "unreleasable-..." is one this responder cannot end.
+            let ends = !lease_id.starts_with("unreleasable");
             Box::pin(async move {
                 let _ = tx.send(values);
+                ends
             })
         }
     }
@@ -1267,6 +1270,7 @@ mod service_rpc_wire_tests {
                         lease_id: "lease-1".to_string(),
                         root_digest: expected_digest,
                         expires_at_unix: 999,
+                        ttl_seconds: 900,
                     }),
                     releases: tx,
                 }),
@@ -1286,6 +1290,7 @@ mod service_rpc_wire_tests {
         assert_eq!(grant.lease_id, "lease-1");
         assert_eq!(grant.root_digest, expected_digest);
         assert_eq!(grant.expires_at_unix, 999);
+        assert_eq!(grant.ttl_seconds, 900, "the lease lifetime crosses the wire as a duration");
 
         session_a.release_handoff_lease_to_peer(GROUP, "lease-1").await.unwrap();
         let released = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -1293,6 +1298,10 @@ mod service_rpc_wire_tests {
             .expect("release message should arrive")
             .expect("release recorder should remain open");
         assert_eq!(released, (GROUP.to_string(), "lease-1".to_string()));
+
+        // A release the responder could not carry out is an error, not an
+        // acknowledgement.
+        assert!(session_a.release_handoff_lease_to_peer(GROUP, "unreleasable-1").await.is_err());
     }
 
     /// A request for a group the two sessions do NOT share is refused
@@ -1314,6 +1323,7 @@ mod service_rpc_wire_tests {
                         lease_id: "lease-should-never-be-seen".to_string(),
                         root_digest: [1u8; 32],
                         expires_at_unix: 999,
+                        ttl_seconds: 900,
                     }),
                     releases: tx,
                 }),

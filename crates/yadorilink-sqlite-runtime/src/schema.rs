@@ -18,7 +18,7 @@ use crate::error::DatabaseError;
 /// Bump this whenever the created shape changes at all, since the previous
 /// shape becomes unopenable by this binary and unopenable is the intended
 /// outcome.
-pub const SCHEMA_VERSION: i32 = 117;
+pub const SCHEMA_VERSION: i32 = 126;
 
 /// Reads `PRAGMA user_version` and refuses anything that is not exactly
 /// this binary's [`SCHEMA_VERSION`], in either direction: a newer stamp is
@@ -453,6 +453,18 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
             group_id TEXT NOT NULL,
             tmp_path TEXT NOT NULL,
             PRIMARY KEY (group_id, tmp_path)
+        );
+        -- The directories a durable removal moved aside and could not put back
+        -- (a child appeared meanwhile and something else took the name): the
+        -- directory and its child stand under the reserved name at
+        -- `dir_path` (absolute, as the link root spelled it) and nothing was
+        -- deleted. Written when that happens, so the user can be told; status
+        -- counts the rows whose path still stands. A row is kept when its path
+        -- is gone (an unmounted volume looks the same).
+        CREATE TABLE IF NOT EXISTS stranded_directories (
+            group_id TEXT NOT NULL,
+            dir_path TEXT NOT NULL,
+            PRIMARY KEY (group_id, dir_path)
         );
         -- The content targets of earlier writes of a path that a newer
         -- write's intent replaced before they were proven. Such a write may
@@ -928,8 +940,9 @@ fn create_provider_tables(conn: &Connection) -> Result<(), DatabaseError> {
             -- of what the item SHOWS (an announcement, a rename or move, a direct edit). The
             -- OS-visible version identifiers carry it.
             generation             INTEGER NOT NULL DEFAULT 1,
-            -- How many of the generation's advances were a change of this folder's CHILD SET (a
-            -- child added, removed or moved in or out). `generation - child_bumps` is the
+            -- How many of the generation's advances were a change of this folder's CHILD SET or of
+            -- anything below it (a child added, removed or moved in or out, or a descendant
+            -- changed at any depth). `generation - child_bumps` is the
             -- folder's PLACE generation (renames, moves, announcements): the source-folder
             -- check of a rename uses it, so a sibling being added does not stale a rename.
             child_bumps            INTEGER NOT NULL DEFAULT 0,
@@ -1596,8 +1609,37 @@ fn reconcile_provider_namespace(conn: &Connection) -> rusqlite::Result<()> {
                 stmt.query_map([&root], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
             rows
         };
-        for parent in &parents {
-            bump_folder(conn, &root, parent, &mut next)?;
+        // The same advance, once per folder, for every folder ABOVE a changed path: a folder's
+        // token covers its whole subtree (a recursive delete is fenced by it), so a change at any
+        // depth, content edits included, moves every ancestor's token. The cost is the number of
+        // distinct ancestors of the changed paths, never the size of any subtree.
+        let ancestors: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT a.p FROM provider_anc a \
+                 JOIN provider_roots r ON r.group_id = a.g \
+                 WHERE r.root_id = ?1 AND a.p <> '' \
+                   AND EXISTS (SELECT 1 FROM provider_dirty_paths d WHERE d.group_id = a.g \
+                               AND d.path > a.p || '/' AND d.path < a.p || '0')",
+            )?;
+            let rows =
+                stmt.query_map([&root], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
+            rows
+        };
+        let folders: std::collections::BTreeSet<&String> =
+            parents.iter().chain(ancestors.iter()).collect();
+        let before_bumps = next;
+        for folder in folders {
+            bump_folder(conn, &root, folder, &mut next)?;
+        }
+        if next != before_bumps {
+            // The upserts above are only delivered by a host signal. A change that makes no item
+            // pending (an edit of a known file below a folder) raises none of its own, so a folder
+            // whose token moved must raise one, or a delete on its old token would stay stale
+            // with nothing to refresh the OS.
+            conn.execute(
+                "UPDATE provider_roots SET change_seq = change_seq + 1 WHERE root_id = ?1",
+                [&root],
+            )?;
         }
         if next != base {
             conn.execute(

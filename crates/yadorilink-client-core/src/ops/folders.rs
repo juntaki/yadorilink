@@ -2,9 +2,12 @@
 
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
-use yadorilink_ipc_proto::daemonctl::{PauseRequest, ResumeRequest, StatusRequest, StatusResponse};
+use yadorilink_ipc_proto::daemonctl::{
+    PauseDuration as WirePauseDuration, PauseRequest, ResumeRequest, StatusRequest, StatusResponse,
+};
 
 use crate::daemon::control;
+use crate::dto::PauseDuration;
 use crate::error::CoreError;
 use crate::ops::links::list_links;
 
@@ -18,9 +21,16 @@ pub async fn status() -> Result<StatusResponse, CoreError> {
     Ok(status)
 }
 
-/// Pauses sync for one linked folder.
-pub async fn pause_folder(local_path: String) -> Result<(), CoreError> {
-    control::send(ReqPayload::Pause(PauseRequest { local_path })).await?;
+/// Pauses sync for one linked folder for `duration`.
+pub async fn pause_folder(local_path: String, duration: PauseDuration) -> Result<(), CoreError> {
+    let duration = match duration {
+        PauseDuration::UntilResumed => WirePauseDuration::Unspecified,
+        PauseDuration::ThirtyMinutes => WirePauseDuration::ThirtyMinutes,
+        PauseDuration::OneHour => WirePauseDuration::OneHour,
+        PauseDuration::UntilTomorrow => WirePauseDuration::UntilTomorrow,
+    };
+    control::send(ReqPayload::Pause(PauseRequest { local_path, duration: duration as i32 }))
+        .await?;
     Ok(())
 }
 
@@ -33,9 +43,9 @@ pub async fn resume_folder(local_path: String) -> Result<(), CoreError> {
 /// Pauses every currently linked folder. The control protocol tracks pause
 /// per link, so this lists the links and pauses each, rather than adding a
 /// "pause everything" daemon request.
-pub async fn pause_all() -> Result<(), CoreError> {
+pub async fn pause_all(duration: PauseDuration) -> Result<(), CoreError> {
     for link in list_links().await? {
-        pause_folder(link.local_path).await?;
+        pause_folder(link.local_path, duration).await?;
     }
     Ok(())
 }

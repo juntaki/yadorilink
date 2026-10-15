@@ -59,12 +59,42 @@ fn windows_move(from: &Path, to: &Path, replace: Replace) -> io::Result<()> {
     let (from, to) =
         (wide(&crate::long_path::for_win32(from))?, wide(&crate::long_path::for_win32(to))?);
     let flags = windows_move_flags(replace);
-    // SAFETY: both buffers are NUL-terminated and outlive the call.
-    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } == 0 {
-        return Err(io::Error::last_os_error());
+    // A replacing move onto a name that another handle has open (a concurrent reader, a virus
+    // scanner, the search indexer) is refused with ACCESS_DENIED / SHARING_VIOLATION, even when
+    // that handle shares DELETE; the refusal ends with the handle. Retry for a bounded time, then
+    // fail closed with the last error. A no-replace move has no such target and is not retried.
+    let mut delay = REPLACE_RETRY_FIRST_DELAY;
+    for attempt in 0..=REPLACE_RETRY_LIMIT {
+        // SAFETY: both buffers are NUL-terminated and outlive the call.
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } != 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        let busy = matches!(
+            error.raw_os_error().map(|code| code as u32),
+            Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+        );
+        if replace == Replace::No || !busy || attempt == REPLACE_RETRY_LIMIT {
+            return Err(error);
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(REPLACE_RETRY_MAX_DELAY);
     }
-    Ok(())
+    unreachable!("the last attempt returns")
 }
+
+#[cfg(windows)]
+const ERROR_ACCESS_DENIED: u32 = 5;
+#[cfg(windows)]
+const ERROR_SHARING_VIOLATION: u32 = 32;
+/// Retries of a refused replacing move: 1, 2, 4, ... 50 ms, about 0.4 seconds in all. The wait
+/// blocks the calling thread like the write-through move itself does, so it stays short.
+#[cfg(windows)]
+const REPLACE_RETRY_LIMIT: u32 = 12;
+#[cfg(windows)]
+const REPLACE_RETRY_FIRST_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+#[cfg(windows)]
+const REPLACE_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[cfg(unix)]
 fn unix_move(from: &Path, to: &Path, replace: Replace) -> io::Result<()> {

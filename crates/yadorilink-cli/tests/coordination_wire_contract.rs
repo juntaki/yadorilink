@@ -961,6 +961,8 @@ async fn signing_out_revokes_the_installation_on_the_server() {
     let store = credential_store::open().expect("the credential store");
     let lock = store.lock(std::time::Duration::from_secs(5)).await.expect("lock");
     store.save(&lock, &stolen).expect("restoring");
+    // Released before the call: refreshing takes this same lock.
+    drop(lock);
     match account::deletion_status().await {
         Err(CoreError::AuthFailed(_)) => {}
         Err(CoreError::NotLoggedIn) => {
@@ -1006,6 +1008,8 @@ async fn forgetting_local_credentials_does_not_revoke_anything() {
     let store = credential_store::open().expect("the credential store");
     let lock = store.lock(std::time::Duration::from_secs(5)).await.expect("lock");
     store.save(&lock, &kept).expect("restoring");
+    // Released before the call: refreshing takes this same lock.
+    drop(lock);
     account::deletion_status()
         .await
         .expect("forgetting local credentials must not have revoked the installation");
@@ -1418,28 +1422,34 @@ async fn the_authorization_server_refuses_every_request_that_is_wrong_in_exactly
     println!("  D1 refresh -> 200, a different refresh token");
     assert_ne!(next, spent, "the spent refresh token must not be reissued");
 
+    // D2. Use the successor. A rotated-away token is still accepted while its
+    // successor is unused and the rotation is recent (a client that crashed
+    // before storing the successor), so the replay below is only "wrong in
+    // exactly one way" after the successor has been used.
+    let confirmed = client.refresh(&next).await.expect("the successor must be redeemable");
+    println!("  D2 refresh with the successor -> 200, the successor is now confirmed");
+    let (status, body) = outcome(
+        "D2 control: the newest access token, before any replay",
+        client.protected_get(&userinfo, confirmed.access_token()).await.expect("protected GET"),
+    )
+    .await;
+    assert_eq!(status, 200, "the control leg must succeed or D4 proves nothing: {body}");
+
     let err = client
         .refresh(&spent)
         .await
-        .expect_err("a rotated-away refresh token must not be redeemable");
-    println!("  D2 the OLD refresh token, after rotation -> {err}");
+        .expect_err("a rotated-away refresh token whose successor was used must not be redeemable");
+    println!("  D3 the OLD refresh token, after its successor was used -> {err}");
     assert_eq!(err.status(), Some(400));
     assert_eq!(err.oauth_error(), Some("invalid_grant"));
 
-    // What replaying a refresh token costs, observed rather than assumed.
+    // A replay past a confirmed successor is reuse, and reuse revokes the grant.
     let (status, body) = outcome(
-        "D3 the rotated access token, after the old refresh token was replayed",
-        client.protected_get(&userinfo, rotated.access_token()).await.expect("protected GET"),
+        "D4 the newest access token, after the old refresh token was replayed",
+        client.protected_get(&userinfo, confirmed.access_token()).await.expect("protected GET"),
     )
     .await;
-    println!(
-        "     (a 401 here means refresh replay tore the grant down; \
-         a 200 means only the replay was refused)"
-    );
-    assert!(
-        status == 401 || status == 200,
-        "unexpected status {status} at the protected resource: {body}"
-    );
+    assert_eq!(status, 401, "refresh token reuse must tear the grant down: {body}");
 
     println!("\n=== every negative refused ===\n");
     credential_store::clear().await.ok();

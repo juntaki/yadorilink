@@ -11,6 +11,13 @@ public struct CopyRow: Identifiable, Equatable, Sendable {
     public var tooltip: String
 }
 
+public struct RetainedRow: Identifiable, Equatable, Sendable {
+    public var id: String { path }
+    public var path: String
+    /// "12 KB", or why the size is unknown.
+    public var size: String
+}
+
 public struct ConflictRow: Identifiable, Equatable, Sendable {
     public var id: String { path }
     public var path: String
@@ -19,6 +26,10 @@ public struct ConflictRow: Identifiable, Equatable, Sendable {
     public var subtitle: String
     public var keptAs: String
     public var reason: ConflictReason
+    /// "Sep 21, 2026 at 10:12 AM", when the copy was saved.
+    public var savedAt: String?
+    public var canResolve: Bool
+    var conflict: ConflictSummary
 
     /// How the copy relates to the name it came from.
     public var relation: String {
@@ -82,11 +93,18 @@ public final class FolderDetailViewModel {
     public private(set) var folder: FolderSummary
     public private(set) var detail: FolderDetail?
     public private(set) var conflicts: [ConflictRow] = []
+    public private(set) var retained: [RetainedRow] = []
     public private(set) var trash: [TrashRow] = []
     public private(set) var selectedFile: String?
     public private(set) var availability: FileAvailability?
+    /// What the daemon says about keeping the chosen file on this device; `nil` when not read.
+    public private(set) var retention: FileRetention?
     public private(set) var versions: [VersionRow] = []
     public private(set) var isLoading = false
+    /// The last read of the folder's details failed; nothing below it is known to be current.
+    public private(set) var loadFailure: Notice?
+    /// The chosen file's status or history could not be read; none of it is known.
+    public private(set) var historyFailure: Notice?
     public private(set) var isWorking = false
     /// One result line for the whole window, whichever section acted.
     public var notice: Notice?
@@ -103,22 +121,30 @@ public final class FolderDetailViewModel {
     public func load() async {
         isLoading = true
         defer { isLoading = false }
-        await loadDeviceNames()
+        let namesFailure = await loadDeviceNames()
         do {
             let detail = try await client.folderDetail(localPath: folder.localPath)
             self.detail = detail
             folder = detail.summary
             conflicts = try await client.listConflicts(localPath: folder.localPath).map(conflictRow)
             trash = try await client.listTrash(localPath: folder.localPath).map(trashRow)
+            retained = try await loadRetained()
+            loadFailure = namesFailure
         } catch {
-            notice = .failure(error)
+            loadFailure = .failure(error)
         }
     }
 
-    private func loadDeviceNames() async {
-        guard deviceNames == nil else { return }
-        if let devices = try? await client.listFolderDevices() {
+    /// Device names label copies and versions; without them they read "another
+    /// device". Returns the failure so the details can offer Retry.
+    private func loadDeviceNames() async -> Notice? {
+        guard deviceNames == nil else { return nil }
+        do {
+            let devices = try await client.listFolderDevices()
             deviceNames = Dictionary(devices.map { ($0.deviceId, $0.displayName) }, uniquingKeysWith: { a, _ in a })
+            return nil
+        } catch {
+            return .failure(error)
         }
     }
 
@@ -136,12 +162,47 @@ public final class FolderDetailViewModel {
     public var thisDevice: String { Format.localCopyLine(folder) }
     public var freeSpace: String? { folder.volume.map(Format.freeSpace) }
 
+    /// "None yet" is only said once the details were read.
+    public var showsNoCopies: Bool { detail != nil && loadFailure == nil && copies.isEmpty }
+
     public var copies: [CopyRow] {
         (detail?.completeCopies ?? []).map { copy in
             let status = [copy.reachability.title, copy.route.title].compactMap { $0 }.joined(separator: " · ")
             let tone: StatusTone = copy.reachability == .connected ? .ok : copy.reachability == .unreachable ? .neutral : .info
             return CopyRow(name: name(for: copy.deviceId), status: status, tone: tone, tooltip: copy.deviceId)
         }
+    }
+
+    // MARK: Kept originals
+
+    /// Why they are kept and when they can go; shown once above the list.
+    public static let retainedExplanation = "These files were kept as they were because it could not be proved safe to remove them. Each can be released once nothing is writing to it. A file that changed meanwhile is saved first."
+
+    private func loadRetained() async throws -> [RetainedRow] {
+        try await client.listRetainedOriginals().filter { $0.groupId == folder.groupId }.map {
+            RetainedRow(path: $0.path, size: $0.reachable ? Format.bytes($0.size) : "Size unknown while this folder is not watched")
+        }
+    }
+
+    /// Releases what can safely be released; whatever cannot stays listed.
+    public func releaseRetained() async {
+        let groupId = folder.groupId
+        let done = await act { client in
+            Self.releaseSummary(try await client.releaseRetainedOriginals(groupId: groupId))
+        }
+        if done { retained = (try? await loadRetained()) ?? retained }
+    }
+
+    static func releaseSummary(_ releases: [RetainedRelease]) -> String {
+        let released = releases.filter { [.removed, .savedThenRemoved, .gone].contains($0.outcome) }.count
+        let kept = releases.count - released
+        var parts: [String] = []
+        if released > 0 { parts.append("Released \(released) file\(released == 1 ? "" : "s").") }
+        if kept > 0 { parts.append("\(kept) kept: still in use, changed, or not safe to release yet. Try again later.") }
+        if releases.contains(where: { $0.outcome == .savedThenRemoved || $0.outcome == .savedStillRetained }) {
+            parts.append("Changed content was saved first.")
+        }
+        return parts.isEmpty ? "Nothing to release." : parts.joined(separator: " ")
     }
 
     // MARK: Conflicts and trash
@@ -152,7 +213,7 @@ public final class FolderDetailViewModel {
         guard !reasons.isEmpty else { return nil }
         var sentences: [String] = []
         if reasons.contains(.concurrentEdit) {
-            sentences.append("Two devices changed the same file at the same time. YadoriLink kept both versions: the original name holds one, and the copy holds the other.")
+            sentences.append("Edited on two devices; both versions were kept. The original name holds one, and the copy holds the other.")
         }
         if reasons.contains(.folderAtPath) {
             sentences.append("One device made a folder where another had a file with the same name. The folder keeps the name, and the file was kept beside it as a copy.")
@@ -169,7 +230,30 @@ public final class FolderDetailViewModel {
         var parts = [sizeOrFolder(c.size, c.kind)]
         if let modified = c.modifiedAt { parts.append(Format.relative(modified, now: now())) }
         if c.loserDeviceId != nil { parts.append("from \(name(for: c.loserDeviceId))") }
-        return ConflictRow(path: c.path, title: (c.path as NSString).lastPathComponent, subtitle: parts.joined(separator: " · "), keptAs: c.currentPath, reason: c.reason)
+        return ConflictRow(
+            path: c.path, title: (c.path as NSString).lastPathComponent, subtitle: parts.joined(separator: " · "),
+            keptAs: c.currentPath, reason: c.reason, savedAt: c.modifiedAt.map(Format.dateTime),
+            canResolve: !folder.provider && Self.isResolvable(c), conflict: c
+        )
+    }
+
+    /// Only a file copy of an edit made on two devices can be resolved: a copy
+    /// moved aside for a folder has no single other file.
+    static func isResolvable(_ c: ConflictSummary) -> Bool {
+        c.kind == .file && c.reason == .concurrentEdit && c.currentPath != c.path
+    }
+
+    /// Keeps this copy as the file (`keepThis`) or both as separate files
+    /// (`keepBoth`), then re-reads the list.
+    public func resolve(_ row: ConflictRow, _ choice: ConflictChoice) async {
+        let done = await act { client in
+            _ = try await client.resolveConflict(copyPath: (row.conflict.localPath as NSString).appendingPathComponent(row.conflict.path), choice: choice)
+            switch choice {
+            case .keepThis: return "Kept this version of \(row.keptAs)."
+            case .keepBoth: return "Kept both versions of \(row.keptAs)."
+            }
+        }
+        if done { conflicts.removeAll { $0.id == row.id } }
     }
 
     /// A directory has no size of its own, so it reads "Folder" instead of
@@ -213,8 +297,11 @@ public final class FolderDetailViewModel {
             notice = .failure(error)
         }
         isWorking = false
-        if let trash = try? await client.listTrash(localPath: folder.localPath) {
-            self.trash = trash.map(trashRow)
+        do {
+            trash = try await client.listTrash(localPath: folder.localPath).map(trashRow)
+        } catch {
+            // The rows shown may include entries that were just restored.
+            loadFailure = .failure(error)
         }
     }
 
@@ -240,7 +327,15 @@ public final class FolderDetailViewModel {
 
     // MARK: File history and download options
 
-    public var fileActions: [FileAction] { availability.map(FileAction.available(for:)) ?? [] }
+    public var fileActions: [FileAction] {
+        availability.map { FileAction.available(for: $0, providerFolder: folder.provider, retention: retention) } ?? []
+    }
+
+    /// Said only for a kept file, so the absence of a line means "not kept".
+    public var retentionLine: String? {
+        guard let retention, retention.policy == .pinned else { return nil }
+        return retention.inherited ? "Always kept on this device (by a folder above)" : "Always kept on this device"
+    }
 
     public var fileStateTitle: String? {
         guard let availability else { return nil }
@@ -253,19 +348,31 @@ public final class FolderDetailViewModel {
     public func selectFile(_ absolutePath: String) async {
         selectedFile = absolutePath
         availability = nil
+        retention = nil
         versions = []
-        await loadDeviceNames()
+        historyFailure = nil
+        let namesFailure = await loadDeviceNames()
         do {
             let availability = try await client.fileAvailability(absolutePath: absolutePath)
             guard selectedFile == absolutePath else { return }
             self.availability = availability
+            let retention = try await client.fileRetention(absolutePath: absolutePath)
+            guard selectedFile == absolutePath else { return }
+            self.retention = retention
             let versions = try await client.listVersions(absolutePath: absolutePath).map(versionRow)
             guard selectedFile == absolutePath else { return }
             self.versions = versions
+            historyFailure = namesFailure
         } catch {
             guard selectedFile == absolutePath else { return }
-            notice = .failure(error)
+            historyFailure = .failure(error)
         }
+    }
+
+    /// Re-reads only the chosen file's availability and history.
+    public func retryFileHistory() async {
+        guard let path = selectedFile else { return }
+        await selectFile(path)
     }
 
     private func versionRow(_ v: FileVersion) -> VersionRow {
@@ -291,10 +398,19 @@ public final class FolderDetailViewModel {
             case .freeUpSpace:
                 let outcome = try await client.evictFile(absolutePath: path)
                 return outcome.evicted ? "Freed up \(Format.bytes(outcome.bytesReclaimed)) from \(name)." : "\(name) is already online only."
+            case .keepOnDevice:
+                let outcome = try await client.pinFile(absolutePath: path)
+                if let why = outcome.downloadError { return "\(name) will stay on this device, but couldn't be downloaded yet: \(why)" }
+                return "\(name) will always stay on this device."
+            case .stopKeeping:
+                let retention = try await client.unpinFile(absolutePath: path)
+                if retention.policy == .pinned { return "\(name) is still kept on this device because a folder above it is." }
+                return "\(name) is no longer kept on this device. It stays here until you free up space."
             }
         }
         let availability = try? await client.fileAvailability(absolutePath: path)
-        if selectedFile == path { self.availability = availability }
+        let retention = try? await client.fileRetention(absolutePath: path)
+        if selectedFile == path { self.availability = availability; self.retention = retention }
     }
 
     public func restore(_ version: VersionRow) async {

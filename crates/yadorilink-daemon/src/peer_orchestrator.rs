@@ -211,10 +211,23 @@ fn apply_netmap_membership(
 ) {
     let present: HashSet<String> = current_netmap.keys().cloned().collect();
     let may_withdraw = diff_state.may_withdraw(frame_generation);
-    let diff = {
+    let (diff, removed_edges, for_leases) = {
         let mut previous =
             diff_state.previous.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let diff = diff_netmap(&previous, &current_netmap);
+        // Every (device, group) edge the netmap this device was acting on had
+        // and this one lacks, for the custody leases those devices hold here.
+        let removed_edges: Vec<(String, String)> = previous
+            .iter()
+            .flat_map(|(device, groups)| {
+                let listed = current_netmap.get(device);
+                groups
+                    .iter()
+                    .filter(move |group| !listed.is_some_and(|now| now.contains(*group)))
+                    .map(move |group| (device.clone(), group.clone()))
+            })
+            .collect();
+        let for_leases = if may_withdraw { current_netmap.clone() } else { NetmapSnapshot::new() };
         if may_withdraw {
             *previous = current_netmap;
         } else {
@@ -229,8 +242,12 @@ fn apply_netmap_membership(
                 previous.entry(device_id).or_default().extend(groups);
             }
         }
-        diff
+        (diff, removed_edges, for_leases)
     };
+    // A requester this snapshot no longer lists for a group cannot reach this
+    // device to release its custody leases there; they end with its place in
+    // the group (see `custody_handoff`).
+    state.drop_custody_leases_of_departed_requesters(&removed_edges, &for_leases, may_withdraw);
     if !may_withdraw {
         tracing::warn!(
             frame_generation,
@@ -357,6 +374,8 @@ fn record_group_policy_states(
 
     let mut states = HashMap::new();
     let mut stale_groups: Vec<String> = Vec::new();
+    // Groups whose verified policy head moved with this frame.
+    let mut advanced_groups: Vec<String> = Vec::new();
     for log in logs {
         let cached = state.authority.group_policy_state(&log.group_id);
         // The coordination plane's policy-send watermark is PER CONNECTION,
@@ -429,6 +448,12 @@ fn record_group_policy_states(
                         // with no policy at all -- see
                         // `restore_offline_group_policy_states`.
                         remember_group_policy_log(state, log, carries_whole_chain);
+                        let head_of = |p: &crate::change_policy::GroupPolicyState| {
+                            p.to_watermark().highest_verified_head
+                        };
+                        if cached.as_ref().map(head_of) != Some(head_of(&policy)) {
+                            advanced_groups.push(log.group_id.clone());
+                        }
                         states.insert(log.group_id.clone(), policy);
                     }
                     crate::change_policy::WatermarkVerdict::Reject(reason) => {
@@ -484,6 +509,11 @@ fn record_group_policy_states(
     // nor marked stale. The failed groups are revoked from live sessions only
     // after that switch is visible.
     state.apply_policy_snapshot(states, stale_groups);
+    // A checkpoint the plane signs pins its live policy head, and a flush
+    // checks it against this device's verified chain, so a batch that
+    // failed because the chain lagged becomes publishable exactly when the
+    // chain catches up. Nothing else would retry it.
+    ws_netmap::spawn_flush_pending_checkpoints(state, Some(advanced_groups));
     // What a fork pass may do depends on the verified policy (the fallback
     // for an author that can no longer act): it looks at the contests again.
     state.reconsider_contests_after_policy_change();
@@ -1282,6 +1312,10 @@ pub(crate) fn peer_sync_session_deps(state: &Arc<DaemonState>) -> PeerSyncSessio
         // `HandoffTicketResponder for DaemonState`'s doc comment
         // (`daemon_state.rs`).
         handoff_ticket_responder: state.clone(),
+        // Lets this session answer a full replica that asks this device to
+        // move its custody lease elsewhere -- see
+        // `DaemonState::rehome_custody_hold`.
+        custody_rehome_responder: state.clone(),
     }
 }
 

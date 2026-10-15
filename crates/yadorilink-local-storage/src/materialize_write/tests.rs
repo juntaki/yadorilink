@@ -813,8 +813,15 @@ fn xattrs_already_match_disk_reports_an_unreadable_file_as_not_matching() {
 #[derive(Default)]
 struct HeldLedger {
     held: std::sync::Mutex<Vec<PathBuf>>,
+    stranded: std::sync::Mutex<Vec<PathBuf>>,
     refuse: bool,
 }
+/// After a temp or Discard object was unlinked: Unix released its record; Windows documents no
+/// durability for an unlink, so the record stays until a restart finds the path absent.
+fn assert_record_after_an_unlink(ledger: &HeldLedger) {
+    assert_eq!(ledger.held.lock().unwrap().len(), usize::from(cfg!(windows)));
+}
+
 impl TempFileLedger for HeldLedger {
     fn record(&self, tmp_path: &Path) -> Result<(), StorageError> {
         if self.refuse {
@@ -826,6 +833,48 @@ impl TempFileLedger for HeldLedger {
     fn release(&self, tmp_path: &Path) {
         self.held.lock().unwrap().retain(|p| p != tmp_path);
     }
+    fn strand(&self, dir_path: &Path) -> Result<(), StorageError> {
+        if self.refuse {
+            return Err(StorageError::Io(std::io::Error::other("refused")));
+        }
+        self.stranded.lock().unwrap().push(dir_path.to_path_buf());
+        Ok(())
+    }
+}
+
+/// A directory a durable removal could not put back is reported to the ledger
+/// by the path it stands at, and the removal says `Stranded` with that path.
+#[test]
+fn a_stranded_directory_is_recorded_with_the_ledger() {
+    let ledger = HeldLedger::default();
+    let aside = PathBuf::from("/root/.d.discard");
+    let outcome = crate::fs_ops::stranded(Path::new("/root/d"), aside.clone(), &ledger).unwrap();
+    assert_eq!(outcome, crate::EmptyDirectoryRemoval::Stranded(aside.clone()));
+    assert_eq!(*ledger.stranded.lock().unwrap(), [aside]);
+}
+
+/// A directory moved aside whose removal failed is stranded only if it still
+/// holds something (or cannot be read).
+#[test]
+fn a_moved_aside_directory_counts_as_stranded_only_if_it_holds_something() {
+    let root = tempfile::tempdir().unwrap();
+    let (empty, full) = (root.path().join("empty"), root.path().join("full"));
+    fs::create_dir(&empty).unwrap();
+    fs::create_dir(&full).unwrap();
+    fs::write(full.join("late"), b"x").unwrap();
+    assert!(!crate::fs_ops::holds_entries_or_unreadable(&empty));
+    assert!(crate::fs_ops::holds_entries_or_unreadable(&full));
+    assert!(crate::fs_ops::holds_entries_or_unreadable(&root.path().join("gone")));
+}
+
+/// A removal that cannot record the directory it stranded fails rather than
+/// reporting a state nobody can see.
+#[test]
+fn a_stranded_directory_that_cannot_be_recorded_is_an_error() {
+    let ledger = HeldLedger { refuse: true, ..Default::default() };
+    let outcome =
+        crate::fs_ops::stranded(Path::new("/root/d"), PathBuf::from("/root/.d.discard"), &ledger);
+    assert!(outcome.is_err());
 }
 
 /// The record is made before the file exists and is released with the file on
@@ -841,7 +890,7 @@ fn a_failed_assembly_removes_its_temp_file_and_its_record() {
     let result = reconstruct_file_to_temp_in(&store, &dir.path().join("f"), &missing, 0, &ledger);
 
     assert!(result.is_err());
-    assert!(ledger.held.lock().unwrap().is_empty());
+    assert_record_after_an_unlink(&ledger);
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
@@ -875,7 +924,7 @@ fn a_failed_publish_removes_the_temp_file_and_its_record() {
     assert!(persist_reconstructed_file_in(&tmp, &out, &ledger).is_err());
 
     assert!(!tmp.exists());
-    assert!(ledger.held.lock().unwrap().is_empty());
+    assert_record_after_an_unlink(&ledger);
 }
 
 /// A temp file that cannot be removed keeps its record, so the next link
@@ -1040,7 +1089,7 @@ fn a_crash_between_the_stage_directory_and_its_publication_creates_nothing_visib
 
 #[test]
 fn remove_durably_removes_a_file_and_a_gone_file_is_fine() {
-    use yadorilink_fs_platform::durable_dir::trace::{self, Event};
+    use yadorilink_fs_platform::durable_dir::trace;
     let dir = tempfile::tempdir().unwrap();
     let (file, ledger) = (dir.path().join("f"), HeldLedger::default());
     fs::write(&file, b"x").unwrap();
@@ -1052,6 +1101,7 @@ fn remove_durably_removes_a_file_and_a_gone_file_is_fine() {
     assert!(!file.exists());
     #[cfg(unix)]
     {
+        use yadorilink_fs_platform::durable_dir::trace::Event;
         let steps = trace::take();
         assert!(
             matches!(steps.first(), Some(Event::Remove { path }) if *path == file),
@@ -1059,7 +1109,7 @@ fn remove_durably_removes_a_file_and_a_gone_file_is_fine() {
         );
         assert!(steps.iter().any(|e| matches!(e, Event::FlushDir { .. })));
     }
-    assert!(ledger.held.lock().unwrap().is_empty());
+    assert_record_after_an_unlink(&ledger);
 }
 
 #[test]
@@ -1119,4 +1169,99 @@ fn remove_empty_dir_in_removes_only_what_is_empty() {
 fn remove_durably_treats_a_missing_parent_as_already_removed() {
     let dir = tempfile::tempdir().unwrap();
     crate::remove_durably(&dir.path().join("gone/dir/file"), &HeldLedger::default()).unwrap();
+}
+
+/// A volume `DurableNamespace::open` refused (`Unsupported`, `Unknown`) is not turned into the
+/// plain rename or `mkdir` a closed gate keeps: the visible target is left as it was.
+mod a_refused_volume_fails_closed {
+    use super::*;
+    use yadorilink_fs_platform::durable_dir::UnavailableReason;
+
+    fn refused(reason: UnavailableReason) -> impl Drop {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::fs_ops::set_test_namespace_refusal(None);
+            }
+        }
+        crate::fs_ops::set_test_namespace_refusal(Some(reason));
+        Reset
+    }
+
+    const REASONS: [UnavailableReason; 2] =
+        [UnavailableReason::Unsupported, UnavailableReason::Unknown];
+
+    #[test]
+    fn a_replacing_publish_keeps_the_old_bytes_and_creates_nothing_by_a_plain_rename() {
+        for reason in REASONS {
+            let dir = tempfile::tempdir().unwrap();
+            let (out, ledger) = (dir.path().join("f"), HeldLedger::default());
+            fs::write(&out, b"old").unwrap();
+            let tmp = staged_file(dir.path(), "f.yadorilink-tmp.1.1", b"new", &ledger);
+            let _refusal = refused(reason);
+            assert!(persist_reconstructed_file_in(&tmp, &out, &ledger).is_err(), "{reason:?}");
+            assert_eq!(fs::read(&out).unwrap(), b"old", "{reason:?}");
+            // The documented contract: on any failure the temp object is removed and its record
+            // released (Windows keeps the record of an unlink until a restart finds it absent).
+            assert!(!tmp.exists(), "{reason:?}: the Stage temp leaked");
+            assert_record_after_an_unlink(&ledger);
+        }
+    }
+
+    #[test]
+    fn a_new_name_is_not_created_by_a_plain_rename() {
+        for reason in REASONS {
+            let dir = tempfile::tempdir().unwrap();
+            let (out, ledger) = (dir.path().join("f"), HeldLedger::default());
+            let tmp = staged_file(dir.path(), "f.yadorilink-tmp.1.1", b"new", &ledger);
+            let _refusal = refused(reason);
+            assert!(persist_reconstructed_file_in(&tmp, &out, &ledger).is_err(), "{reason:?}");
+            assert!(!out.exists(), "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn a_directory_is_not_created() {
+        for reason in REASONS {
+            let dir = tempfile::tempdir().unwrap();
+            let canonical_root = dir.path().canonicalize().unwrap();
+            let target = canonical_root.join("d");
+            let _refusal = refused(reason);
+            let result =
+                create_explicit_directory(&target, &canonical_root, &RecordingLedger::default());
+            assert!(result.is_err(), "{reason:?}");
+            assert!(!target.exists(), "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn a_relative_path_with_no_relative_ancestor_is_not_created_by_a_plain_mkdir() {
+        for reason in REASONS {
+            let name = format!("yl-rel-refused-{}-{reason:?}", std::process::id());
+            let relative = Path::new(&name).join("blocks");
+            let _refusal = refused(reason);
+            let result = crate::fs_ops::create_dir_all_durably(&relative);
+            let created = relative.exists();
+            let _ = fs::remove_dir_all(&name);
+            assert!(result.is_err(), "{reason:?}");
+            assert!(!created, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn a_removal_and_a_move_leave_their_objects() {
+        for reason in REASONS {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("f");
+            fs::write(&file, b"x").unwrap();
+            let _refusal = refused(reason);
+            assert!(crate::remove_durably(&file, &HeldLedger::default()).is_err(), "{reason:?}");
+            assert!(file.exists(), "{reason:?}");
+            assert!(
+                crate::remove_empty_dir_in(dir.path(), &HeldLedger::default()).is_err(),
+                "{reason:?}"
+            );
+            assert!(file.exists());
+        }
+    }
 }

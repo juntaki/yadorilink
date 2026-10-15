@@ -921,6 +921,9 @@ public struct AttentionReason: Equatable, Hashable {
      * The daemon's own `category:subject` text.
      */
     public var raw: String
+    public var kind: AttentionKind
+    public var primaryAction: ProductAction
+    public var secondaryAction: ProductAction?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -934,11 +937,14 @@ public struct AttentionReason: Equatable, Hashable {
          */folderLocalPath: String?, 
         /**
          * The daemon's own `category:subject` text.
-         */raw: String) {
+         */raw: String, kind: AttentionKind, primaryAction: ProductAction, secondaryAction: ProductAction?) {
         self.category = category
         self.subject = subject
         self.folderLocalPath = folderLocalPath
         self.raw = raw
+        self.kind = kind
+        self.primaryAction = primaryAction
+        self.secondaryAction = secondaryAction
     }
 
     
@@ -960,7 +966,10 @@ public struct FfiConverterTypeAttentionReason: FfiConverterRustBuffer {
                 category: FfiConverterTypeAttentionCategory.read(from: &buf), 
                 subject: FfiConverterString.read(from: &buf), 
                 folderLocalPath: FfiConverterOptionString.read(from: &buf), 
-                raw: FfiConverterString.read(from: &buf)
+                raw: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterTypeAttentionKind.read(from: &buf), 
+                primaryAction: FfiConverterTypeProductAction.read(from: &buf), 
+                secondaryAction: FfiConverterOptionTypeProductAction.read(from: &buf)
         )
     }
 
@@ -969,6 +978,9 @@ public struct FfiConverterTypeAttentionReason: FfiConverterRustBuffer {
         FfiConverterString.write(value.subject, into: &buf)
         FfiConverterOptionString.write(value.folderLocalPath, into: &buf)
         FfiConverterString.write(value.raw, into: &buf)
+        FfiConverterTypeAttentionKind.write(value.kind, into: &buf)
+        FfiConverterTypeProductAction.write(value.primaryAction, into: &buf)
+        FfiConverterOptionTypeProductAction.write(value.secondaryAction, into: &buf)
     }
 }
 
@@ -985,6 +997,68 @@ public func FfiConverterTypeAttentionReason_lift(_ buf: RustBuffer) throws -> At
 #endif
 public func FfiConverterTypeAttentionReason_lower(_ value: AttentionReason) -> RustBuffer {
     return FfiConverterTypeAttentionReason.lower(value)
+}
+
+
+/**
+ * The availability with the other devices it concerns: those recorded as full copies of the
+ * folder, split by whether they are reachable now. Ids are for lookup, never for display.
+ */
+public struct AvailabilitySummary: Equatable, Hashable {
+    public var availability: Availability
+    public var reachableDeviceIds: [String]
+    public var offlineDeviceIds: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(availability: Availability, reachableDeviceIds: [String], offlineDeviceIds: [String]) {
+        self.availability = availability
+        self.reachableDeviceIds = reachableDeviceIds
+        self.offlineDeviceIds = offlineDeviceIds
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension AvailabilitySummary: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAvailabilitySummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AvailabilitySummary {
+        return
+            try AvailabilitySummary(
+                availability: FfiConverterTypeAvailability.read(from: &buf), 
+                reachableDeviceIds: FfiConverterSequenceString.read(from: &buf), 
+                offlineDeviceIds: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AvailabilitySummary, into buf: inout [UInt8]) {
+        FfiConverterTypeAvailability.write(value.availability, into: &buf)
+        FfiConverterSequenceString.write(value.reachableDeviceIds, into: &buf)
+        FfiConverterSequenceString.write(value.offlineDeviceIds, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAvailabilitySummary_lift(_ buf: RustBuffer) throws -> AvailabilitySummary {
+    return try FfiConverterTypeAvailabilitySummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAvailabilitySummary_lower(_ value: AvailabilitySummary) -> RustBuffer {
+    return FfiConverterTypeAvailabilitySummary.lower(value)
 }
 
 
@@ -1548,6 +1622,66 @@ public func FfiConverterTypeFileAvailability_lower(_ value: FileAvailability) ->
 }
 
 
+public struct FileRetention: Equatable, Hashable {
+    public var policy: RetentionPolicy
+    /**
+     * Pinned only because a folder above is; unpinning this path alone changes nothing.
+     */
+    public var inherited: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(policy: RetentionPolicy, 
+        /**
+         * Pinned only because a folder above is; unpinning this path alone changes nothing.
+         */inherited: Bool) {
+        self.policy = policy
+        self.inherited = inherited
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FileRetention: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFileRetention: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FileRetention {
+        return
+            try FileRetention(
+                policy: FfiConverterTypeRetentionPolicy.read(from: &buf), 
+                inherited: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FileRetention, into buf: inout [UInt8]) {
+        FfiConverterTypeRetentionPolicy.write(value.policy, into: &buf)
+        FfiConverterBool.write(value.inherited, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFileRetention_lift(_ buf: RustBuffer) throws -> FileRetention {
+    return try FfiConverterTypeFileRetention.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFileRetention_lower(_ value: FileRetention) -> RustBuffer {
+    return FfiConverterTypeFileRetention.lower(value)
+}
+
+
 public struct FileVersion: Equatable, Hashable {
     public var versionSeq: Int64
     public var size: UInt64
@@ -1835,6 +1969,10 @@ public struct FolderSummary: Equatable, Hashable {
     public var mode: FolderMode
     public var state: FolderState
     public var paused: Bool
+    /**
+     * When a timed pause ends by itself; `None` when not paused or paused until resumed.
+     */
+    public var pausedUntil: Date?
     public var conflictCount: UInt64
     public var hydratedFileCount: UInt64
     public var placeholderFileCount: UInt64
@@ -1846,6 +1984,8 @@ public struct FolderSummary: Equatable, Hashable {
     public var durabilityEvidence: DurabilityEvidence
     public var localStorage: LocalStorageState
     public var fetchAvailability: FetchAvailability
+    public var availability: AvailabilitySummary
+    public var protection: ProtectionSummary
     public var fullReplicaDeviceIds: [String]
     public var policyStale: Bool
     public var ambiguous: Bool
@@ -1867,7 +2007,10 @@ public struct FolderSummary: Equatable, Hashable {
     public init(
         /**
          * The identity key: the daemon keys links by path.
-         */localPath: String, groupId: String, name: String, mode: FolderMode, state: FolderState, paused: Bool, conflictCount: UInt64, hydratedFileCount: UInt64, placeholderFileCount: UInt64, hydratingFileCount: UInt64, heldFileCount: UInt64, skippedSymlinkCount: UInt64, transfer: FolderTransferProgress?, durability: DurabilityStatus, durabilityEvidence: DurabilityEvidence, localStorage: LocalStorageState, fetchAvailability: FetchAvailability, fullReplicaDeviceIds: [String], policyStale: Bool, ambiguous: Bool, ambiguousLocalPaths: [String], degraded: Bool, 
+         */localPath: String, groupId: String, name: String, mode: FolderMode, state: FolderState, paused: Bool, 
+        /**
+         * When a timed pause ends by itself; `None` when not paused or paused until resumed.
+         */pausedUntil: Date?, conflictCount: UInt64, hydratedFileCount: UInt64, placeholderFileCount: UInt64, hydratingFileCount: UInt64, heldFileCount: UInt64, skippedSymlinkCount: UInt64, transfer: FolderTransferProgress?, durability: DurabilityStatus, durabilityEvidence: DurabilityEvidence, localStorage: LocalStorageState, fetchAvailability: FetchAvailability, availability: AvailabilitySummary, protection: ProtectionSummary, fullReplicaDeviceIds: [String], policyStale: Bool, ambiguous: Bool, ambiguousLocalPaths: [String], degraded: Bool, 
         /**
          * Diagnostic text for a tooltip.
          */degradedReason: String?, volume: VolumeSummary?, 
@@ -1881,6 +2024,7 @@ public struct FolderSummary: Equatable, Hashable {
         self.mode = mode
         self.state = state
         self.paused = paused
+        self.pausedUntil = pausedUntil
         self.conflictCount = conflictCount
         self.hydratedFileCount = hydratedFileCount
         self.placeholderFileCount = placeholderFileCount
@@ -1892,6 +2036,8 @@ public struct FolderSummary: Equatable, Hashable {
         self.durabilityEvidence = durabilityEvidence
         self.localStorage = localStorage
         self.fetchAvailability = fetchAvailability
+        self.availability = availability
+        self.protection = protection
         self.fullReplicaDeviceIds = fullReplicaDeviceIds
         self.policyStale = policyStale
         self.ambiguous = ambiguous
@@ -1924,6 +2070,7 @@ public struct FfiConverterTypeFolderSummary: FfiConverterRustBuffer {
                 mode: FfiConverterTypeFolderMode.read(from: &buf), 
                 state: FfiConverterTypeFolderState.read(from: &buf), 
                 paused: FfiConverterBool.read(from: &buf), 
+                pausedUntil: FfiConverterOptionTimestamp.read(from: &buf), 
                 conflictCount: FfiConverterUInt64.read(from: &buf), 
                 hydratedFileCount: FfiConverterUInt64.read(from: &buf), 
                 placeholderFileCount: FfiConverterUInt64.read(from: &buf), 
@@ -1935,6 +2082,8 @@ public struct FfiConverterTypeFolderSummary: FfiConverterRustBuffer {
                 durabilityEvidence: FfiConverterTypeDurabilityEvidence.read(from: &buf), 
                 localStorage: FfiConverterTypeLocalStorageState.read(from: &buf), 
                 fetchAvailability: FfiConverterTypeFetchAvailability.read(from: &buf), 
+                availability: FfiConverterTypeAvailabilitySummary.read(from: &buf), 
+                protection: FfiConverterTypeProtectionSummary.read(from: &buf), 
                 fullReplicaDeviceIds: FfiConverterSequenceString.read(from: &buf), 
                 policyStale: FfiConverterBool.read(from: &buf), 
                 ambiguous: FfiConverterBool.read(from: &buf), 
@@ -1953,6 +2102,7 @@ public struct FfiConverterTypeFolderSummary: FfiConverterRustBuffer {
         FfiConverterTypeFolderMode.write(value.mode, into: &buf)
         FfiConverterTypeFolderState.write(value.state, into: &buf)
         FfiConverterBool.write(value.paused, into: &buf)
+        FfiConverterOptionTimestamp.write(value.pausedUntil, into: &buf)
         FfiConverterUInt64.write(value.conflictCount, into: &buf)
         FfiConverterUInt64.write(value.hydratedFileCount, into: &buf)
         FfiConverterUInt64.write(value.placeholderFileCount, into: &buf)
@@ -1964,6 +2114,8 @@ public struct FfiConverterTypeFolderSummary: FfiConverterRustBuffer {
         FfiConverterTypeDurabilityEvidence.write(value.durabilityEvidence, into: &buf)
         FfiConverterTypeLocalStorageState.write(value.localStorage, into: &buf)
         FfiConverterTypeFetchAvailability.write(value.fetchAvailability, into: &buf)
+        FfiConverterTypeAvailabilitySummary.write(value.availability, into: &buf)
+        FfiConverterTypeProtectionSummary.write(value.protection, into: &buf)
         FfiConverterSequenceString.write(value.fullReplicaDeviceIds, into: &buf)
         FfiConverterBool.write(value.policyStale, into: &buf)
         FfiConverterBool.write(value.ambiguous, into: &buf)
@@ -3070,6 +3222,66 @@ public func FfiConverterTypePendingInviteSummary_lower(_ value: PendingInviteSum
 }
 
 
+public struct PinOutcome: Equatable, Hashable {
+    public var retention: FileRetention
+    /**
+     * Why the content could not be downloaded just now; the pin stands regardless.
+     */
+    public var downloadError: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(retention: FileRetention, 
+        /**
+         * Why the content could not be downloaded just now; the pin stands regardless.
+         */downloadError: String?) {
+        self.retention = retention
+        self.downloadError = downloadError
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PinOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePinOutcome: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PinOutcome {
+        return
+            try PinOutcome(
+                retention: FfiConverterTypeFileRetention.read(from: &buf), 
+                downloadError: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PinOutcome, into buf: inout [UInt8]) {
+        FfiConverterTypeFileRetention.write(value.retention, into: &buf)
+        FfiConverterOptionString.write(value.downloadError, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePinOutcome_lift(_ buf: RustBuffer) throws -> PinOutcome {
+    return try FfiConverterTypePinOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePinOutcome_lower(_ value: PinOutcome) -> RustBuffer {
+    return FfiConverterTypePinOutcome.lower(value)
+}
+
+
 public struct PreflightResult: Equatable, Hashable {
     public var resolvedPath: String
     public var pathExists: Bool
@@ -3159,6 +3371,65 @@ public func FfiConverterTypePreflightResult_lift(_ buf: RustBuffer) throws -> Pr
 #endif
 public func FfiConverterTypePreflightResult_lower(_ value: PreflightResult) -> RustBuffer {
     return FfiConverterTypePreflightResult.lower(value)
+}
+
+
+/**
+ * The protection with the other devices it concerns: those holding a full copy when
+ * protected, those a confirmation is awaited from when pending, none otherwise. Ids are for
+ * lookup, never for display.
+ */
+public struct ProtectionSummary: Equatable, Hashable {
+    public var protection: Protection
+    public var deviceIds: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(protection: Protection, deviceIds: [String]) {
+        self.protection = protection
+        self.deviceIds = deviceIds
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ProtectionSummary: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeProtectionSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ProtectionSummary {
+        return
+            try ProtectionSummary(
+                protection: FfiConverterTypeProtection.read(from: &buf), 
+                deviceIds: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ProtectionSummary, into buf: inout [UInt8]) {
+        FfiConverterTypeProtection.write(value.protection, into: &buf)
+        FfiConverterSequenceString.write(value.deviceIds, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProtectionSummary_lift(_ buf: RustBuffer) throws -> ProtectionSummary {
+    return try FfiConverterTypeProtectionSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProtectionSummary_lower(_ value: ProtectionSummary) -> RustBuffer {
+    return FfiConverterTypeProtectionSummary.lower(value)
 }
 
 
@@ -3415,6 +3686,157 @@ public func FfiConverterTypeReplicaCopy_lower(_ value: ReplicaCopy) -> RustBuffe
 }
 
 
+/**
+ * An original file kept after a reset replaced it, until the user releases it.
+ */
+public struct RetainedOriginal: Equatable, Hashable {
+    public var groupId: String
+    /**
+     * The path the original had in the folder.
+     */
+    public var path: String
+    /**
+     * Bytes it takes; 0 when it is not reachable.
+     */
+    public var size: UInt64
+    /**
+     * Whether the folder is watched, so the kept file can be reached.
+     */
+    public var reachable: Bool
+    public var groupRemoved: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(groupId: String, 
+        /**
+         * The path the original had in the folder.
+         */path: String, 
+        /**
+         * Bytes it takes; 0 when it is not reachable.
+         */size: UInt64, 
+        /**
+         * Whether the folder is watched, so the kept file can be reached.
+         */reachable: Bool, groupRemoved: Bool) {
+        self.groupId = groupId
+        self.path = path
+        self.size = size
+        self.reachable = reachable
+        self.groupRemoved = groupRemoved
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension RetainedOriginal: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRetainedOriginal: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RetainedOriginal {
+        return
+            try RetainedOriginal(
+                groupId: FfiConverterString.read(from: &buf), 
+                path: FfiConverterString.read(from: &buf), 
+                size: FfiConverterUInt64.read(from: &buf), 
+                reachable: FfiConverterBool.read(from: &buf), 
+                groupRemoved: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RetainedOriginal, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.groupId, into: &buf)
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterUInt64.write(value.size, into: &buf)
+        FfiConverterBool.write(value.reachable, into: &buf)
+        FfiConverterBool.write(value.groupRemoved, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRetainedOriginal_lift(_ buf: RustBuffer) throws -> RetainedOriginal {
+    return try FfiConverterTypeRetainedOriginal.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRetainedOriginal_lower(_ value: RetainedOriginal) -> RustBuffer {
+    return FfiConverterTypeRetainedOriginal.lower(value)
+}
+
+
+public struct RetainedRelease: Equatable, Hashable {
+    public var path: String
+    public var outcome: RetainedReleaseOutcome
+    /**
+     * Why an original was left; empty otherwise.
+     */
+    public var detail: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(path: String, outcome: RetainedReleaseOutcome, 
+        /**
+         * Why an original was left; empty otherwise.
+         */detail: String) {
+        self.path = path
+        self.outcome = outcome
+        self.detail = detail
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension RetainedRelease: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRetainedRelease: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RetainedRelease {
+        return
+            try RetainedRelease(
+                path: FfiConverterString.read(from: &buf), 
+                outcome: FfiConverterTypeRetainedReleaseOutcome.read(from: &buf), 
+                detail: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RetainedRelease, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterTypeRetainedReleaseOutcome.write(value.outcome, into: &buf)
+        FfiConverterString.write(value.detail, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRetainedRelease_lift(_ buf: RustBuffer) throws -> RetainedRelease {
+    return try FfiConverterTypeRetainedRelease.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRetainedRelease_lower(_ value: RetainedRelease) -> RustBuffer {
+    return FfiConverterTypeRetainedRelease.lower(value)
+}
+
+
 public struct SentTransfer: Equatable, Hashable {
     public var transferId: String
     public var filesOffered: [String]
@@ -3593,12 +4015,198 @@ public func FfiConverterTypeSignOutOutcome_lower(_ value: SignOutOutcome) -> Rus
 }
 
 
+/**
+ * Automatic space management for provider folders: while free disk space is low, downloaded
+ * files that are safe to give back are given back.
+ */
+public struct SpaceManagement: Equatable, Hashable {
+    public var enabled: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(enabled: Bool) {
+        self.enabled = enabled
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SpaceManagement: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSpaceManagement: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SpaceManagement {
+        return
+            try SpaceManagement(
+                enabled: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SpaceManagement, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.enabled, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSpaceManagement_lift(_ buf: RustBuffer) throws -> SpaceManagement {
+    return try FfiConverterTypeSpaceManagement.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSpaceManagement_lower(_ value: SpaceManagement) -> RustBuffer {
+    return FfiConverterTypeSpaceManagement.lower(value)
+}
+
+
+/**
+ * The dry run: nothing was removed.
+ */
+public struct SpaceReclaimPreview: Equatable, Hashable {
+    public var items: [SpaceReclaimPreviewItem]
+    /**
+     * Folders that could not be read; their items are missing.
+     */
+    public var unreadableRoots: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(items: [SpaceReclaimPreviewItem], 
+        /**
+         * Folders that could not be read; their items are missing.
+         */unreadableRoots: UInt32) {
+        self.items = items
+        self.unreadableRoots = unreadableRoots
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SpaceReclaimPreview: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSpaceReclaimPreview: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SpaceReclaimPreview {
+        return
+            try SpaceReclaimPreview(
+                items: FfiConverterSequenceTypeSpaceReclaimPreviewItem.read(from: &buf), 
+                unreadableRoots: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SpaceReclaimPreview, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeSpaceReclaimPreviewItem.write(value.items, into: &buf)
+        FfiConverterUInt32.write(value.unreadableRoots, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSpaceReclaimPreview_lift(_ buf: RustBuffer) throws -> SpaceReclaimPreview {
+    return try FfiConverterTypeSpaceReclaimPreview.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSpaceReclaimPreview_lower(_ value: SpaceReclaimPreview) -> RustBuffer {
+    return FfiConverterTypeSpaceReclaimPreview.lower(value)
+}
+
+
+public struct SpaceReclaimPreviewItem: Equatable, Hashable {
+    public var groupId: String
+    /**
+     * Path relative to the folder.
+     */
+    public var path: String
+    public var verdict: SpaceReclaimVerdict
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(groupId: String, 
+        /**
+         * Path relative to the folder.
+         */path: String, verdict: SpaceReclaimVerdict) {
+        self.groupId = groupId
+        self.path = path
+        self.verdict = verdict
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SpaceReclaimPreviewItem: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSpaceReclaimPreviewItem: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SpaceReclaimPreviewItem {
+        return
+            try SpaceReclaimPreviewItem(
+                groupId: FfiConverterString.read(from: &buf), 
+                path: FfiConverterString.read(from: &buf), 
+                verdict: FfiConverterTypeSpaceReclaimVerdict.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SpaceReclaimPreviewItem, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.groupId, into: &buf)
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterTypeSpaceReclaimVerdict.write(value.verdict, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSpaceReclaimPreviewItem_lift(_ buf: RustBuffer) throws -> SpaceReclaimPreviewItem {
+    return try FfiConverterTypeSpaceReclaimPreviewItem.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSpaceReclaimPreviewItem_lower(_ value: SpaceReclaimPreviewItem) -> RustBuffer {
+    return FfiConverterTypeSpaceReclaimPreviewItem.lower(value)
+}
+
+
 public struct StatusSnapshot: Equatable, Hashable {
     public var capturedAt: Date
     public var overall: OverallState
     public var attentionReasons: [AttentionReason]
     public var thisDeviceId: String?
     public var folders: [FolderSummary]
+    /**
+     * All folders together, by the aggregation rules on [`Availability`] and [`Protection`].
+     */
+    public var availability: AvailabilitySummary
+    public var protection: ProtectionSummary
     public var peers: [PeerSummary]
     public var transfers: [TransferSummary]
     public var bandwidth: BandwidthStatus
@@ -3609,12 +4217,17 @@ public struct StatusSnapshot: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(capturedAt: Date, overall: OverallState, attentionReasons: [AttentionReason], thisDeviceId: String?, folders: [FolderSummary], peers: [PeerSummary], transfers: [TransferSummary], bandwidth: BandwidthStatus, volumes: [VolumeSummary], storage: StorageSummary, update: UpdateBadge, recentErrors: [RecentError]) {
+    public init(capturedAt: Date, overall: OverallState, attentionReasons: [AttentionReason], thisDeviceId: String?, folders: [FolderSummary], 
+        /**
+         * All folders together, by the aggregation rules on [`Availability`] and [`Protection`].
+         */availability: AvailabilitySummary, protection: ProtectionSummary, peers: [PeerSummary], transfers: [TransferSummary], bandwidth: BandwidthStatus, volumes: [VolumeSummary], storage: StorageSummary, update: UpdateBadge, recentErrors: [RecentError]) {
         self.capturedAt = capturedAt
         self.overall = overall
         self.attentionReasons = attentionReasons
         self.thisDeviceId = thisDeviceId
         self.folders = folders
+        self.availability = availability
+        self.protection = protection
         self.peers = peers
         self.transfers = transfers
         self.bandwidth = bandwidth
@@ -3645,6 +4258,8 @@ public struct FfiConverterTypeStatusSnapshot: FfiConverterRustBuffer {
                 attentionReasons: FfiConverterSequenceTypeAttentionReason.read(from: &buf), 
                 thisDeviceId: FfiConverterOptionString.read(from: &buf), 
                 folders: FfiConverterSequenceTypeFolderSummary.read(from: &buf), 
+                availability: FfiConverterTypeAvailabilitySummary.read(from: &buf), 
+                protection: FfiConverterTypeProtectionSummary.read(from: &buf), 
                 peers: FfiConverterSequenceTypePeerSummary.read(from: &buf), 
                 transfers: FfiConverterSequenceTypeTransferSummary.read(from: &buf), 
                 bandwidth: FfiConverterTypeBandwidthStatus.read(from: &buf), 
@@ -3661,6 +4276,8 @@ public struct FfiConverterTypeStatusSnapshot: FfiConverterRustBuffer {
         FfiConverterSequenceTypeAttentionReason.write(value.attentionReasons, into: &buf)
         FfiConverterOptionString.write(value.thisDeviceId, into: &buf)
         FfiConverterSequenceTypeFolderSummary.write(value.folders, into: &buf)
+        FfiConverterTypeAvailabilitySummary.write(value.availability, into: &buf)
+        FfiConverterTypeProtectionSummary.write(value.protection, into: &buf)
         FfiConverterSequenceTypePeerSummary.write(value.peers, into: &buf)
         FfiConverterSequenceTypeTransferSummary.write(value.transfers, into: &buf)
         FfiConverterTypeBandwidthStatus.write(value.bandwidth, into: &buf)
@@ -4044,7 +4661,6 @@ public struct UpdateBadge: Equatable, Hashable {
     public var state: UpdateState
     public var availableVersion: String?
     public var mandatory: Bool
-    public var waitingForSafePoint: Bool
     public var lastErrorCategory: String?
     public var channel: String
     public var installSource: String
@@ -4052,11 +4668,10 @@ public struct UpdateBadge: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(state: UpdateState, availableVersion: String?, mandatory: Bool, waitingForSafePoint: Bool, lastErrorCategory: String?, channel: String, installSource: String, holdbackReason: String?) {
+    public init(state: UpdateState, availableVersion: String?, mandatory: Bool, lastErrorCategory: String?, channel: String, installSource: String, holdbackReason: String?) {
         self.state = state
         self.availableVersion = availableVersion
         self.mandatory = mandatory
-        self.waitingForSafePoint = waitingForSafePoint
         self.lastErrorCategory = lastErrorCategory
         self.channel = channel
         self.installSource = installSource
@@ -4082,7 +4697,6 @@ public struct FfiConverterTypeUpdateBadge: FfiConverterRustBuffer {
                 state: FfiConverterTypeUpdateState.read(from: &buf), 
                 availableVersion: FfiConverterOptionString.read(from: &buf), 
                 mandatory: FfiConverterBool.read(from: &buf), 
-                waitingForSafePoint: FfiConverterBool.read(from: &buf), 
                 lastErrorCategory: FfiConverterOptionString.read(from: &buf), 
                 channel: FfiConverterString.read(from: &buf), 
                 installSource: FfiConverterString.read(from: &buf), 
@@ -4094,7 +4708,6 @@ public struct FfiConverterTypeUpdateBadge: FfiConverterRustBuffer {
         FfiConverterTypeUpdateState.write(value.state, into: &buf)
         FfiConverterOptionString.write(value.availableVersion, into: &buf)
         FfiConverterBool.write(value.mandatory, into: &buf)
-        FfiConverterBool.write(value.waitingForSafePoint, into: &buf)
         FfiConverterOptionString.write(value.lastErrorCategory, into: &buf)
         FfiConverterString.write(value.channel, into: &buf)
         FfiConverterString.write(value.installSource, into: &buf)
@@ -4118,15 +4731,18 @@ public func FfiConverterTypeUpdateBadge_lower(_ value: UpdateBadge) -> RustBuffe
 }
 
 
+/**
+ * Update preferences. Updates are installed by the user (or a package
+ * manager or store), never by YadoriLink, so the only setting is whether it
+ * checks for a newer version by itself.
+ */
 public struct UpdateConfig: Equatable, Hashable {
     public var automaticChecks: Bool
-    public var installMode: UpdateInstallMode
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(automaticChecks: Bool, installMode: UpdateInstallMode) {
+    public init(automaticChecks: Bool) {
         self.automaticChecks = automaticChecks
-        self.installMode = installMode
     }
 
     
@@ -4145,14 +4761,12 @@ public struct FfiConverterTypeUpdateConfig: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UpdateConfig {
         return
             try UpdateConfig(
-                automaticChecks: FfiConverterBool.read(from: &buf), 
-                installMode: FfiConverterTypeUpdateInstallMode.read(from: &buf)
+                automaticChecks: FfiConverterBool.read(from: &buf)
         )
     }
 
     public static func write(_ value: UpdateConfig, into buf: inout [UInt8]) {
         FfiConverterBool.write(value.automaticChecks, into: &buf)
-        FfiConverterTypeUpdateInstallMode.write(value.installMode, into: &buf)
     }
 }
 
@@ -4172,6 +4786,66 @@ public func FfiConverterTypeUpdateConfig_lower(_ value: UpdateConfig) -> RustBuf
 }
 
 
+/**
+ * How to get the new version. Nothing is downloaded or installed by
+ * YadoriLink: `guidance` is the sentence to show (the download page, or the
+ * package-manager steps for a package-managed install), and `url` is the
+ * official page to open, only when there is one to open.
+ */
+public struct UpdateDownloadGuidance: Equatable, Hashable {
+    public var guidance: String
+    public var url: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(guidance: String, url: String?) {
+        self.guidance = guidance
+        self.url = url
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension UpdateDownloadGuidance: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUpdateDownloadGuidance: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UpdateDownloadGuidance {
+        return
+            try UpdateDownloadGuidance(
+                guidance: FfiConverterString.read(from: &buf), 
+                url: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: UpdateDownloadGuidance, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.guidance, into: &buf)
+        FfiConverterOptionString.write(value.url, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUpdateDownloadGuidance_lift(_ buf: RustBuffer) throws -> UpdateDownloadGuidance {
+    return try FfiConverterTypeUpdateDownloadGuidance.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUpdateDownloadGuidance_lower(_ value: UpdateDownloadGuidance) -> RustBuffer {
+    return FfiConverterTypeUpdateDownloadGuidance.lower(value)
+}
+
+
 public struct UpdateStatus: Equatable, Hashable {
     public var currentVersion: String
     public var channel: String
@@ -4182,14 +4856,22 @@ public struct UpdateStatus: Equatable, Hashable {
     public var releaseNotesUrl: String?
     public var mandatory: Bool
     public var holdbackReason: String?
-    public var waitingForSafePoint: Bool
     public var lastErrorCategory: String?
     public var lastErrorMessage: String?
+    /**
+     * A package manager or store owns this install, so the new version
+     * comes with steps to follow, not a page to open.
+     */
+    public var packageManaged: Bool
     public var config: UpdateConfig
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(currentVersion: String, channel: String, installSource: String, lastCheckedAt: Date?, state: UpdateState, availableVersion: String?, releaseNotesUrl: String?, mandatory: Bool, holdbackReason: String?, waitingForSafePoint: Bool, lastErrorCategory: String?, lastErrorMessage: String?, config: UpdateConfig) {
+    public init(currentVersion: String, channel: String, installSource: String, lastCheckedAt: Date?, state: UpdateState, availableVersion: String?, releaseNotesUrl: String?, mandatory: Bool, holdbackReason: String?, lastErrorCategory: String?, lastErrorMessage: String?, 
+        /**
+         * A package manager or store owns this install, so the new version
+         * comes with steps to follow, not a page to open.
+         */packageManaged: Bool, config: UpdateConfig) {
         self.currentVersion = currentVersion
         self.channel = channel
         self.installSource = installSource
@@ -4199,9 +4881,9 @@ public struct UpdateStatus: Equatable, Hashable {
         self.releaseNotesUrl = releaseNotesUrl
         self.mandatory = mandatory
         self.holdbackReason = holdbackReason
-        self.waitingForSafePoint = waitingForSafePoint
         self.lastErrorCategory = lastErrorCategory
         self.lastErrorMessage = lastErrorMessage
+        self.packageManaged = packageManaged
         self.config = config
     }
 
@@ -4230,9 +4912,9 @@ public struct FfiConverterTypeUpdateStatus: FfiConverterRustBuffer {
                 releaseNotesUrl: FfiConverterOptionString.read(from: &buf), 
                 mandatory: FfiConverterBool.read(from: &buf), 
                 holdbackReason: FfiConverterOptionString.read(from: &buf), 
-                waitingForSafePoint: FfiConverterBool.read(from: &buf), 
                 lastErrorCategory: FfiConverterOptionString.read(from: &buf), 
                 lastErrorMessage: FfiConverterOptionString.read(from: &buf), 
+                packageManaged: FfiConverterBool.read(from: &buf), 
                 config: FfiConverterTypeUpdateConfig.read(from: &buf)
         )
     }
@@ -4247,9 +4929,9 @@ public struct FfiConverterTypeUpdateStatus: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.releaseNotesUrl, into: &buf)
         FfiConverterBool.write(value.mandatory, into: &buf)
         FfiConverterOptionString.write(value.holdbackReason, into: &buf)
-        FfiConverterBool.write(value.waitingForSafePoint, into: &buf)
         FfiConverterOptionString.write(value.lastErrorCategory, into: &buf)
         FfiConverterOptionString.write(value.lastErrorMessage, into: &buf)
+        FfiConverterBool.write(value.packageManaged, into: &buf)
         FfiConverterTypeUpdateConfig.write(value.config, into: &buf)
     }
 }
@@ -4574,11 +5256,22 @@ public enum AttentionCategory: Equatable, Hashable {
     case fetchAvailabilityUnknown
     case conflict
     case held
+    case strandedDirectory
     case lowDiskCritical
     case lowDisk
     case peerDisconnected
     case recentError
     case updateFailed
+    /**
+     * The folder group is linked at more than one place on this device.
+     */
+    case ambiguous
+    case ownershipLost
+    case volumeChanged
+    case providerNotReady
+    case providerStuck
+    case keptEdits
+    case providerOrphanDomain
     case unrecognized
 
 
@@ -4615,17 +5308,33 @@ public struct FfiConverterTypeAttentionCategory: FfiConverterRustBuffer {
         
         case 7: return .held
         
-        case 8: return .lowDiskCritical
+        case 8: return .strandedDirectory
         
-        case 9: return .lowDisk
+        case 9: return .lowDiskCritical
         
-        case 10: return .peerDisconnected
+        case 10: return .lowDisk
         
-        case 11: return .recentError
+        case 11: return .peerDisconnected
         
-        case 12: return .updateFailed
+        case 12: return .recentError
         
-        case 13: return .unrecognized
+        case 13: return .updateFailed
+        
+        case 14: return .ambiguous
+        
+        case 15: return .ownershipLost
+        
+        case 16: return .volumeChanged
+        
+        case 17: return .providerNotReady
+        
+        case 18: return .providerStuck
+        
+        case 19: return .keptEdits
+        
+        case 20: return .providerOrphanDomain
+        
+        case 21: return .unrecognized
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -4663,28 +5372,60 @@ public struct FfiConverterTypeAttentionCategory: FfiConverterRustBuffer {
             writeInt(&buf, Int32(7))
         
         
-        case .lowDiskCritical:
+        case .strandedDirectory:
             writeInt(&buf, Int32(8))
         
         
-        case .lowDisk:
+        case .lowDiskCritical:
             writeInt(&buf, Int32(9))
         
         
-        case .peerDisconnected:
+        case .lowDisk:
             writeInt(&buf, Int32(10))
         
         
-        case .recentError:
+        case .peerDisconnected:
             writeInt(&buf, Int32(11))
         
         
-        case .updateFailed:
+        case .recentError:
             writeInt(&buf, Int32(12))
         
         
-        case .unrecognized:
+        case .updateFailed:
             writeInt(&buf, Int32(13))
+        
+        
+        case .ambiguous:
+            writeInt(&buf, Int32(14))
+        
+        
+        case .ownershipLost:
+            writeInt(&buf, Int32(15))
+        
+        
+        case .volumeChanged:
+            writeInt(&buf, Int32(16))
+        
+        
+        case .providerNotReady:
+            writeInt(&buf, Int32(17))
+        
+        
+        case .providerStuck:
+            writeInt(&buf, Int32(18))
+        
+        
+        case .keptEdits:
+            writeInt(&buf, Int32(19))
+        
+        
+        case .providerOrphanDomain:
+            writeInt(&buf, Int32(20))
+        
+        
+        case .unrecognized:
+            writeInt(&buf, Int32(21))
         
         }
     }
@@ -4703,6 +5444,182 @@ public func FfiConverterTypeAttentionCategory_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeAttentionCategory_lower(_ value: AttentionCategory) -> RustBuffer {
     return FfiConverterTypeAttentionCategory.lower(value)
+}
+
+
+
+/**
+ * Whether time alone can fix an attention item.
+ */
+
+public enum AttentionKind: Equatable, Hashable {
+    
+    /**
+     * Something outside the user's hands has to come back.
+     */
+    case waiting
+    /**
+     * The work is tried again; trying again may succeed.
+     */
+    case retryable
+    /**
+     * Nothing changes until the user acts.
+     */
+    case permanent
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension AttentionKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAttentionKind: FfiConverterRustBuffer {
+    typealias SwiftType = AttentionKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AttentionKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .waiting
+        
+        case 2: return .retryable
+        
+        case 3: return .permanent
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: AttentionKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .waiting:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .retryable:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .permanent:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAttentionKind_lift(_ buf: RustBuffer) throws -> AttentionKind {
+    return try FfiConverterTypeAttentionKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAttentionKind_lower(_ value: AttentionKind) -> RustBuffer {
+    return FfiConverterTypeAttentionKind.lower(value)
+}
+
+
+
+/**
+ * Whether the exact content needed can be fetched now. Independent of [`Protection`].
+ * Several folders aggregate to the least available one (update required, waiting for exact
+ * content, waiting for a device, unknown, available); available only when all are.
+ */
+
+public enum Availability: Equatable, Hashable {
+    
+    case available
+    /**
+     * A device holding the content is offline or unreachable.
+     */
+    case waitingForPeer
+    /**
+     * Devices are reachable but none is known to hold the exact version.
+     */
+    case waitingForExactContent
+    case unknown
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension Availability: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAvailability: FfiConverterRustBuffer {
+    typealias SwiftType = Availability
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Availability {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .available
+        
+        case 2: return .waitingForPeer
+        
+        case 3: return .waitingForExactContent
+        
+        case 4: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: Availability, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .available:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .waitingForPeer:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .waitingForExactContent:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAvailability_lift(_ buf: RustBuffer) throws -> Availability {
+    return try FfiConverterTypeAvailability.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAvailability_lower(_ value: Availability) -> RustBuffer {
+    return FfiConverterTypeAvailability.lower(value)
 }
 
 
@@ -4769,6 +5686,81 @@ public func FfiConverterTypeBrowserPurpose_lift(_ buf: RustBuffer) throws -> Bro
 #endif
 public func FfiConverterTypeBrowserPurpose_lower(_ value: BrowserPurpose) -> RustBuffer {
     return FfiConverterTypeBrowserPurpose.lower(value)
+}
+
+
+
+/**
+ * What to do with a kept copy of a file that was edited on two devices.
+ */
+
+public enum ConflictChoice: Equatable, Hashable {
+    
+    /**
+     * The copy becomes the file; the other version is no longer current.
+     */
+    case keepThis
+    /**
+     * The copy stays beside the original as an ordinary file under a plain name.
+     */
+    case keepBoth
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ConflictChoice: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConflictChoice: FfiConverterRustBuffer {
+    typealias SwiftType = ConflictChoice
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConflictChoice {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .keepThis
+        
+        case 2: return .keepBoth
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ConflictChoice, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .keepThis:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .keepBoth:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConflictChoice_lift(_ buf: RustBuffer) throws -> ConflictChoice {
+    return try FfiConverterTypeConflictChoice.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConflictChoice_lower(_ value: ConflictChoice) -> RustBuffer {
+    return FfiConverterTypeConflictChoice.lower(value)
 }
 
 
@@ -5887,6 +6879,11 @@ public enum IncomingTransferStatus: Equatable, Hashable {
     case pending
     case inProgress
     case completed
+    /**
+     * The receive stopped on an error, or the daemon restarted during it.
+     */
+    case failed
+    case canceled
     case other(raw: String
     )
 
@@ -5916,7 +6913,11 @@ public struct FfiConverterTypeIncomingTransferStatus: FfiConverterRustBuffer {
         
         case 3: return .completed
         
-        case 4: return .other(raw: try FfiConverterString.read(from: &buf)
+        case 4: return .failed
+        
+        case 5: return .canceled
+        
+        case 6: return .other(raw: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -5939,8 +6940,16 @@ public struct FfiConverterTypeIncomingTransferStatus: FfiConverterRustBuffer {
             writeInt(&buf, Int32(3))
         
         
-        case let .other(raw):
+        case .failed:
             writeInt(&buf, Int32(4))
+        
+        
+        case .canceled:
+            writeInt(&buf, Int32(5))
+        
+        
+        case let .other(raw):
+            writeInt(&buf, Int32(6))
             FfiConverterString.write(raw, into: &buf)
             
         }
@@ -6782,6 +7791,95 @@ public func FfiConverterTypeOverallState_lower(_ value: OverallState) -> RustBuf
 
 
 
+/**
+ * How long a pause lasts. The daemon computes the deadline.
+ */
+
+public enum PauseDuration: Equatable, Hashable {
+    
+    /**
+     * Until the user resumes.
+     */
+    case untilResumed
+    case thirtyMinutes
+    case oneHour
+    /**
+     * Until the next local midnight.
+     */
+    case untilTomorrow
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PauseDuration: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePauseDuration: FfiConverterRustBuffer {
+    typealias SwiftType = PauseDuration
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PauseDuration {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .untilResumed
+        
+        case 2: return .thirtyMinutes
+        
+        case 3: return .oneHour
+        
+        case 4: return .untilTomorrow
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PauseDuration, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .untilResumed:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .thirtyMinutes:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .oneHour:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .untilTomorrow:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePauseDuration_lift(_ buf: RustBuffer) throws -> PauseDuration {
+    return try FfiConverterTypePauseDuration.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePauseDuration_lower(_ value: PauseDuration) -> RustBuffer {
+    return FfiConverterTypePauseDuration.lower(value)
+}
+
+
+
 
 public enum PeerReachability: Equatable, Hashable {
     
@@ -7094,6 +8192,382 @@ public func FfiConverterTypePreflightIssue_lift(_ buf: RustBuffer) throws -> Pre
 #endif
 public func FfiConverterTypePreflightIssue_lower(_ value: PreflightIssue) -> RustBuffer {
     return FfiConverterTypePreflightIssue.lower(value)
+}
+
+
+
+/**
+ * What the user can be offered to do about an attention item.
+ */
+
+public enum ProductAction: Equatable, Hashable {
+    
+    case retry
+    case reviewConflict
+    case freeUpSpace
+    case revealPath
+    case openSettings
+    case downloadUpdate
+    case viewDetails
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ProductAction: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeProductAction: FfiConverterRustBuffer {
+    typealias SwiftType = ProductAction
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ProductAction {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .retry
+        
+        case 2: return .reviewConflict
+        
+        case 3: return .freeUpSpace
+        
+        case 4: return .revealPath
+        
+        case 5: return .openSettings
+        
+        case 6: return .downloadUpdate
+        
+        case 7: return .viewDetails
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ProductAction, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .retry:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .reviewConflict:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .freeUpSpace:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .revealPath:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .openSettings:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .downloadUpdate:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .viewDetails:
+            writeInt(&buf, Int32(7))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProductAction_lift(_ buf: RustBuffer) throws -> ProductAction {
+    return try FfiConverterTypeProductAction.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProductAction_lower(_ value: ProductAction) -> RustBuffer {
+    return FfiConverterTypeProductAction.lower(value)
+}
+
+
+
+/**
+ * Whether the data is still elsewhere if this device is lost. Independent of [`Availability`]:
+ * a copy on an offline device still counts. Several folders aggregate to the least protected
+ * one (at risk, pending, unknown, protected); protected only when all are provably so, and
+ * unknown is never read as protected.
+ */
+
+public enum Protection: Equatable, Hashable {
+    
+    case protected
+    /**
+     * Confirmed: only this device holds the current content.
+     */
+    case atRisk
+    /**
+     * A copy is being made or a confirmation is still awaited.
+     */
+    case pending
+    case unknown
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension Protection: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeProtection: FfiConverterRustBuffer {
+    typealias SwiftType = Protection
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Protection {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .protected
+        
+        case 2: return .atRisk
+        
+        case 3: return .pending
+        
+        case 4: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: Protection, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .protected:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .atRisk:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .pending:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProtection_lift(_ buf: RustBuffer) throws -> Protection {
+    return try FfiConverterTypeProtection.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProtection_lower(_ value: Protection) -> RustBuffer {
+    return FfiConverterTypeProtection.lower(value)
+}
+
+
+
+
+public enum RetainedReleaseOutcome: Equatable, Hashable {
+    
+    case removed
+    case gone
+    case stillRetained
+    case savedThenRemoved
+    case savedStillRetained
+    /**
+     * Left in place; `detail` says why.
+     */
+    case left
+    /**
+     * A value this build does not know.
+     */
+    case unknown
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension RetainedReleaseOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRetainedReleaseOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = RetainedReleaseOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RetainedReleaseOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .removed
+        
+        case 2: return .gone
+        
+        case 3: return .stillRetained
+        
+        case 4: return .savedThenRemoved
+        
+        case 5: return .savedStillRetained
+        
+        case 6: return .left
+        
+        case 7: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RetainedReleaseOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .removed:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .gone:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .stillRetained:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .savedThenRemoved:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .savedStillRetained:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .left:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(7))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRetainedReleaseOutcome_lift(_ buf: RustBuffer) throws -> RetainedReleaseOutcome {
+    return try FfiConverterTypeRetainedReleaseOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRetainedReleaseOutcome_lower(_ value: RetainedReleaseOutcome) -> RustBuffer {
+    return FfiConverterTypeRetainedReleaseOutcome.lower(value)
+}
+
+
+
+/**
+ * Whether local space for a file or folder may be reclaimed, apart from whether its content is
+ * on this device now. Local to this device.
+ */
+
+public enum RetentionPolicy: Equatable, Hashable {
+    
+    case reclaimable
+    /**
+     * "Always keep on this device".
+     */
+    case pinned
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension RetentionPolicy: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRetentionPolicy: FfiConverterRustBuffer {
+    typealias SwiftType = RetentionPolicy
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RetentionPolicy {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .reclaimable
+        
+        case 2: return .pinned
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RetentionPolicy, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .reclaimable:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .pinned:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRetentionPolicy_lift(_ buf: RustBuffer) throws -> RetentionPolicy {
+    return try FfiConverterTypeRetentionPolicy.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRetentionPolicy_lower(_ value: RetentionPolicy) -> RustBuffer {
+    return FfiConverterTypeRetentionPolicy.lower(value)
 }
 
 
@@ -7556,6 +9030,132 @@ public func FfiConverterTypeSignOutKind_lower(_ value: SignOutKind) -> RustBuffe
 
 
 /**
+ * What automatic space management says about one downloaded item.
+ */
+
+public enum SpaceReclaimVerdict: Equatable, Hashable {
+    
+    /**
+     * Would be given back now.
+     */
+    case eligible
+    /**
+     * The user keeps it on this device.
+     */
+    case pinned
+    /**
+     * This folder never gives space back automatically.
+     */
+    case unsupportedRoot
+    /**
+     * No other device can confirm it holds this version right now.
+     */
+    case custodyUnavailable
+    /**
+     * Another operation, a program or the file system holds the item at the moment.
+     */
+    case busy
+    /**
+     * The content is new, being updated or not confirmed by the system yet.
+     */
+    case changed
+    /**
+     * Something makes freeing unsafe or unprovable, or the daemon answered with a value this
+     * build does not know.
+     */
+    case safetyBlocked
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SpaceReclaimVerdict: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSpaceReclaimVerdict: FfiConverterRustBuffer {
+    typealias SwiftType = SpaceReclaimVerdict
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SpaceReclaimVerdict {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .eligible
+        
+        case 2: return .pinned
+        
+        case 3: return .unsupportedRoot
+        
+        case 4: return .custodyUnavailable
+        
+        case 5: return .busy
+        
+        case 6: return .changed
+        
+        case 7: return .safetyBlocked
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SpaceReclaimVerdict, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .eligible:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .pinned:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .unsupportedRoot:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .custodyUnavailable:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .busy:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .changed:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .safetyBlocked:
+            writeInt(&buf, Int32(7))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSpaceReclaimVerdict_lift(_ buf: RustBuffer) throws -> SpaceReclaimVerdict {
+    return try FfiConverterTypeSpaceReclaimVerdict.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSpaceReclaimVerdict_lower(_ value: SpaceReclaimVerdict) -> RustBuffer {
+    return FfiConverterTypeSpaceReclaimVerdict.lower(value)
+}
+
+
+
+/**
  * One result of the status poll loop.
  */
 
@@ -7709,171 +9309,6 @@ public func FfiConverterTypeUnreachableCategory_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeUnreachableCategory_lower(_ value: UnreachableCategory) -> RustBuffer {
     return FfiConverterTypeUnreachableCategory.lower(value)
-}
-
-
-
-
-public enum UpdateInstallMode: Equatable, Hashable {
-    
-    case automatic
-    case manual
-    case other(raw: String
-    )
-
-
-
-
-
-}
-
-#if compiler(>=6)
-extension UpdateInstallMode: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeUpdateInstallMode: FfiConverterRustBuffer {
-    typealias SwiftType = UpdateInstallMode
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UpdateInstallMode {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-        
-        case 1: return .automatic
-        
-        case 2: return .manual
-        
-        case 3: return .other(raw: try FfiConverterString.read(from: &buf)
-        )
-        
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: UpdateInstallMode, into buf: inout [UInt8]) {
-        switch value {
-        
-        
-        case .automatic:
-            writeInt(&buf, Int32(1))
-        
-        
-        case .manual:
-            writeInt(&buf, Int32(2))
-        
-        
-        case let .other(raw):
-            writeInt(&buf, Int32(3))
-            FfiConverterString.write(raw, into: &buf)
-            
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeUpdateInstallMode_lift(_ buf: RustBuffer) throws -> UpdateInstallMode {
-    return try FfiConverterTypeUpdateInstallMode.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeUpdateInstallMode_lower(_ value: UpdateInstallMode) -> RustBuffer {
-    return FfiConverterTypeUpdateInstallMode.lower(value)
-}
-
-
-
-
-public enum UpdateInstallOutcome: Equatable, Hashable {
-    
-    case installing
-    case deferred
-    /**
-     * Updates come from a store; `guidance` says where.
-     */
-    case storeManaged(guidance: String
-    )
-    case other(raw: String
-    )
-
-
-
-
-
-}
-
-#if compiler(>=6)
-extension UpdateInstallOutcome: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeUpdateInstallOutcome: FfiConverterRustBuffer {
-    typealias SwiftType = UpdateInstallOutcome
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UpdateInstallOutcome {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-        
-        case 1: return .installing
-        
-        case 2: return .deferred
-        
-        case 3: return .storeManaged(guidance: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 4: return .other(raw: try FfiConverterString.read(from: &buf)
-        )
-        
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: UpdateInstallOutcome, into buf: inout [UInt8]) {
-        switch value {
-        
-        
-        case .installing:
-            writeInt(&buf, Int32(1))
-        
-        
-        case .deferred:
-            writeInt(&buf, Int32(2))
-        
-        
-        case let .storeManaged(guidance):
-            writeInt(&buf, Int32(3))
-            FfiConverterString.write(guidance, into: &buf)
-            
-        
-        case let .other(raw):
-            writeInt(&buf, Int32(4))
-            FfiConverterString.write(raw, into: &buf)
-            
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeUpdateInstallOutcome_lift(_ buf: RustBuffer) throws -> UpdateInstallOutcome {
-    return try FfiConverterTypeUpdateInstallOutcome.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeUpdateInstallOutcome_lower(_ value: UpdateInstallOutcome) -> RustBuffer {
-    return FfiConverterTypeUpdateInstallOutcome.lower(value)
 }
 
 
@@ -8266,6 +9701,30 @@ fileprivate struct FfiConverterOptionTypeVolumeSummary: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeProductAction: FfiConverterRustBuffer {
+    typealias SwiftType = ProductAction?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeProductAction.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeProductAction.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeShareRole: FfiConverterRustBuffer {
     typealias SwiftType = ShareRole?
 
@@ -8556,6 +10015,31 @@ fileprivate struct FfiConverterSequenceTypeReplicaCopy: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeReplicaCopy.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSpaceReclaimPreviewItem: FfiConverterRustBuffer {
+    typealias SwiftType = [SpaceReclaimPreviewItem]
+
+    public static func write(_ value: [SpaceReclaimPreviewItem], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSpaceReclaimPreviewItem.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SpaceReclaimPreviewItem] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SpaceReclaimPreviewItem]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSpaceReclaimPreviewItem.read(from: &buf))
         }
         return seq
     }

@@ -51,6 +51,7 @@ fn eager_progress_and_stuck_files_are_encoded() {
             hydrating: 2,
             current: 9,
             stuck: vec![("a/b.bin".into(), 4)],
+            unreadable: false,
         },
         &mut line,
     );
@@ -92,4 +93,46 @@ fn the_overall_status_names_provider_folders_that_need_attention() {
     assert!(reasons.contains(&"provider_stuck:r2".to_owned()));
     assert!(reasons.contains(&"kept_edits:r2".to_owned()));
     assert!(!reasons.iter().any(|r| r.ends_with(":r3")));
+}
+
+/// A line that could not be read says so (so the rollup asks for attention) instead of showing
+/// zero counters; once the read works again the real numbers return.
+#[test]
+fn unreadable_provider_state_is_not_reported_as_zero() {
+    use crate::provider_read_fault::{declared_root, Fault};
+    let (coordinator, _root) = declared_root();
+    let repo = coordinator.provider_repository();
+    let healthy = |lines: &[(String, ProviderRootStatus)]| {
+        lines.len() == 1 && !lines[0].1.readiness.contains("unreadable")
+    };
+    assert!(healthy(&repository_lines(repo, 0)));
+
+    // The root list itself.
+    let fault = Fault::inject(&coordinator, "links", "provider_kind");
+    let lines = repository_lines(repo, 0);
+    assert_eq!(lines.len(), 1, "an unreadable root list vanished from the status");
+    assert!(lines[0].1.readiness.contains("unreadable"), "{}", lines[0].1.readiness);
+    assert_ne!(lines[0].1.readiness, "ready");
+    let pending = pending_items(&coordinator, 5, 0);
+    assert!(pending.is_err(), "an unreadable root list is an empty pending list");
+    fault.restore();
+    assert!(healthy(&repository_lines(repo, 0)));
+    assert_eq!(pending_items(&coordinator, 5, 0).unwrap().len(), 0);
+
+    // Each per-root counter.
+    for (table, column) in [
+        ("provider_roots", "kept_edits"),
+        ("provider_items", "pending_since"),
+        ("provider_items", "unconfirmed_since"),
+    ] {
+        let fault = Fault::inject(&coordinator, table, column);
+        let lines = repository_lines(repo, 0);
+        assert!(
+            lines[0].1.readiness.contains("unreadable"),
+            "{table}.{column} failure read as zero: {}",
+            lines[0].1.readiness
+        );
+        fault.restore();
+        assert!(healthy(&repository_lines(repo, 0)), "{table}.{column}");
+    }
 }

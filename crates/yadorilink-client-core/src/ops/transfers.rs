@@ -4,8 +4,8 @@
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
-    InboxTransfer, ListInboxRequest, ReceiveTransferRequest, ReceiveTransferResponse,
-    SendFileRequest, SendFileResponse,
+    CancelTransferRequest, InboxTransfer, ListInboxRequest, ReceiveTransferRequest,
+    ReceiveTransferResponse, RetryTransferRequest, SendFileRequest, SendFileResponse,
 };
 
 use crate::daemon::control;
@@ -61,4 +61,29 @@ pub async fn receive_transfer(
         return Err(unexpected());
     };
     Ok(result)
+}
+
+/// Stops an inbound transfer. Idempotent for one already canceled or completed.
+pub async fn cancel_transfer(transfer_id: String) -> Result<(), CoreError> {
+    let resp =
+        control::send(ReqPayload::CancelTransfer(CancelTransferRequest { transfer_id })).await?;
+    let Some(RespPayload::CancelTransfer(_)) = resp.payload else {
+        return Err(unexpected());
+    };
+    Ok(())
+}
+
+/// Resumes a failed or canceled inbound transfer once the daemon has re-validated the sender,
+/// the manifest and the destination.
+pub async fn retry_transfer(transfer_id: String) -> Result<ReceiveTransferResponse, CoreError> {
+    let resp =
+        control::send(ReqPayload::RetryTransfer(RetryTransferRequest { transfer_id })).await?;
+    let Some(RespPayload::RetryTransfer(result)) = resp.payload else {
+        return Err(unexpected());
+    };
+    Ok(ReceiveTransferResponse {
+        destination_dir: result.destination_dir,
+        files_received: result.files_received,
+        bytes_received: result.bytes_received,
+    })
 }

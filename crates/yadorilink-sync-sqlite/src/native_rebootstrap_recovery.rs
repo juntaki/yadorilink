@@ -10,7 +10,6 @@
 //! target.verification.json the local verification record
 //! verification-material/  what the verification was answered from
 //! versions/<hex hash>      the bytes of one file version
-//! late/<hex sha256>        an edit made after the barrier, saved before its original leaves
 //! deltas/<hex hash>.bin    the exact signed bytes of one own delta
 //! manifest.json            canonical, versioned, self-hashed; written last
 //! ```
@@ -42,7 +41,6 @@ use sha2::{Digest, Sha256};
 use yadorilink_fs_platform::durable_dir::{
     DiscardOutcome, DurableNamespace, NoLedger, NsError, Replace,
 };
-use yadorilink_fs_platform::reserved_namespace::{parse_artefact_component, ArtefactKind};
 
 use yadorilink_replica_domain::author::{AuthorId, IncarnationId};
 use yadorilink_replica_domain::file::FileVersion;
@@ -85,7 +83,6 @@ const MANIFEST_FILE: &str = "manifest.json";
 const TARGET_BUNDLE: &str = "target.bundle";
 const TARGET_DIGEST: &str = "target.bundle.sha256";
 const VERIFICATION_RECORD: &str = "target.verification.json";
-const LATE_DIR: &str = "late";
 const MATERIAL_DIR: &str = "verification-material";
 const MATERIAL_FILE: &str = "policy-answers.json";
 const VERSIONS_DIR: &str = "versions";
@@ -95,6 +92,57 @@ pub(crate) const MANIFEST_FORMAT_VERSION: u64 = 3;
 
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+/// The size of the one fixed buffer every whole-file read or copy on the rebootstrap path uses:
+/// file contents are streamed through it, never held whole.
+pub const IO_CHUNK: usize = 64 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Forces a tiny buffer so tests cross chunk boundaries with small files.
+    pub(crate) static IO_CHUNK_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The buffer size in effect: [`IO_CHUNK`], or a test's forced one.
+pub(crate) fn io_chunk() -> usize {
+    #[cfg(test)]
+    if let Some(chunk) = IO_CHUNK_OVERRIDE.with(|c| c.get()) {
+        return chunk;
+    }
+    IO_CHUNK
+}
+
+/// Reads `reader` to its end through one `chunk`-sized buffer, passing each filled piece to
+/// `each`. Returns the number of bytes read.
+pub(crate) fn for_each_chunk(
+    reader: &mut dyn Read,
+    chunk: usize,
+    mut each: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<u64> {
+    let mut buf = vec![0u8; chunk.max(1)];
+    let mut total = 0u64;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => return Ok(total),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        each(&buf[..n])?;
+        total += n as u64;
+    }
+}
+
+/// The SHA-256 and length of everything `reader` yields, streamed through a `chunk` buffer.
+pub(crate) fn sha256_stream(reader: &mut dyn Read, chunk: usize) -> io::Result<([u8; 32], u64)> {
+    let mut hasher = Sha256::new();
+    let len = for_each_chunk(reader, chunk, |piece| {
+        hasher.update(piece);
+        Ok(())
+    })?;
+    Ok((hasher.finalize().into(), len))
 }
 
 /// `hash` as lowercase hex, the only spelling a name in the area may have.
@@ -120,7 +168,7 @@ fn is_link(meta: &fs::Metadata) -> bool {
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        return meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
     false
@@ -251,20 +299,52 @@ pub(crate) mod test_hooks {
         pub static NO_DIRECTORY_DURABILITY: Cell<bool> = const { Cell::new(false) };
     }
 
-    pub fn maybe_corrupt(path: &Path, bytes: &[u8]) -> Vec<u8> {
-        let mut out = bytes.to_vec();
-        let hit = CORRUPT_PATH_CONTAINING.with(|text| {
+    /// A writer that changes the first byte it is given (or writes one, for an empty file) when
+    /// the path is one the test asked to corrupt.
+    pub struct Corrupting<'a> {
+        file: &'a mut std::fs::File,
+        hit: bool,
+        wrote: bool,
+    }
+
+    impl<'a> Corrupting<'a> {
+        pub fn new(path: &Path, file: &'a mut std::fs::File) -> Self {
+            Self { file, hit: corrupts(path), wrote: false }
+        }
+
+        pub fn finish(self) -> std::io::Result<()> {
+            use std::io::Write;
+            if self.hit && !self.wrote {
+                self.file.write_all(&[1])?;
+            }
+            Ok(())
+        }
+    }
+
+    impl std::io::Write for Corrupting<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.hit && !self.wrote && !buf.is_empty() {
+                self.wrote = true;
+                let mut first = buf.to_vec();
+                first[0] ^= 0xff;
+                self.file.write_all(&first)?;
+                return Ok(buf.len());
+            }
+            self.wrote |= !buf.is_empty();
+            self.file.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.file.flush()
+        }
+    }
+
+    fn corrupts(path: &Path) -> bool {
+        CORRUPT_PATH_CONTAINING.with(|text| {
             text.borrow()
                 .as_deref()
                 .is_some_and(|t| path.to_string_lossy().replace('\\', "/").contains(t))
-        });
-        if hit {
-            match out.first_mut() {
-                Some(first) => *first ^= 0xff,
-                None => out.push(1),
-            }
-        }
-        out
+        })
     }
 }
 
@@ -307,7 +387,7 @@ pub const fn platform_supports_directory_durability() -> bool {
 pub(crate) fn directory_durability_available(root: &Path) -> bool {
     // Under test the rebootstrap logic is exercised on every platform, so
     // Windows runs it too; whether a platform really offers durable namespace
-    // changes is asserted separately by `only_a_unix_platform_claims_directory_durability`
+    // changes is asserted separately by `only_unix_and_windows_claim_directory_durability`
     // and the refusal by `a_platform_without_directory_durability_starts_nothing`.
     #[cfg(test)]
     {
@@ -366,17 +446,30 @@ pub(crate) fn require_real_dir(dir: &Path) -> Result<(), AreaError> {
 /// Writes `bytes` as `dir/name`: a Stage file beside it, fsynced, then published
 /// by a durable move that replaces any earlier file of that name.
 pub(crate) fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), AreaError> {
+    write_durable_with(dir, name, |file| Ok(file.write_all(bytes)?))
+}
+
+/// [`write_durable`] for content produced piece by piece: `fill` writes the file's bytes, and
+/// nothing is published unless it succeeds.
+pub(crate) fn write_durable_with(
+    dir: &Path,
+    name: &str,
+    fill: impl FnOnce(&mut dyn Write) -> Result<(), AreaError>,
+) -> Result<(), AreaError> {
     require_real_dir(dir)?;
-    #[cfg(test)]
-    let owned = test_hooks::maybe_corrupt(&dir.join(name), bytes);
-    #[cfg(test)]
-    let bytes = owned.as_slice();
     let ns = namespace_for(dir)?;
     let target = dir.join(name);
     let stage = ns.stage_path(&target).map_err(ns_error)?;
     let staged = (|| -> Result<(), AreaError> {
         let mut file = create_private_file(&stage)?;
-        file.write_all(bytes)?;
+        #[cfg(test)]
+        {
+            let mut writer = test_hooks::Corrupting::new(&target, &mut file);
+            fill(&mut writer)?;
+            writer.finish()?;
+        }
+        #[cfg(not(test))]
+        fill(&mut file)?;
         fsync_file(&file, &stage)?;
         drop(file);
         #[cfg(windows)]
@@ -390,8 +483,8 @@ pub(crate) fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), 
     ns.publish(&stage, &target, Replace::Yes, &NoLedger).map_err(ns_error)
 }
 
-/// The bytes of a regular file under the area, never through a link.
-pub(crate) fn read_regular(path: &Path) -> Result<Vec<u8>, AreaError> {
+/// A regular file under the area opened for reading, never through a link.
+pub(crate) fn open_regular(path: &Path) -> Result<fs::File, AreaError> {
     if let Some(parent) = path.parent() {
         require_real_dir(parent)?;
     }
@@ -403,10 +496,21 @@ pub(crate) fn read_regular(path: &Path) -> Result<Vec<u8>, AreaError> {
     require_private(&meta, 0o600, path)?;
     let mut options = fs::OpenOptions::new();
     options.read(true);
-    let mut file = open_no_follow(&mut options).open(path)?;
+    Ok(open_no_follow(&mut options).open(path)?)
+}
+
+/// The bytes of a regular file under the area, never through a link.
+pub(crate) fn read_regular(path: &Path) -> Result<Vec<u8>, AreaError> {
+    let mut file = open_regular(path)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     Ok(bytes)
+}
+
+/// The SHA-256 and length of a regular file under the area, read through one fixed buffer.
+pub(crate) fn sha256_regular(path: &Path) -> Result<([u8; 32], u64), AreaError> {
+    let mut file = open_regular(path)?;
+    Ok(sha256_stream(&mut file, io_chunk())?)
 }
 
 // --- the area ---------------------------------------------------------------------------
@@ -543,31 +647,6 @@ impl RecoveryArea {
         matches!(lstat_no_link(&self.dir.join(MANIFEST_FILE)), Ok(Some(_)) | Err(_))
     }
 
-    /// Removes the Stage files an interrupted write left. The area is a private
-    /// directory of this product, so a Stage name in it is ours by where it is.
-    pub fn remove_temporaries(&self) -> Result<(), AreaError> {
-        for dir in [
-            self.dir.clone(),
-            self.dir.join(VERSIONS_DIR),
-            self.dir.join(DELTAS_DIR),
-            self.dir.join(MATERIAL_DIR),
-            self.dir.join(LATE_DIR),
-        ] {
-            let Some(meta) = lstat_no_link(&dir)? else { continue };
-            if !meta.is_dir() {
-                continue;
-            }
-            for entry in fs::read_dir(&dir)? {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if matches!(parse_artefact_component(&name), Some((ArtefactKind::Stage, _))) {
-                    fs::remove_file(entry.path())?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     // The fixed names.
 
     pub fn write_target_bundle(&self, bytes: &[u8]) -> Result<[u8; 32], AreaError> {
@@ -615,24 +694,25 @@ impl RecoveryArea {
 
     // The content-addressed names.
 
-    /// A file or link the user changed after the barrier, kept under its own
-    /// digest in `late/` before its original leaves the root.
-    pub fn write_late_edit(&self, sha256: &[u8; 32], bytes: &[u8]) -> Result<(), AreaError> {
-        let dir = self.dir.join(LATE_DIR);
-        ensure_private_dir_durably(&dir)?;
-        write_durable(&dir, &hex::encode(sha256), bytes)
-    }
-
-    pub fn read_late_edit(&self, sha256: &[u8; 32]) -> Result<Vec<u8>, AreaError> {
-        read_regular(&self.dir.join(LATE_DIR).join(hex::encode(sha256)))
-    }
-
     pub fn write_version(&self, version: &VersionHash, bytes: &[u8]) -> Result<(), AreaError> {
         write_durable(&self.dir.join(VERSIONS_DIR), &hex::encode(version.0), bytes)
     }
 
     pub fn read_version(&self, version: &VersionHash) -> Result<Vec<u8>, AreaError> {
         read_regular(&self.dir.join(VERSIONS_DIR).join(hex::encode(version.0)))
+    }
+
+    /// Whether the stored copy of `version` hashes to `sha256` and is `size` bytes, read through
+    /// one fixed buffer: the copy is never held whole.
+    pub fn version_matches(
+        &self,
+        version: &VersionHash,
+        sha256: &[u8; 32],
+        size: u64,
+    ) -> Result<bool, AreaError> {
+        let (digest, len) =
+            sha256_regular(&self.dir.join(VERSIONS_DIR).join(hex::encode(version.0)))?;
+        Ok(digest == *sha256 && len == size)
     }
 
     /// Stores the canonical encoding of a version's whole record (block list and
@@ -1283,8 +1363,6 @@ pub struct RecoveredIntent {
     /// The own deltas the target does not cover, in the manifest's replay order,
     /// each with its exact signed bytes.
     pub deltas: Vec<(NativeDelta, Vec<u8>)>,
-    /// The bytes of every version that has any.
-    pub versions: BTreeMap<VersionHash, Vec<u8>>,
     /// The full record of every version the manifest lists, each verified to hash
     /// to its version.
     pub records: BTreeMap<VersionHash, FileVersion>,
@@ -1343,15 +1421,13 @@ impl RecoveryArea {
             }
             records.insert(version.version, record);
         }
-        let mut versions = BTreeMap::new();
+        // Each copy is checked against the manifest by streaming; none is held.
         for version in manifest.versions.iter().filter(|v| v.has_bytes) {
-            let bytes = self.read_version(&version.version)?;
-            if sha256(&bytes) != version.sha256 || bytes.len() as u64 != version.size {
+            if !self.version_matches(&version.version, &version.sha256, version.size)? {
                 return Err(inconsistent("a version does not match the manifest"));
             }
-            versions.insert(version.version, bytes);
         }
-        Ok(RecoveredIntent { manifest, deltas, versions, records, target_bundle })
+        Ok(RecoveredIntent { manifest, deltas, records, target_bundle })
     }
 }
 

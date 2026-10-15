@@ -53,6 +53,7 @@
 //! decides what a peer's reachability is.
 
 mod address_report;
+mod link_cache;
 mod peer_sessions;
 mod reachability;
 #[cfg(any(test, feature = "test-support"))]
@@ -151,10 +152,12 @@ pub struct PeerConnectivityRuntime {
     /// Every peer's connections and dials, as the iroh endpoint reported
     /// them, and the reachability they add up to.
     reachability: Mutex<LinkReachability>,
+    /// This device, for the measurement-only join timeline.
+    local_device_id: String,
 }
 
 impl PeerConnectivityRuntime {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(local_device_id: String) -> Self {
         let (local_substrate_reachability_tx, local_substrate_reachability) = watch::channel(None);
         Self {
             local_substrate_reachability,
@@ -162,6 +165,28 @@ impl PeerConnectivityRuntime {
             peer_substrate_reachability: Mutex::new(HashMap::new()),
             endpoints: Mutex::new(Vec::new()),
             reachability: Mutex::new(LinkReachability::default()),
+            local_device_id,
+        }
+    }
+
+    /// Measurement only: records `milestone` on every join timeline of this
+    /// device that shares a group with `peer_device`.
+    fn mark_peer_groups(
+        &self,
+        authority: &PeerAuthorityState,
+        peer_device: &str,
+        milestone: yadorilink_fs_platform::join_timeline::Milestone,
+    ) {
+        if !yadorilink_fs_platform::join_timeline::is_active() {
+            return;
+        }
+        for group in authority.authorized_groups_for_peer(peer_device) {
+            yadorilink_fs_platform::join_timeline::mark_with_peer(
+                &self.local_device_id,
+                &group,
+                milestone,
+                peer_device,
+            );
         }
     }
 
@@ -216,6 +241,11 @@ impl PeerConnectivityRuntime {
         match event {
             LinkEvent::Dialing(peer) => {
                 if let Some(device) = authority.device_id_for_signing_key(peer.as_bytes()) {
+                    self.mark_peer_groups(
+                        authority,
+                        &device,
+                        yadorilink_fs_platform::join_timeline::Milestone::LinkDialStarted,
+                    );
                     self.record_dial_started(&device, peer);
                 }
             }
@@ -228,11 +258,21 @@ impl PeerConnectivityRuntime {
                     .dial_connected(peer)
                     .or_else(|| authority.device_id_for_signing_key(peer.as_bytes()));
                 if let Some(device) = device {
+                    self.mark_peer_groups(
+                        authority,
+                        &device,
+                        yadorilink_fs_platform::join_timeline::Milestone::CarrierEstablished,
+                    );
                     self.follow_link(device, link);
                 }
             }
             LinkEvent::Accepted(link) => {
                 if let Some(device) = authority.device_id_for_signing_key(link.peer().as_bytes()) {
+                    self.mark_peer_groups(
+                        authority,
+                        &device,
+                        yadorilink_fs_platform::join_timeline::Milestone::CarrierEstablished,
+                    );
                     self.follow_link(device, link);
                 }
             }
@@ -408,8 +448,11 @@ impl PeerConnectivityRuntime {
         });
         self.endpoints.lock().unwrap_or_else(|p| p.into_inner()).push(Arc::downgrade(&open));
         let (inbound_tx, inbound) = mpsc::channel(ACCEPTED_QUEUE);
+        let links = Arc::new(link_cache::LinkCache::default());
         {
             let open = open.clone();
+            let links = links.clone();
+            let authority = Arc::downgrade(authority);
             tokio::spawn(async move {
                 loop {
                     let link = tokio::select! {
@@ -426,6 +469,14 @@ impl PeerConnectivityRuntime {
                         );
                         continue;
                     }
+                    // An admitted peer's connection is as good a link as one
+                    // this device dialled: whoever is waiting on a dial
+                    // takes it.
+                    if let Some(device) = authority.upgrade().and_then(|authority| {
+                        authority.device_id_for_signing_key(link.peer().as_bytes())
+                    }) {
+                        links.offer_accepted(&device, &link);
+                    }
                     if inbound_tx.send(link.clone()).await.is_err() {
                         link.close();
                         return;
@@ -439,7 +490,7 @@ impl PeerConnectivityRuntime {
                 node,
                 directory,
                 authority: authority.clone(),
-                links: Mutex::new(HashMap::new()),
+                links,
                 open,
                 track_send_inbound: Mutex::new(Some(track_send_inbound)),
                 native_replication_inbound: Mutex::new(Some(native_replication_inbound)),
@@ -619,10 +670,6 @@ impl OpenConnections {
     }
 }
 
-/// One device's cached connection. Its lock is held across that device's
-/// dial and nothing else's.
-type LinkSlot = Arc<tokio::sync::Mutex<Option<Arc<PeerLink>>>>;
-
 /// One bound iroh endpoint and router, and everything whose lifetime is that
 /// endpoint's: who it admits, where it looks peers up, and the links it holds
 /// open.
@@ -637,7 +684,7 @@ pub struct IrohEndpoint {
     /// Resolved per call rather than held open forever: a link that has gone
     /// away is redialled, and the flow-control separation between lanes only
     /// means anything if they are lanes of the *same* connection.
-    links: Mutex<HashMap<String, LinkSlot>>,
+    links: Arc<link_cache::LinkCache>,
     /// Every connection this endpoint holds, dialled into `links` or
     /// accepted, for [`PeerConnectivityRuntime::revoke_device`] to close.
     open: Arc<OpenConnections>,
@@ -697,51 +744,57 @@ impl IrohEndpoint {
     ///
     /// `dial` is the caller's, so a dial made for the link cache is seen by
     /// the same observers as every other dial the reconciliation runtime
-    /// makes. Each device has its own slot, held across its dial, so
-    /// concurrent callers for one peer share one connection rather than
-    /// racing two, while a peer whose dial runs to its deadline holds up
-    /// nobody else's link. The map of slots is locked only to find or add one.
+    /// makes. Concurrent callers for one peer share one dial, and no lock is
+    /// held across it: an authorized link the peer opens while the dial is
+    /// still pending completes the call at once (see `link_cache`).
+    #[cfg(test)]
     pub(crate) async fn link_to<E, Fut>(
         &self,
         device_id: &str,
         dial: impl FnOnce(PeerId) -> Fut,
     ) -> Result<Option<Arc<PeerLink>>, E>
     where
-        Fut: Future<Output = Result<PeerLink, E>>,
+        Fut: Future<Output = Result<PeerLink, E>> + Send + 'static,
+        E: Send + 'static,
     {
-        let slot = self
-            .links
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .entry(device_id.to_string())
-            .or_default()
-            .clone();
-        let mut cached = slot.lock().await;
-        // Who the device is, asked before the cache: a cached connection to a
-        // device the netmap no longer pins is not one to hand out, however
-        // alive it looks.
-        let Some(peer) = self.peer_id_of(device_id) else {
-            if let Some(stale) = cached.take() {
-                stale.close();
+        self.link_to_adopting(device_id, |_| {}, dial).await
+    }
+
+    /// [`Self::link_to`], calling `adopt` on a dialled link once it is held
+    /// (admitted and revocable) and before it is cached or handed out.
+    pub(crate) async fn link_to_adopting<E, Fut>(
+        &self,
+        device_id: &str,
+        adopt: impl Fn(&PeerLink) + Send + 'static,
+        dial: impl FnOnce(PeerId) -> Fut,
+    ) -> Result<Option<Arc<PeerLink>>, E>
+    where
+        Fut: Future<Output = Result<PeerLink, E>> + Send + 'static,
+        E: Send + 'static,
+    {
+        let (authority, device) = (self.authority.clone(), device_id.to_string());
+        let open = self.open.clone();
+        self.links
+            .link_to(
+                device_id,
+                move || authority.peer_signing_key(&device).map(PeerId::from_bytes),
+                move |link| open.hold(link),
+                adopt,
+                dial,
+            )
+            .await
+    }
+
+    /// Resolves when a live link to `device_id` is current, however it came
+    /// to be (dialled, or opened by the peer meanwhile). Never resolves for a
+    /// device the netmap pins no key for.
+    pub(crate) async fn wait_for_link(&self, device_id: &str) {
+        match self.peer_id_of(device_id) {
+            Some(peer) => {
+                self.links.wait_for_link(device_id, peer).await;
             }
-            return Ok(None);
-        };
-        if let Some(link) = cached.as_ref() {
-            if link.is_alive() && link.peer() == peer {
-                return Ok(Some(link.clone()));
-            }
-            *cached = None;
+            None => std::future::pending::<()>().await,
         }
-        let link = dial(peer).await?;
-        // A revocation can land while the dial is in flight. Held first and
-        // checked second, so either the revocation finds it or this check
-        // sees the withdrawn key -- never neither.
-        if !self.open.hold(&link) {
-            return Ok(None);
-        }
-        let link = Arc::new(link);
-        *cached = Some(link.clone());
-        Ok(Some(link))
     }
 
     /// The queue of admitted Track Send connections. `None` after the first

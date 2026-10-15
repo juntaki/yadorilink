@@ -27,6 +27,8 @@ pub struct ControlContext {
     pub(crate) provider_status: Arc<crate::provider_status::ProviderStatusSource>,
     /// Frees the local copy of a provider folder's file; installed by the shell side.
     pub(crate) provider_evict: Arc<crate::provider_evict::ProviderEvictSlot>,
+    /// Automatic space management; installed by the shell side.
+    pub(crate) auto_reclaim: Arc<crate::provider_auto_reclaim::AutoReclaimSlot>,
 }
 
 impl ControlContext {
@@ -36,6 +38,7 @@ impl ControlContext {
             queries,
             provider_status: Arc::default(),
             provider_evict: Arc::default(),
+            auto_reclaim: Arc::default(),
         }
     }
 

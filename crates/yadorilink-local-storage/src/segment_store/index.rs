@@ -410,6 +410,48 @@ impl BlockIndex {
             .map_err(to_storage)
     }
 
+    /// [`Self::lookup_many`] for a put: every block found is also stamped as added `now_nanos`
+    /// (never earlier than it was), in the same write transaction, so a sweep that chooses
+    /// its candidates afterwards finds it inside the grace window and the sweep's own removal
+    /// (see [`Self::remove_swept_blocks`]) rechecks the stamp. A block that is gone by the time
+    /// the transaction runs is reported absent, so the caller writes it again.
+    pub(crate) fn lookup_many_refreshing(
+        &self,
+        hashes: &[[u8; RAW_HASH_LEN]],
+        now_nanos: i64,
+    ) -> Result<Vec<Option<BlockLocation>>, StorageError> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.db
+            .write_immediate(|tx| {
+                let mut touch = tx.prepare_cached(
+                    "UPDATE blocks SET added_at = MAX(added_at, ?2) WHERE hash = ?1",
+                )?;
+                let mut find = tx.prepare_cached(
+                    "SELECT segment_id, record_offset, payload_len FROM blocks WHERE hash = ?1",
+                )?;
+                let mut out = Vec::with_capacity(hashes.len());
+                for hash in hashes {
+                    let found = if touch.execute(rusqlite::params![&hash[..], now_nanos])? == 1 {
+                        find.query_row([&hash[..]], |row| {
+                            Ok(BlockLocation {
+                                segment_id: row.get::<_, i64>(0)? as u64,
+                                record_offset: row.get::<_, i64>(1)? as u64,
+                                length: row.get::<_, i64>(2)? as u32,
+                            })
+                        })
+                        .optional()?
+                    } else {
+                        None
+                    };
+                    out.push(found);
+                }
+                Ok(out)
+            })
+            .map_err(to_storage)
+    }
+
     /// Applies one group commit's mappings, segment accounting and
     /// segment-id watermark in a single transaction.
     ///
@@ -651,12 +693,66 @@ impl BlockIndex {
             .map_err(to_storage)
     }
 
+    /// [`Self::remove_blocks`] for one block, but only while its row still points at
+    /// `location`: a mapping repaired or replaced since the caller looked is left alone
+    /// (returns whether a row was removed).
+    pub(crate) fn remove_block_at(
+        &self,
+        hash: &[u8; RAW_HASH_LEN],
+        location: &BlockLocation,
+    ) -> Result<bool, StorageError> {
+        self.db
+            .write_immediate(|tx| {
+                let row: Option<(i64, i64)> = tx
+                    .query_row(
+                        "SELECT payload_len, record_len FROM blocks \
+                         WHERE hash = ?1 AND segment_id = ?2 AND record_offset = ?3",
+                        rusqlite::params![
+                            &hash[..],
+                            location.segment_id as i64,
+                            location.record_offset as i64
+                        ],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((payload_len, record_len)) = row else { return Ok(false) };
+                tx.execute("DELETE FROM blocks WHERE hash = ?1", [&hash[..]])?;
+                tx.execute(
+                    "UPDATE segments SET live_blocks = live_blocks - 1, \
+                     live_payload_bytes = live_payload_bytes - ?2, \
+                     live_record_bytes = live_record_bytes - ?3 WHERE segment_id = ?1",
+                    rusqlite::params![location.segment_id as i64, payload_len, record_len],
+                )?;
+                Ok(true)
+            })
+            .map_err(to_storage)
+    }
+
     /// Drops mappings for `hashes` and debits their segments. Physical
     /// bytes stay where they are -- reclaiming them is compaction's job,
     /// and is deliberately not coupled to a delete.
     pub(crate) fn remove_blocks(
         &self,
         hashes: &[[u8; RAW_HASH_LEN]],
+    ) -> Result<RemovalSummary, StorageError> {
+        self.remove_blocks_added_by(hashes, None)
+    }
+
+    /// [`Self::remove_blocks`] for a sweep: a block whose ingest stamp is later than
+    /// `cutoff_nanos` when it comes to be removed (a put refreshed it after the candidates
+    /// were chosen) is left alone.
+    pub(crate) fn remove_swept_blocks(
+        &self,
+        hashes: &[[u8; RAW_HASH_LEN]],
+        cutoff_nanos: i64,
+    ) -> Result<RemovalSummary, StorageError> {
+        self.remove_blocks_added_by(hashes, Some(cutoff_nanos))
+    }
+
+    fn remove_blocks_added_by(
+        &self,
+        hashes: &[[u8; RAW_HASH_LEN]],
+        cutoff_nanos: Option<i64>,
     ) -> Result<RemovalSummary, StorageError> {
         if hashes.is_empty() {
             return Ok(RemovalSummary::default());
@@ -665,7 +761,8 @@ impl BlockIndex {
             .write_immediate(|tx| {
                 let mut summary = RemovalSummary::default();
                 let mut lookup = tx.prepare_cached(
-                    "SELECT segment_id, payload_len, record_len FROM blocks WHERE hash = ?1",
+                    "SELECT segment_id, payload_len, record_len, added_at FROM blocks \
+                     WHERE hash = ?1",
                 )?;
                 let mut delete = tx.prepare_cached("DELETE FROM blocks WHERE hash = ?1")?;
                 let mut debit = tx.prepare_cached(
@@ -674,10 +771,17 @@ impl BlockIndex {
                      live_record_bytes = live_record_bytes - ?3 WHERE segment_id = ?1",
                 )?;
                 for hash in hashes {
-                    let row: Option<(i64, i64, i64)> = lookup
-                        .query_row([&hash[..]], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    let row: Option<(i64, i64, i64, i64)> = lookup
+                        .query_row([&hash[..]], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                        })
                         .optional()?;
-                    let Some((segment_id, payload_len, record_len)) = row else { continue };
+                    let Some((segment_id, payload_len, record_len, added_at)) = row else {
+                        continue;
+                    };
+                    if cutoff_nanos.is_some_and(|cutoff| added_at > cutoff) {
+                        continue;
+                    }
                     delete.execute([&hash[..]])?;
                     debit.execute(rusqlite::params![segment_id, payload_len, record_len])?;
                     summary.blocks_removed += 1;

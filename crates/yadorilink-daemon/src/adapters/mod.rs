@@ -104,6 +104,8 @@ pub(crate) fn build_application_services(state: Arc<DaemonState>) -> Arc<Applica
     let on_demand_capability = Arc::new(
         runtime::on_demand_capability::DaemonOnDemandCapabilityAdapter::new(state.clone()),
     );
+    let custody_handoff =
+        Arc::new(runtime::custody_handoff::DaemonCustodyLeaseHandoffAdapter::new(state.clone()));
     let replica_role = Arc::new(ReplicaRoleService::new(
         state.device_id.clone(),
         replica_role_repository,
@@ -112,6 +114,7 @@ pub(crate) fn build_application_services(state: Arc<DaemonState>) -> Arc<Applica
         role_loss_coordination,
         link_runtime,
         on_demand_capability,
+        custody_handoff,
     ));
 
     let pause_resume = Arc::new(runtime::runtime_control::DaemonPauseResumeAdapter::new(

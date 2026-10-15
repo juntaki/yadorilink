@@ -519,6 +519,8 @@ pub struct SubstrateNode {
     /// `track_send_open` and of the sync protocol's own connection
     /// lifecycle -- see `native_replication_transport`'s module doc.
     native_replication_open: crate::NativeReplicationConnections,
+    /// See `dial_settle`.
+    dial_settle: Arc<crate::dial_settle::DialSettle>,
 }
 
 impl SubstrateNode {
@@ -635,6 +637,7 @@ impl SubstrateNode {
                 observer: config.link_observer,
                 track_send_open,
                 native_replication_open,
+                dial_settle: Default::default(),
             },
             inbound_rx,
         ))
@@ -681,6 +684,7 @@ impl SubstrateNode {
         let link =
             PeerLink::new(PeerId::from_bytes(*connection.remote_id().as_bytes()), connection);
         dial.finish(Ok(&link));
+        self.dial_settle.sync_dial_completed(peer);
         Ok(link)
     }
 
@@ -711,6 +715,7 @@ impl SubstrateNode {
         &self,
         address: &PeerAddress,
     ) -> Result<crate::NativeReplicationConnection, SubstrateError> {
+        self.dial_settle.before_native_dial(address.peer()).await;
         crate::native_replication_transport::connect(
             self.router.endpoint(),
             &self.native_replication_open,

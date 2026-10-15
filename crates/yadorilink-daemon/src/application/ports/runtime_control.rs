@@ -3,12 +3,16 @@
 //! `MaterializationPort`'s per-file shape (pause/resume act on a link as a
 //! whole; GC and shutdown aren't scoped to a link at all).
 
+use crate::pause_deadline::PauseDuration;
 use crate::sync_error::SyncError;
 
 use super::common::BoxFuture;
 
 pub(crate) trait LinkPauseResumePort: Send + Sync {
-    fn pause(&self, local_path: &str) -> Result<(), SyncError>;
+    /// Pauses the link as a whole for `duration`. Pausing an already paused
+    /// link replaces its deadline; [`Self::resume`] ends the pause and
+    /// clears the deadline.
+    fn pause(&self, local_path: &str, duration: PauseDuration) -> Result<(), SyncError>;
 
     fn resume<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, Result<(), SyncError>>;
 

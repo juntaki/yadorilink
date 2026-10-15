@@ -68,3 +68,17 @@ fn a_directory_takes_the_least_materialized_state_below_it() {
     seed(&db, "album/c.jpg", RecordKind::File, MaterializationState::Hydrating);
     assert_eq!(state("album"), MaterializationState::Hydrating);
 }
+
+/// An evicting file is not a fetch: it is counted apart from `hydrating`, which is a request
+/// signal for content.
+#[test]
+fn evicting_files_are_not_counted_as_hydrating() {
+    let db = open_full_test_db();
+    seed(&db, "a.txt", RecordKind::File, MaterializationState::Hydrating);
+    seed(&db, "b.txt", RecordKind::File, MaterializationState::Evicting);
+    seed(&db, "c.txt", RecordKind::File, MaterializationState::Evicting);
+
+    let counts = MaterializationStateRepository::new(db).materialization_counts(GROUP).unwrap();
+
+    assert_eq!((counts.hydrating, counts.evicting), (1, 2));
+}

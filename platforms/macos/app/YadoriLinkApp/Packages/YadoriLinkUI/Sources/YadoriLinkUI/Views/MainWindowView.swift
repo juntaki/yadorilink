@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import YadoriLinkFixtures
 import YadoriLinkModel
@@ -48,6 +49,26 @@ public struct MainWindowView: View {
         .sheet(isPresented: $context.showsSignIn) {
             SignInView(model: context.makeSignInModel())
         }
+        .alert(
+            context.unlink.pendingConfirmation.map(UnlinkWording.title) ?? "",
+            isPresented: Binding(get: { context.unlink.pendingConfirmation != nil }, set: { if !$0 { context.unlink.pendingConfirmation = nil } }),
+            presenting: context.unlink.pendingConfirmation
+        ) { _ in
+            Button("Cancel", role: .cancel) { context.unlink.cancel() }
+            Button(UnlinkWording.confirmButton, role: .destructive) { Task { await context.unlink.confirm() } }
+        } message: { folder in
+            Text(UnlinkWording.message(folder))
+        }
+        .alert(
+            context.unlink.pendingOverride.map(UnlinkWording.overrideTitle) ?? "",
+            isPresented: Binding(get: { context.unlink.pendingOverride != nil }, set: { if !$0 { context.unlink.pendingOverride = nil } }),
+            presenting: context.unlink.pendingOverride
+        ) { _ in
+            Button("Cancel", role: .cancel) { context.unlink.cancel() }
+            Button(UnlinkWording.overrideButton, role: .destructive) { Task { await context.unlink.confirmOverride() } }
+        } message: { folder in
+            Text(UnlinkWording.overrideMessage(folder))
+        }
     }
 
     @ViewBuilder private var detail: some View {
@@ -81,15 +102,22 @@ struct HomeContent: View {
             VStack(alignment: .leading, spacing: 20) {
                 if model.showsLoading {
                     LoadingRow("Checking status…")
-                } else if model.banner != .daemonUnavailable {
-                    Text(model.headline).font(.title2.weight(.semibold))
+                } else if model.banner == .daemonUnavailable {
+                    SummaryCard(summary: model.summary)
+                } else {
+                    SummaryCard(summary: model.summary)
 
-                    if !model.attentionLines.isEmpty {
-                        VStack(alignment: .leading, spacing: 6) {
-                            ForEach(model.attentionLines) { line in
-                                Label(line.text, systemImage: "exclamationmark.triangle.fill")
-                                    .foregroundStyle(.orange)
-                                    .help(line.tooltip)
+                    if !model.waitingLines.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(model.waitingLines, id: \.self) { Text($0).font(.callout).foregroundStyle(.secondary) }
+                        }
+                    }
+
+                    if !model.attentionItems.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            SectionHeader("Needs your attention")
+                            ForEach(model.attentionItems) { item in
+                                AttentionItemRow(item: item)
                             }
                         }
                     }
@@ -111,8 +139,23 @@ struct HomeContent: View {
                             SectionHeader("Transfers") {
                                 Button("Show All") { context.sidebar = .transfers }.buttonStyle(.link)
                             }
-                            ForEach(TransfersViewModel(app: context.app).syncRows.prefix(3)) { row in
+                            let transfers = TransfersViewModel(app: context.app)
+                            if let rate = transfers.rateLine {
+                                Text(rate).font(.callout).foregroundStyle(.secondary)
+                            }
+                            ForEach(transfers.syncRows.prefix(3)) { row in
                                 SyncRowView(row: row)
+                            }
+                        }
+                    }
+
+                    if !model.recentProblemLines.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            SectionHeader("Recent problems")
+                            ForEach(model.recentProblemLines) { line in
+                                Label(line.text, systemImage: "clock.badge.exclamationmark")
+                                    .foregroundStyle(.secondary)
+                                    .help(line.tooltip)
                             }
                         }
                     }
@@ -121,11 +164,14 @@ struct HomeContent: View {
                         VStack(alignment: .leading, spacing: 8) {
                             SectionHeader("Devices")
                             if let error = model.devicesError {
-                                EmptyStateText(error)
+                                RetryRow(LoadWording.devices, notice: error) { await model.loadDevices() }
                             } else if model.devices == .loading {
                                 LoadingRow()
                             } else if model.showsNoDevicesMessage {
                                 EmptyStateText("No other devices yet.")
+                            }
+                            if let stale = model.devicesStale {
+                                RetryRow(LoadWording.stale("devices"), notice: stale) { await model.loadDevices() }
                             }
                             ForEach(model.deviceRows) { row in
                                 HStack(spacing: 8) {
@@ -147,6 +193,67 @@ struct HomeContent: View {
     private func openAddFolder() { openWindow(id: WindowID.addFolder) }
 }
 
+/// The five answers Home gives first, one per line.
+struct SummaryCard: View {
+    let summary: ProductSummary
+
+    var body: some View {
+        Card {
+            ForEach(summary.lines, id: \.label) { line in
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(line.label).font(.callout).foregroundStyle(.secondary).frame(width: 110, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(line.text).foregroundStyle(line.tone.color)
+                        if let detail = line.detail {
+                            Text(detail).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+                .accessibilityElement(children: .combine)
+            }
+            if let storage = summary.storage {
+                Text(storage).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+/// One problem with its first action as a button and its second, if any, as a link.
+struct AttentionItemRow: View {
+    @Environment(AppContext.self) private var context
+    @Environment(\.openSettings) private var openSettings
+    let item: AttentionItem
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Label(item.text, systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            Button(item.primary.title) { run(item.primary) }
+                .accessibilityHint(item.text)
+            if let secondary = item.secondary {
+                Button(secondary.title) { run(secondary) }.buttonStyle(.link)
+                    .accessibilityHint(item.text)
+            }
+        }
+    }
+
+    private func run(_ offer: ActionOffer) {
+        switch offer.destination {
+        case .refresh: context.app.refresh()
+        case .folder(let path): context.showFolder(path)
+        case .sidebar(let item): context.sidebar = item
+        case .revealInFinder(let path): context.revealInFinder(path)
+        case .settings(let tab):
+            context.settingsTab = tab
+            NSApp.activate()
+            openSettings()
+        }
+    }
+}
+
 /// Row 1: name, state and Share…/Details…. Row 2: one quiet summary.
 /// Pause and the mode sit behind the "⋯" menu.
 struct FolderCard: View {
@@ -163,14 +270,16 @@ struct FolderCard: View {
                 Button("Share…") {
                     context.shareTarget = ShareTarget(groupId: row.folder.groupId, folderName: row.name)
                 }
+                .accessibilityLabel("Share \(row.name)")
                 Button("Details…") { context.showFolder(row.folder.localPath) }
+                    .accessibilityLabel("Details for \(row.name)")
                 FolderOptionsMenu(folder: row.folder)
             }
             Text(row.summary)
                 .font(.callout)
                 .foregroundStyle(row.summaryIsWarning ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
             if let detail = row.detail {
-                Text(detail).font(.callout).foregroundStyle(row.folder.durability.tone.color)
+                Text(detail).font(.callout).foregroundStyle(row.protectionTone.color)
             }
             if let progress = row.progress {
                 ProgressView(value: progress) {
@@ -178,6 +287,8 @@ struct FolderCard: View {
                 } currentValueLabel: {
                     Text(row.progressText ?? "").font(.caption)
                 }
+                .accessibilityLabel("\(row.name), \(row.stateTitle)")
+                .accessibilityValue(row.progressText ?? "")
             }
         }
     }
@@ -189,8 +300,17 @@ struct FolderOptionsMenu: View {
 
     var body: some View {
         Menu {
-            Button(folder.paused ? "Resume Syncing" : "Pause Syncing") {
-                Task { await context.app.setPaused(!folder.paused, for: folder) }
+            if folder.paused {
+                Text(PauseText.status(until: folder.pausedUntil, now: Date()))
+                Button("Resume Syncing") {
+                    Task { await context.app.setPaused(false, for: folder) }
+                }
+            } else {
+                ForEach(PauseDuration.allCases, id: \.self) { duration in
+                    Button(duration.menuTitle) {
+                        Task { await context.app.setPaused(true, for: folder, duration: duration) }
+                    }
+                }
             }
             Divider()
             Picker("Files on this Mac", selection: Binding(
@@ -206,6 +326,9 @@ struct FolderOptionsMenu: View {
                 Divider()
                 Button("Show in Finder") { context.revealInFinder(folder.localPath) }
             }
+            Divider()
+            Button(UnlinkWording.menuTitle, role: .destructive) { context.unlink.request(folder) }
+                .disabled(context.unlink.isWorking)
         } label: {
             Image(systemName: "ellipsis.circle")
         }

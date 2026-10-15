@@ -17,12 +17,13 @@ use crate::error::DesktopError;
 mod convert;
 
 pub use convert::{
-    account_deletion_status, attention_reason, conflict_summary, file_availability, file_version,
-    file_versions, folder_detail, folder_restore_outcome, folder_summary, gc_report,
+    account_deletion_status, attention_reason, conflict_summary, file_availability, file_retention,
+    file_version, file_versions, folder_detail, folder_restore_outcome, folder_summary, gc_report,
     handoff_summary, incoming_transfer, invite_summary, member_summary, membership_outcome,
-    pending_approval_summary, pending_invite_summary, preflight_result, received_transfer,
-    sent_transfer, share_summary, status_snapshot, trashed_file, update_config,
-    update_install_outcome, update_status,
+    pending_approval_summary, pending_invite_summary, pin_outcome, preflight_result,
+    received_transfer, retained_original, retained_release, sent_transfer, share_summary,
+    space_management, space_reclaim_preview, status_dimensions_json, status_snapshot, trashed_file,
+    update_config, update_download_guidance, update_status,
 };
 
 // ---- construction -------------------------------------------------------
@@ -198,12 +199,46 @@ pub enum AttentionCategory {
     FetchAvailabilityUnknown,
     Conflict,
     Held,
+    StrandedDirectory,
     LowDiskCritical,
     LowDisk,
     PeerDisconnected,
     RecentError,
     UpdateFailed,
+    /// The folder group is linked at more than one place on this device.
+    Ambiguous,
+    OwnershipLost,
+    VolumeChanged,
+    ProviderNotReady,
+    ProviderStuck,
+    KeptEdits,
+    ProviderOrphanDomain,
     Unrecognized,
+}
+
+/// Whether time alone can fix an attention item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum AttentionKind {
+    /// Something outside the user's hands has to come back.
+    Waiting,
+    /// The work is tried again; trying again may succeed.
+    Retryable,
+    /// Nothing changes until the user acts.
+    Permanent,
+}
+
+/// What the user can be offered to do about an attention item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum ProductAction {
+    Retry,
+    ReviewConflict,
+    FreeUpSpace,
+    RevealPath,
+    OpenSettings,
+    DownloadUpdate,
+    ViewDetails,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,6 +252,9 @@ pub struct AttentionReason {
     pub folder_local_path: Option<String>,
     /// The daemon's own `category:subject` text.
     pub raw: String,
+    pub kind: AttentionKind,
+    pub primary_action: ProductAction,
+    pub secondary_action: Option<ProductAction>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,6 +313,55 @@ pub enum FetchAvailability {
     Unknown,
 }
 
+/// Whether the exact content needed can be fetched now. Independent of [`Protection`].
+/// Several folders aggregate to the least available one (update required, waiting for exact
+/// content, waiting for a device, unknown, available); available only when all are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum Availability {
+    Available,
+    /// A device holding the content is offline or unreachable.
+    WaitingForPeer,
+    /// Devices are reachable but none is known to hold the exact version.
+    WaitingForExactContent,
+    Unknown,
+}
+
+/// The availability with the other devices it concerns: those recorded as full copies of the
+/// folder, split by whether they are reachable now. Ids are for lookup, never for display.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct AvailabilitySummary {
+    pub availability: Availability,
+    pub reachable_device_ids: Vec<String>,
+    pub offline_device_ids: Vec<String>,
+}
+
+/// Whether the data is still elsewhere if this device is lost. Independent of [`Availability`]:
+/// a copy on an offline device still counts. Several folders aggregate to the least protected
+/// one (at risk, pending, unknown, protected); protected only when all are provably so, and
+/// unknown is never read as protected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum Protection {
+    Protected,
+    /// Confirmed: only this device holds the current content.
+    AtRisk,
+    /// A copy is being made or a confirmation is still awaited.
+    Pending,
+    Unknown,
+}
+
+/// The protection with the other devices it concerns: those holding a full copy when
+/// protected, those a confirmation is awaited from when pending, none otherwise. Ids are for
+/// lookup, never for display.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct ProtectionSummary {
+    pub protection: Protection,
+    pub device_ids: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "ffi", derive(uniffi::Record))]
 pub struct FolderTransferProgress {
@@ -314,6 +401,8 @@ pub struct FolderSummary {
     pub mode: FolderMode,
     pub state: FolderState,
     pub paused: bool,
+    /// When a timed pause ends by itself; `None` when not paused or paused until resumed.
+    pub paused_until: Option<SystemTime>,
     pub conflict_count: u64,
     pub hydrated_file_count: u64,
     pub placeholder_file_count: u64,
@@ -325,6 +414,8 @@ pub struct FolderSummary {
     pub durability_evidence: DurabilityEvidence,
     pub local_storage: LocalStorageState,
     pub fetch_availability: FetchAvailability,
+    pub availability: AvailabilitySummary,
+    pub protection: ProtectionSummary,
     pub full_replica_device_ids: Vec<String>,
     pub policy_stale: bool,
     pub ambiguous: bool,
@@ -388,6 +479,100 @@ pub struct TransferSummary {
     pub started_at: Option<SystemTime>,
 }
 
+/// What to do with a kept copy of a file that was edited on two devices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum ConflictChoice {
+    /// The copy becomes the file; the other version is no longer current.
+    KeepThis,
+    /// The copy stays beside the original as an ordinary file under a plain name.
+    KeepBoth,
+}
+
+/// An original file kept after a reset replaced it, until the user releases it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct RetainedOriginal {
+    pub group_id: String,
+    /// The path the original had in the folder.
+    pub path: String,
+    /// Bytes it takes; 0 when it is not reachable.
+    pub size: u64,
+    /// Whether the folder is watched, so the kept file can be reached.
+    pub reachable: bool,
+    pub group_removed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum RetainedReleaseOutcome {
+    Removed,
+    Gone,
+    StillRetained,
+    SavedThenRemoved,
+    SavedStillRetained,
+    /// Left in place; `detail` says why.
+    Left,
+    /// A value this build does not know.
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct RetainedRelease {
+    pub path: String,
+    pub outcome: RetainedReleaseOutcome,
+    /// Why an original was left; empty otherwise.
+    pub detail: String,
+}
+
+/// Automatic space management for provider folders: while free disk space is low, downloaded
+/// files that are safe to give back are given back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct SpaceManagement {
+    pub enabled: bool,
+}
+
+/// What automatic space management says about one downloaded item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum SpaceReclaimVerdict {
+    /// Would be given back now.
+    Eligible,
+    /// The user keeps it on this device.
+    Pinned,
+    /// This folder never gives space back automatically.
+    UnsupportedRoot,
+    /// No other device can confirm it holds this version right now.
+    CustodyUnavailable,
+    /// Another operation, a program or the file system holds the item at the moment.
+    Busy,
+    /// The content is new, being updated or not confirmed by the system yet.
+    Changed,
+    /// Something makes freeing unsafe or unprovable, or the daemon answered with a value this
+    /// build does not know.
+    SafetyBlocked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct SpaceReclaimPreviewItem {
+    pub group_id: String,
+    /// Path relative to the folder.
+    pub path: String,
+    pub verdict: SpaceReclaimVerdict,
+}
+
+/// The dry run: nothing was removed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct SpaceReclaimPreview {
+    pub items: Vec<SpaceReclaimPreviewItem>,
+    /// Folders that could not be read; their items are missing.
+    pub unreadable_roots: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "ffi", derive(uniffi::Record))]
 pub struct BandwidthLimits {
@@ -438,7 +623,6 @@ pub struct UpdateBadge {
     pub state: UpdateState,
     pub available_version: Option<String>,
     pub mandatory: bool,
-    pub waiting_for_safe_point: bool,
     pub last_error_category: Option<String>,
     pub channel: String,
     pub install_source: String,
@@ -461,6 +645,9 @@ pub struct StatusSnapshot {
     pub attention_reasons: Vec<AttentionReason>,
     pub this_device_id: Option<String>,
     pub folders: Vec<FolderSummary>,
+    /// All folders together, by the aggregation rules on [`Availability`] and [`Protection`].
+    pub availability: AvailabilitySummary,
+    pub protection: ProtectionSummary,
     pub peers: Vec<PeerSummary>,
     pub transfers: Vec<TransferSummary>,
     pub bandwidth: BandwidthStatus,
@@ -619,6 +806,32 @@ pub enum MaterializationState {
 pub struct FileAvailability {
     pub tracked: bool,
     pub state: MaterializationState,
+}
+
+/// Whether local space for a file or folder may be reclaimed, apart from whether its content is
+/// on this device now. Local to this device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum RetentionPolicy {
+    Reclaimable,
+    /// "Always keep on this device".
+    Pinned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct FileRetention {
+    pub policy: RetentionPolicy,
+    /// Pinned only because a folder above is; unpinning this path alone changes nothing.
+    pub inherited: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct PinOutcome {
+    pub retention: FileRetention,
+    /// Why the content could not be downloaded just now; the pin stands regardless.
+    pub download_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -916,7 +1129,24 @@ pub enum IncomingTransferStatus {
     Pending,
     InProgress,
     Completed,
-    Other { raw: String },
+    /// The receive stopped on an error, or the daemon restarted during it.
+    Failed,
+    Canceled,
+    Other {
+        raw: String,
+    },
+}
+
+/// How long a pause lasts. The daemon computes the deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum PauseDuration {
+    /// Until the user resumes.
+    UntilResumed,
+    ThirtyMinutes,
+    OneHour,
+    /// Until the next local midnight.
+    UntilTomorrow,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -972,19 +1202,13 @@ pub enum DaemonStartOutcome {
     Started,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
-pub enum UpdateInstallMode {
-    Automatic,
-    Manual,
-    Other { raw: String },
-}
-
+/// Update preferences. Updates are installed by the user (or a package
+/// manager or store), never by YadoriLink, so the only setting is whether it
+/// checks for a newer version by itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "ffi", derive(uniffi::Record))]
 pub struct UpdateConfig {
     pub automatic_checks: bool,
-    pub install_mode: UpdateInstallMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -999,25 +1223,23 @@ pub struct UpdateStatus {
     pub release_notes_url: Option<String>,
     pub mandatory: bool,
     pub holdback_reason: Option<String>,
-    pub waiting_for_safe_point: bool,
     pub last_error_category: Option<String>,
     pub last_error_message: Option<String>,
+    /// A package manager or store owns this install, so the new version
+    /// comes with steps to follow, not a page to open.
+    pub package_managed: bool,
     pub config: UpdateConfig,
 }
 
+/// How to get the new version. Nothing is downloaded or installed by
+/// YadoriLink: `guidance` is the sentence to show (the download page, or the
+/// package-manager steps for a package-managed install), and `url` is the
+/// official page to open, only when there is one to open.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
-pub enum UpdateInstallOutcome {
-    Installing,
-    Deferred,
-    /// Updates are installed manually (or by a package manager / store);
-    /// `guidance` says where to get the new version.
-    StoreManaged {
-        guidance: String,
-    },
-    Other {
-        raw: String,
-    },
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct UpdateDownloadGuidance {
+    pub guidance: String,
+    pub url: Option<String>,
 }
 
 #[cfg(test)]

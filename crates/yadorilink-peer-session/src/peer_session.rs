@@ -40,9 +40,9 @@ mod service;
 
 use self::block_fetch::BlockFetchOutcome;
 pub use self::deps::{
-    BlockWriteActivityProvider, HandoffLeaseResponder, HandoffTicketResponder,
-    PeerHandoffLeaseGrant, PeerHandoffTicketGrant, PeerSyncSessionDeps, PendingLocalChangeFlush,
-    PendingLocalFlushOutcome, RootCommitAuthorityProvider,
+    BlockWriteActivityProvider, CustodyRehomeResponder, HandoffLeaseResponder,
+    HandoffTicketResponder, PeerHandoffLeaseGrant, PeerHandoffTicketGrant, PeerSyncSessionDeps,
+    PendingLocalChangeFlush, PendingLocalFlushOutcome, RootCommitAuthorityProvider,
 };
 
 const MAX_BLOCK_SIZE: usize = yadorilink_replica_domain::limits::MAX_BLOCK_SIZE_BYTES as usize;
@@ -519,6 +519,11 @@ pub struct PeerSyncSession {
     /// deny-by-default implementation, so an incoming `HandoffTicketRequest`
     /// answers `granted = false` rather than panic or hang.
     handoff_ticket_responder: Arc<dyn HandoffTicketResponder>,
+    /// This session's bridge to the daemon's custody holds, answering a full
+    /// replica that asks this device to move custody off it -- see
+    /// `CustodyRehomeResponder`. A caller with no real responder passes a
+    /// deny-by-default one.
+    custody_rehome_responder: Arc<dyn CustodyRehomeResponder>,
 }
 
 impl PeerSyncSession {
@@ -572,6 +577,7 @@ impl PeerSyncSession {
             transports,
             handoff_lease_responder: deps.handoff_lease_responder,
             handoff_ticket_responder: deps.handoff_ticket_responder,
+            custody_rehome_responder: deps.custody_rehome_responder,
         })
     }
 

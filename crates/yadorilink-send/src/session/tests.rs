@@ -1014,3 +1014,210 @@ async fn a_granted_offer_with_an_inconsistent_manifest_is_rejected_and_not_recor
     let ack = raw_offer_manifest(&dialer, &acceptor, good, "grant-ok", "nonce-ok").await;
     assert!(ack.accepted, "a consistent manifest is still accepted: {}", ack.reason);
 }
+
+// ---- cancel and retry ----------------------------------------------------
+
+/// `ReceiverWithResolvableSender` whose sender can be made unknown, standing
+/// in for a sender that was removed from the account after the offer.
+struct SwitchableDirectory {
+    inner: ReceiverWithResolvableSender,
+    sender_known: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl DeviceDirectory for SwitchableDirectory {
+    fn resolve(&self, device_query: &str) -> Option<ResolvedDevice> {
+        if self.sender_known.load(std::sync::atomic::Ordering::SeqCst) {
+            self.inner.resolve(device_query)
+        } else {
+            None
+        }
+    }
+    fn device_id_for_key(&self, signing_key: &[u8; 32]) -> Option<String> {
+        self.inner.device_id_for_key(signing_key)
+    }
+    async fn consume_grant(
+        &self,
+        grant_id: &str,
+        grant_nonce: &str,
+        peer_key: &[u8; 32],
+    ) -> std::result::Result<(), String> {
+        self.inner.consume_grant(grant_id, grant_nonce, peer_key).await
+    }
+}
+
+struct OfferedPair {
+    receiver: Arc<SendService>,
+    sender_known: Arc<std::sync::atomic::AtomicBool>,
+    transfer_id: String,
+    content: Vec<u8>,
+    _guards: (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir),
+    _endpoints: (Arc<TestEndpoint>, Arc<TestEndpoint>),
+}
+
+/// A sender that has offered one multi-chunk file to a receiver that has
+/// accepted it, and has not yet received anything.
+async fn offered_pair() -> OfferedPair {
+    let sender_endpoint = raw_endpoint().await;
+    let receiver_endpoint = raw_endpoint().await;
+    receiver_endpoint.admit(sender_endpoint.key);
+    sender_endpoint.admit(receiver_endpoint.key);
+
+    let grants = Arc::new(FakeGrantStore::default());
+    let sender_directory: Arc<dyn DeviceDirectory> = Arc::new(GrantingDirectory {
+        sender_key: sender_endpoint.key,
+        grants: grants.clone(),
+        target: receiver_endpoint.resolved("receiver-device"),
+    });
+    let (sender_service, sender_guard) = serving_service(&sender_endpoint, sender_directory);
+    let sender_known = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let receiver_directory: Arc<dyn DeviceDirectory> = Arc::new(SwitchableDirectory {
+        inner: ReceiverWithResolvableSender {
+            sender: sender_endpoint.resolved("sender-device"),
+            grants,
+        },
+        sender_known: sender_known.clone(),
+    });
+    let (receiver, receiver_guard) = serving_service(&receiver_endpoint, receiver_directory);
+
+    let content: Vec<u8> = (0..400_000u32).map(|n| (n % 251) as u8).collect();
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_path = source_dir.path().join("big.bin");
+    std::fs::write(&source_path, &content).unwrap();
+    let offer = sender_service.offer_send(&source_path, "receiver-device").await.unwrap();
+    OfferedPair {
+        receiver,
+        sender_known,
+        transfer_id: offer.transfer_id,
+        content,
+        _guards: (sender_guard, receiver_guard, source_dir),
+        _endpoints: (sender_endpoint, receiver_endpoint),
+    }
+}
+
+fn inbox_status(service: &SendService, transfer_id: &str) -> &'static str {
+    service
+        .list_inbox()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.transfer_id == transfer_id)
+        .expect("listed")
+        .status
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_is_idempotent_and_a_canceled_transfer_is_not_received() {
+    let pair = offered_pair().await;
+    pair.receiver.cancel_transfer(&pair.transfer_id).unwrap();
+    pair.receiver.cancel_transfer(&pair.transfer_id).unwrap();
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "canceled");
+
+    let error = pair.receiver.receive_transfer(&pair.transfer_id, None).await.unwrap_err();
+    assert!(matches!(error, SendError::TransferCanceled(_)), "got {error:?}");
+    assert!(matches!(
+        pair.receiver.cancel_transfer("no-such-transfer"),
+        Err(SendError::UnknownTransfer(_))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_stops_the_running_receive_and_retry_finishes_it() {
+    let pair = offered_pair().await;
+    let parked = pair.receiver.test_abort_after_n_chunks(1);
+    let destination = tempfile::tempdir().unwrap();
+    let dest_path = destination.path().join("out");
+
+    let receiver = pair.receiver.clone();
+    let id = pair.transfer_id.clone();
+    let dest = dest_path.clone();
+    let running = tokio::spawn(async move { receiver.receive_transfer(&id, Some(&dest)).await });
+    tokio::time::timeout(Duration::from_secs(20), parked.notified())
+        .await
+        .expect("the receive must reach its first confirmed chunk");
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "in_progress");
+
+    pair.receiver.cancel_transfer(&pair.transfer_id).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap();
+    assert!(matches!(result, Err(SendError::TransferCanceled(_))), "got {result:?}");
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "canceled");
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        pair.receiver.retry_transfer(&pair.transfer_id),
+    )
+    .await
+    .unwrap()
+    .expect("retry resumes a canceled transfer");
+    assert_eq!(outcome.destination_dir, dest_path, "retry keeps the recorded destination");
+    assert_eq!(std::fs::read(dest_path.join("big.bin")).unwrap(), pair.content);
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "completed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_of_one_transfer_leaves_another_running_receive_alone() {
+    let pair = offered_pair().await;
+    let parked = pair.receiver.test_abort_after_n_chunks(1);
+    let receiver = pair.receiver.clone();
+    let id = pair.transfer_id.clone();
+    let dest = tempfile::tempdir().unwrap();
+    let dest_path = dest.path().join("out");
+    let running =
+        tokio::spawn(async move { receiver.receive_transfer(&id, Some(&dest_path)).await });
+    tokio::time::timeout(Duration::from_secs(20), parked.notified()).await.unwrap();
+
+    // Canceling an unrelated id neither errors for a known row nor stops this receive.
+    assert!(pair.receiver.cancel_transfer("other").is_err());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!running.is_finished(), "an unrelated cancel must not stop this receive");
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "in_progress");
+    running.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_revalidates_before_changing_anything() {
+    let pair = offered_pair().await;
+    let destination = tempfile::tempdir().unwrap();
+    let dest_path = destination.path().join("out");
+
+    // Nothing to retry while it is still waiting to be received.
+    let error = pair.receiver.retry_transfer(&pair.transfer_id).await.unwrap_err();
+    assert!(matches!(error, SendError::NotRetryable { .. }), "got {error:?}");
+
+    // Record a destination, then cancel.
+    pair.receiver
+        .store
+        .claim_inbound_destination(&pair.transfer_id, dest_path.to_str().unwrap())
+        .unwrap();
+    pair.receiver.cancel_transfer(&pair.transfer_id).unwrap();
+
+    // The sender is no longer a known device: retry refuses and the transfer stays canceled.
+    pair.sender_known.store(false, std::sync::atomic::Ordering::SeqCst);
+    let error = pair.receiver.retry_transfer(&pair.transfer_id).await.unwrap_err();
+    assert!(matches!(error, SendError::NoKnownAddress(_)), "got {error:?}");
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "canceled");
+    pair.sender_known.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // The destination became a file: retry refuses and the transfer stays canceled.
+    std::fs::write(&dest_path, b"in the way").unwrap();
+    let error = pair.receiver.retry_transfer(&pair.transfer_id).await.unwrap_err();
+    assert!(matches!(error, SendError::BadDestination(..)), "got {error:?}");
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "canceled");
+
+    // Once the problems are gone retry succeeds.
+    std::fs::remove_file(&dest_path).unwrap();
+    pair.receiver.retry_transfer(&pair.transfer_id).await.unwrap();
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "completed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_receive_that_errors_is_failed_not_in_progress() {
+    let pair = offered_pair().await;
+    pair.sender_known.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(pair.receiver.receive_transfer(&pair.transfer_id, None).await.is_err());
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "failed");
+
+    // A failed transfer is retried the same way.
+    pair.sender_known.store(true, std::sync::atomic::Ordering::SeqCst);
+    pair.receiver.retry_transfer(&pair.transfer_id).await.unwrap();
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "completed");
+}

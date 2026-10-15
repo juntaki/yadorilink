@@ -10,11 +10,10 @@ import Foundation
 public struct HostFolder: Equatable, Sendable {
     public let root: Data
     public let displayName: String
-    public let eager: Bool
     public let ready: Bool
     public let latestEvidenceSeq: UInt64
-    public init(root: Data, displayName: String, eager: Bool, ready: Bool, latestEvidenceSeq: UInt64) {
-        self.root = root; self.displayName = displayName; self.eager = eager
+    public init(root: Data, displayName: String, ready: Bool, latestEvidenceSeq: UInt64) {
+        self.root = root; self.displayName = displayName
         self.ready = ready; self.latestEvidenceSeq = latestEvidenceSeq
     }
 }
@@ -295,7 +294,7 @@ public final class ProviderDriver {
     /// sent as exclusions. One query per root at a time; the answer arrives as a `downloads` event.
     public func eagerTick(root: Data) {
         lock.lock()
-        guard folders[root]?.eager == true, !paused.contains(root) else { lock.unlock(); return }
+        guard folders[root] != nil, !paused.contains(root) else { lock.unlock(); return }
         var state = eager[root] ?? EagerState()
         // At capacity the query still goes out with room 0: its answer carries the SETTLED ids, the
         // only way a slot is freed when no other evidence arrives.

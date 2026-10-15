@@ -224,6 +224,36 @@ pub fn resolve_content_is_current(sync_state: &ReplicaCoordinator, absolute_path
         || sync_state.local_copy_names_current_version(&group_id, &rel_path).unwrap_or(false)
 }
 
+/// How the user's pauses apply to `absolute_path`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ItemPause {
+    /// This exact item is paused (the link root counts as the empty item): Resume applies.
+    pub paused: bool,
+    /// An item strictly above it is paused, whether or not it is paused itself: resuming only
+    /// lifts the pause of the exact item, so neither Pause nor Resume would change anything.
+    pub by_ancestor: bool,
+}
+
+/// The user pauses that apply to `absolute_path` (the held paths of a rebootstrap are not a user
+/// pause). All false for a path not under a linked folder, and when the paused items cannot be
+/// read: the menu then offers Pause, which is idempotent, rather than a Resume that may not apply.
+pub fn resolve_item_pause(sync_state: &ReplicaCoordinator, absolute_path: &str) -> ItemPause {
+    let Some((group_id, rel_path)) = resolve_group_and_rel_path(sync_state, absolute_path) else {
+        return ItemPause::default();
+    };
+    let rel_path = rel_path.trim_end_matches('/');
+    let Ok(items) = sync_state.paused_item_repository().list(&group_id) else {
+        return ItemPause::default();
+    };
+    ItemPause {
+        paused: items.iter().any(|item| item == rel_path),
+        by_ancestor: items.iter().any(|item| {
+            item.is_empty() && !rel_path.is_empty()
+                || rel_path.strip_prefix(item.as_str()).is_some_and(|rest| rest.starts_with('/'))
+        }),
+    }
+}
+
 /// What stands on this device for a path with this row state: the one place
 /// the two facts the wire carries are derived. `exact` is whether a usable
 /// proof names the version the row holds now; callers that could not read the

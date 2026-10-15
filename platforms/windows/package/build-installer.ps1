@@ -80,20 +80,29 @@ if ($Release) {
     }
 }
 
-$args = @()
+# Stage every shipped PE file and sign each one BEFORE Inno Setup packs it
+# (SignTool alone only signs the installer and uninstaller). The installer
+# and the release binary archive both take their bytes from this directory.
+if ([string]::IsNullOrWhiteSpace($BinDir)) { $BinDir = Join-Path $repoRoot "target\release" }
+if ([string]::IsNullOrWhiteSpace($ShellExtDir)) { $ShellExtDir = Join-Path $repoRoot "platforms\windows\shell\target\release" }
+$payloadDir = Join-Path $repoRoot "target\installer-payload"
+$signArgs = @{ BinDir = $BinDir; ShellExtDir = $ShellExtDir; StageDir = $payloadDir }
 if (-not [string]::IsNullOrWhiteSpace($SignToolName)) {
     if ([string]::IsNullOrWhiteSpace($SignToolCommand)) {
         throw "-SignToolCommand is required when -SignToolName is set."
     }
+    $signArgs.SignCommand = $SignToolCommand
+}
+& (Join-Path $scriptDir "sign-payload.ps1") @signArgs
+if (-not $?) { throw "staging/signing the shipped binaries failed" }
+
+$args = @()
+if (-not [string]::IsNullOrWhiteSpace($SignToolName)) {
     $args += "/S$SignToolName=$SignToolCommand"
     $args += "/DYadoriLinkSignTool=$SignToolName"
 }
-if (-not [string]::IsNullOrWhiteSpace($BinDir)) {
-    $args += "/DBinDir=$BinDir"
-}
-if (-not [string]::IsNullOrWhiteSpace($ShellExtDir)) {
-    $args += "/DShellExtDir=$ShellExtDir"
-}
+$args += "/DBinDir=$payloadDir"
+$args += "/DShellExtDir=$payloadDir"
 # AGPL-3.0 corresponding-source pointer shipped next to the LICENSE text: the
 # release workflow's tag/commit, else this checkout's commit.
 $sourceRef = $env:YADORILINK_SOURCE_REF
@@ -130,3 +139,21 @@ $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $outputPath
 $sidecar = "$outputPath.sha256"
 "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $outputPath)" | Set-Content -LiteralPath $sidecar -NoNewline
 Write-Output "Wrote $sidecar"
+
+# Record which commit and which bytes this installer is, so a later
+# verification run can bind its results to exactly this build.
+$commit = (git -C $PSScriptRoot rev-parse HEAD).Trim()
+$prov = "$outputPath.provenance.json"
+[ordered]@{
+    schema = "yadorilink-release-provenance/1"
+    artifact_sha256 = $hash.Hash.ToLowerInvariant()
+    product_sha = $commit
+} | ConvertTo-Json | Set-Content -LiteralPath $prov
+Write-Output "Wrote $prov"
+
+# A signed build must also verify every shipped PE file, not only the outer
+# installer.
+if (-not [string]::IsNullOrWhiteSpace($SignToolName)) {
+    & (Join-Path $scriptDir "verify-installer.ps1") -Path $outputPath -Release -PayloadDir $payloadDir
+    if ($LASTEXITCODE -ne 0) { throw "verification of the signed payload failed" }
+}

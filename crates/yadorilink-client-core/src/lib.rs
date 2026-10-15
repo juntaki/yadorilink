@@ -21,11 +21,12 @@ uniffi::setup_scaffolding!();
 
 pub mod coordination;
 pub mod daemon;
+/// The shared meaning of problems that need the user (see `yadorilink-product-view`).
+pub use yadorilink_product_view as attention;
 pub mod dto;
 pub mod error;
 mod facade;
 pub mod ops;
-pub mod presentation;
 pub mod session;
 pub mod wording;
 

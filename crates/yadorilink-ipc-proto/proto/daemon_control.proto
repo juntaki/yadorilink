@@ -174,6 +174,67 @@ message LinkStatus {
   // example an unmounted disk left an empty mountpoint). Deletions under it
   // are withheld rather than synced. Additive; `false` when unchanged.
   bool capture_volume_changed = 39;
+  // Directories a removal moved aside and could not put back (a child
+  // appeared meanwhile and something else took the name). Each still stands,
+  // with its contents, under a reserved name beside its old place; nothing
+  // was deleted. Additive; 0 when none.
+  uint64 stranded_directory_count = 40;
+  // The daemon's accurate "content requested" signal: content fetches the user
+  // or the system has asked for that have not finished. It counts files being
+  // hydrated (an On-Demand open), opens still queued for a daemon-wide assembly
+  // slot, and, for an unpaused Eager folder, files not yet materialized. It never counts
+  // files being evicted (`hydrating_count` no longer does either), and an idle
+  // On-Demand folder's remote placeholders are not requests. Fetch availability
+  // matters only while this is non-zero. Additive; 0 on a daemon that predates it.
+  uint64 requested_content_count = 41;
+  // The two product dimensions for this link, derived by the daemon from the
+  // facts above and the peer list (never recomputed by a client). Both are
+  // fail-safe: `UNSPECIFIED` (an older daemon) reads as `UNKNOWN`.
+  //
+  // Availability: can the exact content this link needs be fetched now.
+  // `availability_reachable_device_ids` / `availability_offline_device_ids`
+  // are the other devices recorded as full copies of this group, split by
+  // whether they are reachable right now (sorted, no duplicates).
+  ProductAvailability availability = 42;
+  repeated string availability_reachable_device_ids = 43;
+  repeated string availability_offline_device_ids = 44;
+  // Protection: if this device were lost now, is the data still elsewhere.
+  // `protection_device_ids` are the other devices recorded as holding a full
+  // copy when `protection` is `PROTECTED`, and the devices a confirmation is
+  // still awaited from when it is `PENDING`; empty otherwise.
+  DataProtection protection = 45;
+  repeated string protection_device_ids = 46;
+  // Seconds since the epoch at which a timed pause ends by itself; 0 when the
+  // link is not paused or the pause has no deadline.
+  int64 paused_until_unix = 47;
+}
+
+// See `LinkStatus.availability`. A link is `AVAILABLE` only when the exact
+// content it needs can be fetched now; every other value says why not.
+enum ProductAvailability {
+  PRODUCT_AVAILABILITY_UNSPECIFIED = 0;
+  PRODUCT_AVAILABILITY_AVAILABLE = 1;
+  // A device recorded as holding the content is offline or unreachable.
+  PRODUCT_AVAILABILITY_WAITING_FOR_PEER = 2;
+  // Devices are reachable but none is known to hold the exact version.
+  PRODUCT_AVAILABILITY_WAITING_FOR_EXACT_CONTENT = 3;
+  // Value 4 was UPDATE_REQUIRED, removed until a real version-incompatibility signal exists.
+  reserved 4;
+  reserved "PRODUCT_AVAILABILITY_UPDATE_REQUIRED";
+  PRODUCT_AVAILABILITY_UNKNOWN = 5;
+}
+
+// See `LinkStatus.protection`. Independent of availability: a folder can be
+// waiting for a device and still be protected. `UNKNOWN` means the evidence
+// is insufficient and is never read as `PROTECTED`.
+enum DataProtection {
+  DATA_PROTECTION_UNSPECIFIED = 0;
+  DATA_PROTECTION_PROTECTED = 1;
+  // Confirmed: only this device holds the current content.
+  DATA_PROTECTION_AT_RISK = 2;
+  // A copy is being made or a confirmation is still awaited.
+  DATA_PROTECTION_PENDING = 3;
+  DATA_PROTECTION_UNKNOWN = 4;
 }
 
 // See `LinkStatus.local_storage_state`'s own doc comment.
@@ -500,6 +561,17 @@ message ListLinksResponse {
 
 message PauseRequest {
   string local_path = 1;
+  // How long the pause lasts; unspecified means until the user resumes.
+  PauseDuration duration = 2;
+}
+
+// A closed set of pause lengths; the daemon computes the deadline.
+enum PauseDuration {
+  PAUSE_DURATION_UNSPECIFIED = 0;
+  PAUSE_DURATION_THIRTY_MINUTES = 1;
+  PAUSE_DURATION_ONE_HOUR = 2;
+  // Until the next local midnight.
+  PAUSE_DURATION_UNTIL_TOMORROW = 3;
 }
 message PauseResponse {}
 
@@ -691,9 +763,80 @@ message InboxTransfer {
   repeated InboxFileSummary files = 3;
   uint64 total_size = 4;
   int64 offered_at_unix_nanos = 5;
-  // "pending" | "in_progress" | "completed" | "failed".
+  // "pending" | "in_progress" | "completed" | "failed" | "canceled".
   string status = 6;
 }
+
+// Stops an inbound transfer. Idempotent: one already canceled or completed
+// answers success; an unknown id is the usual error.
+message CancelTransferRequest {
+  string transfer_id = 1;
+}
+message CancelTransferResponse {}
+
+// Re-validates the sender's authorization, the manifest and the destination,
+// then resumes the transfer like `ReceiveTransferRequest`.
+message RetryTransferRequest {
+  string transfer_id = 1;
+}
+message RetryTransferResponse {
+  string destination_dir = 1;
+  repeated string files_received = 2;
+  uint64 bytes_received = 3;
+}
+
+// Automatic space management for provider folders: when on, and only while free disk space is
+// low, downloaded files that are safe to give back are removed from this device's disk.
+message SpaceManagementSettings {
+  bool enabled = 1;
+  reserved 2;
+  reserved "keep_days";
+}
+message GetSpaceManagementRequest {}
+message GetSpaceManagementResponse {
+  SpaceManagementSettings settings = 1;
+}
+// Stores the setting; the response is what was stored (after clamping).
+message SetSpaceManagementRequest {
+  SpaceManagementSettings settings = 1;
+}
+message SetSpaceManagementResponse {
+  SpaceManagementSettings settings = 1;
+}
+
+// Dry run: what automatic space management would do with each downloaded item if free space
+// were low now. Nothing is removed.
+message PreviewSpaceReclaimRequest {}
+enum SpaceReclaimVerdict {
+  SPACE_RECLAIM_VERDICT_UNSPECIFIED = 0;
+  // Would be given back now.
+  SPACE_RECLAIM_VERDICT_ELIGIBLE = 1;
+  // The user keeps it on this device.
+  SPACE_RECLAIM_VERDICT_PINNED = 2;
+  reserved 3;
+  // This folder never gives space back automatically.
+  SPACE_RECLAIM_VERDICT_UNSUPPORTED_ROOT = 4;
+  // No other device can confirm it holds this version right now.
+  SPACE_RECLAIM_VERDICT_CUSTODY_UNAVAILABLE = 5;
+  // Another operation, a program or the file system holds the item at the moment.
+  SPACE_RECLAIM_VERDICT_BUSY = 6;
+  // The content is new, being updated or not confirmed by the system yet.
+  SPACE_RECLAIM_VERDICT_CHANGED = 7;
+  // Something makes freeing unsafe or unprovable.
+  SPACE_RECLAIM_VERDICT_SAFETY_BLOCKED = 8;
+}
+message SpaceReclaimPreviewItem {
+  string group_id = 1;
+  // Path relative to the folder.
+  string path = 2;
+  SpaceReclaimVerdict verdict = 3;
+}
+message PreviewSpaceReclaimResponse {
+  repeated SpaceReclaimPreviewItem items = 1;
+  // Folders that could not be read; their items are missing from `items`.
+  uint32 unreadable_roots = 2;
+}
+
 message ListInboxResponse {
   repeated InboxTransfer transfers = 1;
 }
@@ -745,7 +888,9 @@ message StatusResponse {
   string update_state = 8;
   string update_available_version = 9;
   bool update_mandatory = 10;
-  bool update_waiting_for_safe_point = 11;
+  // Field 11 was `bool update_waiting_for_safe_point`, removed: it was always false.
+  reserved 11;
+  reserved "update_waiting_for_safe_point";
   string update_last_error_category = 12;
   string update_channel = 13;
   string update_install_source = 14;
@@ -817,6 +962,8 @@ message ProviderRemovalStatus {
   string display_name = 2;
   bool removed = 3;    // false: the app has not yet confirmed the removal
   string preserved_location = 4;
+  // The removals could not be read: this one row says so, in place of the list.
+  bool unreadable = 5;
 }
 
 message ProviderRootStatus {
@@ -870,11 +1017,15 @@ message PreservedSummary {
   // The size above which the total is worth a warning, and whether it is exceeded.
   uint64 warn_bytes = 6;
   bool warn = 7;
+  // Originals a rebootstrap kept under a claim instead of unlinking (see `RetainedOriginal`,
+  // whose listing carries the sizes).
+  uint32 retained_originals = 8;
 }
 
 // One thing a rebootstrap kept for the user: a version another device wrote that the
 // replacing state does not contain (`remote_only`, or `beyond_closure_cutoff` when it is above
-// the cutoff at which that state closes its author), or this device's own changes that were
+// the cutoff at which that state closes its author), an edit made during the freeze to a path
+// whose original the install removed (`late_edit`), or this device's own changes that were
 // not replayed (`own_unit`). Nothing is ever deleted except by an explicit discard.
 message PreservedItem {
   string kind = 1;
@@ -891,6 +1042,40 @@ message PreservedItem {
   uint32 blocks_total = 10;
   string recovery_id = 11;
   bool originals_quarantined = 12;
+}
+
+// An original a rebootstrap kept instead of unlinking because no writer exclusion could be
+// proved. Nothing removes it except `release_retained_originals`, and only under a proven
+// exclusion while it still has the bytes recorded for it.
+message RetainedOriginal {
+  string group_id = 1;
+  bool group_removed = 2;
+  // The path the original had in the folder.
+  string path = 3;
+  string recovery_id = 4;
+  // The bytes it takes; 0 when `reachable` is false.
+  uint64 size = 5;
+  // Whether the folder is watched, so the kept object can be reached.
+  bool reachable = 6;
+}
+message ListRetainedOriginalsRequest {}
+message ListRetainedOriginalsResponse {
+  repeated RetainedOriginal items = 1;
+}
+// Tries to release the retained originals of one group; what cannot be proved safe stays.
+message ReleaseRetainedOriginalsRequest {
+  string group_id = 1;
+}
+message RetainedRelease {
+  string path = 1;
+  // "removed" | "gone" | "still_retained" | "saved_then_removed" | "saved_still_retained" |
+  // "left".
+  string outcome = 2;
+  // Why an original was "left".
+  string detail = 3;
+}
+message ReleaseRetainedOriginalsResponse {
+  repeated RetainedRelease releases = 1;
 }
 
 message ListPreservedRequest {}
@@ -1172,6 +1357,10 @@ message EvictResponse {
   bool dehydrated = 1;
   uint64 blocks_reclaimed = 2;
   uint64 bytes_reclaimed = 3;
+  // Set when the daemon kept its cached blocks of the file although the file was evicted (or
+  // would have been): a stable machine code naming why, e.g. "custody_not_acquired". Empty when
+  // nothing was kept back or the daemon does not say.
+  string retained_reason = 4;
 }
 
 // One file's current materialization state -- the
@@ -1198,6 +1387,45 @@ message MaterializationStatusResponse {
   reserved "pinned";
   // Unset when `known` is false.
   LocalState local_state = 4;
+  // The retention policy in force at the path, apart from what is stored there. Set for any
+  // path under a linked folder, `known` or not: it is a standing choice, not an observation.
+  RetentionState retention = 5;
+}
+
+// Whether local space for a path may be reclaimed. Local to this device: it is never sent to
+// peers and changes nothing about what the folder's history says or what any device keeps.
+enum RetentionPolicy {
+  RETENTION_POLICY_RECLAIMABLE = 0;
+  // "Always keep on this device".
+  RETENTION_POLICY_PINNED = 1;
+}
+
+message RetentionState {
+  RetentionPolicy policy = 1;
+  // The pin was set at exactly this path. When `policy` is PINNED and this is false, the pin is
+  // inherited from a folder above, and only unpinning that folder lifts it.
+  bool explicit = 2;
+}
+
+// Marks a file or folder "always keep on this device" and fetches what is not here yet through
+// the ordinary download path. A folder's pin covers everything beneath it.
+message PinItemRequest {
+  string absolute_path = 1;
+}
+message PinItemResponse {
+  RetentionState retention = 1;
+  // Why the content could not be downloaded just now; empty when it was (or needed no download).
+  // The pin stands either way.
+  string download_error = 2;
+}
+
+// Stops keeping a file or folder: content is NOT removed, it only becomes eligible to be freed.
+message UnpinItemRequest {
+  string absolute_path = 1;
+}
+message UnpinItemResponse {
+  // The policy in force afterwards: still PINNED (and not explicit) when a folder above is.
+  RetentionState retention = 1;
 }
 
 // What stands on this device for one path, as two independent facts plus the
@@ -1444,15 +1672,18 @@ message UpdateStatusResponse {
   // or a manifest kill-switch entry — the "Rollout holdback
   // prevents install" / kill-switch scenarios.
   string holdback_reason = 9;
-  bool waiting_for_safe_point = 10;
+  // Field 10 was `bool waiting_for_safe_point`, removed: it was always false.
+  reserved 10;
+  reserved "waiting_for_safe_point";
   // Empty when there is no recorded failure. A short, stable category
   // (never the raw error text) — mirrors `CliError::report_category`'s
   // "coarse, stable category label" convention.
   string last_error_category = 11;
   string last_error_message = 12;
   bool automatic_checks_enabled = 13;
-  // Always "manual" in v1.
-  string automatic_install_mode = 14;
+  // Field 14 was `string automatic_install_mode` (always "manual"), removed.
+  reserved 14;
+  reserved "automatic_install_mode";
 }
 
 // `yadorilink update check` triggers an immediate manifest
@@ -1473,24 +1704,31 @@ message UpdateInstallRequest {}
 message UpdateInstallResponse {
   // Always "manual_download".
   string outcome = 1;
-  // The download page URL, or the package-manager command for a
-  // package-managed install.
+  // The sentence to show: names the download page, or gives the
+  // package-manager steps for a package-managed install. Display text
+  // only; clients never extract a link from it.
   string guidance = 2;
+  // The official release page to open, set only for installs that are
+  // not package-managed. Empty for a package-managed install, whose
+  // steps are `guidance`.
+  string download_url = 3;
 }
 
-// `yadorilink update config --checks <on|off> --install <automatic|manual>`
+// `yadorilink update config --checks <on|off>`
 // Absent (`None`) means "leave this setting unchanged" — the same
 // "absent = no change" discipline the other optional-field commands use,
-// expressed here as two independent optional booleans/strings so a single
-// call can change either, both, or neither setting.
+// expressed here as an optional boolean.
 message UpdateConfigRequest {
   optional bool automatic_checks_enabled = 1;
-  // "automatic" | "manual".
-  optional string automatic_install_mode = 2;
+  // Field 2 was `optional string automatic_install_mode`, removed: updates are always installed manually.
+  reserved 2;
+  reserved "automatic_install_mode";
 }
 message UpdateConfigResponse {
   bool automatic_checks_enabled = 1;
-  string automatic_install_mode = 2;
+  // Field 2 was `string automatic_install_mode` (always "manual"), removed.
+  reserved 2;
+  reserved "automatic_install_mode";
 }
 
 // Connection Operations: a
@@ -2125,6 +2363,17 @@ message DaemonControlRequest {
     RetryPreservedRequest retry_preserved = 78;
     // Provider publications waiting on the OS.
     ListProviderPendingRequest list_provider_pending = 79;
+    // Originals a rebootstrap kept under a claim: list them, try to release them.
+    ListRetainedOriginalsRequest list_retained_originals = 80;
+    ReleaseRetainedOriginalsRequest release_retained_originals = 81;
+    // Local retention ("always keep on this device"). `pin`/`unpin` and 9/10 are reserved.
+    PinItemRequest pin_item = 82;
+    UnpinItemRequest unpin_item = 83;
+    CancelTransferRequest cancel_transfer = 84;
+    RetryTransferRequest retry_transfer = 85;
+    GetSpaceManagementRequest get_space_management = 86;
+    SetSpaceManagementRequest set_space_management = 87;
+    PreviewSpaceReclaimRequest preview_space_reclaim = 88;
   }
   // Field numbers 24-26 were the directional-mode requests (set_mode,
   // override, revert); 40-43 were the directional folder-operation requests
@@ -2247,6 +2496,15 @@ message DaemonControlResponse {
     DiscardPreservedResponse discard_preserved = 77;
     RetryPreservedResponse retry_preserved = 78;
     ListProviderPendingResponse list_provider_pending = 79;
+    ListRetainedOriginalsResponse list_retained_originals = 80;
+    ReleaseRetainedOriginalsResponse release_retained_originals = 81;
+    PinItemResponse pin_item = 82;
+    UnpinItemResponse unpin_item = 83;
+    CancelTransferResponse cancel_transfer = 84;
+    RetryTransferResponse retry_transfer = 85;
+    GetSpaceManagementResponse get_space_management = 86;
+    SetSpaceManagementResponse set_space_management = 87;
+    PreviewSpaceReclaimResponse preview_space_reclaim = 88;
   }
   // Field numbers 25-27 were the directional-mode responses (set_mode,
   // override, revert); 40-43 were the directional folder-operation responses

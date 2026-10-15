@@ -698,3 +698,137 @@ async fn a_netmap_push_costs_one_write_per_peer_and_a_repeat_push_costs_none() {
         "a peer whose authorization changed must be written the moment it changes"
     );
 }
+
+// ---- custody leases of a requester the plane no longer lists ----
+
+fn lease_request(
+    group: &str,
+    requester: &str,
+) -> yadorilink_sync_sqlite::remote_custody_lease::CustodyLeaseRequest {
+    yadorilink_sync_sqlite::remote_custody_lease::CustodyLeaseRequest {
+        group_id: group.into(),
+        requester_device_id: requester.into(),
+        path: "a.bin".into(),
+        version_hash: [9; 32],
+        blocks: vec!["aa".into()],
+        membership_generation: 1,
+        attempt_token: [4; 16],
+        now_unix: 1,
+    }
+}
+
+/// Links the groups as this device's eager folders, so it is their full
+/// replica and its leases have standing.
+fn link_eager(state: &DaemonState, groups: &[&str]) {
+    for group in groups {
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link(&format!("/links/{group}"), group)
+            .unwrap();
+    }
+}
+
+fn lease_holders(state: &DaemonState) -> Vec<String> {
+    let mut holders: Vec<String> = state
+        .replica_coordinator
+        .remote_custody_lease_repository()
+        .list_active()
+        .unwrap()
+        .into_iter()
+        .map(|lease| format!("{}/{}", lease.group_id, lease.requester_device_id))
+        .collect();
+    holders.sort();
+    holders
+}
+
+/// A requester revoked from the group (the plane's next frame no longer lists
+/// it) cannot reach this device to release its custody lease, so the frame
+/// that drops it drops the lease -- and only that requester's.
+#[tokio::test]
+async fn a_frame_that_no_longer_lists_a_requester_for_a_group_drops_its_custody_leases() {
+    let device = Device::new();
+    let state = device.start();
+    link_eager(&state, &[GROUP, SECOND_GROUP]);
+    let leases = state.replica_coordinator.remote_custody_lease_repository();
+    for (group, requester) in
+        [(GROUP, REMOVED_PEER), (GROUP, KEPT_PEER), (SECOND_GROUP, REMOVED_PEER)]
+    {
+        leases.acquire(&lease_request(group, requester)).unwrap();
+    }
+    let diff_state = NetmapDiffState::seeded_from_current_authorization(&state);
+
+    // REMOVED_PEER is still in the netmap, but no longer shares GROUP.
+    let frame: NetmapSnapshot = HashMap::from([
+        (REMOVED_PEER.to_string(), groups(SECOND_GROUP)),
+        (KEPT_PEER.to_string(), groups(GROUP)),
+    ]);
+    apply_frame(&state, &diff_state, 1, frame);
+
+    assert_eq!(
+        lease_holders(&state),
+        vec![format!("{GROUP}/{KEPT_PEER}"), format!("{SECOND_GROUP}/{REMOVED_PEER}")]
+    );
+
+    // And a device removed altogether takes the rest of its leases with it.
+    apply_frame(&state, &diff_state, 2, netmap(&[KEPT_PEER]));
+    assert_eq!(lease_holders(&state), vec![format!("{GROUP}/{KEPT_PEER}")]);
+}
+
+/// The run's first frame, older than the authorization cache, may narrow a
+/// peer it names but may not act on a peer it is merely silent about: that
+/// peer's lease stays until a frame that outranks the cache says it is gone.
+#[tokio::test]
+async fn a_refused_first_frame_does_not_drop_the_leases_of_a_requester_it_is_silent_about() {
+    let device = Device::new();
+    {
+        let first = device.start();
+        first.authority.note_applied_snapshot_generation(CACHE_SNAPSHOT_GENERATION);
+        authorize(&first, REMOVED_PEER, REMOVED_PEER_KEY);
+    }
+    let restarted = device.start();
+    link_eager(&restarted, &[GROUP]);
+    restarted
+        .replica_coordinator
+        .remote_custody_lease_repository()
+        .acquire(&lease_request(GROUP, REMOVED_PEER))
+        .unwrap();
+    let diff_state = NetmapDiffState::seeded_from_current_authorization(&restarted);
+
+    apply_frame(&restarted, &diff_state, CACHE_SNAPSHOT_GENERATION - 1, netmap(&[KEPT_PEER]));
+    assert_eq!(lease_holders(&restarted), vec![format!("{GROUP}/{REMOVED_PEER}")]);
+
+    apply_frame(&restarted, &diff_state, CACHE_SNAPSHOT_GENERATION + 1, netmap(&[KEPT_PEER]));
+    assert!(lease_holders(&restarted).is_empty());
+}
+
+/// The same frame that lists the requester without the group (a narrowing,
+/// which the session-level revocation does apply from a stale frame) must not
+/// delete its lease: the frame may predate the group being added, and a lease
+/// deleted on it is not restored by the next frame. A frame that outranks the
+/// cache does delete it.
+#[tokio::test]
+async fn a_refused_first_frame_does_not_drop_the_leases_of_a_requester_it_narrows() {
+    let device = Device::new();
+    {
+        let first = device.start();
+        first.authority.note_applied_snapshot_generation(CACHE_SNAPSHOT_GENERATION);
+        authorize_for_groups(&first, REMOVED_PEER, REMOVED_PEER_KEY, &[GROUP, SECOND_GROUP]);
+    }
+    let restarted = device.start();
+    link_eager(&restarted, &[GROUP]);
+    restarted
+        .replica_coordinator
+        .remote_custody_lease_repository()
+        .acquire(&lease_request(GROUP, REMOVED_PEER))
+        .unwrap();
+    let diff_state = NetmapDiffState::seeded_from_current_authorization(&restarted);
+    let narrowing =
+        || -> NetmapSnapshot { HashMap::from([(REMOVED_PEER.to_string(), groups(SECOND_GROUP))]) };
+
+    apply_frame(&restarted, &diff_state, CACHE_SNAPSHOT_GENERATION - 1, narrowing());
+    assert_eq!(lease_holders(&restarted), vec![format!("{GROUP}/{REMOVED_PEER}")]);
+
+    apply_frame(&restarted, &diff_state, CACHE_SNAPSHOT_GENERATION + 1, narrowing());
+    assert!(lease_holders(&restarted).is_empty());
+}

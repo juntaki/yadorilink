@@ -4,8 +4,8 @@ use yadorilink_replica_domain::session_state::{MaterializationPolicy, RoleLossOp
 
 use super::model::{HandoffCommitResult, RoleLossCommitOutcome};
 use super::ports::{
-    HandoffReadinessPort, LinkRuntimePort, OnDemandCapabilityPort, ReplicaRoleRepository,
-    RoleLossCoordination, RoleLossJournal,
+    CustodyLeaseHandoffPort, HandoffReadinessPort, LinkRuntimePort, OnDemandCapabilityPort,
+    ReplicaRoleRepository, RoleLossCoordination, RoleLossJournal,
 };
 
 /// Past this many compensation attempts for the same role-loss operation,
@@ -42,6 +42,7 @@ pub(crate) struct ReplicaRoleService {
     coordination: Arc<dyn RoleLossCoordination>,
     runtime: Arc<dyn LinkRuntimePort>,
     on_demand_capability: Arc<dyn OnDemandCapabilityPort>,
+    custody_leases: Arc<dyn CustodyLeaseHandoffPort>,
 }
 
 #[derive(Debug)]
@@ -80,6 +81,10 @@ pub(crate) struct UnlinkOutcome {
 }
 
 impl ReplicaRoleService {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one port per independent reason to vary; the composition root is the only caller"
+    )]
     pub(crate) fn new(
         device_id: String,
         repository: Arc<dyn ReplicaRoleRepository>,
@@ -88,6 +93,7 @@ impl ReplicaRoleService {
         coordination: Arc<dyn RoleLossCoordination>,
         runtime: Arc<dyn LinkRuntimePort>,
         on_demand_capability: Arc<dyn OnDemandCapabilityPort>,
+        custody_leases: Arc<dyn CustodyLeaseHandoffPort>,
     ) -> Self {
         Self {
             device_id,
@@ -97,6 +103,7 @@ impl ReplicaRoleService {
             coordination,
             runtime,
             on_demand_capability,
+            custody_leases,
         }
     }
 
@@ -256,6 +263,11 @@ impl ReplicaRoleService {
             };
             let digest_at_check = proof.root_digest();
             let ready_peer_device_id = proof.into_peer_device_id();
+            // Custody leases this device holds for on-demand devices are the
+            // only copy of versions those devices have dropped. They move to
+            // another full replica before the role can go, and the group takes
+            // no new one until this call returns.
+            let _custody_closed = self.custody_leases.hand_off_leases(group_id).await?;
             // Same role-loss shape as `ensure_unlink_keeps_a_full_replica`'s
             // unlink path (this device giving up its own eager status) --
             // reuse its exact wiring: a real confirmed peer means a
@@ -897,6 +909,26 @@ impl ReplicaRoleService {
         ))
     }
 
+    /// Moves the custody leases off an eager link that is about to be
+    /// unlinked. `None` for a link that is not eager (it holds none) or is not
+    /// there.
+    async fn hand_off_custody_leases_for_unlink(
+        &self,
+        local_path: &str,
+    ) -> Result<Option<Box<dyn Send>>, String> {
+        let links = self
+            .repository
+            .list_links()
+            .map_err(|e| format!("could not read the local link table: {e}"))?;
+        let Some(link) = links.iter().find(|l| l.key() == local_path) else {
+            return Ok(None);
+        };
+        if link.materialization_policy != MaterializationPolicy::Eager {
+            return Ok(None);
+        }
+        self.custody_leases.hand_off_leases(&link.group_id).await.map(Some)
+    }
+
     /// Durability gate, atomic link removal (or normal removal), and the
     /// legacy duplicate-root recovery restart of a surviving link -- the
     /// exact sequence `control_socket`'s `Unlink` handler used to run
@@ -934,6 +966,21 @@ impl ReplicaRoleService {
         // tombstones files that only existed under the departed root.
         let ambiguity_recovery =
             self.prepare_ambiguity_recovery(local_path).map_err(|e| e.to_string())?;
+        // An eager link's custody leases (the only copy of versions on-demand
+        // devices dropped) move to another full replica before the link can
+        // go; a forced unlink goes ahead without them and says so.
+        let _custody_closed = match self.hand_off_custody_leases_for_unlink(local_path).await {
+            Ok(closed) => closed,
+            Err(message) if force => {
+                tracing::warn!(
+                    local_path,
+                    %message,
+                    "forced unlink proceeding without handing off the custody leases this device holds"
+                );
+                None
+            }
+            Err(message) => return Err(message),
+        };
         match self.ensure_unlink_keeps_a_full_replica(local_path, force).await {
             Ok(commit) => {
                 self.runtime.stop_link_watch(local_path).await;

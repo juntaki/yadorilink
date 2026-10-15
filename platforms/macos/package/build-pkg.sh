@@ -16,9 +16,14 @@
 #
 # SIGNING: release builds must set YADORILINK_RELEASE_BUILD=1 and provide
 # YADORILINK_APP_SIGN_IDENTITY (a Developer ID Application identity, used to
-# codesign the yadorilink/yadorilink-daemon Mach-O
-# binaries directly -- YadoriLink.app is signed separately by
-# xcodebuild's own automatic signing) and YADORILINK_PKG_SIGN_IDENTITY (a
+# codesign the yadorilink/yadorilink-daemon Mach-O binaries directly and, via
+# xcodebuild, YadoriLink.app and its two extensions: Manual signing, secure
+# timestamp, no Xcode account; see xcode-signing-args.sh), the three
+# provisioning profiles (host app, FinderSync, File Provider: all claim the App
+# Group) as YADORILINK_HOST_PROFILE_FILE, YADORILINK_FINDERSYNC_PROFILE_FILE and
+# YADORILINK_FILEPROVIDER_PROFILE_FILE (installed .provisionprofile files, which
+# ensure-macos-profiles.py can produce), and
+# YADORILINK_PKG_SIGN_IDENTITY (a
 # Developer ID Installer identity, used to sign the assembled .pkg). Set
 # YADORILINK_NOTARY_PROFILE to an xcrun notarytool keychain profile, OR all
 # three of YADORILINK_NOTARY_KEY / _KEY_ID / _ISSUER (an App Store Connect
@@ -59,6 +64,20 @@ PKG_COMPONENT_ID="com.yadorilink.installer.component"
 PKG_VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | sed -E 's/.*"([^"]*)".*/\1/')"
 
 APP_NAME="YadoriLink.app"
+
+# Record which commit and which bytes this package is, next to the package, so
+# a later verification run can bind its results to exactly this build.
+write_provenance() {
+    local pkg="$1" digest commit
+    if [ "${2:-}" = "release" ] && [ -n "$(git -C "$(dirname "$0")" status --porcelain --untracked-files=no)" ]; then
+        echo "refusing to record release provenance: working tree has uncommitted changes" >&2
+        exit 1
+    fi
+    digest="$(shasum -a 256 "$pkg" | cut -d' ' -f1)"
+    commit="$(git -C "$(dirname "$0")" rev-parse HEAD)"
+    printf '{"schema": "yadorilink-release-provenance/1", "artifact_sha256": "%s", "product_sha": "%s"}\n' \
+        "$digest" "$commit" > "$pkg.provenance.json"
+}
 
 log() { echo "== $* =="; }
 
@@ -109,6 +128,26 @@ if [ "$RELEASE_BUILD" = "1" ]; then
     fi
 fi
 
+# Release profiles: decoded and checked before the long builds start. Skipped
+# only for the explicit Xcode-managed-profiles experiment, whose embedded
+# profiles are checked after the build instead (see below).
+VALIDATE_PROFILES="$SCRIPT_DIR/validate-macos-profiles.py"
+if [ "$RELEASE_BUILD" = "1" ] && [ "${YADORILINK_XCODE_PROFILE_EXPERIMENT:-0}" != "1" ]; then
+    for need in YADORILINK_HOST_PROFILE_FILE YADORILINK_FINDERSYNC_PROFILE_FILE YADORILINK_FILEPROVIDER_PROFILE_FILE; do
+        if [ -z "${!need:-}" ]; then
+            echo "YADORILINK_RELEASE_BUILD=1 requires $need (an installed Developer ID .provisionprofile)."
+            exit 1
+        fi
+    done
+    YADORILINK_HOST_PROFILE="$(python3 "$VALIDATE_PROFILES" profile \
+        "$YADORILINK_HOST_PROFILE_FILE" --bundle-id com.juntaki.yadorilink --print-uuid)" || exit 1
+    YADORILINK_FINDERSYNC_PROFILE="$(python3 "$VALIDATE_PROFILES" profile \
+        "$YADORILINK_FINDERSYNC_PROFILE_FILE" --bundle-id com.juntaki.yadorilink.FinderSync --print-uuid)" || exit 1
+    YADORILINK_FILEPROVIDER_PROFILE="$(python3 "$VALIDATE_PROFILES" profile \
+        "$YADORILINK_FILEPROVIDER_PROFILE_FILE" --bundle-id com.juntaki.yadorilink.FileProvider --print-uuid)" || exit 1
+    export YADORILINK_HOST_PROFILE YADORILINK_FINDERSYNC_PROFILE YADORILINK_FILEPROVIDER_PROFILE
+fi
+
 XCODEGEN_BIN="$(command -v xcodegen || true)"
 if [ -z "$XCODEGEN_BIN" ] && [ -x "$HOME/xcodegen-bin/xcodegen" ]; then
     XCODEGEN_BIN="$HOME/xcodegen-bin/xcodegen"
@@ -151,18 +190,29 @@ test -x "$YADORILINK_DAEMON_BIN" || { echo "missing $YADORILINK_DAEMON_BIN"; exi
 log "xcodegen generate"
 ( cd "$XCODE_PROJ_DIR" && "$XCODEGEN_BIN" generate )
 
-log "xcodebuild (Release, real signing identity, -allowProvisioningUpdates)"
+# shellcheck source=xcode-signing-args.sh
+source "$SCRIPT_DIR/xcode-signing-args.sh"
+xcode_signing_args || exit 1
+
+log "xcodebuild (Release)"
 rm -rf "$XCODE_BUILD_DIR"
 ( cd "$XCODE_PROJ_DIR" && xcodebuild \
     -project YadoriLinkFinderSync.xcodeproj \
     -scheme YadoriLink \
     -configuration Release \
     -derivedDataPath "$XCODE_BUILD_DIR" \
-    -allowProvisioningUpdates \
+    "${XCODE_SIGNING_ARGS[@]}" \
     build )
 
 APP_PATH="$XCODE_BUILD_DIR/Build/Products/Release/$APP_NAME"
 test -d "$APP_PATH" || { echo "missing $APP_PATH"; exit 1; }
+
+# Release: the host app and each extension embed a valid profile for their own
+# bundle id, and the App Group each signs is one that profile authorizes.
+if [ "$RELEASE_BUILD" = "1" ]; then
+    log "validating the built app's provisioning profiles"
+    python3 "$VALIDATE_PROFILES" built-app "$APP_PATH" || exit 1
+fi
 
 log "verifying .app signature"
 codesign --verify --deep --strict "$APP_PATH"
@@ -293,9 +343,11 @@ if [ -n "$PKG_SIGN_IDENTITY" ]; then
     pkgutil --check-signature "$SIGNED_PKG"
     spctl -a -vvv -t install "$SIGNED_PKG"
     shasum -a 256 "$SIGNED_PKG" > "$SIGNED_PKG.sha256"
+    write_provenance "$SIGNED_PKG" release
     log "Done: $SIGNED_PKG"
 else
     shasum -a 256 "$UNSIGNED_PKG" > "$UNSIGNED_PKG.sha256"
+    write_provenance "$UNSIGNED_PKG"
     log "Done: $UNSIGNED_PKG"
     echo "This .pkg is UNSIGNED/unnotarized — publish and verify $UNSIGNED_PKG.sha256 with it."
 fi

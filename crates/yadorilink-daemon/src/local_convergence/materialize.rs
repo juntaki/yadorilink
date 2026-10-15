@@ -92,6 +92,39 @@ impl super::LocalConvergenceExecutor {
         satisfied: Option<&BlockRequirement>,
         claim: Option<super::obligation_claims::PathClaim<'_>>,
     ) -> Result<LocalMaterializeOutcome, PeerSessionError> {
+        let outcome = self
+            .materialize_local_inner(
+                group_id,
+                payload,
+                policy,
+                origin_device_id,
+                authoring,
+                satisfied,
+                claim,
+            )
+            .await;
+        // A newer version (or a deletion) is now this path's current record:
+        // a custody lease this device holds for the version it replaced no
+        // longer backs anything. The reconciler judges that; this only wakes
+        // it, and not for a call that changed nothing (blocks still needed, or
+        // an error).
+        if matches!(outcome, Ok(LocalMaterializeOutcome::Concluded(_))) {
+            self.state.nudge_custody_hold_reconciler();
+        }
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn materialize_local_inner(
+        &self,
+        group_id: &str,
+        payload: &MaterializationPayload,
+        policy: MaterializationPolicy,
+        origin_device_id: &str,
+        authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
+        satisfied: Option<&BlockRequirement>,
+        claim: Option<super::obligation_claims::PathClaim<'_>>,
+    ) -> Result<LocalMaterializeOutcome, PeerSessionError> {
         let root_commit_authority = self.root_lease_for(group_id)?;
         let root_commit_authority_op = root_commit_authority.begin_operation()?;
         let root_commit_permit = root_commit_authority_op.permit();

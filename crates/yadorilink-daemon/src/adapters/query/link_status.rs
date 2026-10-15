@@ -126,8 +126,10 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
             let durability_status = state.group_durability_status(&link.group_id);
             let durability_evidence = state.group_durability_evidence(&link.group_id);
             let durability_check_pending = state.group_durability_check_pending(&link.group_id);
-            let fully_hydrated_locally =
-                materialization.placeholder == 0 && materialization.hydrating == 0;
+            let fully_hydrated_locally = materialization.placeholder == 0
+                && materialization.hydrating == 0
+                && materialization.evicting == 0;
+            let requested_content_count = requested_content_count(state, &link, &materialization);
             let local_storage_state = match link.materialization_policy {
                 yadorilink_replica_domain::session_state::MaterializationPolicy::Eager => {
                     if fully_hydrated_locally {
@@ -194,6 +196,8 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
                     .as_deref()
                         != Some(stored.as_str())
                 });
+            let stranded_directory_count =
+                state.replica_coordinator.temp_ledger(&link.group_id).standing_stranded_count()?;
             let provider = match &link.location {
                 yadorilink_replica_domain::session_state::LinkLocation::Provider {
                     root_id,
@@ -215,6 +219,11 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
                 local_path: link.key().to_string(),
                 group_id: link.group_id.clone(),
                 paused: link.paused,
+                paused_until_unix: state
+                    .replica_coordinator
+                    .link_repository()
+                    .paused_until(link.key())?
+                    .unwrap_or(0),
                 conflict_count,
                 conflict_note: if (conflict_count > 0 || conflicts_pending > 0)
                     && !yadorilink_sync_sqlite::displacement_guard::destructive_step_durable(
@@ -231,8 +240,10 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
                 hydrated_count: materialization.hydrated,
                 placeholder_count: materialization.placeholder,
                 hydrating_count: materialization.hydrating,
+                requested_content_count,
                 held_files,
                 skipped_symlink_count,
+                stranded_directory_count,
                 degraded,
                 transfer,
                 durability_status,
@@ -315,3 +326,23 @@ mod tests;
 /// any other connected route, but no scenario below pins a relay row yet.
 #[cfg(test)]
 mod durability_acceptance_matrix;
+
+/// `LinkStatus.requested_content_count`: requests, not states. Fetches in flight and opens queued
+/// for a slot (the same fetch once it has a `Hydrating` row, so the larger of the two), plus a
+/// folder-backed Eager link's unmaterialized files (it asks for all of them). A provider root's
+/// Eager downloads are tracked by its own status (the OS holds the content, not these rows), and
+/// a paused link requests nothing new. Eviction is never a request.
+fn requested_content_count(
+    state: &DaemonState,
+    link: &yadorilink_replica_domain::session_state::FolderLink,
+    materialization: &yadorilink_sync_sqlite::MaterializationCounts,
+) -> u64 {
+    use yadorilink_replica_domain::session_state::{LinkLocation, MaterializationPolicy};
+    let is_provider = matches!(&link.location, LinkLocation::Provider { .. });
+    let eager_wanted = match link.materialization_policy {
+        MaterializationPolicy::Eager if !is_provider && !link.paused => materialization.placeholder,
+        _ => 0,
+    };
+    eager_wanted
+        .saturating_add(materialization.hydrating.max(state.requested_opens.count(&link.group_id)))
+}

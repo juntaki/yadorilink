@@ -499,12 +499,22 @@ fn a_stream_recreating_backend_watches_the_root_once_recursively() {
     .unwrap();
     assert_eq!(watcher.watched, vec![root.clone(), root.join("a"), root.join("a/b")]);
     assert!(watcher.modes.iter().all(|mode| *mode == RecursiveMode::NonRecursive));
+}
 
-    assert_eq!(
-        ROOT_WATCH == RootWatch::Recursive,
-        REGISTRATION_RECREATES_STREAM,
-        "the root is watched recursively exactly where registration blinds the stream"
-    );
+/// Per-directory watches are wrong on FSEvents (blind window) and on
+/// Windows (an open handle on a descendant makes NTFS refuse to rename the
+/// directories above it, os error 5); only inotify-like backends take them.
+#[test]
+fn root_watch_policy_is_recursive_on_macos_and_windows() {
+    assert_eq!(root_watch_for(WatchBackend::FsEvents), RootWatch::Recursive);
+    assert_eq!(root_watch_for(WatchBackend::ReadDirectoryChanges), RootWatch::Recursive);
+    assert_eq!(root_watch_for(WatchBackend::Other), RootWatch::PerDirectory);
+    let expected = if cfg!(any(target_os = "macos", windows)) {
+        RootWatch::Recursive
+    } else {
+        RootWatch::PerDirectory
+    };
+    assert_eq!(ROOT_WATCH, expected);
 }
 
 /// Under a recursive root watch, only a directory not seen before has its
@@ -585,4 +595,23 @@ fn registration_retries_back_off_up_to_a_cap() {
     assert_eq!(registration_retry_delay(2), Duration::from_millis(200));
     assert_eq!(registration_retry_delay(3), Duration::from_millis(400));
     assert_eq!(registration_retry_delay(40), Duration::from_secs(30));
+}
+
+/// Renaming a directory that contains a subdirectory succeeds while the
+/// watcher runs, and the renamed tree is still watched. On Windows a
+/// per-directory watch held a handle on the subdirectory, so NTFS refused
+/// the rename with access denied (os error 5).
+#[tokio::test]
+async fn renaming_a_directory_with_subdirectories_succeeds_while_watching() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("outer/inner")).unwrap();
+    let mut watcher = watch_folder(&root).unwrap();
+
+    std::fs::rename(root.join("outer"), root.join("renamed"))
+        .expect("renaming a directory that has a subdirectory must not be blocked by the watcher");
+
+    let file_path = root.join("renamed/inner/after.txt");
+    std::fs::write(&file_path, b"x").unwrap();
+    recv_until(&mut watcher.events, &file_path, "the renamed tree is no longer watched").await;
 }

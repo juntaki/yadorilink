@@ -91,6 +91,31 @@ pub struct TopologyNode {
     /// "signature does not verify against the claimed device key" error
     /// in restart-convergence scenarios.
     signing_key: ed25519_dalek::SigningKey,
+    /// Frees the node's state once the test lets go of the node: see [`ReleasesCycles`].
+    _releases_cycles: ReleasesCycles,
+}
+
+/// Breaks the reference cycles a paired state forms with itself when it is dropped.
+///
+/// Registered sessions and the peer session driver reach back to their `DaemonState`, which
+/// would otherwise keep it, both databases and every descriptor they hold alive for the rest of
+/// the test binary; a binary whose tests each build several nodes then runs out of descriptors
+/// at the default limit. Dropping a node releases them, as a daemon's exit would.
+struct ReleasesCycles(Arc<DaemonState>);
+
+impl Drop for ReleasesCycles {
+    fn drop(&mut self) {
+        // A hook that captured the group's states reaches back to this one too.
+        self.0.set_rebootstrap_hook_for_test(None);
+        self.0.release_reference_cycles_for_tests();
+    }
+}
+
+impl TopologyNode {
+    /// The root directory of this node's block store.
+    pub fn store_root(&self) -> &std::path::Path {
+        self.store_dir.path()
+    }
 }
 
 pub fn new_node(device_id: &str) -> TopologyNode {
@@ -130,6 +155,7 @@ pub fn new_node(device_id: &str) -> TopologyNode {
     state.set_device_signing_key(signing_key.clone());
     TopologyNode {
         device_id: device_id.to_string(),
+        _releases_cycles: ReleasesCycles(state.clone()),
         state,
         root: tempfile::tempdir().unwrap(),
         signing_key,
@@ -257,6 +283,7 @@ pub async fn restart_node(node: TopologyNode) -> TopologyNode {
     }
     TopologyNode {
         device_id: node.device_id,
+        _releases_cycles: ReleasesCycles(state.clone()),
         state,
         root: node.root,
         store_dir: node.store_dir,

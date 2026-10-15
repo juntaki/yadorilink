@@ -148,7 +148,7 @@ pub(crate) fn compact_segment(
                     report.unreadable_blocks_dropped += 1;
                 }
                 Err(StorageError::ChecksumMismatch { .. } | StorageError::CorruptStore(_)) => {
-                    index.remove_blocks(&[*raw])?;
+                    index.remove_block_at(raw, location)?;
                     report.unreadable_blocks_dropped += 1;
                 }
                 Err(other) => return Err(other),
@@ -186,6 +186,8 @@ pub(crate) fn compact_segment(
 pub(crate) fn reclaim_retired_segments(
     root: &std::path::Path,
     index: &BlockIndex,
+    may_delete: impl Fn() -> Result<(), StorageError>,
+    remove: impl Fn(&std::path::Path) -> Result<std::io::Result<()>, StorageError>,
     mut evict_reader: impl FnMut(u64),
 ) -> Result<u64, StorageError> {
     let retired: Vec<u64> = index
@@ -196,9 +198,10 @@ pub(crate) fn reclaim_retired_segments(
         .collect();
     let mut removed = 0;
     for segment_id in retired {
+        may_delete()?;
         evict_reader(segment_id);
         let path = crate::segment_store::segment::segment_path(root, segment_id);
-        match crate::fs_ops::remove_path(&path) {
+        match remove(&path)? {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             // Still referenced by an open handle (Windows), or a transient

@@ -36,7 +36,6 @@ enum ActionKind {
     TrashRestore,
     VersionRestore,
     Hydrate,
-    Evict,
 }
 
 enum Event {
@@ -376,9 +375,7 @@ impl eframe::App for FolderStatusApp {
                                 self.trash_fetch_in_flight = true;
                                 spawn_trash_fetch(self.sink.clone(), self.local_path.clone())
                             }
-                            ActionKind::VersionRestore
-                            | ActionKind::Hydrate
-                            | ActionKind::Evict => {
+                            ActionKind::VersionRestore | ActionKind::Hydrate => {
                                 if let Some(path) = self.file_tools.absolute_path.clone() {
                                     self.file_tools.loading = true;
                                     spawn_file_tools_fetch(self.sink.clone(), path);
@@ -788,7 +785,7 @@ impl FolderStatusApp {
                         crate::actions::pick_file_in(&self.local_path)
                     } else if ui
                         .button("Choose a folder…")
-                        .on_hover_text("Download or evict a folder as a whole.")
+                        .on_hover_text("Download a folder as a whole.")
                         .clicked()
                     {
                         crate::actions::pick_folder_in(&self.local_path)
@@ -853,24 +850,6 @@ impl FolderStatusApp {
                                         .await
                                         .map(|()| "Hydrated.".to_string())
                                         .map_err(|e| e.to_string())
-                                });
-                            }
-                            if ui.add_enabled(!busy, egui::Button::new("Evict")).clicked() {
-                                self.action_in_flight = true;
-                                let path = absolute_path.clone();
-                                spawn_action(self.sink.clone(), ActionKind::Evict, async move {
-                                    crate::actions::evict_file(path)
-                                        .await
-                                        .map_err(|e| e.to_string())
-                                        .map(|dehydrated| {
-                                            if dehydrated {
-                                                "Evicted (converted to a placeholder).".to_string()
-                                            } else {
-                                                "Not evicted -- it may be busy or not fully \
-                                                 synced."
-                                                    .to_string()
-                                            }
-                                        })
                                 });
                             }
                         });

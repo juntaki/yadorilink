@@ -16,7 +16,6 @@ fn fresh_store_reports_defaults_without_writing_a_file() {
     let policy = store.load().unwrap();
     assert_eq!(policy.channel, "beta");
     assert!(policy.automatic_checks_enabled);
-    assert_eq!(policy.automatic_install_mode, AutoInstallMode::Manual);
     assert_eq!(policy.state, UpdateState::Idle);
     assert!(!dir.path().join("update_policy.json").exists());
 }

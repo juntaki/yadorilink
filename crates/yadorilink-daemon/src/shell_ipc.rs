@@ -26,7 +26,7 @@ use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
     ContextAction, ContextActionResponse, DomainEvidence, FolderFileEntry, HydrateResponse,
-    HydrationPolicy, ListFolderFilesResponse, ListProviderFoldersResponse,
+    HydrationPolicy, ListFolderFilesResponse, ListLinkedRootsResponse, ListProviderFoldersResponse,
     LocalState as ShellLocalState, LocalTransition as ShellLocalTransition, LocalWriteKind,
     LocalWriteResponse, ProviderFolder, ShellIpcMessage, StatusResponse,
 };
@@ -114,26 +114,39 @@ fn provider_folders(
 /// The domains the daemon wants removed: the roots with a requested removal intent.
 fn provider_removals(
     context: &ShellContext,
-) -> Vec<yadorilink_ipc_proto::shellipc::ProviderRemoval> {
-    context
-        .replica_coordinator
-        .provider_repository()
-        .removals()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|removal| removal.requested)
-        .filter_map(|removal| {
-            Some(yadorilink_ipc_proto::shellipc::ProviderRemoval {
-                root_id: hex::decode(&removal.root_id).ok()?,
-                display_name: removal.display_name,
-            })
-        })
-        .collect()
+) -> Result<Vec<yadorilink_ipc_proto::shellipc::ProviderRemoval>, crate::sync_error::SyncError> {
+    let mut removals = Vec::new();
+    for removal in context.replica_coordinator.provider_repository().removals()? {
+        if !removal.requested {
+            continue;
+        }
+        // A requested removal whose id is not hex is corrupt state, not a removal to skip.
+        let root_id = hex::decode(&removal.root_id).map_err(|_| {
+            crate::sync_error::SyncError::CorruptState("a provider removal id is not hex".into())
+        })?;
+        removals.push(yadorilink_ipc_proto::shellipc::ProviderRemoval {
+            root_id,
+            display_name: removal.display_name,
+        });
+    }
+    Ok(removals)
 }
 
 /// Persists one readiness evidence message for the root it names. An unknown root is
 /// logged and ignored; a write failure is logged (the evidence is simply not recorded,
 /// which can only keep a root not ready).
+/// Whether the daemon knows the root. A lookup that fails is logged and answers "no": the callers
+/// ignore what the host reported about a root rather than act on a root they could not confirm.
+fn root_is_known(repo: &yadorilink_sync_sqlite::provider::ProviderRepository, root: &str) -> bool {
+    match repo.group_of_root(root) {
+        Ok(group) => group.is_some(),
+        Err(error) => {
+            tracing::warn!(root_id = %root, %error, "could not look up the provider root; ignored");
+            false
+        }
+    }
+}
+
 fn record_provider_evidence(
     context: &ShellContext,
     root_id: &[u8],
@@ -272,11 +285,21 @@ async fn provider_channel_message(
             let repo = context.replica_coordinator.provider_repository();
             // Only the attached host's reports are evidence: any other connection on the
             // user-owned socket could claim anything. An unknown root is ignored too.
-            let known = repo.group_of_root(&root).ok().flatten().is_some();
+            let known = root_is_known(repo, &root);
             if known && context.provider_host.is_attached(host_tx) {
-                if let Ok(Some(latest_issued)) = repo.latest_evidence_seq(&root) {
-                    let ack = context.membership.apply(report, latest_issued);
+                let latest_issued = repo.latest_evidence_seq(&root).unwrap_or_else(|error| {
+                    tracing::warn!(root_id = %root, %error, "could not read the evidence sequence; report ignored");
+                    None
+                });
+                if let Some(latest_issued) = latest_issued {
+                    let (ack, departed) =
+                        context.membership.apply_reporting_departures(report, latest_issued);
                     context.provider_host.send_to_host(Payload::ProviderReportAck(ack));
+                    // The OS dropped its copy of these without being asked: free the daemon's
+                    // half, if a full replica takes custody of the version.
+                    if !departed.is_empty() {
+                        context.reclaim_queue.schedule(&root, departed);
+                    }
                 }
             }
             true
@@ -318,7 +341,29 @@ async fn provider_channel_message(
             // counts as evidence. The one exception is the report of an ORPHAN domain (registered
             // for a root this database does not know): it is only recorded, for `status`, and
             // changes nothing, so the domain stays available for recovery.
-            if repo.group_of_root(&root).ok().flatten().is_none() {
+            // A lookup that FAILS is not an unknown root: neither the orphan note nor an attach may
+            // be decided on a guess. The host reports again; nothing is recorded now.
+            let known = match repo.group_of_root(&root) {
+                Ok(group) => group.is_some(),
+                Err(error) => {
+                    tracing::warn!(root_id = %root, %error, "could not look up the provider root; domain state ignored");
+                    return true;
+                }
+            };
+            // The rollback check compares the host's acknowledged revision with ours. It must not
+            // be skipped by a failed read, so the revision is read before the host is attached.
+            let ours = if state.evidence() == DomainEvidence::Removed {
+                None
+            } else {
+                match repo.namespace_revision(&root) {
+                    Ok(ours) => ours,
+                    Err(error) => {
+                        tracing::warn!(root_id = %root, %error, "could not read the namespace revision; domain state ignored");
+                        return true;
+                    }
+                }
+            };
+            if !known {
                 if state.evidence() == DomainEvidence::Orphan
                     && context.provider_host.is_attached(host_tx)
                 {
@@ -345,12 +390,7 @@ async fn provider_channel_message(
             // means this database was restored: the OS holds state the daemon no longer knows.
             // The root is replaced (a new root_id); the host sees the old one vanish from the
             // provider-folder snapshot and removes that domain.
-            if repo
-                .namespace_revision(&root)
-                .ok()
-                .flatten()
-                .is_some_and(|ours| state.last_acked_namespace_revision > ours)
-            {
+            if ours.is_some_and(|ours| state.last_acked_namespace_revision > ours) {
                 context
                     .publication
                     .rebootstrap_root(&root, "the daemon's namespace revision is behind the host's")
@@ -381,16 +421,26 @@ async fn provider_channel_message(
 async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<ShellIpcMessage> {
     match msg.payload {
         Some(Payload::StatusQuery(q)) => {
-            let status = resolve_status_detail(&context.replica_coordinator, &q.path);
+            let path = q.path;
+            let status = resolve_status_detail(&context.replica_coordinator, &path);
             let materialization_state =
-                resolve_materialization_state(&context.replica_coordinator, &q.path);
+                resolve_materialization_state(&context.replica_coordinator, &path);
             let exact = crate::shell_status::resolve_content_is_current(
                 &context.replica_coordinator,
-                &q.path,
+                &path,
             );
+            let pause =
+                crate::shell_status::resolve_item_pause(&context.replica_coordinator, &path);
+            let reclaim_supported =
+                context.queries.linked_path.resolve(&path).is_some_and(|(group_id, _)| {
+                    context.application.materialization.evict_supported(&group_id)
+                });
             Some(ShellIpcMessage {
                 payload: Some(Payload::StatusResponse(StatusResponse {
-                    path: q.path,
+                    item_paused: pause.paused,
+                    paused_by_ancestor: pause.by_ancestor,
+                    reclaim_supported,
+                    path,
                     state: status.state as i32,
                     local_state: to_shell_local_state(materialization_state, exact),
                     status_detail: status.detail.unwrap_or_default(),
@@ -518,12 +568,13 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
             if !request.app_group_container.is_empty() {
                 context.handoff.adopt(&request.app_group_container);
             }
-            let response = match provider_folders(context) {
-                Ok(folders) => ListProviderFoldersResponse {
-                    folders,
-                    snapshot_available: true,
-                    removals: provider_removals(context),
-                },
+            // The removals are part of the snapshot: an unreadable removal list is not "none".
+            let snapshot = provider_folders(context)
+                .and_then(|folders| Ok((folders, provider_removals(context)?)));
+            let response = match snapshot {
+                Ok((folders, removals)) => {
+                    ListProviderFoldersResponse { folders, snapshot_available: true, removals }
+                }
                 Err(error) => {
                     tracing::warn!(
                         %error,
@@ -538,6 +589,30 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
                 }
             };
             Some(ShellIpcMessage { payload: Some(Payload::ListProviderFoldersResponse(response)) })
+        }
+        // The Finder extension's `directoryURLs`: every live folder link. A link-table read
+        // error is `snapshot_available: false`, never an empty snapshot, so the extension keeps
+        // the set it last confirmed instead of dropping every root.
+        Some(Payload::ListLinkedRootsRequest(_)) => {
+            let response = match context.replica_coordinator.link_repository().list_links() {
+                Ok(links) => ListLinkedRootsResponse {
+                    local_paths: links
+                        .iter()
+                        .filter(|link| !link.orphaned)
+                        .filter_map(|link| link.location.folder_path().map(str::to_owned))
+                        .collect(),
+                    snapshot_available: true,
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "ListLinkedRootsRequest could not read the links; reporting \
+                         snapshot_available=false rather than an empty snapshot"
+                    );
+                    ListLinkedRootsResponse { local_paths: Vec::new(), snapshot_available: false }
+                }
+            };
+            Some(ShellIpcMessage { payload: Some(Payload::ListLinkedRootsResponse(response)) })
         }
         // Readiness evidence from the host app and the extension. No response: the
         // evidence is persisted and the next listing/status reflects it.
@@ -775,13 +850,7 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
         // User activity on a provider root pauses its prefetch (one push) and is remembered.
         Some(Payload::ProviderActivity(activity)) => {
             let root = hex::encode(&activity.root_id);
-            let known = context
-                .replica_coordinator
-                .provider_repository()
-                .group_of_root(&root)
-                .ok()
-                .flatten()
-                .is_some();
+            let known = root_is_known(context.replica_coordinator.provider_repository(), &root);
             if known
                 && context.prefetch.on_activity(
                     &root,
@@ -821,6 +890,8 @@ pub(crate) async fn handle_message_for_tests(context: &ShellContext, msg: ShellI
 
 #[cfg(test)]
 mod item_pause_tests;
+#[cfg(test)]
+mod linked_roots_tests;
 #[cfg(test)]
 mod list_folder_files_tests;
 #[cfg(test)]

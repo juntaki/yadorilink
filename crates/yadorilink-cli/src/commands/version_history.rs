@@ -10,6 +10,8 @@ use yadorilink_ipc_proto::daemonctl::{
     ConflictReason, ConflictedFileInfo, EntryKind, FileVersionInfo, TrashedFileInfo,
 };
 
+use yadorilink_client_core::attention as view;
+
 use crate::error::CliError;
 
 /// Same "best-effort canonicalize, fall back to the given string"
@@ -124,7 +126,7 @@ fn folder_operation_label(deleted_by_operation: &str) -> Option<&str> {
 /// `yadorilink conflicts list` — every currently-live conflicted-copy
 /// file across every linked folder (the same files `yadorilink status`'s
 /// per-link `conflict_count` already tallies, listed here individually).
-pub async fn conflicts_list() -> Result<(), CliError> {
+async fn conflicts_list() -> Result<(), CliError> {
     let conflicts = files::list_conflicts(None).await?;
     if conflicts.is_empty() {
         println!("No conflicted files.");
@@ -133,33 +135,66 @@ pub async fn conflicts_list() -> Result<(), CliError> {
     for file in &conflicts {
         println!("{}", conflicted_file_line(file));
     }
-    println!("{CONFLICT_RESOLVE_HINT}");
+    if conflicts.iter().any(is_resolvable) {
+        println!("{CONFLICT_RESOLVE_HINT}");
+    }
     Ok(())
 }
 
-/// The one place the `conflicts` wording lives, so it can be unified with
-/// the other UIs later.
-const CONFLICT_RESOLVE_HINT: &str = "Both versions were kept. To resolve, open the copies, keep \
-     the content you want in the original file, then delete the other copy.";
+pub enum ConflictsCommand {
+    List,
+    Keep(String),
+    KeepBoth(String),
+}
+
+pub async fn conflicts(command: ConflictsCommand) -> Result<(), CliError> {
+    match command {
+        ConflictsCommand::List => conflicts_list().await,
+        ConflictsCommand::Keep(path) => {
+            conflicts_resolve(path, files::ConflictChoice::KeepThis).await
+        }
+        ConflictsCommand::KeepBoth(path) => {
+            conflicts_resolve(path, files::ConflictChoice::KeepBoth).await
+        }
+    }
+}
+
+/// `yadorilink conflicts keep|keep-both <copy>`.
+async fn conflicts_resolve(
+    copy_path: String,
+    choice: files::ConflictChoice,
+) -> Result<(), CliError> {
+    let absolute_path = absolute_path(&copy_path)?;
+    let kept = files::resolve_conflict(&absolute_path, choice).await?;
+    match choice {
+        files::ConflictChoice::KeepThis => println!("Kept this version as {}", kept.display()),
+        files::ConflictChoice::KeepBoth => {
+            println!("Kept both versions; this one is now {}", kept.display())
+        }
+    }
+    Ok(())
+}
+
+const CONFLICT_RESOLVE_HINT: &str = "To choose, run `yadorilink conflicts keep <copy>` to make \
+     a copy the file, or `yadorilink conflicts keep-both <copy>` to keep both as separate files.";
+
+/// Only a file copy of an edit made on two devices can be resolved with
+/// `keep` / `keep-both`.
+fn is_resolvable(f: &ConflictedFileInfo) -> bool {
+    f.kind() != EntryKind::Directory && f.reason() != ConflictReason::FolderAtPath
+}
 
 fn conflicted_file_line(f: &ConflictedFileInfo) -> String {
-    let line = if f.kind() == EntryKind::Directory {
-        format!("{}/{}/  directory", f.local_path, f.path)
+    let why = view::conflict_detail(f).reason.explanation();
+    let place = format!("{}/{}", f.local_path, f.path);
+    if f.kind() == EntryKind::Directory {
+        format!("{place}/\n  {why}")
     } else {
         format!(
-            "{}/{}  size={}  modified={}",
-            f.local_path,
-            f.path,
-            f.size,
+            "{place}\n  {why}\n  {}, saved {}",
+            super::status::format_bytes(f.size.max(0) as u64),
             format_local_time(f.mtime_unix_nanos)
         )
-    };
-    // A concurrent edit is what every copy used to mean, so only the other
-    // reason is spelled out.
-    if f.reason() == ConflictReason::FolderAtPath {
-        format!("{line}  reason=folder_at_path")
-    } else {
-        line
     }
 }
 

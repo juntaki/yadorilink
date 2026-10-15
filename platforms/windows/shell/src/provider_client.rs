@@ -6,6 +6,7 @@
 //! empty success: a caller that reconciles the local namespace against an answer must not read
 //! "could not ask" as "nothing there".
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -20,7 +21,13 @@ use yadorilink_ipc_proto::shellipc::{
 };
 
 const ENUMERATE_TIMEOUT: Duration = Duration::from_secs(10);
-const MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(40);
+/// One materialization request. A fetch is served in bounded windows (see `windowed_fetch`), so
+/// this bounds one window and does not grow with the size of the file.
+pub(crate) const MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(40);
+/// The request that records a whole version after its windows were delivered. The daemon
+/// assembles the whole file from blocks it already has, which takes as long as the file is big;
+/// nothing waits for it.
+pub(crate) const RECORD_TIMEOUT: Duration = Duration::from_secs(600);
 const APPLY_TIMEOUT: Duration = Duration::from_secs(60);
 const EXTENSION_BUILD: &str = "1";
 /// Children per enumeration page.
@@ -76,13 +83,32 @@ fn call<T>(
     request: Payload,
     pick: impl Fn(Payload) -> Option<T>,
 ) -> Option<T> {
+    call_unless(timeout, &AtomicBool::new(false), root, request, pick)
+}
+
+/// [`call`] that gives up as soon as `cancel` is set: the connection is dropped, which makes the
+/// daemon abort the request.
+fn call_unless<T>(
+    timeout: Duration,
+    cancel: &AtomicBool,
+    root: &[u8],
+    request: Payload,
+    pick: impl Fn(Payload) -> Option<T>,
+) -> Option<T> {
     runtime().block_on(async {
-        tokio::time::timeout(timeout, async {
+        let work = tokio::time::timeout(timeout, async {
             let mut stream = crate::ipc_client::connect().await.ok()?;
             exchange(&mut stream, root, request, pick).await
-        })
-        .await
-        .ok()?
+        });
+        let cancelled = async {
+            while !cancel.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::select! {
+            answer = work => answer.ok()?,
+            () = cancelled => None,
+        }
     })
 }
 
@@ -122,21 +148,98 @@ pub fn enumerate_children(root: &[u8], parent: &[u8]) -> Option<Vec<ProviderItem
     None
 }
 
-/// Asks the daemon for the current bytes of `item`, as a verified file in its handoff directory.
+/// What a fetch asks the daemon for: the exact `version`, whole (`range` `None`) or only the
+/// bytes `[offset, offset + length)` of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FetchTarget {
+    pub version: [u8; 32],
+    pub range: Option<(u64, u64)>,
+}
+
+/// The versions of the items the host has shown, by `(root, item)`: the version a placeholder
+/// stands for, which is what a fetch of it asks the daemon for. Replaced as a whole per root
+/// whenever the host records or loads what it shows.
+type ShownVersions = std::sync::Mutex<std::collections::HashMap<(Vec<u8>, Vec<u8>), [u8; 32]>>;
+
+fn shown_versions() -> &'static ShownVersions {
+    static SHOWN: OnceLock<ShownVersions> = OnceLock::new();
+    SHOWN.get_or_init(Default::default)
+}
+
+/// The version hash inside a 40-byte content version identifier (hash, then generation); `None`
+/// for anything else.
+pub fn version_hash_of(content_version: &[u8]) -> Option<[u8; 32]> {
+    if content_version.len() != 40 {
+        return None;
+    }
+    content_version[..32].try_into().ok()
+}
+
+/// Records the versions of the items now shown in `root`, replacing what was recorded for it.
+pub fn set_shown_versions<'a>(root: &[u8], items: impl IntoIterator<Item = (&'a [u8], &'a [u8])>) {
+    let mut shown = shown_versions().lock().unwrap();
+    shown.retain(|(r, _), _| r != root);
+    for (item, content_version) in items {
+        if let Some(hash) = version_hash_of(content_version) {
+            shown.insert((root.to_vec(), item.to_vec()), hash);
+        }
+    }
+}
+
+/// The version of `item` as shown in `root`; `None` when none was recorded.
+pub fn shown_version(root: &[u8], item: &[u8]) -> Option<[u8; 32]> {
+    shown_versions().lock().unwrap().get(&(root.to_vec(), item.to_vec())).copied()
+}
+
+/// The request for `item`: the current whole file (`target` `None`), or the exact version named
+/// by `target`, whole or one window of it.
+pub(crate) fn materialize_request(
+    root: &[u8],
+    item: &[u8],
+    request_id: &[u8],
+    target: Option<FetchTarget>,
+) -> MaterializeToTempRequest {
+    let range = target.and_then(|t| t.range);
+    MaterializeToTempRequest {
+        request_id: request_id.to_vec(),
+        root_id: root.to_vec(),
+        item_id: item.to_vec(),
+        requested_version_hash: target.map_or_else(Vec::new, |t| t.version.to_vec()),
+        ranged: range.is_some(),
+        range_offset: range.map_or(0, |r| r.0),
+        range_length: range.map_or(0, |r| r.1),
+    }
+}
+
+/// Asks the daemon for bytes of `item`, as a verified file in its handoff directory. A ranged
+/// `target` is answered with only that window of that exact version (a daemon that predates
+/// ranged requests answers with the whole file and `ranged` unset, see
+/// [`MaterializeToTempResponse`]); a whole one with the whole file of that version, which the
+/// daemon records as handed over; `None` with the whole current file.
 pub fn materialize(
     root: &[u8],
     item: &[u8],
     request_id: &[u8],
+    target: Option<FetchTarget>,
 ) -> Option<MaterializeToTempResponse> {
-    call(
-        MATERIALIZE_TIMEOUT,
+    materialize_within(MATERIALIZE_TIMEOUT, &AtomicBool::new(false), root, item, request_id, target)
+}
+
+/// [`materialize`] with its own `timeout`, abandoned (the connection dropped) once `cancel` is
+/// set.
+pub(crate) fn materialize_within(
+    timeout: Duration,
+    cancel: &AtomicBool,
+    root: &[u8],
+    item: &[u8],
+    request_id: &[u8],
+    target: Option<FetchTarget>,
+) -> Option<MaterializeToTempResponse> {
+    call_unless(
+        timeout,
+        cancel,
         root,
-        Payload::MaterializeToTempRequest(MaterializeToTempRequest {
-            request_id: request_id.to_vec(),
-            root_id: root.to_vec(),
-            item_id: item.to_vec(),
-            requested_version_hash: Vec::new(),
-        }),
+        Payload::MaterializeToTempRequest(materialize_request(root, item, request_id, target)),
         move |payload| match payload {
             Payload::MaterializeToTempResponse(r) if r.request_id == request_id => Some(r),
             _ => None,
@@ -193,6 +296,40 @@ pub fn note_fetch_activity(root: &[u8], item: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    /// A 4 KiB open of a 1 GiB file is a ranged request of that window, naming the version; a
+    /// whole-version request names the version only; a request without a target is the current
+    /// whole file.
+    #[test]
+    fn the_request_names_the_window_and_the_version() {
+        let target = FetchTarget { version: [3; 32], range: Some((1 << 29, 4096)) };
+        let request = materialize_request(&[1; 16], &[2; 16], b"id", Some(target));
+        assert!(request.ranged);
+        assert_eq!((request.range_offset, request.range_length), (1 << 29, 4096));
+        assert_eq!(request.requested_version_hash, vec![3; 32]);
+        let whole_version = FetchTarget { version: [3; 32], range: None };
+        let request = materialize_request(&[1; 16], &[2; 16], b"id", Some(whole_version));
+        assert!(!request.ranged && request.requested_version_hash == vec![3; 32]);
+        let whole = materialize_request(&[1; 16], &[2; 16], b"id", None);
+        assert!(!whole.ranged && whole.requested_version_hash.is_empty());
+        assert_eq!((whole.range_offset, whole.range_length), (0, 0));
+    }
+
+    /// The version a placeholder stands for is the hash of its 40-byte content version, and a
+    /// root's record is replaced as a whole.
+    #[test]
+    fn shown_versions_are_the_hash_of_the_content_version() {
+        assert_eq!(version_hash_of(&[9; 39]), None);
+        let mut content = vec![4u8; 32];
+        content.extend_from_slice(&7u64.to_le_bytes());
+        assert_eq!(version_hash_of(&content), Some([4; 32]));
+        let root = b"shown-versions-root";
+        set_shown_versions(root, [(&b"item-a"[..], &content[..]), (&b"item-b"[..], &[1u8][..])]);
+        assert_eq!(shown_version(root, b"item-a"), Some([4; 32]));
+        assert_eq!(shown_version(root, b"item-b"), None);
+        set_shown_versions(root, std::iter::empty());
+        assert_eq!(shown_version(root, b"item-a"), None);
+    }
+
     use super::*;
     use yadorilink_ipc_proto::shellipc::{EnumerateChildrenResponse, StatusPush};
 

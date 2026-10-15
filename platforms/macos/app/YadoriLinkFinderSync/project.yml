@@ -77,6 +77,17 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.juntaki.yadorilink
         INFOPLIST_FILE: ../YadoriLinkApp/App/Info.plist
         PRODUCT_NAME: YadoriLink
+        # The host app is NOT sandboxed, but NSFileProviderManager (and the
+        # group container lookup) require it to carry the same App Group as
+        # the extensions; without it the OS logs "document group name ...
+        # doesn't match the groups defined in application entitlements ({})".
+        # application-groups is restricted, so the App ID needs the App Groups
+        # capability and a profile (dev: Xcode automatic signing).
+        CODE_SIGN_ENTITLEMENTS: ../YadoriLinkApp/App/App.entitlements
+        # Release builds select the Developer ID provisioning profile by
+        # passing this variable (platforms/macos/package/xcode-signing-args.sh);
+        # it is empty, and so ignored, in development builds.
+        PROVISIONING_PROFILE_SPECIFIER: $(YADORILINK_HOST_PROFILE)
         SWIFT_VERSION: "6.0"
         # ProviderHostService needs the fileprovider-core FFI (the provider
         # folder list and the persistent host connection) and the
@@ -198,12 +209,19 @@ targets:
     platform: macOS
     sources:
       - path: Extension/FinderSync.swift
+      - path: ../FileProviderCore/Sources/FileProviderCore/EagerRoots.swift
+      - path: ../FileProviderCore/Sources/FileProviderCore/FinderMenu.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.juntaki.yadorilink.FinderSync
         INFOPLIST_FILE: Extension/Info.plist
         PRODUCT_NAME: YadoriLinkFinderSync
         CODE_SIGN_ENTITLEMENTS: Extension/Extension.entitlements
+        # Release builds select the Developer ID provisioning profile by
+        # passing this variable (platforms/macos/package/xcode-signing-args.sh);
+        # it is empty, and so ignored, in development builds. The host app has
+        # its own (YADORILINK_HOST_PROFILE): all three targets claim application-groups.
+        PROVISIONING_PROFILE_SPECIFIER: $(YADORILINK_FINDERSYNC_PROFILE)
         SWIFT_OBJC_BRIDGING_HEADER: Extension/YadoriLinkFinderSync-Bridging-Header.h
         HEADER_SEARCH_PATHS: ../core/include
         LIBRARY_SEARCH_PATHS: ../core/target/aarch64-apple-darwin/release
@@ -265,6 +283,8 @@ targets:
         INFOPLIST_FILE: ../YadoriLinkFileProvider/Extension/Info.plist
         PRODUCT_NAME: YadoriLinkFileProvider
         CODE_SIGN_ENTITLEMENTS: ../YadoriLinkFileProvider/Extension/Extension.entitlements
+        # See the matching comment on YadoriLinkFinderSync.
+        PROVISIONING_PROFILE_SPECIFIER: $(YADORILINK_FILEPROVIDER_PROFILE)
         SWIFT_OBJC_BRIDGING_HEADER: ../YadoriLinkFileProvider/Extension/YadoriLinkFileProvider-Bridging-Header.h
         HEADER_SEARCH_PATHS: ../fileprovider-core/include
         LIBRARY_SEARCH_PATHS: ../fileprovider-core/target/aarch64-apple-darwin/release

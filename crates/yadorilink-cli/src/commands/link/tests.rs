@@ -19,9 +19,11 @@ fn base_link() -> LinkStatus {
         hydrated_count: 0,
         placeholder_count: 0,
         hydrating_count: 0,
+        requested_content_count: 0,
         held_file_count: 0,
         held_files: vec![],
         skipped_symlink_count: 0,
+        stranded_directory_count: 0,
         degraded: false,
         degraded_reason: String::new(),
         has_active_transfer: false,
@@ -40,6 +42,7 @@ fn base_link() -> LinkStatus {
         local_storage_state: LocalStorageState::FullCopy as i32,
         fetch_availability: FetchAvailability::AvailableNow as i32,
         full_replica_device_ids: Vec::new(),
+        ..Default::default()
     }
 }
 

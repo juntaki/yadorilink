@@ -23,5 +23,9 @@ pub use local_change::{FlushOutcome, LocalChangeOutcome, LocalChangeProcessor};
 /// Deterministic race injection for other crates' test builds.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_hooks {
-    pub use crate::local_change::{arm_content_read_race_hook, disarm_content_read_race_hook};
+    pub use crate::local_change::{
+        arm_content_read_race_hook, arm_post_capture_race_hook, arm_post_identity_race_hook,
+        disarm_content_read_race_hook, disarm_post_capture_race_hook,
+        disarm_post_identity_race_hook,
+    };
 }

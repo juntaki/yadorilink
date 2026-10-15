@@ -9,12 +9,20 @@
 use yadorilink_replica_domain::file::VersionBlock;
 use yadorilink_replica_domain::ids::VersionHash;
 
-/// Physical on-demand cache reclamation remains disabled until the responder
-/// can issue a crash-durable, exact-version lease that its GC treats as a live
-/// root. An instantaneous VersionPresent acknowledgement is not a custody
-/// lifetime: the responder may advance and reclaim that version immediately
-/// afterward without any membership change.
-pub const REMOTE_CUSTODY_LEASES_SUPPORTED: bool = false;
+/// Physical on-demand cache reclamation is enabled. The responder issues a
+/// crash-durable, exact-version lease that its GC treats as a live root; the
+/// requester records every lease it may hold (a durable `remote_custody_hold`)
+/// and releases the ones it no longer depends on; a responder that stops being
+/// a full replica hands its leases to another one or refuses; and a requester
+/// that leaves the group loses its leases.
+///
+/// This flag is platform independent. The callers that actually delete local
+/// bytes additionally require the volume holding them to be durable
+/// (`volume_offers_durable_namespace`)
+/// (`yadorilink-fs-platform`), so Windows deletes only on a volume whose probe passed
+/// (and is retain-only everywhere else, and everywhere while
+/// `WINDOWS_DIRECTORY_DURABILITY_VALIDATED` is `false`).
+pub const REMOTE_CUSTODY_LEASES_SUPPORTED: bool = true;
 
 /// Identity and authorization epoch of the peer that confirmed custody.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,7 +58,14 @@ pub trait FullReplicaCustody {
         blocks: &[VersionBlock],
     ) -> Option<CustodyStamp>;
 
-    fn confirmation_still_valid(&self, group_id: &str, stamp: &CustodyStamp) -> bool;
+    /// Whether `stamp` still authorizes reclaiming `version_hash` at `path`.
+    fn confirmation_still_valid(
+        &self,
+        group_id: &str,
+        path: &str,
+        version_hash: &VersionHash,
+        stamp: &CustodyStamp,
+    ) -> bool;
 }
 
 // Unit tests (this crate's own, and -- via the `test-support` feature --
@@ -69,7 +84,13 @@ impl<F: Fn(&str, &str, &VersionHash, &[VersionBlock]) -> bool> FullReplicaCustod
         self(group_id, path, version_hash, blocks).then(|| CustodyStamp::new("test-peer".into(), 0))
     }
 
-    fn confirmation_still_valid(&self, _group_id: &str, _stamp: &CustodyStamp) -> bool {
+    fn confirmation_still_valid(
+        &self,
+        _group_id: &str,
+        _path: &str,
+        _version_hash: &VersionHash,
+        _stamp: &CustodyStamp,
+    ) -> bool {
         true
     }
 }
@@ -106,7 +127,12 @@ impl VerifiedCustody<'_> {
     }
 
     pub fn confirmation_still_valid(&self) -> bool {
-        self.oracle.confirmation_still_valid(&self.group_id, &self.stamp)
+        self.oracle.confirmation_still_valid(
+            &self.group_id,
+            &self.path,
+            &self.version_hash,
+            &self.stamp,
+        )
     }
 }
 
@@ -129,7 +155,7 @@ fn issue_verified<'a>(
 }
 
 /// Verifies exact-version custody for a reclaim decision -- the sole
-/// production entry point. Fails closed (`None`) while
+/// production entry point. Fails closed (`None`) if
 /// [`REMOTE_CUSTODY_LEASES_SUPPORTED`] is `false`, since an instantaneous
 /// confirmation is not a durable custody lease (see that const's own doc
 /// comment).

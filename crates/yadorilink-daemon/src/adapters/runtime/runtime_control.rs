@@ -11,6 +11,7 @@ use crate::application::ports::{
 };
 use crate::daemon_state::DaemonState;
 use crate::gc::{self, GcTriggerError};
+use crate::pause_deadline::PauseDuration;
 
 pub(crate) struct DaemonPauseResumeAdapter {
     state: Arc<DaemonState>,
@@ -24,12 +25,13 @@ impl DaemonPauseResumeAdapter {
 }
 
 impl LinkPauseResumePort for DaemonPauseResumeAdapter {
-    fn pause(&self, local_path: &str) -> Result<(), SyncError> {
-        self.state
-            .replica_coordinator
-            .link_repository()
-            .set_paused(local_path, true)
-            .map_err(SyncError::from)
+    fn pause(&self, local_path: &str, duration: PauseDuration) -> Result<(), SyncError> {
+        let links = self.state.replica_coordinator.link_repository();
+        match duration.resume_at(chrono::Local::now()) {
+            Some(resume_at) => links.pause_until(local_path, resume_at),
+            None => links.set_paused(local_path, true),
+        }
+        .map_err(SyncError::from)
     }
 
     fn resume<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, Result<(), SyncError>> {

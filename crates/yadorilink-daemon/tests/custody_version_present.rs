@@ -729,3 +729,53 @@ async fn custody_binds_the_unix_mode_from_the_atomic_current_row() {
          exec bit is set"
     );
 }
+
+/// The responder's strong proof (every block read and re-hashed) is synchronous
+/// disk work. While a `VersionPresent` query waits on it, the async runtime must
+/// keep running: with a single worker, a timer task keeps ticking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_version_present_proof_does_not_stall_the_async_runtime() {
+    support::ensure_isolated_config_dir();
+    let (a, slow) = new_daemon_with_slow_get("device-a", Duration::from_millis(1000));
+    let b = new_daemon("device-b");
+    let content = b"content whose proof takes a while";
+    let hash_bytes = put_and_record(&a, content);
+    let record = record_referencing("slow.bin", hash_bytes.clone(), content.len() as u64);
+    for d in [&a, &b] {
+        d.state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file(
+                GROUP,
+                &record,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+    }
+    connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (vh, blocks) = version_and_blocks(hash_bytes, content.len() as u64);
+
+    let mut entered_get = slow.arm_entered_get_signal();
+    let asker = b.state.clone();
+    let query = tokio::spawn(async move {
+        asker.confirm_version_present_via_peer(GROUP, "slow.bin", vh, &blocks).await
+    });
+    entered_get.recv().await.expect("the proof must start");
+    let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ticker = {
+        let ticks = ticks.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let during = ticks.load(std::sync::atomic::Ordering::SeqCst);
+    ticker.abort();
+    assert!(query.await.unwrap());
+    assert!(during >= 10, "the runtime ran {during} timer ticks in 700ms during the proof");
+}

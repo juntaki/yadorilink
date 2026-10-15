@@ -31,11 +31,9 @@ pub(crate) fn encode_update_status(
         release_notes_url: view.release_notes_url,
         mandatory: view.mandatory,
         holdback_reason: view.holdback_reason,
-        waiting_for_safe_point: view.waiting_for_safe_point,
         last_error_category: view.last_error_category,
         last_error_message: view.last_error_message,
         automatic_checks_enabled: view.automatic_checks_enabled,
-        automatic_install_mode: view.automatic_install_mode,
     }
 }
 
@@ -47,22 +45,23 @@ pub(crate) fn encode_check_response(
 
 /// v1 ships manual updates: the daemon never installs, it points the user
 /// at the official download page.
-pub(crate) fn encode_download_response(guidance: String) -> UpdateInstallResponse {
-    UpdateInstallResponse { outcome: "manual_download".into(), guidance }
+pub(crate) fn encode_download_response(
+    guidance: String,
+    download_url: Option<String>,
+) -> UpdateInstallResponse {
+    UpdateInstallResponse {
+        outcome: "manual_download".into(),
+        guidance,
+        download_url: download_url.unwrap_or_default(),
+    }
 }
 
 pub(crate) fn decode_config_request(req: UpdateConfigRequest) -> UpdateConfigCommand {
-    UpdateConfigCommand {
-        automatic_checks_enabled: req.automatic_checks_enabled,
-        automatic_install_mode: req.automatic_install_mode,
-    }
+    UpdateConfigCommand { automatic_checks_enabled: req.automatic_checks_enabled }
 }
 
 pub(crate) fn encode_config_response(
     policy: crate::application::UpdatePolicyView,
 ) -> UpdateConfigResponse {
-    UpdateConfigResponse {
-        automatic_checks_enabled: policy.automatic_checks_enabled,
-        automatic_install_mode: policy.automatic_install_mode,
-    }
+    UpdateConfigResponse { automatic_checks_enabled: policy.automatic_checks_enabled }
 }

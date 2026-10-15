@@ -328,6 +328,14 @@ impl SendTransferService {
         let destination_dir = destination_dir.map(std::path::Path::new);
         service.receive_transfer(transfer_id, destination_dir).await.map_err(|e| e.to_string())
     }
+
+    pub(crate) fn cancel(&self, transfer_id: &str) -> Result<(), String> {
+        self.service()?.cancel_transfer(transfer_id).map_err(|e| e.to_string())
+    }
+
+    pub(crate) async fn retry(&self, transfer_id: &str) -> Result<ReceiveOutcome, String> {
+        self.service()?.retry_transfer(transfer_id).await.map_err(|e| e.to_string())
+    }
 }
 
 pub(crate) struct InboxQueries {

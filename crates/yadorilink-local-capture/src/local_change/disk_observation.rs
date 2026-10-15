@@ -220,44 +220,120 @@ pub(super) fn exact_leaf_exists_as_file_or_symlink(root: &Path, path: &str) -> b
     try_exact_leaf_exists_as_file_or_symlink(root, path).unwrap_or(false)
 }
 
-/// [`exact_leaf_exists_as_file_or_symlink`], but a failed look (the parent
+/// [`exact_leaf_exists_as_file_or_symlink`], but a failed look (a directory
 /// cannot be listed, an entry cannot be read) is an error, not "absent".
 pub(super) fn try_exact_leaf_exists_as_file_or_symlink(
     root: &Path,
     path: &str,
 ) -> std::io::Result<bool> {
-    let full = root.join(path);
-    let (Some(leaf), Some(parent)) =
-        (full.file_name().map(|n| n.to_os_string()), full.parent().map(|p| p.to_path_buf()))
-    else {
-        return Ok(false);
-    };
-    for entry in std::fs::read_dir(&parent)? {
-        let entry = entry?;
-        if entry.file_name() == leaf {
-            let file_type = entry.file_type()?;
-            return Ok(file_type.is_file() || file_type.is_symlink());
-        }
-    }
-    Ok(false)
+    Ok(exact_entry_type(root, path)?.is_some_and(|ft| ft.is_file() || ft.is_symlink()))
 }
 
-/// Whether a real directory (lstat, never followed) answers to `path`'s
-/// exact leaf name. The directory counterpart of
-/// [`exact_leaf_exists_as_file_or_symlink`], for an explicit Directory row:
-/// the walk never admits a directory, so the directory itself is the only
-/// evidence that such a row is still present.
+/// Whether a real directory (lstat, never followed) answers to `path` under its exact
+/// spelling. The directory counterpart of [`exact_leaf_exists_as_file_or_symlink`], for an
+/// explicit Directory row: the walk never admits a directory, so the directory itself is the
+/// only evidence that such a row is still present.
 pub(super) fn exact_leaf_exists_as_directory(root: &Path, path: &str) -> bool {
-    let full = root.join(path);
-    let (Some(leaf), Some(parent)) =
-        (full.file_name().map(|n| n.to_os_string()), full.parent().map(|p| p.to_path_buf()))
-    else {
-        return false;
-    };
-    let Ok(entries) = std::fs::read_dir(&parent) else { return false };
-    entries
-        .filter_map(|e| e.ok())
-        .any(|entry| entry.file_name() == leaf && entry.file_type().is_ok_and(|ft| ft.is_dir()))
+    try_exact_leaf_exists_as_directory(root, path).unwrap_or(false)
+}
+
+/// [`exact_leaf_exists_as_directory`], but a failed look is an error, not "absent": only a
+/// successful listing that has no such directory is evidence of absence (a case-only
+/// directory rename leaves the lookup answering to the new spelling).
+pub(super) fn try_exact_leaf_exists_as_directory(root: &Path, path: &str) -> std::io::Result<bool> {
+    Ok(exact_entry_type(root, path)?.is_some_and(|ft| ft.is_dir()))
+}
+
+/// Whether nothing answers to `path` under its exact spelling, EVERY component included: a
+/// leaf that survives under a renamed ancestor (`Photos/a.jpg` after `Photos` became
+/// `photos`) is not that path. An unreadable directory is not an absence.
+pub(super) fn is_exact_path_confirmed_absent(root: &Path, path: &str) -> bool {
+    match std::fs::symlink_metadata(root.join(path)) {
+        Err(error) => error_means_absent(&error),
+        Ok(_) => matches!(exact_entry_type(root, path), Ok(None)),
+    }
+}
+
+/// The type of the entry `path` names under its exact spelling, found by listing each
+/// directory on the way and matching the name byte-for-byte: never by resolving the full
+/// path, which a case- or normalization-insensitive volume answers for any folded sibling.
+/// `None` when some component has no entry of that exact name.
+fn exact_entry_type(root: &Path, path: &str) -> std::io::Result<Option<std::fs::FileType>> {
+    let mut dir = root.to_path_buf();
+    let mut components = path.split('/').filter(|c| !c.is_empty()).peekable();
+    if components.peek().is_none() {
+        return Ok(None);
+    }
+    while let Some(name) = components.next() {
+        let mut found = None;
+        let mut listed_name = None;
+        let is_leaf = components.peek().is_none();
+        // An ancestor is matched leniently across Unicode forms (a volume that stores names
+        // decomposed lists it so) only when no entry has the exact bytes: presence is what an
+        // ancestor can prove, and erring toward "present" never authors a delete. Case and
+        // the leaf stay exact.
+        let mut lenient = None;
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_name() == name {
+                found = Some(entry.file_type()?);
+                listed_name = Some(entry.file_name());
+                lenient = None;
+                break;
+            }
+            if !is_leaf
+                && lenient.is_none()
+                && same_name_up_to_unicode_form(&entry.file_name(), name)
+                && volume_answers_through(&dir, name, &entry.file_name())
+            {
+                lenient = Some((entry.file_type()?, entry.file_name()));
+            }
+        }
+        if let Some((file_type, listed)) = lenient {
+            found = Some(file_type);
+            listed_name = Some(listed);
+        }
+        let Some(file_type) = found else { return Ok(None) };
+        if components.peek().is_none() {
+            return Ok(Some(file_type));
+        }
+        if file_type.is_symlink() {
+            // A path through a link is not one this exact walk can vouch for either way.
+            return Err(std::io::Error::other("a symlink stands in the path"));
+        }
+        if !file_type.is_dir() {
+            return Ok(None);
+        }
+        dir.push(listed_name.unwrap_or_else(|| name.into()));
+    }
+    Ok(None)
+}
+
+/// Whether the exact spelling `name` resolves, in `dir`, to the very entry listed as `listed`:
+/// only a volume that folds the Unicode forms answers one through the other, while one that
+/// tells them apart (Linux, NTFS) has a different directory there, not this ancestor. The
+/// same file identity is what proves it; a name that resolves to some other entry (a case
+/// match on a case-folding volume) does not. Platforms without a stable identity here (NTFS
+/// keeps the forms apart) never take the lenient match.
+#[cfg(unix)]
+fn volume_answers_through(dir: &Path, name: &str, listed: &std::ffi::OsStr) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::symlink_metadata(dir.join(name)), std::fs::symlink_metadata(dir.join(listed))) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn volume_answers_through(_dir: &Path, _name: &str, _listed: &std::ffi::OsStr) -> bool {
+    false
+}
+
+fn same_name_up_to_unicode_form(listed: &std::ffi::OsStr, name: &str) -> bool {
+    listed.to_str().is_some_and(|listed| {
+        yadorilink_fs_platform::canonical_fold::nfc(listed)
+            == yadorilink_fs_platform::canonical_fold::nfc(name)
+    })
 }
 
 /// Runs one of this module's long synchronous capture passes — a
@@ -336,4 +412,102 @@ pub(super) fn disk_bytes_match_indexed_blocks_off_worker(
     run_capture_pass_off_worker(|| {
         yadorilink_local_storage::disk_bytes_match_indexed_blocks(path, blocks)
     })
+}
+
+#[cfg(test)]
+mod exact_path_tests {
+    use super::*;
+
+    /// After `Photos` becomes `photos`, nothing answers to `Photos/a.jpg` under its exact
+    /// spelling, whether or not the volume folds (where it does, a plain lookup still answers).
+    #[test]
+    fn a_leaf_under_a_renamed_ancestor_is_not_the_old_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("Photos")).unwrap();
+        std::fs::write(root.join("Photos/a.jpg"), b"x").unwrap();
+        assert!(!is_exact_path_confirmed_absent(root, "Photos/a.jpg"));
+        assert!(try_exact_leaf_exists_as_file_or_symlink(root, "Photos/a.jpg").unwrap());
+        assert!(try_exact_leaf_exists_as_directory(root, "Photos").unwrap());
+
+        std::fs::rename(root.join("Photos"), root.join("photos")).unwrap();
+        assert!(is_exact_path_confirmed_absent(root, "Photos/a.jpg"));
+        assert!(is_exact_path_confirmed_absent(root, "Photos"));
+        assert!(!try_exact_leaf_exists_as_file_or_symlink(root, "Photos/a.jpg").unwrap());
+        assert!(!try_exact_leaf_exists_as_directory(root, "Photos").unwrap());
+        assert!(!is_exact_path_confirmed_absent(root, "photos/a.jpg"));
+        assert!(try_exact_leaf_exists_as_directory(root, "photos").unwrap());
+    }
+
+    /// An ancestor listed in another Unicode form than the wire path's is still that ancestor:
+    /// a delete must never be authored for a file that is there.
+    #[test]
+    fn an_ancestor_in_another_unicode_form_is_not_an_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("Caf\u{e9}")).unwrap();
+        std::fs::write(root.join("Caf\u{e9}/a.jpg"), b"x").unwrap();
+        // A volume that tells the forms apart has two distinct paths here, and the
+        // decomposed one really is absent.
+        if std::fs::symlink_metadata(root.join("Cafe\u{301}/a.jpg")).is_err() {
+            return;
+        }
+        assert!(!is_exact_path_confirmed_absent(root, "Cafe\u{301}/a.jpg"));
+        assert!(try_exact_leaf_exists_as_file_or_symlink(root, "Cafe\u{301}/a.jpg").unwrap());
+    }
+
+    /// Where both Unicode forms of an ancestor exist (a volume that keeps them apart), the
+    /// exact one is the ancestor, whichever is listed first.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_exact_ancestor_wins_over_another_unicode_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for name in ["Caf\u{e9}", "Cafe\u{301}"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        // A temp volume that folds the forms made one directory, not two.
+        if std::fs::read_dir(root).unwrap().count() != 2 {
+            return;
+        }
+        std::fs::write(root.join("Cafe\u{301}/only-here.jpg"), b"x").unwrap();
+        assert!(!is_exact_path_confirmed_absent(root, "Cafe\u{301}/only-here.jpg"));
+        assert!(is_exact_path_confirmed_absent(root, "Caf\u{e9}/only-here.jpg"));
+    }
+
+    /// A form-sensitive volume whose only entry is the other form's directory has no such
+    /// ancestor: the path is absent, not withheld behind a different directory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn another_unicode_form_alone_is_not_the_ancestor_on_a_form_sensitive_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("Caf\u{e9}")).unwrap();
+        std::fs::write(root.join("Caf\u{e9}/a.jpg"), b"x").unwrap();
+        if std::fs::symlink_metadata(root.join("Cafe\u{301}")).is_ok() {
+            return;
+        }
+        assert!(is_exact_path_confirmed_absent(root, "Cafe\u{301}/a.jpg"));
+        assert!(!try_exact_leaf_exists_as_file_or_symlink(root, "Cafe\u{301}/a.jpg").unwrap());
+    }
+
+    /// An unlistable directory is no evidence of absence.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_is_not_an_absence() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/a"), b"x").unwrap();
+        std::fs::set_permissions(root.join("d"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(root.join("d")).is_ok(); // root user ignores modes
+        let absent = is_exact_path_confirmed_absent(root, "d/a");
+        let leaf = try_exact_leaf_exists_as_directory(root, "d/a");
+        std::fs::set_permissions(root.join("d"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !readable {
+            assert!(!absent);
+            assert!(leaf.is_err());
+        }
+    }
 }

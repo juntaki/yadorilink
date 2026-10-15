@@ -42,7 +42,7 @@ use yadorilink_sync_sqlite::CanonicalCurrentRow;
 
 use super::disk_observation::{
     closed_disk_observation_if_unraced, exact_leaf_exists_as_directory,
-    exact_leaf_exists_as_file_or_symlink, is_confirmed_absent,
+    exact_leaf_exists_as_file_or_symlink, is_exact_path_confirmed_absent,
 };
 use super::flush::path_lock_order;
 use super::path_policy::{
@@ -108,7 +108,7 @@ pub(super) struct ObservedSubtree {
     entries: Vec<(String, CanonicalCurrentRow, NativeCaptureWitness)>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl ObservedSubtree {
     pub(super) fn entries(&self) -> Vec<&str> {
         self.entries.iter().map(|(path, ..)| path.as_str()).collect()
@@ -449,6 +449,9 @@ impl LocalChangeProcessor {
             guards.push(self.state.path_lock(group_id, path).lock_owned().await);
         }
         let mut entries = Vec::with_capacity(candidates.len());
+        // Nothing below a directory that is gone under its exact spelling is there under
+        // its own: one answer for the whole subtree, not a listing per entry.
+        let subtree_gone = is_exact_path_confirmed_absent(root, rel_path);
         for path in candidates {
             // Native's witness before the row it accompanies.
             let native_witness = self.state.native_capture_witness(group_id, &path)?;
@@ -465,7 +468,7 @@ impl LocalChangeProcessor {
                     }
                     Removal::Semantic(delete) => !delete.names_current_version(&path, Some(&row)),
                 }
-                || !is_confirmed_absent(&root.join(&path))
+                || !(subtree_gone || is_exact_path_confirmed_absent(root, &path))
             {
                 continue;
             }
@@ -558,7 +561,7 @@ impl LocalChangeProcessor {
         let Ok(to_lstat) = std::fs::symlink_metadata(&to_abs) else {
             return Ok(LocalChangeOutcome::None);
         };
-        if !to_lstat.is_dir() || std::fs::symlink_metadata(root.join(from)).is_ok() {
+        if !to_lstat.is_dir() || !is_exact_path_confirmed_absent(root, from) {
             return Ok(LocalChangeOutcome::None);
         }
         let dest_of = |path: &str| format!("{to}{}", &path[from.len()..]);
@@ -824,15 +827,27 @@ impl LocalChangeProcessor {
             if rel.is_empty() || skip_reason_for_inadmissible_wire_path(&rel).is_some() {
                 continue;
             }
-            match std::fs::symlink_metadata(path) {
-                Err(_) => {
+            // Gone under its exact spelling: nothing answers to the name, or only a folded
+            // sibling does (a case-only rename leaves the old spelling answering).
+            // (Only a directory answering to the name is looked at exactly: a file or a
+            // directory edited in place is not listed for, and a vanished entry is `Err`.)
+            let gone = match std::fs::symlink_metadata(path) {
+                Err(_) => true,
+                Ok(meta) => {
+                    meta.is_dir()
+                        && self.was_directory(group_id, &rel)?
+                        && is_exact_path_confirmed_absent(&root, &rel)
+                }
+            };
+            match std::fs::symlink_metadata(path).ok().filter(|_| !gone) {
+                None => {
                     // The topmost gone directory this path was in, or the
                     // path itself: a child reported before its directory
                     // (in an earlier flush of the same `rm -rf`) is part of
                     // the directory's removal, not one of its own.
                     let mut gone = vec![rel.as_str()];
                     while let Some((parent, _)) = gone[gone.len() - 1].rsplit_once('/') {
-                        if std::fs::symlink_metadata(root.join(parent)).is_ok() {
+                        if !is_exact_path_confirmed_absent(&root, parent) {
                             break;
                         }
                         gone.push(parent);
@@ -846,7 +861,7 @@ impl LocalChangeProcessor {
                         }
                     }
                 }
-                Ok(meta) if meta.is_dir() => {
+                Some(meta) if meta.is_dir() => {
                     let live_row = self
                         .state
                         .canonical_current_row(group_id, &rel)?
@@ -858,7 +873,7 @@ impl LocalChangeProcessor {
                         appeared.push(rel);
                     }
                 }
-                Ok(_) => {}
+                Some(_) => {}
             }
         }
         if vanished.is_empty() {

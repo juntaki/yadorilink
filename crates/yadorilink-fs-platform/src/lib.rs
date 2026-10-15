@@ -9,6 +9,7 @@
 //!   objects, and the wire-path admission rules built on them.
 //! * [`canonical_fold`]: the case/normalization-folded path equivalence key.
 //! * [`ignore_patterns`]: ignore-file matching.
+//! * [`join_timeline`]: measurement-only share-join milestone timeline.
 //!
 //! Nothing here depends on root authority: leases, permits, sync-root locks
 //! and root identity live in `yadorilink-root-authority`, which builds on
@@ -18,6 +19,9 @@ pub mod canonical_fold;
 pub mod durable_dir;
 pub mod fs_capabilities;
 pub mod fs_identity;
+pub mod generation;
 pub mod ignore_patterns;
+pub mod join_timeline;
 pub mod long_path;
 pub mod reserved_namespace;
+pub mod write_exclusion;

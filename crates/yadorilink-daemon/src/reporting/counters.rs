@@ -130,7 +130,7 @@ impl ReportingCounters {
 
     fn save(&self, state: &CountersState) -> ReportingResult<()> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            yadorilink_fs_platform::durable_dir::create_dir_all_durably(parent)?;
         }
         let json = serde_json::to_string_pretty(state)?;
         let tmp_path = self.path.with_extension("json.tmp");

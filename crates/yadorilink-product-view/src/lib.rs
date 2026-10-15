@@ -11,13 +11,21 @@
 //! enforced by this crate's `Cargo.toml` simply not listing them as
 //! dependencies, not by any lint here.
 
+pub mod attention;
+pub mod availability;
 pub mod conflict;
 pub mod device;
 pub mod folder;
+pub mod protection;
+pub mod summary;
 
+pub use attention::{Attention, AttentionItem, AttentionKind, AttentionScope, ProductAction};
+pub use availability::{Availability, AvailabilitySummary};
 pub use conflict::{conflict_detail, ConflictDetail, ConflictReason};
 pub use device::{device_summaries, distinct_group_ids, peer_count, peer_counts, DeviceSummary};
 pub use folder::{
     DurabilityStatus, FetchAvailability, FolderMode, FolderState, FolderSummary, FolderTransfer,
     LocalStorageState,
 };
+pub use protection::{Protection, ProtectionSummary};
+pub use summary::{AttentionReason, ProductState, ProductStatusSummary};

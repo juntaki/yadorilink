@@ -65,6 +65,23 @@ typedef enum {
 int yadorilink_query_status(const char *path);
 
 /*
+ * The facts behind one path's context menu, from the daemon's own answer. All false means
+ * "no YadoriLink actions": an unknown path, or a daemon that is not reachable. Mirrors
+ * `YadoriLinkItemFacts` in src/lib.rs.
+ */
+typedef struct {
+    bool tracked;
+    bool paused;
+    bool paused_by_ancestor;
+    bool reclaim_supported;
+    bool current_content_present;
+    bool in_transition;
+} YadoriLinkItemFacts;
+
+/* Bounded by the same short timeout as `yadorilink_query_status`; never blocks or crashes. */
+YadoriLinkItemFacts yadorilink_query_item(const char *path);
+
+/*
  * Sends a context-menu action (`action`, a YadoriLinkContextAction value)
  * for `path` to the daemon. Returns true only on a confirmed success
  * response; false for any failure, timeout, unreachable daemon, invalid
@@ -73,6 +90,20 @@ int yadorilink_query_status(const char *path);
  * `path` must be a null-terminated UTF-8 C string; must not be NULL.
  */
 bool yadorilink_send_context_action(const char *path, int action);
+
+/*
+ * The ordinary linked folders, as one confirmed snapshot.
+ * `yadorilink_linked_roots_open` returns NULL when the daemon could not
+ * confirm the set (unreachable, timeout, unavailable): keep what you last
+ * confirmed. A non-NULL handle is authoritative even with zero paths (a
+ * confirmed empty set). Paths stay valid until `yadorilink_linked_roots_free`.
+ */
+typedef struct YadoriLinkRoots YadoriLinkRoots;
+
+YadoriLinkRoots *yadorilink_linked_roots_open(void);
+unsigned long yadorilink_linked_roots_count(const YadoriLinkRoots *roots);
+const char *yadorilink_linked_roots_path(const YadoriLinkRoots *roots, unsigned long index);
+void yadorilink_linked_roots_free(YadoriLinkRoots *roots);
 
 #ifdef __cplusplus
 }

@@ -34,6 +34,13 @@ impl NameLedger for Ledger {
     }
 }
 
+/// After a Stage or Discard object was unlinked: Unix released its record (the unlink and the
+/// parent sync prove the absence); Windows documents no durability for an unlink, so the record
+/// stays for a restart to find the path absent.
+fn assert_record_after_an_unlink(ledger: &Ledger) {
+    assert_eq!(ledger.live().len(), usize::from(cfg!(windows)), "{:?}", ledger.live());
+}
+
 fn ns() -> DurableNamespace {
     DurableNamespace::unchecked_for_tests()
 }
@@ -79,7 +86,7 @@ fn no_replace_never_touches_an_existing_target() {
     assert!(matches!(error, NsError::AlreadyExists), "{error:?}");
     assert_eq!(fs::read(&target).unwrap(), b"old");
     assert_eq!(names(dir.path()), ["a.txt"], "the stage name is removed");
-    assert!(ledger.live().is_empty());
+    assert_record_after_an_unlink(&ledger);
 }
 
 #[test]
@@ -101,7 +108,7 @@ fn a_failed_write_leaves_no_target_and_no_stage() {
         .unwrap_err();
     assert!(matches!(error, NsError::Io(_)));
     assert!(names(dir.path()).is_empty());
-    assert!(ledger.live().is_empty());
+    assert_record_after_an_unlink(&ledger);
 }
 
 #[test]
@@ -162,7 +169,7 @@ fn discard_commits_the_removal_and_finish_removes_the_object() {
     );
     assert_eq!(discarded.finish(&ns(), &ledger), DiscardOutcome::Removed);
     assert!(names(dir.path()).is_empty());
-    assert!(ledger.live().is_empty());
+    assert_record_after_an_unlink(&ledger);
 }
 
 #[test]
@@ -319,14 +326,56 @@ fn a_crash_between_levels_of_a_chain_leaves_only_published_levels() {
 
 // --- the gate and the probe ---
 
+/// With the Windows gate open, the volume's probe verdict is what decides: a supported volume
+/// opens, any other verdict is an `Unavailable` error, and the answer is never the closed gate's.
 #[cfg(windows)]
 #[test]
-fn the_closed_gate_refuses_every_windows_volume() {
+fn an_open_windows_gate_leaves_each_volume_to_its_probe() {
     let dir = tempfile::tempdir().unwrap();
+    match (probe::cached_verdict(dir.path()), DurableNamespace::open(dir.path())) {
+        (Capability::Supported, Ok(_)) => {}
+        (Capability::Unsupported, Err(NsError::Unavailable(UnavailableReason::Unsupported))) => {}
+        (Capability::Unknown, Err(NsError::Unavailable(UnavailableReason::Unknown))) => {}
+        (verdict, opened) => panic!("verdict {verdict:?} but open gave {opened:?}"),
+    }
+}
+
+/// Only a `Supported` verdict yields a handle; the other two verdicts are refusals that no
+/// caller can turn into a handle or a plain-rename fallback.
+#[test]
+fn only_a_supported_verdict_opens_a_handle() {
+    use UnavailableReason::{Unknown, Unsupported};
+    let dir = tempfile::tempdir().unwrap();
+    assert!(DurableNamespace::from_verdict(Capability::Supported, dir.path()).is_ok());
+    for (verdict, reason) in
+        [(Capability::Unsupported, Unsupported), (Capability::Unknown, Unknown)]
+    {
+        let refused = DurableNamespace::from_verdict(verdict, dir.path());
+        assert!(matches!(&refused, Err(NsError::Unavailable(r)) if *r == reason), "{refused:?}");
+        let fallback = DurableNamespace::only_a_closed_gate_may_fall_back(refused);
+        assert!(matches!(fallback, Err(NsError::Unavailable(r)) if r == reason), "{fallback:?}");
+    }
+}
+
+/// A directory whose volume cannot be identified is refused, on every platform and with the
+/// gate open: not as a closed gate, and never with a handle.
+#[test]
+fn a_directory_that_cannot_be_probed_is_refused_as_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no").join("such").join("directory");
     assert!(matches!(
-        DurableNamespace::open(dir.path()),
-        Err(NsError::Unavailable(UnavailableReason::GateClosed))
+        DurableNamespace::open(&missing),
+        Err(NsError::Unavailable(UnavailableReason::Unknown))
     ));
+    assert!(matches!(
+        DurableNamespace::open_unless_gate_closed(&missing),
+        Err(NsError::Unavailable(UnavailableReason::Unknown))
+    ));
+    #[cfg(windows)]
+    {
+        assert!(!volume_offers_durable_namespace(Some(&missing)));
+        assert!(!volume_offers_durable_namespace(None));
+    }
 }
 
 #[cfg(unix)]
@@ -587,11 +636,11 @@ fn the_windows_move_asks_for_write_through_and_never_for_a_copy() {
 }
 
 #[test]
-fn the_windows_gate_stays_closed_until_the_owner_opens_it() {
-    // Opening it needs the CI guard, the F/M/O series on three platforms, the
-    // E1 re-run and E2's API check, and the owner's approval.
-    const { assert!(!WINDOWS_DIRECTORY_DURABILITY_VALIDATED) };
-    assert_eq!(platform_offers_durable_namespace(), cfg!(unix));
+fn the_windows_gate_is_open_and_windows_offers_durable_namespace_changes() {
+    // Closing it again is a deliberate act: this test and the ones that pin the closed
+    // behaviour change with it.
+    const { assert!(WINDOWS_DIRECTORY_DURABILITY_VALIDATED) };
+    assert_eq!(platform_offers_durable_namespace(), cfg!(any(unix, windows)));
 }
 
 #[test]
@@ -631,6 +680,41 @@ fn publish_durably_replaces_or_refuses_and_remove_file_durably_is_idempotent() {
     assert!(names(dir.path()).is_empty());
 }
 
+/// A reader that has the target open (a second device of the same process, a virus scanner,
+/// the search indexer) must not make a replacing publish fail for good: the publish waits for
+/// the reader to let go, and the name is then the new file.
+#[cfg(windows)]
+#[test]
+fn a_replacing_move_waits_out_a_reader_that_has_the_target_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (staged, target) = (dir.path().join("staged"), dir.path().join("target"));
+    fs::write(&target, b"old").unwrap();
+    fs::write(&staged, b"new").unwrap();
+    let reader = fs::File::open(&target).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(reader);
+    });
+    raw::move_entry(&staged, &target, Replace::Yes).unwrap();
+    release.join().unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"new");
+    assert!(!staged.exists());
+}
+
+/// A reader that never lets go still ends the publish, with the OS error, and leaves the target.
+#[cfg(windows)]
+#[test]
+fn a_replacing_move_fails_closed_while_a_reader_never_lets_go() {
+    let dir = tempfile::tempdir().unwrap();
+    let (staged, target) = (dir.path().join("staged"), dir.path().join("target"));
+    fs::write(&target, b"old").unwrap();
+    fs::write(&staged, b"new").unwrap();
+    let _reader = fs::File::open(&target).unwrap();
+    let error = raw::move_entry(&staged, &target, Replace::Yes).unwrap_err();
+    assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+    assert_eq!(fs::read(&target).unwrap(), b"old");
+}
+
 #[test]
 fn the_fallback_publish_replaces_or_refuses_like_the_durable_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -666,4 +750,108 @@ fn move_durably_moves_a_file_or_a_directory_and_never_replaces_with_no_replace()
     assert_eq!(move_durably(&a, &b, Replace::No).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
     assert_eq!(fs::read(&a).unwrap(), b"again", "a refused move leaves the source alone");
     assert_eq!(fs::read(&b).unwrap(), b"a");
+}
+
+#[test]
+fn only_a_closed_gate_lets_a_writer_fall_back_to_a_plain_rename() {
+    use UnavailableReason::{GateClosed, Unknown, Unsupported};
+    let fall_back = DurableNamespace::only_a_closed_gate_may_fall_back;
+    assert!(matches!(fall_back(Err(NsError::Unavailable(GateClosed))), Ok(None)));
+    assert!(matches!(fall_back(Ok(ns())), Ok(Some(_))));
+    // A refused volume (ReFS, exFAT, SMB, a failed probe) is an error, never the plain path.
+    for reason in [Unsupported, Unknown] {
+        assert!(matches!(
+            fall_back(Err(NsError::Unavailable(reason))),
+            Err(NsError::Unavailable(r)) if r == reason
+        ));
+    }
+    assert!(matches!(fall_back(Err(NsError::NotFound)), Err(NsError::NotFound)));
+}
+
+#[test]
+fn a_removal_releases_its_record_only_where_an_unlink_is_proven_durable() {
+    // Unix: the unlink and the parent sync are the proof. Windows documents none: the record
+    // outlives the removal, and a restart finds the path absent (drops it) or present (removes
+    // it again).
+    for (durable, released) in [(true, true), (false, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, ledger) = (dir.path().join("x.stage"), Ledger::default());
+        fs::write(&path, b"x").unwrap();
+        ledger.record(&path).unwrap();
+        remove_and_release_with(&path, &ledger, durable).unwrap();
+        assert!(!path.exists());
+        assert_eq!(ledger.live().is_empty(), released, "durable={durable}");
+    }
+}
+
+#[test]
+fn local_bytes_are_deletable_only_when_every_named_volume_is_durable() {
+    let block_store = Path::new("/blocks");
+    let sync_root = Path::new("/sync");
+    let verdict = |blocks: bool, sync: bool| {
+        move |dir: Option<&Path>| match dir {
+            Some(d) if d == Path::new("/blocks") => blocks,
+            Some(d) if d == Path::new("/sync") => sync,
+            _ => false,
+        }
+    };
+    let both = [Some(block_store), Some(sync_root)];
+    assert!(all_volumes_durable(verdict(true, true), &both));
+    assert!(!all_volumes_durable(verdict(false, true), &both), "block store refused");
+    assert!(!all_volumes_durable(verdict(true, false), &both), "sync root refused");
+    assert!(all_volumes_durable(verdict(true, false), &[Some(block_store)]));
+    assert!(!all_volumes_durable(verdict(true, true), &[None, Some(sync_root)]), "unnamed volume");
+}
+
+/// Swaps the file at `path` for an empty directory, the way another process can between the
+/// caller's look and the removal.
+fn swap_file_for_empty_dir_before_removal(path: &Path) {
+    let path = path.to_path_buf();
+    before_next_remove_object(move || {
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+    });
+}
+
+/// A caller that records the path absent after `Ok` must never get `Ok` while an object still
+/// occupies the path. Windows: the directory is moved aside, put back, and `remove_file` says
+/// `Ok(Restored)`, which the callers accept as removed. Unix removes by kind and refuses.
+#[test]
+fn a_file_swapped_for_a_directory_is_not_reported_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("f");
+    fs::write(&target, b"x").unwrap();
+    swap_file_for_empty_dir_before_removal(&target);
+    let result = remove_file_with(&ns(), &target);
+    assert!(target.is_dir(), "the user's directory is still there");
+    assert!(result.is_err(), "Ok would let the caller record an occupied path as absent");
+}
+
+/// The Discard name is left behind when the physical removal fails after the commit point; with
+/// no ledger nothing would ever clean it up. Either the caller learns of it or it is removed.
+#[test]
+fn a_failed_physical_removal_without_a_ledger_leaves_no_discard_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("f");
+    fs::write(&target, b"secret").unwrap();
+    arm_failpoint(NsFailpoint::AfterDiscardBeforeUnlink);
+    let result = remove_file_with(&ns(), &target);
+    disarm_failpoint();
+    assert!(!target.exists());
+    // Whatever the caller is told, nothing unrecorded may stay behind (the failpoint skipped only
+    // the first unlink; a cleanup attempt succeeds).
+    let _ = result;
+    assert!(names(dir.path()).is_empty(), "unledgered leftover: {:?}", names(dir.path()));
+}
+
+/// Only a removal, or a leftover the ledger will finish, reads as removed; anything that
+/// leaves an object beside an occupied path is an error naming the leftover.
+#[test]
+fn only_a_removal_or_a_ledgered_leftover_reads_as_removed() {
+    let left = |reason| DiscardOutcome::Retained { path: PathBuf::from("d"), reason };
+    assert!(DiscardOutcome::Removed.removed().is_ok());
+    assert!(left(RetainReason::RemovalFailed).removed().is_ok());
+    assert!(DiscardOutcome::Restored.removed().is_err());
+    let err = left(RetainReason::OriginalOccupied).removed().unwrap_err();
+    assert!(err.to_string().contains('d'), "{err}");
 }

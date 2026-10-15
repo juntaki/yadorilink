@@ -57,3 +57,6 @@ libc = "0.2"
 
 [profile.release]
 lto = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros"] }

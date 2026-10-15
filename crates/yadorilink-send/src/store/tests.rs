@@ -120,7 +120,7 @@ fn duplicate_inbound_offer_is_idempotent() {
     let manifest = sample_manifest("t1");
     assert!(store.insert_inbound_if_new("t1", "device-a", &manifest, 100).unwrap());
     assert!(!store.insert_inbound_if_new("t1", "device-a", &manifest, 100).unwrap());
-    assert_eq!(store.list_inbound().unwrap().len(), 1);
+    assert_eq!(store.list_inbound_recent(20).unwrap().len(), 1);
 }
 
 /// The "acquire authority before the first mutating action" step:
@@ -139,4 +139,79 @@ fn claim_inbound_destination_is_sticky_across_resumes() {
     assert_eq!(second, "/dest/one", "a resume must not silently redirect to a new destination");
 
     assert_eq!(store.get_inbound("t1").unwrap().unwrap().status, InboundStatus::InProgress);
+}
+
+fn status_of(store: &SendStore, id: &str) -> InboundStatus {
+    store.get_inbound(id).unwrap().unwrap().status
+}
+
+/// A daemon that died mid-receive leaves `in_progress` behind with nothing
+/// running; the next start must not keep reporting it as receiving, and
+/// must leave every other transfer alone.
+#[test]
+fn interrupting_in_progress_rows_marks_only_those_failed() {
+    let (store, _dir) = open_store();
+    for id in ["running", "waiting", "done"] {
+        store.insert_inbound_if_new(id, "device-a", &sample_manifest(id), 100).unwrap();
+    }
+    store.claim_inbound_destination("running", "/dest/running").unwrap();
+    store.claim_inbound_destination("done", "/dest/done").unwrap();
+    store.mark_inbound_completed("done").unwrap();
+
+    assert_eq!(store.interrupt_in_progress_inbound().unwrap(), 1);
+    assert_eq!(status_of(&store, "running"), InboundStatus::Failed);
+    assert_eq!(status_of(&store, "waiting"), InboundStatus::Pending);
+    assert_eq!(status_of(&store, "done"), InboundStatus::Completed);
+    assert_eq!(store.interrupt_in_progress_inbound().unwrap(), 0);
+}
+
+/// Canceling twice, or canceling something already finished, changes
+/// nothing; canceling one transfer never touches another.
+#[test]
+fn cancel_is_idempotent_and_scoped_to_one_transfer() {
+    let (store, _dir) = open_store();
+    for id in ["a", "b", "done"] {
+        store.insert_inbound_if_new(id, "device-a", &sample_manifest(id), 100).unwrap();
+    }
+    store.claim_inbound_destination("a", "/dest/a").unwrap();
+    store.claim_inbound_destination("b", "/dest/b").unwrap();
+    store.mark_inbound_completed("done").unwrap();
+
+    assert!(store.cancel_inbound("a").unwrap());
+    assert!(!store.cancel_inbound("a").unwrap(), "second cancel is a no-op");
+    assert!(!store.cancel_inbound("done").unwrap(), "a finished transfer cannot be canceled");
+
+    assert_eq!(status_of(&store, "a"), InboundStatus::Canceled);
+    assert_eq!(status_of(&store, "b"), InboundStatus::InProgress);
+    assert_eq!(status_of(&store, "done"), InboundStatus::Completed);
+}
+
+/// A failure report from a receive that was canceled underneath it must not
+/// overwrite the cancel.
+#[test]
+fn failure_does_not_overwrite_a_cancel() {
+    let (store, _dir) = open_store();
+    store.insert_inbound_if_new("a", "device-a", &sample_manifest("a"), 100).unwrap();
+    store.claim_inbound_destination("a", "/dest/a").unwrap();
+    store.cancel_inbound("a").unwrap();
+    assert!(!store.fail_inbound("a").unwrap());
+    assert_eq!(status_of(&store, "a"), InboundStatus::Canceled);
+}
+
+/// History is bounded: every unfinished transfer is listed, plus only the
+/// most recent finished ones.
+#[test]
+fn recent_listing_keeps_unfinished_rows_and_bounds_finished_ones() {
+    let (store, _dir) = open_store();
+    for n in 0..5 {
+        let id = format!("old{n}");
+        store.insert_inbound_if_new(&id, "device-a", &sample_manifest(&id), 100 + n).unwrap();
+        store.claim_inbound_destination(&id, "/d").unwrap();
+        store.mark_inbound_completed(&id).unwrap();
+    }
+    store.insert_inbound_if_new("waiting", "device-a", &sample_manifest("waiting"), 1).unwrap();
+
+    let listed: Vec<String> =
+        store.list_inbound_recent(2).unwrap().into_iter().map(|t| t.transfer_id).collect();
+    assert_eq!(listed, vec!["waiting", "old3", "old4"]);
 }

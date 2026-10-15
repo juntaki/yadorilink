@@ -11,6 +11,7 @@
 
 mod address;
 mod admission;
+mod dial_settle;
 mod directory;
 mod error;
 mod lan;

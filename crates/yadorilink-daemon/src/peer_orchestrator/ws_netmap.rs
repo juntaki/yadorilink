@@ -222,26 +222,27 @@ fn is_loopback_host(url: &url::Url) -> bool {
     }
 }
 
-/// Fires once per successful coordination-plane
-/// reconnect, flushing every synced group's own locally-pending
-/// (uncheckpointed) Changes. Spawned via `spawn_one_shot` rather than
-/// awaited inline so a slow or unreachable checkpoint endpoint can
-/// never delay `run_netmap_attempt`'s own message loop from reading
-/// the netmap/send-authorization pushes it exists to
-/// process.
+/// Publishes locally-pending native deltas for `only` (or, with `None`,
+/// every linked group). Spawned so a slow or stuck checkpoint request never
+/// delays the netmap loop from reading its own inbound messages.
 ///
-/// Silently does nothing for a group with no verified
-/// `GroupPolicyState` yet (`state.authority.group_policy_state` returns `None`
-/// before the first netmap push for that group has been processed --
-/// nothing to resolve an authority key against yet, briefly polled for
-/// below since this task is spawned before that same connection's own
-/// netmap frame is guaranteed to have been read) or if this device has
-/// no signing key configured at all. Neither is an error: both resolve
-/// themselves on the next reconnect once the netmap catches up.
-fn spawn_flush_pending_checkpoints_on_reconnect(state: &Arc<DaemonState>) {
+/// Fired on each coordination-plane reconnect (all groups) and after a
+/// netmap frame advanced a group's verified policy (those groups). The
+/// second trigger is the retry condition for a flush that could not verify
+/// its checkpoint because the plane's policy chain was ahead of this
+/// device's. A group with no verified policy yet, or a device with no
+/// signing key, flushes nothing and logs nothing; the policy-advance trigger
+/// covers the first of those once the netmap delivers the group. Concurrent
+/// runs are safe: flushes are serialized per device and idempotent (the
+/// checkpoint request id derives from the pending set), and a failed flush
+/// only warns and leaves the deltas pending.
+pub(super) fn spawn_flush_pending_checkpoints(state: &Arc<DaemonState>, only: Option<Vec<String>>) {
+    if matches!(&only, Some(groups) if groups.is_empty()) {
+        return;
+    }
     let state = Arc::clone(state);
 
-    spawn_one_shot("checkpoint-flush-on-reconnect", async move {
+    spawn_one_shot("checkpoint-flush", async move {
         let links = match state.replica_coordinator.link_repository().list_links() {
             Ok(links) => links,
             Err(e) => {
@@ -253,11 +254,11 @@ fn spawn_flush_pending_checkpoints_on_reconnect(state: &Arc<DaemonState>) {
             .into_iter()
             .filter(|link| !link.paused && !link.orphaned)
             .map(|link| link.group_id)
+            .filter(|group_id| only.as_ref().is_none_or(|groups| groups.contains(group_id)))
             .collect();
         group_ids.sort();
         group_ids.dedup();
 
-        // Publish each group's pending native deltas on reconnect.
         for group_id in group_ids {
             state.flush_pending_native_checkpoint_for_group(&group_id).await;
         }
@@ -321,7 +322,7 @@ pub(super) async fn run_netmap_attempt(
     // (uncheckpointed) Changes -- spawned so a slow or stuck
     // checkpoint request can never delay this netmap loop from
     // reading its own inbound messages.
-    spawn_flush_pending_checkpoints_on_reconnect(state);
+    spawn_flush_pending_checkpoints(state, None);
 
     let mut session = NetmapSessionState {
         config,
@@ -572,6 +573,10 @@ impl NetmapSessionState<'_> {
     /// epoch bump that wakes supervisors to the whole update.
     async fn apply_snapshot(&mut self, update: AdmittedNetmapMessage) -> Result<(), DaemonError> {
         let (update, generation) = update.into_parts();
+        yadorilink_fs_platform::join_timeline::mark_device(
+            &self.state.device_id,
+            yadorilink_fs_platform::join_timeline::Milestone::NetmapReceived,
+        );
         // Recorded before anything this frame writes, so every row it
         // mirrors carries this frame's provenance: a later run compares a
         // first frame's generation against it to decide whether that frame
@@ -782,7 +787,7 @@ impl NetmapSessionState<'_> {
                 &peer.device_id,
                 peer.substrate_reachability.clone(),
             );
-            apply_authoritative_peer_metadata(
+            let effective_groups = apply_authoritative_peer_metadata(
                 state,
                 &peer.device_id,
                 Some(peer.signing_key),
@@ -790,6 +795,29 @@ impl NetmapSessionState<'_> {
                 &peer.full_replica_groups,
                 retained_group_validation_cache,
             );
+            // Measurement only, for the groups the peer was actually admitted to.
+            if yadorilink_fs_platform::join_timeline::is_active() {
+                let has_address = peer
+                    .substrate_reachability
+                    .as_ref()
+                    .is_some_and(|r| !r.direct.is_empty() || !r.relays.is_empty());
+                for group in &effective_groups {
+                    if has_address {
+                        yadorilink_fs_platform::join_timeline::mark_with_peer(
+                            &state.device_id,
+                            group,
+                            yadorilink_fs_platform::join_timeline::Milestone::PeerAddressAvailable,
+                            &peer.device_id,
+                        );
+                    }
+                    yadorilink_fs_platform::join_timeline::mark_with_peer(
+                        &state.device_id,
+                        group,
+                        yadorilink_fs_platform::join_timeline::Milestone::PeerAuthorized,
+                        &peer.device_id,
+                    );
+                }
+            }
         }
     }
 }

@@ -299,6 +299,11 @@ mod contest_displacement_tests;
 #[cfg(test)]
 mod projection_attempt_tests;
 
+/// A newer version or a removal arriving for a path wakes the custody-hold
+/// reconciler.
+#[cfg(test)]
+mod custody_hold_nudge_tests;
+
 /// `materialize_symlink_at` and
 /// `try_apply_metadata_only_update`, exercised directly against a
 /// `SyncState` + tempdir — no `PeerSyncSession`/channel needed, since
@@ -676,7 +681,7 @@ impl LocalConvergenceExecutor {
     ) -> Result<bool, PeerSessionError> {
         use yadorilink_local_storage::{disk_content_comparison, DiskContentComparison};
         use yadorilink_replica_domain::session_state::MaterializationState;
-        let Ok(lstat) = std::fs::symlink_metadata(out_path) else { return Ok(false) };
+        let Some(lstat) = lstat_or_absent(out_path)? else { return Ok(false) };
         if !lstat.is_file() {
             return Ok(false);
         }
@@ -703,9 +708,7 @@ impl LocalConvergenceExecutor {
             return Ok(false);
         }
         if state == Some(MaterializationState::Remote)
-            && self.is_untouched_placeholder_of_this_device(
-                group_id, rel_path, out_path, &lstat, &local_row,
-            )
+            && self.is_untouched_placeholder_of_this_device(group_id, rel_path, out_path)?
         {
             return Ok(false);
         }
@@ -756,7 +759,11 @@ impl LocalConvergenceExecutor {
             return Ok(false);
         };
         let meta = row.to_file_version().meta;
-        let Ok(file) = std::fs::File::open(out_path) else { return Ok(false) };
+        let file = match std::fs::File::open(out_path) {
+            Ok(file) => file,
+            Err(error) if is_absent(&error) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
         // Off Unix a disk has no mode to compare.
         let mode_differs = cfg!(unix)
             && file.metadata().map(|m| yadorilink_local_storage::unix_mode_from_metadata(&m))?
@@ -785,7 +792,7 @@ impl LocalConvergenceExecutor {
         if self.disk_holds_uncaptured_local_bytes(group_id, rel_path, out_path, None)? {
             return Ok(true);
         }
-        let Ok(lstat) = std::fs::symlink_metadata(out_path) else { return Ok(false) };
+        let Some(lstat) = lstat_or_absent(out_path)? else { return Ok(false) };
         if lstat.is_dir() {
             return Ok(false);
         }
@@ -809,13 +816,9 @@ impl LocalConvergenceExecutor {
                         !mode_and_xattrs_match_disk(out_path, &row.to_file_version())?
                     }
                     Some(MaterializationState::Remote) => {
-                        !self.is_untouched_placeholder_of_this_device(
-                            group_id,
-                            rel_path,
-                            out_path,
-                            &lstat,
-                            &row.record,
-                        ) && !mode_and_xattrs_match_disk(out_path, &row.to_file_version())?
+                        !self
+                            .is_untouched_placeholder_of_this_device(group_id, rel_path, out_path)?
+                            && !mode_and_xattrs_match_disk(out_path, &row.to_file_version())?
                     }
                     _ => true,
                 }
@@ -907,9 +910,12 @@ impl LocalConvergenceExecutor {
             {
                 let live_row =
                     self.state.get_file(group_id, rel_path)?.is_some_and(|row| !row.deleted);
+                // A state that cannot be read is not "not Present": nothing then
+                // proves the absence is not the user's delete, so the pass stops
+                // here (and is retried) rather than projecting the old head.
                 let removed = live_row
                     && (kind == RecordKind::Directory
-                        || self.state.get_materialization_state(group_id, rel_path).ok().flatten()
+                        || self.state.get_materialization_state(group_id, rel_path)?
                             == Some(MaterializationState::Present));
                 return Ok(if removed {
                     OwnCaptureOnDisk::Removed
@@ -941,16 +947,12 @@ impl LocalConvergenceExecutor {
             _ if file_type.is_symlink() => true,
             _ if !file_type.is_file() => false,
             _ => {
-                if self.state.get_materialization_state(group_id, rel_path).ok().flatten()
+                if self.state.get_materialization_state(group_id, rel_path)?
                     == Some(MaterializationState::Remote)
+                    && self
+                        .is_untouched_placeholder_of_this_device(group_id, rel_path, &out_path)?
                 {
-                    if let Some(row) = self.state.get_file(group_id, rel_path)? {
-                        if self.is_untouched_placeholder_of_this_device(
-                            group_id, rel_path, &out_path, &lstat, &row,
-                        ) {
-                            return Ok(OwnCaptureOnDisk::Holds);
-                        }
-                    }
+                    return Ok(OwnCaptureOnDisk::Holds);
                 }
                 let record = file_record_from_version(rel_path, version);
                 disk_content_comparison(&out_path, &record.blocks)?
@@ -961,55 +963,43 @@ impl LocalConvergenceExecutor {
         Ok(if moved_on { OwnCaptureOnDisk::MovedOn } else { OwnCaptureOnDisk::Holds })
     }
 
-    /// Whether the object at a `Remote` row's path is still a native
-    /// provider placeholder rather than real bytes someone wrote there. On
-    /// Windows, the same fail-closed rule local capture applies
-    /// (`cfapi_placeholder_untouched`): only a CfAPI placeholder this
-    /// device recorded a generation for, still reporting `Untouched`, is
-    /// taken as untouched. A row with no recorded generation is by
-    /// construction not a placeholder this device wrote -- it is what a
-    /// capture whose disk observation raced leaves over real bytes -- so
-    /// its bytes are compared, unless the object still carries a cloud
-    /// recall attribute: reading a dehydrated cloud file would hydrate it,
-    /// so that object is taken at its word. Another provider's placeholder
-    /// and any state this cannot read are taken at their word too.
+    /// Whether the object at a `Remote` row's path is still the native
+    /// provider placeholder this device wrote, rather than real bytes someone
+    /// wrote there. On Windows this is the rule local capture applies
+    /// (`cfapi_placeholder_untouched`) and nothing looser: only a CfAPI
+    /// placeholder this device recorded a generation for, still reporting
+    /// `Untouched` for that generation, is untouched. No recorded generation,
+    /// another provider's generation, or a recall attribute alone say nothing
+    /// about who wrote the object, so they answer `false` (the caller then
+    /// compares bytes or refuses). A generation that cannot be read is an
+    /// error for the caller, which stops and retries; it is never an answer.
     #[cfg(windows)]
     fn is_untouched_placeholder_of_this_device(
         &self,
         group_id: &str,
         rel_path: &str,
         out_path: &Path,
-        lstat: &std::fs::Metadata,
-        _row: &FileRecord,
-    ) -> bool {
-        use std::os::windows::fs::MetadataExt as _;
+    ) -> Result<bool, PeerSessionError> {
         use yadorilink_local_capture::ports::PlaceholderStatus;
-        const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
-        const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
-        const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
-        let recall = FILE_ATTRIBUTE_OFFLINE
-            | FILE_ATTRIBUTE_RECALL_ON_OPEN
-            | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
-        let reading_could_hydrate = lstat.file_attributes() & recall != 0;
-        match self
-            .state
-            .materialization_state_repository()
-            .get_placeholder_generation(group_id, rel_path)
-        {
-            Ok(Some(recorded))
-                if recorded.provider_kind
-                    == yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND =>
+        Ok(
+            match self
+                .state
+                .materialization_state_repository()
+                .get_placeholder_generation(group_id, rel_path)
+                .map_err(crate::sync_error::SyncError::from)?
             {
-                reading_could_hydrate
-                    || crate::placeholder_inspect_windows::inspect_placeholder(
+                Some(recorded)
+                    if recorded.provider_kind
+                        == yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND =>
+                {
+                    crate::placeholder_inspect_windows::inspect_placeholder(
                         out_path,
                         recorded.identity.ino,
                     ) == PlaceholderStatus::Untouched
-            }
-            Ok(Some(_)) => true,
-            Ok(None) => reading_could_hydrate,
-            Err(_) => true,
-        }
+                }
+                Some(_) | None => false,
+            },
+        )
     }
 
     /// Where no native provider exists, no object is a provider placeholder:
@@ -1021,10 +1011,8 @@ impl LocalConvergenceExecutor {
         _group_id: &str,
         _rel_path: &str,
         _out_path: &Path,
-        _lstat: &std::fs::Metadata,
-        _row: &FileRecord,
-    ) -> bool {
-        false
+    ) -> Result<bool, PeerSessionError> {
+        Ok(false)
     }
 
     pub fn local_file_path(&self, group_id: &str, path: &str) -> Result<PathBuf, PeerSessionError> {
@@ -1588,18 +1576,149 @@ impl LocalConvergenceExecutor {
     }
 
     /// Whether this device refuses to write `record`'s name.
+    ///
+    /// A removal of a name whose exact spelling is a listed entry of its directory, and whose
+    /// folded siblings are all the verified destination of a move of that very head, is not
+    /// ambiguous: it removes that entry and nothing the siblings name that is not also kept.
+    /// This is a case-only rename (with or without an edit) seen from a folding volume, where holding the removal leaves the new
+    /// spelling waiting on the old one's row and the old one's removal waiting on the new.
     pub(crate) fn hazard_reason_for(
         &self,
         group_id: &str,
         record: &FileRecord,
     ) -> Result<Option<String>, PeerSessionError> {
-        hazard_reason_for_policy(
+        let mut reason = hazard_reason_for_policy(
             self.state.as_ref(),
             &self.sync_root(group_id)?,
             group_id,
             record,
             hazard::NamePolicy::local(),
-        )
+        )?;
+        if reason.is_none() && !record.deleted {
+            reason = self.on_disk_spelling_differs(group_id, &record.path)?;
+        }
+        if reason.is_some()
+            && record.deleted
+            && hazard::invalid_name_reason(hazard::NamePolicy::local(), &record.path).is_none()
+        {
+            // Only on a volume whose folding is known: a failed probe keeps the hold.
+            if let Some(volume) = reconcile_native::probed_volume(&self.sync_root(group_id)?) {
+                if self.exact_leaf_listed(group_id, &record.path, volume)?
+                    && self.folded_siblings_are_the_move_of(group_id, &record.path, volume)?
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(reason)
+    }
+
+    /// Why this path must wait because a directory it would be written under (an ancestor, or
+    /// the path itself when it is a directory) is on disk under another spelling: on a folding
+    /// volume the write would land inside the old spelling, and the watcher would report that
+    /// physical path as a local create of its own. The old directory has to go first (its
+    /// removal is a verified move, see `folded_siblings_are_the_move_of`), then this path is
+    /// written under its own spelling. Only a volume that folds, and only a successful look,
+    /// can answer; anything else is "no known mismatch".
+    fn on_disk_spelling_differs(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<String>, PeerSessionError> {
+        let root = self.sync_root(group_id)?;
+        let Some(volume) = reconcile_native::probed_volume(&root) else { return Ok(None) };
+        if !volume.folds_anything() {
+            return Ok(None);
+        }
+        let Ok(canonical_root) = root.canonicalize() else { return Ok(None) };
+        let full = root.join(path);
+        // The directory whose exact spelling matters: the path itself when it is a real
+        // directory, else its parent.
+        let own_is_directory = std::fs::symlink_metadata(&full).is_ok_and(|meta| meta.is_dir());
+        let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        let checked = if own_is_directory { components.len() } else { components.len() - 1 };
+        if checked == 0 {
+            return Ok(None);
+        }
+        let probe =
+            if own_is_directory { full } else { full.parent().unwrap_or(&root).to_path_buf() };
+        let Ok(actual) = probe.canonicalize() else { return Ok(None) };
+        let Ok(relative) = actual.strip_prefix(&canonical_root) else { return Ok(None) };
+        let actual: Vec<_> = relative.components().collect();
+        if actual.len() != checked {
+            return Ok(None);
+        }
+        for (wanted, found) in components.iter().zip(&actual) {
+            let found = found.as_os_str();
+            if !namespace_steps::listed_name_is(
+                found,
+                std::ffi::OsStr::new(wanted),
+                volume.normalization_insensitive,
+            ) {
+                return Ok(Some(format!(
+                    "{}: an existing directory holds this path under another spelling '{}'",
+                    hazard::HELD_REASON_CASE_COLLISION,
+                    found.to_string_lossy()
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether `path` is a regular file or directory whose removal is the delete half of a move: every
+    /// live row whose name this volume folds onto it is a head that descends from a delta
+    /// that removed `path`'s own head and put the sibling (verified from the stored deltas,
+    /// never from bytes or names). A sibling another device created, or this device's
+    /// author created unrelated to the removed head, is not one: the hold stays.
+    fn folded_siblings_are_the_move_of(
+        &self,
+        group_id: &str,
+        path: &str,
+        volume: VolumeFolding,
+    ) -> Result<bool, PeerSessionError> {
+        use yadorilink_sync_sqlite::file_index::NameFoldKey;
+        if self.state.get_file(group_id, path)?.is_none_or(|row| row.deleted)
+            || !matches!(
+                self.state.get_record_kind(group_id, path)?,
+                Some(
+                    yadorilink_replica_domain::file::RecordKind::File
+                        | yadorilink_replica_domain::file::RecordKind::Directory
+                )
+            )
+        {
+            return Ok(false);
+        }
+        let Some(removed) = self.state.row_authoring(group_id, path)? else {
+            return Ok(false);
+        };
+        if removed.source_path.0 != path {
+            return Ok(false);
+        }
+        let mut siblings = self.state.name_fold_matches(
+            group_id,
+            NameFoldKey::Case,
+            &yadorilink_fs_platform::canonical_fold::case_fold(path),
+            path,
+        )?;
+        siblings.extend(self.state.name_fold_matches(
+            group_id,
+            NameFoldKey::Canonical,
+            &yadorilink_fs_platform::canonical_fold::canonical_fold(path),
+            path,
+        )?);
+        siblings.sort();
+        siblings.dedup();
+        // Only the names this volume really folds together are collisions here.
+        siblings.retain(|sibling| reconcile_native::volume_folds_together(volume, path, sibling));
+        if siblings.is_empty() {
+            return Ok(false);
+        }
+        for sibling in &siblings {
+            if !self.state.native_head_descends_from_move_of(group_id, &removed, sibling)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Refuses a delete aimed outside this group's root.
@@ -1753,6 +1872,22 @@ impl LocalConvergenceExecutor {
     }
 }
 
+/// Whether `error` says only that nothing (or no directory) is at the path.
+fn is_absent(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
+}
+
+/// `symlink_metadata`, where only an absent path is `None`: any other error
+/// (the object exists but cannot be examined) is an error, never "nothing to
+/// protect".
+fn lstat_or_absent(path: &Path) -> Result<Option<std::fs::Metadata>, PeerSessionError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(lstat) => Ok(Some(lstat)),
+        Err(error) if is_absent(&error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Test probe: runs a closure at the moment a removal has returned durable and
 /// the caller has not recorded it yet, so a test can observe what the index
 /// holds at that point.
@@ -1765,6 +1900,7 @@ pub(crate) mod removal_ordering_probe {
     type Probe = Arc<dyn Fn() + Send + Sync>;
     static PROBES: Mutex<Option<HashMap<PathBuf, Probe>>> = Mutex::new(None);
 
+    #[cfg(unix)]
     pub(crate) fn arm(removed: PathBuf, probe: impl Fn() + Send + Sync + 'static) {
         PROBES.lock().unwrap().get_or_insert_with(HashMap::new).insert(removed, Arc::new(probe));
     }

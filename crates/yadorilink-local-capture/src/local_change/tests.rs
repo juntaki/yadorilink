@@ -4104,7 +4104,7 @@ async fn batch_commit_failure_leaves_nothing_committed_and_every_dirty_row_survi
     // for its own permit) now fails for every subsequent caller.
     lease.begin_stopping();
 
-    let resolved = proc.flush_pending_batch(group, &mut pending).await;
+    let resolved = proc.flush_pending_batch(group, &root, &mut pending).await;
     let resolved = resolved.unwrap_or_default();
     assert!(resolved.is_empty(), "no mutation may resolve as committed once admission is revoked");
 
@@ -4200,7 +4200,7 @@ async fn a_peer_mutation_between_preparation_and_validation_excludes_the_stale_m
         );
     }
 
-    let resolved = proc.flush_pending_batch(group, &mut pending).await.unwrap();
+    let resolved = proc.flush_pending_batch(group, &root, &mut pending).await.unwrap();
     assert!(
         resolved.is_empty(),
         "a prepared mutation must not commit once the index row it was based on has changed"
@@ -4334,7 +4334,7 @@ async fn a_local_create_over_a_placement_scaffold_is_not_a_descendant_of_the_pee
         .await
         .unwrap();
     assert!(matches!(outcome, EventOutcome::Deferred));
-    let resolved = proc.flush_pending_batch(group, &mut pending).await.unwrap();
+    let resolved = proc.flush_pending_batch(group, &root, &mut pending).await.unwrap();
     assert_eq!(resolved.len(), 1, "the local create must commit, not be dropped");
     // The local write's head is the one at the path that is not the peer's.
     let l_hash = yadorilink_replica_domain::ids::DeltaHash(
@@ -4395,7 +4395,7 @@ async fn a_peer_create_admitted_between_capture_and_emit_of_a_new_path_is_not_it
     // The peer's create is admitted after capture, before emission.
     let r_hash = admit_peer_put_only_into_the_dag(&state, group, "new.txt", vec![], 0, 0);
 
-    let resolved = proc.flush_pending_batch(group, &mut pending).await.unwrap();
+    let resolved = proc.flush_pending_batch(group, &root, &mut pending).await.unwrap();
     assert_eq!(resolved.len(), 1, "the local create must still commit, not be dropped");
     let l_hash = yadorilink_replica_domain::ids::DeltaHash(
         crate::test_support::native_path_head_provenances(&state, group, "new.txt")
@@ -4497,7 +4497,7 @@ async fn a_raw_disk_write_between_preparation_and_validation_excludes_the_stale_
     // change regardless of filesystem mtime granularity.
     std::fs::write(&path, b"externally rewritten while this mutation was pending").unwrap();
 
-    let resolved = proc.flush_pending_batch(group, &mut pending).await.unwrap();
+    let resolved = proc.flush_pending_batch(group, &root, &mut pending).await.unwrap();
     assert!(
         resolved.is_empty(),
         "a prepared mutation must not author stale bytes once the on-disk file has changed \
@@ -4565,8 +4565,8 @@ async fn concurrent_overlapping_batches_never_deadlock_regardless_of_preparation
 
     let (r1, r2) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         tokio::join!(
-            proc.flush_pending_batch(group, &mut batch1),
-            proc.flush_pending_batch(group, &mut batch2),
+            proc.flush_pending_batch(group, &root, &mut batch1),
+            proc.flush_pending_batch(group, &root, &mut batch2),
         )
     })
     .await
@@ -7252,6 +7252,7 @@ fn a_first_scan_commits_each_row_together_with_the_metadata_it_observed() {
                 ));
             }
             *at_commit.lock().unwrap_or_else(|p| p.into_inner()) = seen;
+            Ok(())
         };
         proc.scan_existing_files_with_ignore_streaming(
             ATOMIC_GROUP,
@@ -7737,6 +7738,7 @@ fn streaming_reconciliation_surfaces_each_durable_chunk_before_the_whole_scan_re
     let observed_chunk_sizes = std::cell::RefCell::new(Vec::<usize>::new());
     let mut on_chunk = |records: &[FileRecord]| {
         observed_chunk_sizes.borrow_mut().push(records.len());
+        Ok(())
     };
     let records = proc
         .scan_existing_files_with_ignore_streaming(group, &root, &ignore_set, &mut on_chunk)
@@ -8952,4 +8954,184 @@ async fn a_new_file_where_no_metadata_is_readable_has_no_mode_and_no_attributes(
         .get_xattrs("group-1", "made-here.bin")
         .unwrap()
         .is_empty());
+}
+
+/// A streaming consumer that reports failure must stop the rescan: the scan
+/// returns the consumer error instead of committing the rest of the tree
+/// into chunks nobody will announce.
+#[test]
+fn streaming_reconciliation_stops_when_the_chunk_consumer_fails() {
+    let (proc, _state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    let group = "group-1";
+    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+
+    let n = RECONCILE_CHUNK_OP_LIMIT * 3;
+    for i in 0..n {
+        std::fs::write(root.join(format!("f{i}")), b"a").unwrap();
+    }
+    let mut calls = 0usize;
+    let mut failing = |_records: &[FileRecord]| -> Result<(), LocalCaptureError> {
+        calls += 1;
+        Err(LocalCaptureError::StreamingConsumerClosed)
+    };
+    let result =
+        proc.scan_existing_files_with_ignore_streaming(group, &root, &ignore_set, &mut failing);
+    assert!(
+        matches!(result, Err(LocalCaptureError::StreamingConsumerClosed)),
+        "a failed consumer must fail the scan, got {result:?}"
+    );
+    assert_eq!(calls, 1, "the scan must stop at the first failed hand-off");
+}
+
+/// A write that lands after a batched capture has read and bracketed a file,
+/// but before the batch commits, must not be committed over as if it were the
+/// content that was read. The prepared mutation carries the content read
+/// BEFORE the write; the commit's revalidation has to compare the disk
+/// against the state from before that read. Taken after the read, the
+/// fingerprint described the already-rewritten file, the stale record was
+/// committed with a proof that the rewritten bytes were the daemon's own
+/// write, and the proof then made every later capture of the path dismiss the
+/// rewrite as "an older version's untouched bytes": the edit was lost for good
+/// (monkey_chaos: the base file's content differed per device while every
+/// device agreed on the DAG).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_between_a_batched_capture_and_its_commit_is_not_lost() {
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    let group = "group-1";
+    adopt_root(&state, group, &root);
+    let path = root.join("a.txt");
+    // Same length on purpose: only the content, mtime and ctime tell them apart.
+    std::fs::write(&path, b"version one!!").unwrap();
+
+    let rewrite = path.clone();
+    arm_post_capture_race_hook(path.clone(), move || {
+        // Let the clock tick so the rewrite is visible to any mtime comparison.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&rewrite, b"version two!!").unwrap();
+        false // one-shot
+    });
+    let flush = || {
+        yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![(
+            path.clone(),
+            FsChangeKind::CreatedOrModified,
+            0,
+        )])
+    };
+    proc.process_flush(group, &root, flush()).await.unwrap();
+    disarm_post_capture_race_hook(&path);
+
+    // Whatever the first flush did, the path must end up describing the bytes
+    // on disk once it is re-driven.
+    proc.process_flush(group, &root, flush()).await.unwrap();
+    let on_disk = std::fs::read(&path).unwrap();
+    assert_eq!(on_disk, b"version two!!");
+    let row = state.file_index_repository().get_file(group, "a.txt").unwrap().unwrap();
+    let indexed_hash = row.blocks.first().map(|b| hex::encode(&b.hash));
+    let expected = yadorilink_local_storage::hash_block_bytes(&on_disk);
+    assert_eq!(
+        indexed_hash,
+        Some(expected),
+        "the index must describe the rewritten file, not the content read before the rewrite"
+    );
+}
+
+/// The identity a batch commit publishes as `Present` evidence is observed
+/// after the prepared-fingerprint check; a write landing between that check
+/// and the observation must be caught by a closing re-check, not vouched for
+/// as the bytes of the (stale) record being committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_between_the_batch_fingerprint_check_and_the_identity_observation_is_not_lost() {
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    let group = "group-1";
+    adopt_root(&state, group, &root);
+    let path = root.join("b.txt");
+    std::fs::write(&path, b"version one!!").unwrap();
+
+    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+    let mut pending = Vec::new();
+    let outcome = proc
+        .process_event_with_ignore_at(
+            group,
+            &root,
+            &FsChangeEvent { path: path.clone(), kind: FsChangeKind::CreatedOrModified },
+            &ignore_set,
+            Some(0),
+            Some(&mut pending),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, EventOutcome::Deferred));
+
+    let rewrite = path.clone();
+    arm_post_identity_race_hook(path.clone(), move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&rewrite, b"version two!!").unwrap();
+        false
+    });
+    let resolved = proc.flush_pending_batch(group, &root, &mut pending).await.unwrap();
+    disarm_post_identity_race_hook(&path);
+    assert!(resolved.is_empty(), "a mutation whose file changed during commit must be excluded");
+
+    proc.process_flush(
+        group,
+        &root,
+        yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![(
+            path.clone(),
+            FsChangeKind::CreatedOrModified,
+            0,
+        )]),
+    )
+    .await
+    .unwrap();
+    let row = state.file_index_repository().get_file(group, "b.txt").unwrap().unwrap();
+    assert_eq!(
+        row.blocks.first().map(|b| hex::encode(&b.hash)),
+        Some(yadorilink_local_storage::hash_block_bytes(b"version two!!")),
+        "the re-driven capture must index the rewritten file"
+    );
+}
+
+/// A batched delete whose prepared fingerprint is that of a sibling the path
+/// folds to (the exact name was what was observed absent) must not publish
+/// `Absent` once the exact name exists again with an identical fingerprint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batched_delete_is_dropped_when_the_exact_name_exists_at_commit() {
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    let group = "group-1";
+    adopt_root(&state, group, &root);
+    let path = root.join("c.txt");
+    std::fs::write(&path, b"version one!!").unwrap();
+    let event = FsChangeEvent { path: path.clone(), kind: FsChangeKind::CreatedOrModified };
+    expect_file_changed(proc.process_event(group, &root, &event).await.unwrap());
+
+    std::fs::remove_file(&path).unwrap();
+    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+    let mut pending = Vec::new();
+    let outcome = proc
+        .process_event_with_ignore_at(
+            group,
+            &root,
+            &FsChangeEvent { path: path.clone(), kind: FsChangeKind::ObservedRemoval },
+            &ignore_set,
+            Some(0),
+            Some(&mut pending),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, EventOutcome::Deferred), "test precondition: delete is batched");
+
+    // The exact name comes back, and the prepared fingerprint is the one a
+    // sibling at this name would have shown.
+    std::fs::write(&path, b"version two!!").unwrap();
+    pending[0].disk_fingerprint_at_prepare = disk_race_fingerprint(&path);
+    let resolved = proc.flush_pending_batch(group, &root, &mut pending).await.unwrap();
+    assert!(resolved.is_empty(), "a delete must not commit while the exact name exists");
+    assert!(
+        !state.file_index_repository().get_file(group, "c.txt").unwrap().unwrap().deleted,
+        "the row must stay live"
+    );
 }

@@ -28,6 +28,16 @@ pub fn manual_update_guidance(install_source: &str) -> String {
     }
 }
 
+/// The page to open for a new version, for installs that are not
+/// package-managed. `None` for a package-managed install, whose steps are the
+/// guidance.
+pub fn manual_update_page(install_source: &str) -> Option<&'static str> {
+    match install_source {
+        "homebrew" | "apt" | "winget" | "microsoft_store" => None,
+        _ => Some(DOWNLOAD_PAGE_URL),
+    }
+}
+
 /// Injectable process runner so detection is unit-testable without the
 /// platform tool on `PATH`. `SystemCommandRunner` is what production
 /// code uses.

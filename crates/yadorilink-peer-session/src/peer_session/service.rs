@@ -29,14 +29,27 @@ fn refusal_for(
         crate::service_rpc::ServiceRequest::HandoffTicket { .. } => {
             crate::service_rpc::ServiceResponse::HandoffTicket { grant: None }
         }
-        // A release changes nothing on an unauthorized group, and saying so
-        // is the same answer a real release gets.
-        crate::service_rpc::ServiceRequest::HandoffLeaseRelease { .. }
-        | crate::service_rpc::ServiceRequest::HandoffTicketRelease { .. } => {
+        // A lease release on an unauthorized group ends nothing, and says so.
+        crate::service_rpc::ServiceRequest::HandoffLeaseRelease { .. } => {
+            crate::service_rpc::ServiceResponse::ReleaseNotConfirmed
+        }
+        // A ticket release changes nothing here on an unauthorized group.
+        crate::service_rpc::ServiceRequest::HandoffTicketRelease { .. } => {
             crate::service_rpc::ServiceResponse::Released
         }
         crate::service_rpc::ServiceRequest::GroupDurabilitySummary { .. } => {
             crate::service_rpc::ServiceResponse::GroupDurabilitySummary { summary: None }
+        }
+        crate::service_rpc::ServiceRequest::CustodyAcquire { .. } => {
+            crate::service_rpc::ServiceResponse::CustodyAcquire { granted: false }
+        }
+        // Not reached for a custody release: it is answered for any
+        // authenticated peer, so a lease outlives the group authorization.
+        crate::service_rpc::ServiceRequest::CustodyRelease { .. } => {
+            crate::service_rpc::ServiceResponse::CustodyRelease { released: false }
+        }
+        crate::service_rpc::ServiceRequest::CustodyRehome { .. } => {
+            crate::service_rpc::ServiceResponse::CustodyRehome { moved: false }
         }
     }
 }
@@ -147,7 +160,12 @@ impl PeerSyncSession {
             return;
         }
 
-        let response = if self.shares_group(request.group_id()) {
+        // A release names only the lease this authenticated peer holds, so it
+        // needs no group authorization: a requester removed from the group
+        // must still be able to end the lease that pins our blocks.
+        let is_release =
+            matches!(request, crate::service_rpc::ServiceRequest::CustodyRelease { .. });
+        let response = if is_release || self.shares_group(request.group_id()) {
             self.answer_service_request(&request).await
         } else {
             // Answered rather than dropped, and answered immediately. A
@@ -189,16 +207,29 @@ impl PeerSyncSession {
                     *for_handoff,
                     blocks.len(),
                 );
-                let evaluation = self.replica_engine.holds_version_durably(
-                    &yadorilink_replica_engine::DurableVersionQuery {
-                        folder_group_id: group_id.clone(),
-                        file_path: file_path.clone(),
-                        block_hashes: blocks.iter().map(|b| b.hash.0.clone()).collect(),
-                        for_handoff: *for_handoff,
-                        version_hash: version_hash.as_bytes().to_vec(),
-                        block_sizes: blocks.iter().map(|b| b.size).collect(),
-                    },
-                );
+                // The proof reads and hashes every block: synchronous disk work
+                // that must not hold an async worker.
+                let engine = self.replica_engine.clone();
+                let query = yadorilink_replica_engine::DurableVersionQuery {
+                    folder_group_id: group_id.clone(),
+                    file_path: file_path.clone(),
+                    block_hashes: blocks.iter().map(|b| b.hash.0.clone()).collect(),
+                    for_handoff: *for_handoff,
+                    version_hash: version_hash.as_bytes().to_vec(),
+                    block_sizes: blocks.iter().map(|b| b.size).collect(),
+                };
+                let evaluation =
+                    match super::spawn_blocking(move || engine.holds_version_durably(&query)).await
+                    {
+                        Ok(evaluation) => evaluation,
+                        Err(error) => {
+                            tracing::warn!(%error, "version proof task failed; answering absent");
+                            yadorilink_replica_engine::outcomes::CustodyEvaluation {
+                                present: false,
+                                warning: None,
+                            }
+                        }
+                    };
                 if let Some(warning) = &evaluation.warning {
                     tracing::warn!(
                         group_id = %group_id,
@@ -216,6 +247,7 @@ impl PeerSyncSession {
                         lease_id: g.lease_id,
                         root_digest: g.root_digest,
                         expires_at_unix: g.expires_at_unix,
+                        ttl_seconds: g.ttl_seconds,
                     }),
                 }
             }
@@ -235,8 +267,11 @@ impl PeerSyncSession {
                 }
             }
             crate::service_rpc::ServiceRequest::HandoffLeaseRelease { group_id, lease_id } => {
-                self.handoff_lease_responder.release_handoff_lease(group_id, lease_id).await;
-                crate::service_rpc::ServiceResponse::Released
+                if self.handoff_lease_responder.release_handoff_lease(group_id, lease_id).await {
+                    crate::service_rpc::ServiceResponse::Released
+                } else {
+                    crate::service_rpc::ServiceResponse::ReleaseNotConfirmed
+                }
             }
             crate::service_rpc::ServiceRequest::HandoffTicketRelease {
                 group_id,
@@ -253,6 +288,93 @@ impl PeerSyncSession {
                     summary: self.group_durability_summary_for(group_id),
                 }
             }
+            crate::service_rpc::ServiceRequest::CustodyAcquire {
+                group_id,
+                file_path,
+                version_hash,
+                blocks,
+                membership_generation,
+                attempt_token,
+            } => {
+                // The lease is held for the authenticated peer of this session,
+                // never for a device the request names.
+                // The proof reads and hashes every block and commits the lease:
+                // synchronous disk work (and a wait for a running block
+                // deletion) that must not hold an async worker. Its guards live
+                // and end inside the blocking task.
+                let engine = self.replica_engine.clone();
+                let requester = self.peer_device_id.clone();
+                let query = yadorilink_replica_engine::DurableVersionQuery {
+                    folder_group_id: group_id.clone(),
+                    file_path: file_path.clone(),
+                    block_hashes: blocks.iter().map(|b| b.hash.0.clone()).collect(),
+                    for_handoff: false,
+                    version_hash: version_hash.as_bytes().to_vec(),
+                    block_sizes: blocks.iter().map(|b| b.size).collect(),
+                };
+                let (generation, token) = (*membership_generation, *attempt_token);
+                let evaluation = match super::spawn_blocking(move || {
+                    engine.acquire_custody_lease(&requester, &query, generation, token)
+                })
+                .await
+                {
+                    Ok(evaluation) => evaluation,
+                    Err(error) => {
+                        tracing::warn!(%error, "custody acquire task failed; refusing");
+                        yadorilink_replica_engine::outcomes::CustodyEvaluation {
+                            present: false,
+                            warning: None,
+                        }
+                    }
+                };
+                if let Some(warning) = &evaluation.warning {
+                    tracing::warn!(
+                        group_id = %group_id,
+                        path = %file_path,
+                        error = %warning.message,
+                        "refusing a custody lease"
+                    );
+                }
+                crate::service_rpc::ServiceResponse::CustodyAcquire { granted: evaluation.present }
+            }
+            crate::service_rpc::ServiceRequest::CustodyRelease {
+                group_id,
+                file_path,
+                version_hash,
+                attempt_token,
+            } => {
+                let released = match self.replica_engine.release_custody_lease(
+                    &self.peer_device_id,
+                    group_id,
+                    file_path,
+                    version_hash.as_bytes(),
+                    attempt_token,
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(%error, group_id = %group_id, path = %file_path, "custody lease release failed");
+                        false
+                    }
+                };
+                crate::service_rpc::ServiceResponse::CustodyRelease { released }
+            }
+            crate::service_rpc::ServiceRequest::CustodyRehome {
+                group_id,
+                file_path,
+                version_hash,
+                attempt_token,
+            } => crate::service_rpc::ServiceResponse::CustodyRehome {
+                moved: self
+                    .custody_rehome_responder
+                    .rehome(
+                        &self.peer_device_id,
+                        group_id,
+                        file_path,
+                        *version_hash,
+                        *attempt_token,
+                    )
+                    .await,
+            },
         }
     }
 
@@ -341,6 +463,76 @@ impl PeerSyncSession {
         )
     }
 
+    /// Asks this peer to take durable custody of exactly this version: it
+    /// commits a lease that keeps the version's blocks live before it answers.
+    /// `true` only for that acknowledgement; every refusal, failure and
+    /// timeout is `false` (fail closed).
+    pub async fn request_custody_acquire(
+        &self,
+        group_id: &str,
+        file_path: &str,
+        version_hash: VersionHash,
+        blocks: &[VersionBlock],
+        membership_generation: u64,
+        attempt_token: [u8; 16],
+    ) -> bool {
+        let request = crate::service_rpc::ServiceRequest::CustodyAcquire {
+            group_id: group_id.to_string(),
+            file_path: file_path.to_string(),
+            version_hash,
+            blocks: blocks.to_vec(),
+            membership_generation,
+            attempt_token,
+        };
+        matches!(
+            self.service_rpc(&self.transports.service, &request).await,
+            Some(crate::service_rpc::ServiceResponse::CustodyAcquire { granted: true })
+        )
+    }
+
+    /// Asks this peer to end the lease it holds for this device on exactly
+    /// this version. `true` once the peer acknowledged.
+    pub async fn request_custody_release(
+        &self,
+        group_id: &str,
+        file_path: &str,
+        version_hash: VersionHash,
+        attempt_token: [u8; 16],
+    ) -> bool {
+        let request = crate::service_rpc::ServiceRequest::CustodyRelease {
+            group_id: group_id.to_string(),
+            file_path: file_path.to_string(),
+            version_hash,
+            attempt_token,
+        };
+        matches!(
+            self.service_rpc(&self.transports.service, &request).await,
+            Some(crate::service_rpc::ServiceResponse::CustodyRelease { released: true })
+        )
+    }
+
+    /// Asks this peer, the requester of a lease this device holds, to move
+    /// that custody to another full replica and release ours. `true` only
+    /// when the peer answered that it no longer depends on our lease.
+    pub async fn request_custody_rehome(
+        &self,
+        group_id: &str,
+        file_path: &str,
+        version_hash: VersionHash,
+        attempt_token: [u8; 16],
+    ) -> bool {
+        let request = crate::service_rpc::ServiceRequest::CustodyRehome {
+            group_id: group_id.to_string(),
+            file_path: file_path.to_string(),
+            version_hash,
+            attempt_token,
+        };
+        matches!(
+            self.service_rpc(&self.transports.service, &request).await,
+            Some(crate::service_rpc::ServiceResponse::CustodyRehome { moved: true })
+        )
+    }
+
     /// Asks this peer, over the service RPC lane, to describe its own
     /// durable state for `group_id` — the background health question.
     ///
@@ -396,29 +588,38 @@ impl PeerSyncSession {
                     lease_id: g.lease_id,
                     root_digest: g.root_digest,
                     expires_at_unix: g.expires_at_unix,
+                    ttl_seconds: g.ttl_seconds,
                 })
             }
             _ => None,
         }
     }
 
-    /// Best-effort, one-way release of a lease this peer granted earlier.
-    /// The target validates current group membership before touching either
-    /// half of the id-only lease reservation.
+    /// Releases a lease this peer granted earlier. `Ok` only when the target
+    /// answered that it processed the release; no answer (offline, timed out,
+    /// refused) is an error, so a caller that must know the lease is ended can
+    /// tell. The target validates current group membership before touching
+    /// either half of the id-only lease reservation.
     pub async fn release_handoff_lease_to_peer(
         &self,
         group_id: &str,
         lease_id: &str,
     ) -> Result<(), PeerSessionError> {
-        self.service_rpc(
-            &self.transports.service,
-            &crate::service_rpc::ServiceRequest::HandoffLeaseRelease {
-                group_id: group_id.to_string(),
-                lease_id: lease_id.to_string(),
-            },
-        )
-        .await;
-        Ok(())
+        let response = self
+            .service_rpc(
+                &self.transports.service,
+                &crate::service_rpc::ServiceRequest::HandoffLeaseRelease {
+                    group_id: group_id.to_string(),
+                    lease_id: lease_id.to_string(),
+                },
+            )
+            .await;
+        match response {
+            Some(crate::service_rpc::ServiceResponse::Released) => Ok(()),
+            _ => Err(PeerSessionError::NotFound(
+                "the handoff lease release was not acknowledged".to_string(),
+            )),
+        }
     }
 
     /// Asks this peer (the device being removed/revoked), over the service

@@ -37,7 +37,6 @@ pub fn status_response_json(status: &yadorilink_ipc_proto::daemonctl::StatusResp
             "state": status.update_state,
             "available_version": status.update_available_version,
             "mandatory": status.update_mandatory,
-            "waiting_for_safe_point": status.update_waiting_for_safe_point,
             "last_error_category": status.update_last_error_category,
             "channel": status.update_channel,
             "install_source": status.update_install_source,

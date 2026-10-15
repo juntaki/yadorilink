@@ -16,19 +16,17 @@
 //
 //  NOTE on directory discovery:
 //  `FIFinderSyncController.directoryURLs` is how Finder learns which
-//  folders this extension instruments (driving
-//  beginObservingDirectory/endObservingDirectory below). The daemon's
-//  shell-integration protocol (shellipc.proto) only exposes per-path
-//  StatusQuery/ContextAction —
-//  there is no "list linked folders" message on that protocol. (A
-//  `ListLinksRequest`/`ListLinksResponse` pair does exist, but on the
-//  separate daemon *control* socket used by the CLI — a different
-//  protocol.) Wiring real linked-folder discovery is a follow-up: either
-//  add a shellipc.proto message, or have
-//  the host app relay the control socket's ListLinks response into a
-//  shared App Group default this extension reads. Debug builds may set
-//  `YADORILINK_FINDER_SYNC_FOLDERS` (colon-separated absolute paths) for
-//  local testing; release builds ignore environment overrides.
+//  folders this extension instruments. The eager (ordinary) roots come
+//  from the daemon's shell IPC `ListLinkedRootsRequest` (the same live link
+//  table the product status reads), fetched through the Rust core and
+//  re-read periodically so a link/unlink converges without a restart.
+//  `EagerRootSet` (FileProviderCore/EagerRoots.swift) holds the last
+//  confirmed set: an unreachable daemon keeps it, a confirmed empty
+//  snapshot clears it, and nothing is guessed before the first
+//  confirmation. On-Demand provider roots are re-listed on every poll via
+//  `NSFileProviderManager` and unioned in. Debug builds may set
+//  `YADORILINK_FINDER_SYNC_FOLDERS` (colon-separated absolute paths) as a
+//  test-only fixture that replaces the daemon read; release builds ignore it.
 
 import Cocoa
 import FinderSync
@@ -76,11 +74,24 @@ class FinderSync: FIFinderSync {
         }
     }
 
+    /// Eager roots confirmed by the daemon and File Provider roots; both only touched on `rootsQueue`.
+    private var monitoredRoots = MonitoredRoots()
+    private var lastPublished: Set<URL>?
+    /// Provider listings are async, so at most one runs at a time: overlapping ones could finish
+    /// out of order and let an older listing restore a root a newer one removed. One that has not
+    /// completed after `providerListingTimeout` is abandoned (its late completion is ignored by
+    /// generation), so a callback that never arrives cannot stop polling for good; until a
+    /// newer listing confirms, the last confirmed provider roots stay. Only touched on `rootsQueue`.
+    private var providerListingStarted: Date?
+    private var providerListingGeneration: UInt64 = 0
+    private static let providerListingTimeout: TimeInterval = 30
+    private let rootsQueue = DispatchQueue(label: "com.juntaki.yadorilink.finder-roots")
+    private var rootsTimer: DispatchSourceTimer?
+
     override init() {
         super.init()
         let controller = FIFinderSyncController.default()
-        let eagerFolders = Self.configuredEagerFolders()
-        controller.directoryURLs = eagerFolders
+        startEagerRootPolling()
         for badge in Badge.allCases {
             controller.setBadgeImage(badge.image, label: badge.label, forBadgeIdentifier: badge.rawValue)
         }
@@ -95,7 +106,7 @@ class FinderSync: FIFinderSync {
         // Provider extension that owns it (`beginObservingDirectory` is
         // the same API either way), which is how a single Finder-visible
         // custom badge (online-only/open-elsewhere) and context menu
-        // (evict) mechanism covers both Eager and OnDemand folders
+        // (free up space) mechanism covers both Eager and OnDemand folders
         // without a second, File-Provider-native decoration API.
         //
         // BUG FOUND AND FIXED (real VM verification): the
@@ -112,49 +123,108 @@ class FinderSync: FIFinderSync {
         // domains and resolving each one's actual mount URL via
         // `getUserVisibleURL(for:.rootContainer)`, rather than
         // constructing a guessed path.
-        NSFileProviderManager.getDomainsWithCompletionHandler { domains, error in
+    }
+
+    /// Re-reads the linked-root snapshot now and then, so a folder linked or unlinked while the
+    /// extension runs (or a daemon that was not up yet) converges without a restart. The read
+    /// blocks on the daemon for a bounded time, so it runs off the main thread.
+    private func startEagerRootPolling() {
+        let timer = DispatchSource.makeTimerSource(queue: rootsQueue)
+        timer.schedule(deadline: .now(), repeating: 3)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.monitoredRoots.applyEager(Self.readEagerRootSnapshot())
+            self.refreshProviderRoots()
+            self.publishDirectoryURLs()
+        }
+        rootsTimer = timer
+        timer.resume()
+    }
+
+    /// Lists the registered File Provider domains and resolves each mount root. Any failure (the
+    /// listing, or one domain's URL) is `unavailable`, so the last confirmed provider roots stay;
+    /// zero domains listed without error is a confirmed empty set. Applies on `rootsQueue`.
+    private func refreshProviderRoots() {
+        if let started = providerListingStarted,
+           Date().timeIntervalSince(started) < Self.providerListingTimeout {
+            return
+        }
+        providerListingGeneration &+= 1
+        let generation = providerListingGeneration
+        providerListingStarted = Date()
+        NSFileProviderManager.getDomainsWithCompletionHandler { [weak self] domains, error in
+            guard let self else { return }
             if let error {
                 NSLog("yadorilink: FinderSync failed to list File Provider domains: \(error)")
+                self.rootsQueue.async { self.finishProviderListing(.unavailable, generation: generation) }
                 return
             }
             let group = DispatchGroup()
-            var onDemandFolders: [URL] = []
+            var paths: [String] = []
+            var complete = true
             let lock = NSLock()
             for domain in domains {
-                guard let manager = NSFileProviderManager(for: domain) else { continue }
+                guard let manager = NSFileProviderManager(for: domain) else {
+                    lock.lock(); complete = false; lock.unlock()
+                    continue
+                }
                 group.enter()
                 manager.getUserVisibleURL(for: .rootContainer) { url, error in
                     defer { group.leave() }
-                    if let error {
-                        NSLog("yadorilink: FinderSync failed to resolve URL for domain \(domain.identifier.rawValue): \(error)")
-                        return
-                    }
+                    lock.lock(); defer { lock.unlock() }
                     if let url {
-                        lock.lock()
-                        onDemandFolders.append(url)
-                        lock.unlock()
+                        paths.append(url.path)
+                    } else {
+                        if let error {
+                            NSLog("yadorilink: FinderSync failed to resolve URL for domain \(domain.identifier.rawValue): \(error)")
+                        }
+                        complete = false
                     }
                 }
             }
-            group.notify(queue: .main) {
-                guard !onDemandFolders.isEmpty else { return }
-                controller.directoryURLs = eagerFolders.union(onDemandFolders)
-                NSLog("yadorilink: FinderSync now also watching OnDemand domains: \(onDemandFolders)")
+            group.notify(queue: self.rootsQueue) { [weak self] in
+                self?.finishProviderListing(complete ? .confirmed(paths) : .unavailable, generation: generation)
             }
         }
     }
 
-    private static func configuredEagerFolders() -> Set<URL> {
+    /// Must run on `rootsQueue`.
+    private func finishProviderListing(_ snapshot: EagerRootSnapshot, generation: UInt64) {
+        // A listing abandoned after the timeout must not apply (or end) a newer one.
+        guard generation == providerListingGeneration else { return }
+        providerListingStarted = nil
+        if monitoredRoots.applyProvider(snapshot) {
+            publishDirectoryURLs()
+        }
+    }
+
+    /// Must run on `rootsQueue`. Publishes only when the monitored set changed.
+    private func publishDirectoryURLs() {
+        let urls = monitoredRoots.monitored()
+        guard urls != lastPublished else { return }
+        lastPublished = urls
+        DispatchQueue.main.async {
+            FIFinderSyncController.default().directoryURLs = urls
+            NSLog("yadorilink: FinderSync watching \(urls.map(\.path))")
+        }
+    }
+
+    private static func readEagerRootSnapshot() -> EagerRootSnapshot {
         #if DEBUG
+        // Test-only fixture: replaces the daemon read, never used in release builds.
         if let raw = ProcessInfo.processInfo.environment["YADORILINK_FINDER_SYNC_FOLDERS"], !raw.isEmpty {
-            let paths = raw.split(separator: ":").map(String.init)
-            return Set(paths.map { URL(fileURLWithPath: $0, isDirectory: true) })
+            return .confirmed(raw.split(separator: ":").map(String.init))
         }
         #endif
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let fallback = home.appendingPathComponent("YadoriLinkSync", isDirectory: true)
-        try? FileManager.default.createDirectory(at: fallback, withIntermediateDirectories: true)
-        return [fallback]
+        guard let roots = yadorilink_linked_roots_open() else { return .unavailable }
+        defer { yadorilink_linked_roots_free(roots) }
+        var paths: [String] = []
+        for index in 0..<yadorilink_linked_roots_count(roots) {
+            if let path = yadorilink_linked_roots_path(roots, index) {
+                paths.append(String(cString: path))
+            }
+        }
+        return .confirmed(paths)
     }
 
     // MARK: -: directory lifecycle
@@ -194,42 +264,46 @@ class FinderSync: FIFinderSync {
 
     // MARK: -: context menu wired to daemon actions
 
+    /// The daemon's answer for one selected item, plus the kind Finder reports. Anything that
+    /// cannot be read is "not tracked" / "not a file" so the menu offers less, never more.
+    private static func facts(for url: URL) -> FinderItemFacts {
+        let raw = url.path.withCString { yadorilink_query_item($0) }
+        let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory
+        return FinderItemFacts(
+            tracked: raw.tracked, paused: raw.paused,
+            pausedByAncestor: raw.paused_by_ancestor, reclaimSupported: raw.reclaim_supported,
+            currentContentPresent: raw.current_content_present,
+            inTransition: raw.in_transition, isDirectory: isDirectory)
+    }
+
+    /// A selection this large is not worth one daemon round trip per item on Finder's menu
+    /// callback; it gets no actions.
+    private static let maxMenuSelection = 20
+
     override func menu(for menuKind: FIMenuKind) -> NSMenu {
         let menu = NSMenu(title: "")
         guard menuKind == .contextualMenuForItems else { return menu }
-        guard let urls = FIFinderSyncController.default().selectedItemURLs(), !urls.isEmpty else {
+        guard let urls = FIFinderSyncController.default().selectedItemURLs(), !urls.isEmpty,
+              urls.count <= Self.maxMenuSelection else {
             return menu
         }
 
+        let actions = FinderMenu.actions(for: urls.map(Self.facts(for:)))
+        guard !actions.isEmpty else { return menu }
+
         let submenu = NSMenu(title: "YadoriLink")
-        let actions: [(String, Int32, Selector)] = [
-            ("View sync status", Int32(YadoriLinkContextActionViewStatus.rawValue), #selector(viewStatus(_:))),
-            ("Pause sync for this item", Int32(YadoriLinkContextActionPauseItem.rawValue), #selector(pauseItem(_:))),
-            ("Resume sync for this item", Int32(YadoriLinkContextActionResumeItem.rawValue), #selector(resumeItem(_:))),
-            ("Evict (free disk space)", Int32(YadoriLinkContextActionEvictItem.rawValue), #selector(evictItem(_:))),
-        ]
-        for (title, action, selector) in actions {
-            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+        for action in actions {
+            let selector: Selector
+            switch action {
+            case .viewStatus: selector = #selector(viewStatus(_:))
+            case .pause: selector = #selector(pauseItem(_:))
+            case .resume: selector = #selector(resumeItem(_:))
+            case .freeUpSpace: selector = #selector(freeUpSpace(_:))
+            }
+            let item = NSMenuItem(title: action.title, action: selector, keyEquivalent: "")
             item.target = self
-            item.tag = Int(action)
             submenu.addItem(item)
         }
-
-        // Per the shell-integration spec's "Shell Actions Can Open
-        // Desktop Status App": unlike the actions above,
-        // this is a pure UI action -- it launches a separate companion
-        // process (the menu-bar status app), it does not round-trip
-        // through `yadorilink_send_context_action`/the daemon's shell IPC
-        // at all, so it gets no `YadoriLinkContextAction*` tag from the
-        // Rust core's C header.
-        submenu.addItem(NSMenuItem.separator())
-        let openStatusItem = NSMenuItem(
-            title: "Open YadoriLink Status",
-            action: #selector(openStatusApp(_:)),
-            keyEquivalent: ""
-        )
-        openStatusItem.target = self
-        submenu.addItem(openStatusItem)
 
         let yadorilink = NSMenuItem(title: "YadoriLink", action: nil, keyEquivalent: "")
         yadorilink.submenu = submenu
@@ -240,49 +314,37 @@ class FinderSync: FIFinderSync {
     /// Fire-and-forget, same as the Windows `IContextMenu::InvokeCommand`
     /// handler (platforms/windows/shell/src/context_menu.rs): a failed action
     /// just silently doesn't apply rather than showing an error dialog,
-    /// matching the badge's own fail-soft contract.
-    private func sendAction(_ tag: Int) {
+    /// matching the badge's own fail-soft contract. The daemon revalidates
+    /// the path against its linked folders; this only relays.
+    private func sendAction(_ action: Int32) {
         guard let urls = FIFinderSyncController.default().selectedItemURLs() else { return }
         for url in urls {
             _ = url.path.withCString { path in
-                yadorilink_send_context_action(path, Int32(tag))
+                yadorilink_send_context_action(path, action)
             }
         }
     }
 
-    @objc func viewStatus(_ sender: NSMenuItem) { sendAction(sender.tag) }
-    @objc func pauseItem(_ sender: NSMenuItem) { sendAction(sender.tag) }
-    @objc func resumeItem(_ sender: NSMenuItem) { sendAction(sender.tag) }
-    @objc func evictItem(_ sender: NSMenuItem) { sendAction(sender.tag) }
+    @objc func pauseItem(_ sender: NSMenuItem) {
+        sendAction(Int32(YadoriLinkContextActionPauseItem.rawValue))
+    }
 
-    /// Launches the menu-bar status app
-    /// (`yadorilink-status-app`, installed by `platforms/macos/package/build-pkg.sh`
-    /// alongside `yadorilink`/`yadorilink-daemon`), passing the selected
-    /// item's path as an argument so the app *could* focus on it -- the
-    /// status app doesn't parse an argv path yet (tracked as a documented
-    /// follow-up, since the app is normally already running as a login
-    /// item and a second invocation's argv
-    /// isn't otherwise delivered to it), so today this only guarantees the
-    /// app is running/visible, not that it's focused on this specific
-    /// item. Uses `Process` rather than `NSWorkspace.shared.open`/
-    /// `launchApplication(at:)` because the status app ships as a plain
-    /// signed executable, not an `.app` bundle (see build-pkg.sh's own
-    /// notes on why). Fails soft -- a missing/unlaunchable status app
-    /// never throws or blocks Finder (shell-integration spec's "App is
-    /// unavailable" scenario), matching `sendAction`'s own fire-and-forget
-    /// discipline just above.
-    @objc func openStatusApp(_ sender: NSMenuItem) {
-        let path = "/usr/local/bin/yadorilink-status-app"
-        guard FileManager.default.isExecutableFile(atPath: path) else { return }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        if let url = FIFinderSyncController.default().selectedItemURLs()?.first {
-            process.arguments = [url.path]
-        }
-        do {
-            try process.run()
-        } catch {
-            // Fail soft, per this method's doc comment above.
-        }
+    @objc func resumeItem(_ sender: NSMenuItem) {
+        sendAction(Int32(YadoriLinkContextActionResumeItem.rawValue))
+    }
+
+    /// The daemon's evict operation; "Free Up Space" is its only user-facing name.
+    @objc func freeUpSpace(_ sender: NSMenuItem) {
+        sendAction(Int32(YadoriLinkContextActionEvictItem.rawValue))
+    }
+
+    /// Opens the YadoriLink app at the selected item through its `yadorilink://item` URL, the
+    /// same way for a cold launch and for an app that is already running (the system delivers
+    /// the URL to the running instance, or starts the app with it). The app re-resolves the path
+    /// against its linked folders. Fails soft: no URL or no app means nothing happens.
+    @objc func viewStatus(_ sender: NSMenuItem) {
+        guard let url = FIFinderSyncController.default().selectedItemURLs()?.first,
+              let link = FinderDeepLink.url(forItemAt: url.path) else { return }
+        NSWorkspace.shared.open(link)
     }
 }

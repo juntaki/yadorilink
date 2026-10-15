@@ -208,3 +208,27 @@ async fn starting_a_daemon_that_never_answers_reports_it_unresponsive_promptly()
         other => panic!("expected an unresponsive daemon, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn unlink_sends_the_link_key_verbatim() {
+    use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
+    use yadorilink_ipc_proto::daemonctl::UnlinkResponse;
+
+    let _guard = SOCKET_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = seen.clone();
+    serve(&socket, move |request| {
+        if let Some(ReqPayload::Unlink(r)) = request.payload {
+            record.lock().unwrap().push((r.local_path, r.force));
+        }
+        RespPayload::Unlink(UnlinkResponse::default())
+    });
+    std::env::set_var("YADORILINK_CONTROL_SOCKET", &socket);
+
+    // A provider-backed folder's key is not a filesystem path.
+    core().unlink_folder("provider://root-1".into(), false).await.unwrap();
+    assert_eq!(*seen.lock().unwrap(), [("provider://root-1".to_owned(), false)]);
+    std::env::remove_var("YADORILINK_CONTROL_SOCKET");
+}

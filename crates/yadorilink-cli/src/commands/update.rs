@@ -80,9 +80,9 @@ pub async fn download() -> Result<(), CliError> {
     Ok(())
 }
 
-/// `yadorilink update config --checks <on|off> --install <manual>`
+/// `yadorilink update config --checks <on|off>`
 /// (spec "Configure automatic updates").
-pub async fn config(checks: Option<String>, install: Option<String>) -> Result<(), CliError> {
+pub async fn config(checks: Option<String>) -> Result<(), CliError> {
     let automatic_checks_enabled = match checks.as_deref() {
         Some("on") => Some(true),
         Some("off") => Some(false),
@@ -91,14 +91,7 @@ pub async fn config(checks: Option<String>, install: Option<String>) -> Result<(
         }
         None => None,
     };
-    if let Some(mode) = install.as_deref() {
-        if mode != "manual" {
-            return Err(CliError::Other(format!(
-                "--install must be 'manual' (updates are installed manually), got {mode:?}"
-            )));
-        }
-    }
-    let config = updates::set_update_config(automatic_checks_enabled, install).await?;
+    let config = updates::set_update_config(automatic_checks_enabled).await?;
     println!("automatic checks: {}", if config.automatic_checks_enabled { "on" } else { "off" });
     Ok(())
 }

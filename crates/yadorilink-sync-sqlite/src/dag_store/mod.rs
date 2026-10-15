@@ -21,7 +21,9 @@ mod native_head_blocks;
 pub mod published_view;
 mod serving_authorization_index;
 
-pub use native_head_blocks::native_head_retained_block_hashes_all_groups;
+pub use native_head_blocks::{
+    native_head_retained_block_hashes_all_groups, native_head_retained_block_hashes_except,
+};
 pub use serving_authorization_index::{
     get_file_version, group_has_block_provenance, has_file_version, put_file_version,
     put_file_versions_batch, record_group_block_provenance,

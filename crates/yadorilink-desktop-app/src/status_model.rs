@@ -50,17 +50,21 @@ fn paused_count(status: &StatusResponse) -> usize {
 // action outcome lives in this block, so the shared wording layer can replace
 // it in one place.
 
-/// Plain sentence for a coarse `category:context` attention reason. The
-/// context (group id, path, device id) is never shown; an unrecognised
-/// category becomes a generic sentence.
+/// Plain sentence for a coarse `category:context` attention reason, chosen by the shared
+/// attention item. The context (group id, path, device id) is never shown; a problem without
+/// its own sentence here becomes a generic one.
 pub fn reason_sentence(reason: &str) -> String {
-    let category = reason.split(':').next().unwrap_or("");
-    match category {
-        "conflict" => "A file conflict needs review",
-        "low_disk" => "Disk space is low",
-        "peer_disconnected" => "Another device is offline",
-        "recent_error" => "A recent sync error occurred",
-        "update_failed" => "The update check failed",
+    use yadorilink_product_view::AttentionItem as I;
+    match yadorilink_product_view::Attention::from_reason(reason).item {
+        I::ConflictNeedsReview => "A file conflict needs review",
+        I::DiskLow | I::DiskFull => "Disk space is low",
+        I::PeerUnavailable => "Another device is offline",
+        I::RetryableFailure => "A recent sync error occurred",
+        I::UpdateFailed => "The update check failed",
+        I::NoSafeCopy | I::SafeCopyUnconfirmed => "Files may not have a safe second copy yet",
+        I::ContentUnavailable | I::ContentAvailabilityUnknown => {
+            "Some files can't be downloaded right now"
+        }
         _ => "Something needs attention",
     }
     .to_string()
@@ -124,6 +128,34 @@ pub fn action_notice(action: TrayAction, result: Result<(), String>) -> Notice {
             Notice { text: format!("{what}{why}"), is_error: true, details: Some(raw) }
         }
     }
+}
+
+/// What "download the new version" did. Both are normal results: a
+/// package-managed install is told its command rather than sent to a page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpdateDownload {
+    OpenedPage,
+    /// The daemon's instruction for an install a package manager owns.
+    Guidance(String),
+}
+
+pub fn update_download_notice(result: Result<UpdateDownload, String>) -> Notice {
+    match result {
+        Ok(UpdateDownload::OpenedPage) => action_notice(TrayAction::DownloadUpdate, Ok(())),
+        Ok(UpdateDownload::Guidance(text)) => Notice { text, is_error: false, details: None },
+        Err(raw) => action_notice(TrayAction::DownloadUpdate, Err(raw)),
+    }
+}
+
+/// The tray and Settings label for getting a new version: an install that a
+/// package manager owns is told its steps, not sent to a page.
+pub fn update_download_label(version: &str, install_source: &str) -> String {
+    let verb = if yadorilink_client_core::ops::updates::is_package_managed(install_source) {
+        "Show Update Steps"
+    } else {
+        "Download Update"
+    };
+    format!("{verb} ({version})")
 }
 
 /// What the tray icon shows; `None` status means the daemon is unreachable.

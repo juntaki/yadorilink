@@ -23,6 +23,10 @@ public struct MenuBarContentView: View {
                 if context.isFixture { FixtureBadge() }
             }
 
+            if let protection = p.protectionLine {
+                Text(protection).font(.caption).foregroundStyle(.secondary)
+            }
+
             if p.showsStartAction {
                 Button {
                     Task { await app.startDaemon() }
@@ -33,7 +37,10 @@ public struct MenuBarContentView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(app.isStartingDaemon)
                 if let notice = app.notice, notice.kind == .failure {
-                    Text(notice.text).font(.caption).foregroundStyle(.secondary).help(notice.detail ?? "")
+                    Text(notice.text).font(.caption).foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .accessibilityLabel(notice.spokenText)
+                        .help(notice.detail ?? "")
                 }
             }
 
@@ -47,6 +54,7 @@ public struct MenuBarContentView: View {
                         } label: {
                             HStack {
                                 Image(systemName: "folder").foregroundStyle(.secondary)
+                                    .accessibilityHidden(true)
                                 Text(row.name).lineLimit(1).truncationMode(.middle)
                                 Spacer()
                                 Text(row.stateTitle).font(.caption).foregroundStyle(row.stateTone.color)
@@ -65,7 +73,9 @@ public struct MenuBarContentView: View {
             if let line = p.transferLine {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(line).font(.caption)
-                    if let progress = p.transferProgress { ProgressView(value: progress) }
+                    if let progress = p.transferProgress {
+                        ProgressView(value: progress).accessibilityLabel("Transfer progress")
+                    }
                 }
             }
 
@@ -78,8 +88,19 @@ public struct MenuBarContentView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 if p.canPause {
-                    MenuRowButton(p.pauseTitle, systemImage: p.allPaused ? "play.circle" : "pause.circle") {
-                        Task { await app.setAllPaused(!p.allPaused) }
+                    if p.allPaused {
+                        MenuRowButton(p.pauseTitle, systemImage: "play.circle") {
+                            Task { await app.setAllPaused(false) }
+                        }
+                    } else {
+                        Menu {
+                            ForEach(PauseDuration.allCases, id: \.self) { duration in
+                                Button(duration.menuTitle) { Task { await app.setAllPaused(true, duration: duration) } }
+                            }
+                        } label: {
+                            Label(p.pauseTitle, systemImage: "pause.circle")
+                        }
+                        .menuStyle(.borderlessButton)
                     }
                 }
                 MenuRowButton("Open YadoriLink…", systemImage: "macwindow") { open(.home) }

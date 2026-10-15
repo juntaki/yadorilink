@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::session_state::MaterializationState;
+use yadorilink_sync_sqlite::pinned_items::path_is_covered;
+use yadorilink_sync_sqlite::RetentionPolicy;
 
 use crate::daemon_state::DaemonState;
 use crate::sync_error::SyncError;
@@ -49,19 +51,24 @@ pub(crate) fn evict_directory(
     group_id: &str,
     prefix: &str,
 ) -> Result<DirectoryEviction, SyncError> {
-    crate::provider_gate::require_filesystem_root(&state.replica_coordinator, group_id)?;
-    if !state.root_allows_on_demand(group_id) {
+    crate::hydration::evict_gate(state, group_id, prefix)?;
+    let pins = state.replica_coordinator.pinned_item_repository();
+    // A folder that is itself kept is refused as a whole; a folder that merely holds kept files
+    // is freed around them.
+    if pins.retention(group_id, prefix)?.policy == RetentionPolicy::Pinned {
         return Err(SyncError::EvictionRejected(format!(
-            "{prefix}: eviction is unavailable in this build (on-demand placeholder pipeline is \
-             not connected)"
+            "{}: kept on this device; stop keeping it first to free up its space",
+            if prefix.is_empty() { "root" } else { prefix }
         )));
     }
+    let pinned_below = pins.pinned_beneath(group_id, prefix)?;
     let index = state.replica_coordinator.file_index_repository();
     let materialization = state.replica_coordinator.materialization_state_repository();
     let mut attempts = Vec::new();
     for path in index.list_live_files_under(group_id, prefix)? {
         if materialization.get_materialization_state(group_id, &path)?
             != Some(MaterializationState::Present)
+            || path_is_covered(&pinned_below, &path)
         {
             continue;
         }
@@ -149,6 +156,25 @@ pub(crate) async fn hydrate_directory(
 ) -> Result<(), SyncError> {
     let mut first_error = None;
     for path in files_not_hydrated_under(state, group_id, prefix)? {
+        if let Err(error) = super::hydrate(state, group_id, &path).await {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Hydrates every live file below the directory `prefix`, including the ones already here (a
+/// no-op for those, decided under each file's own lock). Every file is attempted; the first
+/// failure is reported after.
+pub(crate) async fn hydrate_every_file(
+    state: &Arc<DaemonState>,
+    group_id: &str,
+    prefix: &str,
+) -> Result<(), SyncError> {
+    let mut first_error = None;
+    for path in
+        state.replica_coordinator.file_index_repository().list_live_files_under(group_id, prefix)?
+    {
         if let Err(error) = super::hydrate(state, group_id, &path).await {
             first_error.get_or_insert(error);
         }

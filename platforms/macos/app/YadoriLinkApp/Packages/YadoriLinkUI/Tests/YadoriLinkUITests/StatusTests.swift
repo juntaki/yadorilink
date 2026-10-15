@@ -114,7 +114,7 @@ struct HomeTests {
     @Test func headlineIsPlainSentence() async throws {
         #expect(HomeViewModel(app: try await startedApp(.healthy).0).headline == "All folders up to date")
         #expect(HomeViewModel(app: try await startedApp(.syncing).0).headline == "Syncing 1 folder")
-        #expect(HomeViewModel(app: try await startedApp(.problem).0).headline == "4 issues need attention")
+        #expect(HomeViewModel(app: try await startedApp(.problem).0).headline == "3 issues need attention")
         #expect(HomeViewModel(app: try await startedApp(.empty).0).headline == "No folders yet")
     }
 
@@ -127,18 +127,18 @@ struct HomeTests {
     @Test func folderRowSummaryIsOneQuietLine() async throws {
         let home = HomeViewModel(app: try await startedApp(.healthy).0)
         let photos = try #require(home.folderRows.first { $0.name == "Photos" })
-        #expect(photos.summary == "Protected · 2 devices · \(Format.bytes(182 * Fixtures.gib)) free")
+        #expect(photos.summary == "Protected · 2 other devices have a copy · \(Format.bytes(182 * Fixtures.gib)) free")
         #expect(photos.detail == nil, "no detail line while protected")
         #expect(photos.pathTooltip == "/Users/me/Photos")
         let docs = try #require(home.folderRows.first { $0.name == "Documents" })
-        #expect(docs.summary.contains("1 device ·"))
+        #expect(docs.summary.hasPrefix("Protected · another device has a copy"))
     }
 
     @Test func detailLineOnlyWhenNotProtected() async throws {
         let home = HomeViewModel(app: try await startedApp(.problem).0)
         let docs = try #require(home.folderRows.first { $0.name == "Documents" })
-        #expect(docs.detail == "No other device has a complete copy yet.")
-        #expect(docs.summary.hasPrefix("At risk · No devices"))
+        #expect(docs.detail == "No other device has a confirmed copy yet.")
+        #expect(docs.summary.hasPrefix("At risk · this Mac is the only confirmed copy"))
         #expect(home.folderRows.filter { $0.detail != nil }.count == 1)
     }
 
@@ -157,13 +157,17 @@ struct HomeTests {
         #expect(photos.progress != nil)
     }
 
-    @Test func attentionReasonsArePlainSentencesWithRawTooltip() async throws {
+    @Test func attentionItemsArePlainSentencesWithActionsAndNoRawCode() async throws {
         let home = HomeViewModel(app: try await startedApp(.problem).0)
-        let lines = home.attentionLines
-        #expect(lines.map(\.text).contains("Documents has conflicting copies of some files."))
-        #expect(lines.map(\.text).contains("Office iMac is offline.") || lines.map(\.text).contains("A device is offline."))
-        #expect(lines.allSatisfy { !$0.text.contains(":") })
-        #expect(lines.first?.tooltip.contains(":") == true)
+        let items = home.attentionItems
+        let texts = items.map(\.text)
+        #expect(texts.contains("Documents has conflicting copies of some files."))
+        #expect(home.waitingLines.contains("Office iMac is offline.") || home.waitingLines.contains("A device is offline."))
+        #expect(items.allSatisfy { !$0.text.contains(":") && !$0.id.isEmpty })
+        let conflict = try #require(items.first { $0.text.contains("conflicting") })
+        #expect(conflict.primary.action == .reviewConflict)
+        #expect(conflict.primary.title == "Review Conflict…")
+        #expect(conflict.primary.destination == .folder(try #require(conflict.folderLocalPath)))
     }
 
     @Test func devicesLoadOnceAndEmptyStateNeedsASuccessfulFetch() async throws {

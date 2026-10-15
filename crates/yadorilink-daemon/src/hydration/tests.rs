@@ -4135,6 +4135,7 @@ async fn hydration_preflight_counts_the_space_other_writes_hold() {
 
 // ---- placing hydrated bytes over an existing object ----
 
+#[cfg(unix)]
 /// Moves the row of `doc.txt` to a newer version whose bytes are `content` (blocks stored with
 /// this group's provenance), leaving the old version's object on disk under its stale proof.
 fn move_doc_to_newer_version(state: &DaemonState, sync_state: &ReplicaCoordinator, content: &[u8]) {
@@ -4150,6 +4151,7 @@ fn move_doc_to_newer_version(state: &DaemonState, sync_state: &ReplicaCoordinato
         .unwrap();
 }
 
+#[cfg(unix)]
 fn set_swap_gap_hook(out_path: &std::path::Path, hook: Arc<dyn Fn() + Send + Sync>) {
     SWAP_GAP_HOOKS
         .lock()
@@ -4158,6 +4160,7 @@ fn set_swap_gap_hook(out_path: &std::path::Path, hook: Arc<dyn Fn() + Send + Syn
         .insert(out_path.display().to_string(), hook);
 }
 
+#[cfg(unix)]
 fn directory_names(dir: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -4404,4 +4407,252 @@ async fn eviction_keeps_a_same_size_same_mtime_atomic_replace_of_a_hydrated_file
         Some(MaterializationState::Present),
         "an undetected on-disk replacement must not be committed to a placeholder"
     );
+}
+
+// --- local retention pin ---
+
+#[cfg(unix)]
+mod pin {
+    use super::*;
+    use crate::adapters::runtime::materialization::DaemonMaterializationAdapter;
+    use crate::application::ports::MaterializationPort;
+
+    const KEPT: &str = "kept on this device";
+
+    fn is_pin_refusal<T: std::fmt::Debug>(result: &Result<T, SyncError>) -> bool {
+        matches!(result, Err(SyncError::EvictionRejected(msg)) if msg.contains(KEPT))
+    }
+
+    fn materialization(
+        sync_state: &ReplicaCoordinator,
+        path: &str,
+    ) -> Option<MaterializationState> {
+        sync_state
+            .materialization_state_repository()
+            .get_materialization_state("group-1", path)
+            .unwrap()
+    }
+
+    /// Pinning a remote file fetches it through the ordinary hydration path
+    /// and records the policy apart from the materialization state.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinning_a_remote_file_hydrates_it_and_records_the_policy() {
+        let (state, sync_state, root_dir, content) = setup_remote_doc().await;
+        let adapter = DaemonMaterializationAdapter::new(state.clone());
+
+        let outcome = adapter.pin("group-1", "doc.txt").await.unwrap();
+
+        assert_eq!(outcome.download_error, None);
+        assert!(outcome.retention.pinned && outcome.retention.explicit);
+        assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
+        assert_eq!(materialization(&sync_state, "doc.txt"), Some(MaterializationState::Present));
+        assert!(adapter.retention("group-1", "doc.txt").unwrap().pinned);
+    }
+
+    /// A hydrated file is pinned without being rewritten or re-versioned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinning_a_hydrated_file_does_not_rewrite_or_version_it() {
+        use std::os::unix::fs::MetadataExt as _;
+        let (state, sync_state, root_dir, content) = setup_legitimately_hydrated_doc().await;
+        let on_disk = root_dir.path().join("doc.txt");
+        let before = std::fs::metadata(&on_disk).unwrap();
+        let version = current_version_hash_for(&sync_state, "group-1", "doc.txt");
+        let adapter = DaemonMaterializationAdapter::new(state.clone());
+
+        let outcome = adapter.pin("group-1", "doc.txt").await.unwrap();
+
+        assert_eq!(outcome.download_error, None);
+        let after = std::fs::metadata(&on_disk).unwrap();
+        assert_eq!(
+            (before.ino(), before.mtime(), before.mtime_nsec()),
+            (after.ino(), after.mtime(), after.mtime_nsec())
+        );
+        assert_eq!(std::fs::read(&on_disk).unwrap(), content);
+        assert_eq!(current_version_hash_for(&sync_state, "group-1", "doc.txt"), version);
+        assert_eq!(materialization(&sync_state, "doc.txt"), Some(MaterializationState::Present));
+    }
+
+    /// Free Up Space on a pinned file is refused before anything is done.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn freeing_a_pinned_file_is_refused_and_leaves_it_whole() {
+        let (state, sync_state, root_dir, content) = setup_legitimately_hydrated_doc().await;
+        // Reaching the eviction itself must be possible, so that only the pin stops it.
+        state.set_test_on_demand_allowed(true);
+        let adapter = DaemonMaterializationAdapter::new(state.clone());
+        adapter.pin("group-1", "doc.txt").await.unwrap();
+
+        let result = adapter.evict("group-1", "doc.txt");
+
+        assert!(is_pin_refusal(&result), "{result:?}");
+        assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
+        assert_eq!(materialization(&sync_state, "doc.txt"), Some(MaterializationState::Present));
+    }
+
+    /// A folder's pin covers what is beneath it, including through the
+    /// folder-level eviction.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_under_a_pinned_folder_cannot_be_freed_and_neither_can_the_folder() {
+        let (state, sync_state, root_dir, content) = setup_legitimately_hydrated_doc().await;
+        state.set_test_on_demand_allowed(true);
+        let adapter = DaemonMaterializationAdapter::new(state.clone());
+        // The link root is the folder; its pin covers every file.
+        adapter.pin("group-1", "").await.unwrap();
+
+        let file = adapter.evict("group-1", "doc.txt");
+        let folder = adapter.evict("group-1", "");
+
+        assert!(is_pin_refusal(&file), "{file:?}");
+        assert!(is_pin_refusal(&folder), "{folder:?}");
+        assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
+        assert_eq!(materialization(&sync_state, "doc.txt"), Some(MaterializationState::Present));
+    }
+
+    /// Freeing a folder skips the files pinned inside it rather than failing
+    /// or touching them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn freeing_a_folder_leaves_its_pinned_files_alone() {
+        let (state, sync_state, root_dir, content) = setup_legitimately_hydrated_doc().await;
+        state.set_test_on_demand_allowed(true);
+        let adapter = DaemonMaterializationAdapter::new(state.clone());
+        adapter.pin("group-1", "doc.txt").await.unwrap();
+
+        let outcome = adapter.evict("group-1", "").expect("nothing eligible is not an error");
+
+        assert!(!outcome.dehydrated);
+        assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
+        assert_eq!(materialization(&sync_state, "doc.txt"), Some(MaterializationState::Present));
+    }
+
+    /// Unpinning changes eligibility only: the bytes stay, and the pin no
+    /// longer stops a later Free Up Space.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unpinning_keeps_the_bytes_and_only_lifts_the_refusal() {
+        let (state, sync_state, root_dir, content) = setup_legitimately_hydrated_doc().await;
+        state.set_test_on_demand_allowed(true);
+        let adapter = DaemonMaterializationAdapter::new(state.clone());
+        adapter.pin("group-1", "doc.txt").await.unwrap();
+        assert!(is_pin_refusal(&adapter.evict("group-1", "doc.txt")));
+
+        let after = adapter.unpin("group-1", "doc.txt").unwrap();
+
+        assert!(!after.pinned);
+        assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
+        assert_eq!(materialization(&sync_state, "doc.txt"), Some(MaterializationState::Present));
+        let result = adapter.evict("group-1", "doc.txt");
+        assert!(!is_pin_refusal(&result), "{result:?}");
+        // Where eviction itself works (it needs the Linux write lease), it now frees the file.
+        #[cfg(target_os = "linux")]
+        assert!(result.expect("evict").dehydrated);
+    }
+
+    /// There are no per-child overrides: unpinning a file whose folder is
+    /// pinned leaves it pinned and says why.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unpinning_an_inherited_pin_changes_nothing() {
+        let (state, _sync_state, _root_dir, _content) = setup_legitimately_hydrated_doc().await;
+        let adapter = DaemonMaterializationAdapter::new(state.clone());
+        adapter.pin("group-1", "").await.unwrap();
+
+        let after = adapter.unpin("group-1", "doc.txt").unwrap();
+
+        assert_eq!(
+            after,
+            crate::application::ports::RetentionState { pinned: true, explicit: false }
+        );
+    }
+
+    /// A pin that cannot be read is not "unpinned": the request is refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_policy_store_refuses_the_eviction() {
+        let (state, sync_state, root_dir, content) = setup_legitimately_hydrated_doc().await;
+        state.set_test_on_demand_allowed(true);
+        sync_state
+            .database()
+            .write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                conn.execute_batch("DROP TABLE pinned_items")?;
+                Ok(())
+            })
+            .unwrap();
+        let adapter = DaemonMaterializationAdapter::new(state.clone());
+
+        let result = adapter.evict("group-1", "doc.txt");
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
+        assert_eq!(materialization(&sync_state, "doc.txt"), Some(MaterializationState::Present));
+    }
+
+    /// Pinning a folder fetches every file beneath it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinning_a_folder_hydrates_the_files_beneath_it() {
+        let (state, sync_state, root_dir, content) = setup_remote_doc().await;
+        let adapter = DaemonMaterializationAdapter::new(state.clone());
+
+        let outcome = adapter.pin("group-1", "").await.unwrap();
+
+        assert_eq!(outcome.download_error, None);
+        assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
+        assert_eq!(materialization(&sync_state, "doc.txt"), Some(MaterializationState::Present));
+    }
+
+    /// The pin row is recorded first, so every eviction check that starts afterwards sees it;
+    /// the pin then waits for the evictions already past their check (they hold the path lock
+    /// to their end) and fetches the file again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pin_is_on_record_at_once_and_waits_for_an_operation_holding_the_path() {
+        let (state, sync_state, _root_dir, _content) = setup_legitimately_hydrated_doc().await;
+        let adapter = Arc::new(DaemonMaterializationAdapter::new(state.clone()));
+        let lock = sync_state.path_lock_registry().path_lock("group-1", "doc.txt");
+        let held = lock.lock().await;
+
+        let pinning = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.pin("group-1", "doc.txt").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(!pinning.is_finished(), "the pin did not wait for the path");
+        assert!(
+            adapter.retention("group-1", "doc.txt").unwrap().pinned,
+            "the pin must be on record at once, so an eviction that starts now is refused"
+        );
+        drop(held);
+        pinning.await.unwrap().unwrap();
+        assert!(adapter.retention("group-1", "doc.txt").unwrap().pinned);
+    }
+
+    /// A folder's row is on record at once, so a file that appears later is covered by it; the pin
+    /// then waits for evictions of children already past their last check.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_pin_is_on_record_at_once_and_waits_for_a_file_beneath_it() {
+        let (state, sync_state, _root_dir, _content) = setup_legitimately_hydrated_doc().await;
+        let adapter = Arc::new(DaemonMaterializationAdapter::new(state.clone()));
+        let lock = sync_state.path_lock_registry().path_lock("group-1", "doc.txt");
+        let held = lock.lock().await;
+
+        let pinning = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.pin("group-1", "").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(
+            adapter.retention("group-1", "doc.txt").unwrap().pinned,
+            "the folder row must be on record at once: a file that appears later is covered by it"
+        );
+        drop(held);
+        pinning.await.unwrap().unwrap();
+        assert!(adapter.retention("group-1", "doc.txt").unwrap().pinned);
+    }
 }

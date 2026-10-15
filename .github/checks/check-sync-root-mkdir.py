@@ -68,39 +68,31 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     C + "yadorilink-peer-session/src/hazard.rs": {"create_dir": 1, "create_dir_all": 2},
     # Config, state, socket, update and report directories.
     C + "yadorilink-cli/src/commands/diagnose.rs": {"create_dir_all": 1},
-    C + "yadorilink-client-core/src/coordination/device_config.rs": {"create_dir_all": 1},
     C + "yadorilink-client-core/src/facade/settings.rs": {"create_dir_all": 1},
-    C + "yadorilink-daemon/src/app.rs": {"create_dir_all": 2},
     C + "yadorilink-daemon/src/control_socket.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/governance_config.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/peer_orchestrator.rs": {"create_dir_all": 1},
-    C + "yadorilink-daemon/src/reporting/counters.rs": {"create_dir_all": 1},
-    C + "yadorilink-daemon/src/resource_lock.rs": {"create_dir_all": 2},
     C + "yadorilink-daemon/src/shell_ipc.rs": {"create_dir_all": 1},
+    C + "yadorilink-daemon/src/space_management_config.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/update/policy.rs": {"create_dir_all": 1},
     C + "yadorilink-desktop-app/src/account.rs": {"create_dir_all": 1},
     C + "yadorilink-desktop-app/src/actions.rs": {"create_dir_all": 1},
     C + "yadorilink-desktop-app/src/fonts.rs": {"create_dir_all": 1},
     C + "yadorilink-desktop-app/src/login_item.rs": {"create_dir_all": 1},
     C + "yadorilink-desktop-app/src/window.rs": {"create_dir_all": 1},
-    C + "yadorilink-fapi-client/src/store/file.rs": {"create_dir_all": 1},
-    C + "yadorilink-fapi-client/src/store/lock.rs": {"create_dir_all": 1},
     C + "yadorilink-http-api/src/token.rs": {"create_dir_all": 2},
-    C + "yadorilink-reporting/src/local_store/consent_store.rs": {"create_dir_all": 1},
-    C + "yadorilink-reporting/src/local_store/entry_store.rs": {"create_dir_all": 1},
-    C + "yadorilink-reporting/src/local_store/error_candidates.rs": {"create_dir_all": 1},
+    # Reporting queue/candidate/metrics state is best-effort telemetry (plain writes);
+    # every creation of the reporting/ parent itself (consent, counters) is durable.
     C + "yadorilink-reporting/src/metrics_config.rs": {"create_dir_all": 1},
     # The send inbox and its received files' directories: not a sync root.
     C + "yadorilink-send/src/session.rs": {"create_dir_all": 4},
-    C + "yadorilink-transport/src/key_secret_store.rs": {"create_dir_all": 1},
     # Provider/native-recovery private state and the durability probe's scratch
     # directory: app-owned directories (0700), not content inside a sync root.
-    C + "yadorilink-client-core/src/ops/provider_pending.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/provider_handoff.rs": {"DirBuilder::new": 1, "create_dir_all": 1},
     C + "yadorilink-daemon/src/provider_writer.rs": {"DirBuilder::new": 1},
     # `DurableNamespace`: the Stage-directory mkdir, the methods named after it
     # and the probe's own scratch directory.
-    C + "yadorilink-fs-platform/src/durable_dir.rs": {"create_dir": 2},
+    C + "yadorilink-fs-platform/src/durable_dir.rs": {"create_dir": 2, "create_dir_all": 2},
     C + "yadorilink-fs-platform/src/durable_dir/probe.rs": {"create_dir": 2},
     C + "yadorilink-sync-sqlite/src/native_rebootstrap_recovery.rs": {"DirBuilder::new": 3, "create_dir_all": 1},
 }

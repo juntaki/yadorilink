@@ -64,7 +64,7 @@ impl EntryStore {
     /// as `consent_store::new_reporter_id`), applies the retention policy
     /// immediately afterward, and returns the new entry's metadata.
     pub fn insert(&self, envelope: ReportEnvelope) -> ReportingResult<QueuedReportMetadata> {
-        std::fs::create_dir_all(&self.dir)?;
+        yadorilink_fs_platform::durable_dir::create_dir_all_durably(&self.dir)?;
         let report_id = uuid::Uuid::new_v4().to_string();
         let size_bytes = serde_json::to_vec(&envelope)?.len();
         let metadata = QueuedReportMetadata {

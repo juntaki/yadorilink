@@ -29,11 +29,16 @@ use yadorilink_sync_sqlite::native_rebootstrap::{
     RecoveryContentSource, RestartOutcome,
 };
 use yadorilink_sync_sqlite::native_rebootstrap_install::{
-    install_rebootstrap, InstallContext, InstallError, InstallPoint, Observed, QuarantineRoot,
+    install_rebootstrap, observe_regular_file, unlink_exclusively, InstallContext, InstallError,
+    InstallPoint, Observed, QuarantineRoot, Removal, Unlinked,
 };
 use yadorilink_sync_sqlite::native_rebootstrap_replay::{
     catch_up, replay_own_intent, CatchUpLimits, CatchUpPass, CatchUpSource, MachinePoint,
     ReplayContext, ReplayError,
+};
+use yadorilink_sync_sqlite::native_rebootstrap_retained::{
+    cleanup_retained, unlink_claimed_exclusively, ClaimedUnlink, RetainedContext, RetainedOriginal,
+    RetainedOutcome, RetainedRoot,
 };
 use yadorilink_sync_sqlite::SyncSqliteError;
 
@@ -57,6 +62,8 @@ pub enum Point {
     Begin(Failpoint),
     Install(InstallPoint),
     Machine(MachinePoint),
+    /// The best-effort release of the originals the rebootstrap kept is about to be attempted.
+    RetainedCleanup,
 }
 
 /// Called at each [`Point`]; an error stops the machine there as a crash would.
@@ -118,7 +125,11 @@ pub(crate) fn run(
         let _claim = state.native_replication.claim_machine(group).ok_or(RebootstrapError::Busy)?;
         let machine = Machine::new(state, group);
         let preserved = machine.begin(bundle)?;
-        machine.drive(&preserved.recovery_id)
+        let driven = machine.drive(&preserved.recovery_id);
+        if driven.is_ok() {
+            machine.release_retained();
+        }
+        driven
     };
     if matches!(result, Err(RebootstrapError::Waiting(_))) {
         // Nothing is lost by waiting: the journal holds the machine where it stopped.
@@ -140,13 +151,18 @@ pub fn resume(state: &Arc<DaemonState>, group: &FolderGroupId) -> Result<(), Reb
         RestartOutcome::Idle | RestartOutcome::Abandoned { .. } => {
             // No machine: only the replacement checkpoint of an earlier one may still be owed.
             machine.handle.block_on(seal_replacement_checkpoint(state, group));
+            machine.release_retained();
             Ok(())
         }
         RestartOutcome::Blocked(reason) => Err(RebootstrapError::Blocked(format!("{reason:?}"))),
         RestartOutcome::Preserved(preserved)
         | RestartOutcome::Quarantining(preserved)
         | RestartOutcome::CatchingUp(preserved)
-        | RestartOutcome::Replaying(preserved) => machine.drive(&preserved.recovery_id),
+        | RestartOutcome::Replaying(preserved) => {
+            machine.drive(&preserved.recovery_id)?;
+            machine.release_retained();
+            Ok(())
+        }
     }
 }
 
@@ -199,6 +215,28 @@ impl Machine {
             hook: state.native_replication.rebootstrap_hook(),
             recovery_root: crate::device_config::recovery_root_of(&state.device_id),
             items_root: crate::device_config::recovery_items_root_of(&state.device_id),
+        }
+    }
+
+    /// Tries once to release the originals earlier rebootstraps of the group kept, while this
+    /// call holds the group's machine claim. Best effort: what cannot be released stays retained
+    /// and is tried again at the next such event (a finished rebootstrap, a restart); a failure
+    /// is logged and never fails the rebootstrap. No timer and no age: only these events.
+    fn release_retained(&self) {
+        let _ = self.fire(Point::RetainedCleanup);
+        match clean_up_retained_originals_held(&self.state, &self.group) {
+            Ok(outcomes) => {
+                for (original, outcome) in outcomes {
+                    tracing::debug!(
+                        group = %self.group.0, path = %original.path, ?outcome,
+                        "native rebootstrap: retained original"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                group = %self.group.0, %error,
+                "native rebootstrap: the kept originals could not be released"
+            ),
         }
     }
 
@@ -857,8 +895,10 @@ impl DaemonQuarantineRoot {
         let kind = meta.file_type();
         if kind.is_symlink() {
             let target = std::fs::read_link(path).map_err(|e| e.to_string())?;
+            // The raw platform-native bytes, as ordinary capture reads them: never a lossy
+            // UTF-8 conversion, which would save a different target than the link has.
             return Ok(Observed::Symlink {
-                target: target.to_string_lossy().into_owned().into_bytes(),
+                target: yadorilink_fs_platform::fs_identity::target_to_bytes(&target),
             });
         }
         if kind.is_dir() {
@@ -867,8 +907,16 @@ impl DaemonQuarantineRoot {
         if !kind.is_file() {
             return Ok(Observed::Other);
         }
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        Ok(Observed::File { size: bytes.len() as u64, sha256: Sha256::digest(&bytes).into() })
+        observe_regular_file(std::fs::File::open(path).map_err(|e| e.to_string())?)
+    }
+}
+
+impl DaemonQuarantineRoot {
+    fn claimed_name(full: &Path, claim: &str) -> Result<PathBuf, String> {
+        use yadorilink_fs_platform::reserved_namespace::{artefact_component_name, ArtefactKind};
+        Ok(full.with_file_name(
+            artefact_component_name(ArtefactKind::Preimage, claim).map_err(|e| e.to_string())?,
+        ))
     }
 }
 
@@ -881,45 +929,62 @@ impl QuarantineRoot for DaemonQuarantineRoot {
         }
     }
 
-    fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+    fn open_file(&self, path: &str) -> Result<Box<dyn std::io::Read>, String> {
         let _op = self.lease.begin_operation().map_err(|e| e.to_string())?;
         let full = self.confined(path)?.ok_or_else(|| format!("{path} does not exist"))?;
         if !std::fs::symlink_metadata(&full).map_err(|e| e.to_string())?.is_file() {
             return Err(format!("{path} is not a regular file"));
         }
-        std::fs::read(full).map_err(|e| e.to_string())
+        // Streamed by the caller through a bounded buffer; the lease operation covers the open,
+        // and the removal that follows verifies the object against what was observed.
+        let file = std::fs::File::open(full).map_err(|e| e.to_string())?;
+        if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err(format!("{path} is not a regular file"));
+        }
+        Ok(Box::new(file))
     }
 
-    fn remove(&self, path: &str, expected: &Observed) -> Result<(), String> {
-        use yadorilink_fs_platform::reserved_namespace::{artefact_component_name, ArtefactKind};
+    fn remove(&self, path: &str, expected: &Observed, claim: &str) -> Result<Removal, String> {
         let _op = self.lease.begin_operation().map_err(|e| e.to_string())?;
-        let Some(full) = self.confined(path)? else { return Ok(()) };
+        let Some(full) = self.confined(path)? else { return Ok(Removal::Removed) };
         // Compare-then-unlink by name is not atomic: the user could save in between. The
         // object is renamed to a private name in its own directory first, so it cannot be
         // written under its old name, and is checked there.
-        let private = full.with_file_name(
-            artefact_component_name(
-                ArtefactKind::Preimage,
-                &hex::encode(rand::random::<[u8; 8]>()),
-            )
-            .map_err(|e| e.to_string())?,
-        );
+        // The name is derived from `claim`, which the install recorded before this call, so
+        // whatever is under it after a crash is owned and given back by `release_claim`.
+        let private = Self::claimed_name(&full, claim)?;
         // A durable, never-replacing move: the quarantine name is on disk before
         // anything is decided about the object under it.
         match yadorilink_local_storage::move_no_replace_durably(&full, &private) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Removal::Removed),
             Err(e) => return Err(e.to_string()),
         }
-        let renamed = Self::observe_at(&private)?;
-        if renamed == *expected {
-            return if matches!(renamed, Observed::Directory) {
+        if std::fs::symlink_metadata(&private).map_err(|e| e.to_string())?.is_file() {
+            // A regular file may still be open for writing in a program that opened it before
+            // the move: it is unlinked only under an exclusion the platform guarantees, and
+            // kept under its claim otherwise.
+            match unlink_exclusively(
+                &private,
+                expected,
+                &yadorilink_sync_sqlite::native_rebootstrap_install::open_excluding_writers,
+                &|| {},
+                &yadorilink_fs_platform::durable_dir::remove_file_durably,
+            )? {
+                Unlinked::Done(removal) => return Ok(removal),
+                Unlinked::ChangedBeforeUnlink => {}
+            }
+        } else if Self::observe_at(&private)? == *expected {
+            return if matches!(expected, Observed::Directory) {
                 yadorilink_local_storage::move_no_replace_durably(&private, &full)
                     .map_err(|e| e.to_string())
+                    .map(|()| Removal::Removed)
             } else {
                 // The removal was committed by the move above; unlinking the
-                // quarantined object is the non-critical part.
-                std::fs::remove_file(&private).map_err(|e| e.to_string())
+                // quarantined link is the non-critical part.
+                yadorilink_fs_platform::durable_dir::remove_file_durably(&private)
+                    .map_err(|e| e.to_string())
+                    .map(|()| Removal::Removed)
             };
         }
         // Not what the plan saw any more: the name is given back so the next attempt sees
@@ -930,6 +995,130 @@ impl QuarantineRoot for DaemonQuarantineRoot {
         }
         Err(format!("{path} changed while it was being removed"))
     }
+
+    fn release_claim(&self, path: &str, claim: &str) -> Result<(), String> {
+        let _op = self.lease.begin_operation().map_err(|e| e.to_string())?;
+        // The claim is cleared only once the moved object is gone or back; a parent that
+        // vanished meanwhile leaves the object unreachable by this path, so it fails closed.
+        let full = self
+            .confined(path)?
+            .ok_or_else(|| format!("{path}: a parent is gone while its original is moved aside"))?;
+        let private = Self::claimed_name(&full, claim)?;
+        match yadorilink_local_storage::move_no_replace_durably(&private, &full) {
+            Ok(()) => Ok(()),
+            // Nothing under the claim: the removal finished (the object was verified and
+            // unlinked), or the move never happened.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+impl RetainedRoot for DaemonQuarantineRoot {
+    fn observe_claimed(&self, path: &str, claim: &str) -> Result<Observed, String> {
+        let _op = self.lease.begin_operation().map_err(|e| e.to_string())?;
+        let private = self.claimed_path(path, claim)?;
+        Self::observe_at(&private)
+    }
+
+    fn open_claimed(&self, path: &str, claim: &str) -> Result<Box<dyn std::io::Read>, String> {
+        let _op = self.lease.begin_operation().map_err(|e| e.to_string())?;
+        let private = self.claimed_path(path, claim)?;
+        if !std::fs::symlink_metadata(&private).map_err(|e| e.to_string())?.is_file() {
+            return Err(format!("{path}: the claimed object is not a regular file"));
+        }
+        Ok(Box::new(std::fs::File::open(private).map_err(|e| e.to_string())?))
+    }
+
+    fn unlink_claimed(
+        &self,
+        path: &str,
+        claim: &str,
+        expected_fingerprint: &[u8; 32],
+    ) -> Result<ClaimedUnlink, String> {
+        let _op = self.lease.begin_operation().map_err(|e| e.to_string())?;
+        let private = self.claimed_path(path, claim)?;
+        unlink_claimed_exclusively(
+            &private,
+            expected_fingerprint,
+            &yadorilink_sync_sqlite::native_rebootstrap_install::open_excluding_writers,
+            &yadorilink_fs_platform::durable_dir::remove_file_durably,
+        )
+    }
+}
+
+/// The bytes the object kept for `original` takes, when its folder is watched and it is there.
+pub(crate) fn retained_size(
+    state: &Arc<DaemonState>,
+    group: &FolderGroupId,
+    original: &RetainedOriginal,
+) -> Option<u64> {
+    let root = DaemonQuarantineRoot::open(state, group)?;
+    let private = root.claimed_path(&original.path, &original.claim).ok()?;
+    std::fs::symlink_metadata(private).ok().map(|meta| meta.len())
+}
+
+impl DaemonQuarantineRoot {
+    /// Where the object kept under `claim` is. A parent that is gone leaves the object
+    /// unreachable by this path, so it fails closed.
+    fn claimed_path(&self, path: &str, claim: &str) -> Result<PathBuf, String> {
+        let full = self
+            .confined(path)?
+            .ok_or_else(|| format!("{path}: a parent is gone while its original is kept"))?;
+        Self::claimed_name(&full, claim)
+    }
+}
+
+/// Tries to release the originals of `group` that a rebootstrap kept instead of unlinking:
+/// each is removed only while the platform proves that no program can still write to it and it
+/// has the bytes recorded for it; other bytes are saved as a recovery item first. Where the
+/// exclusion cannot be proved the object stays retained. Takes the group's machine claim, so it
+/// never runs beside a rebootstrap of the group. Blocks like [`run`].
+pub fn clean_up_retained_originals(
+    state: &Arc<DaemonState>,
+    group: &FolderGroupId,
+) -> Result<Vec<(RetainedOriginal, RetainedOutcome)>, RebootstrapError> {
+    let _claim = state.native_replication.claim_machine(group).ok_or(RebootstrapError::Busy)?;
+    clean_up_retained_originals_held(state, group)
+}
+
+/// [`clean_up_retained_originals`] for a caller that already holds the group's machine claim.
+fn clean_up_retained_originals_held(
+    state: &Arc<DaemonState>,
+    group: &FolderGroupId,
+) -> Result<Vec<(RetainedOriginal, RetainedOutcome)>, RebootstrapError> {
+    let Some(root) = DaemonQuarantineRoot::open(state, group) else {
+        return Err(RebootstrapError::Blocked(
+            "the folder is not being watched, so its kept originals cannot be reached".into(),
+        ));
+    };
+    let sync_roots: Vec<PathBuf> = state
+        .replica_coordinator
+        .link_repository()
+        .list_links()
+        .map(|links| {
+            links.iter().filter_map(|link| link.folder_path().map(PathBuf::from)).collect()
+        })
+        .unwrap_or_default();
+    let items_root = crate::device_config::recovery_items_root_of(&state.device_id);
+    let ctx = RetainedContext {
+        items_root: &items_root,
+        sync_roots: &sync_roots,
+        now_unix: now_unix(),
+        root: &root,
+    };
+    let mut out = None;
+    state
+        .replica_coordinator
+        .database()
+        .write::<_, SyncSqliteError>(|conn| {
+            // A retained row is terminal and owns its claimed object: a rebootstrap running
+            // at the same time works on rows and claims of its own.
+            out = Some(cleanup_retained(conn, &ctx, group)?);
+            Ok(())
+        })
+        .map_err(RebootstrapError::from)?;
+    Ok(out.expect("the step ran"))
 }
 
 /// One awaited incremental pass over the live peer connections.
@@ -944,5 +1133,51 @@ impl CatchUpSource for DaemonCatchUp {
         let obtained =
             self.handle.block_on(self.state.native_replication.catch_up_pass(&self.group, cap));
         Ok(CatchUpPass { obtained })
+    }
+}
+
+#[cfg(test)]
+mod retained_root_tests {
+    use super::*;
+    use yadorilink_sync_sqlite::native_rebootstrap_retained::kept_fingerprint;
+
+    fn root_with_a_claimed_file(
+        bytes: &[u8],
+    ) -> (tempfile::TempDir, DaemonQuarantineRoot, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = DaemonQuarantineRoot {
+            root: dir.path().to_path_buf(),
+            lease: Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        };
+        let claimed =
+            DaemonQuarantineRoot::claimed_name(&dir.path().join("x"), "0123456789abcdef").unwrap();
+        std::fs::write(&claimed, bytes).unwrap();
+        (dir, root, claimed)
+    }
+
+    #[test]
+    fn an_object_with_other_bytes_than_recorded_is_never_unlinked() {
+        let (_dir, root, claimed) = root_with_a_claimed_file(b"other bytes");
+        let recorded = [7u8; 32];
+        assert_eq!(
+            root.unlink_claimed("x", "0123456789abcdef", &recorded).unwrap(),
+            ClaimedUnlink::Changed
+        );
+        assert!(claimed.exists());
+    }
+
+    #[test]
+    fn an_unchanged_object_is_unlinked_only_where_the_platform_proves_no_writer() {
+        let (_dir, root, claimed) = root_with_a_claimed_file(b"recorded");
+        let observed = root.observe_claimed("x", "0123456789abcdef").unwrap();
+        let recorded = kept_fingerprint(&observed).expect("a regular file");
+        let result = root.unlink_claimed("x", "0123456789abcdef", &recorded).unwrap();
+        if cfg!(any(target_os = "linux", windows)) {
+            assert_eq!(result, ClaimedUnlink::Removed);
+            assert!(!claimed.exists());
+        } else {
+            assert_eq!(result, ClaimedUnlink::Retained);
+            assert!(claimed.exists());
+        }
     }
 }

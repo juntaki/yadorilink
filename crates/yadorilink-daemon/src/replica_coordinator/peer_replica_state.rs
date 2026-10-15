@@ -205,6 +205,19 @@ impl ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
+    /// Drops the bootstrap scaffold of `path`, if that is all the path has as its current row.
+    pub fn retire_bootstrap_scaffold(
+        &self,
+        group_id: &str,
+        path: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<bool, PeerSessionError> {
+        self.file_index_repository()
+            .retire_bootstrap_scaffold(group_id, path, permit)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
     /// The payload producer for every caller that has to read its
     /// payload out of this device's own index: every
     /// materialization-relevant column of `path`'s current row, from ONE
@@ -1452,6 +1465,75 @@ impl ReplicaCoordinator {
     ) -> Result<Vec<FileRecord>, PeerSessionError> {
         self.file_index_repository()
             .list_live_conflict_copy_candidates(group_id)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
+    /// Whether the single live head at `destination` descends, through its own author's
+    /// removals, from a delta that removed `removed`'s exact head and put `destination`
+    /// in the same delta: the verified shape of a move of `removed.source_path` onto
+    /// `destination`. Anything missing, concurrent or unrecognised answers `false`.
+    pub fn native_head_descends_from_move_of(
+        &self,
+        group_id: &str,
+        removed: &yadorilink_replica_domain::native_plan::NativeRowIdentity,
+        destination: &str,
+    ) -> Result<bool, PeerSessionError> {
+        use yadorilink_replica_domain::ids::{FolderGroupId, SyncPath};
+        use yadorilink_replica_domain::native_state::DeltaHash;
+        use yadorilink_replica_domain::signed_delta::NativeDelta;
+        let group = FolderGroupId(group_id.to_owned());
+        let destination = SyncPath(destination.to_owned());
+        self.database()
+            .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                let heads = yadorilink_sync_sqlite::native_store::native_heads_at(
+                    conn,
+                    &group,
+                    &destination,
+                )?;
+                let [head] = heads.as_slice() else { return Ok(false) };
+                let mut dot = head.dot.clone();
+                let mut provenance: DeltaHash = head.payload.provenance;
+                // A delta chain is finite; a repeated dot would be a cycle and answers `false`.
+                let mut seen = std::collections::HashSet::new();
+                while seen.insert(dot.clone()) {
+                    let Some(body) = yadorilink_sync_sqlite::native_store::fetch_delta_body(
+                        conn,
+                        &group,
+                        &dot.author,
+                        dot.seq,
+                    )?
+                    else {
+                        return Ok(false);
+                    };
+                    let Ok(delta) = NativeDelta::from_wire_bytes(&body) else {
+                        return Ok(false);
+                    };
+                    if delta.delta_hash() != provenance {
+                        return Ok(false);
+                    }
+                    let Some(put_op) =
+                        delta.ops.iter().find(|op| op.path == destination && op.put.is_some())
+                    else {
+                        return Ok(false);
+                    };
+                    let moved_here = delta.ops.iter().any(|op| {
+                        op.path == removed.source_path
+                            && op
+                                .removes
+                                .iter()
+                                .any(|r| r.dot == removed.dot && r.provenance == removed.provenance)
+                    });
+                    if moved_here {
+                        return Ok(true);
+                    }
+                    // An edit of the destination: follow the one head it replaced.
+                    let [previous] = put_op.removes.as_slice() else { return Ok(false) };
+                    dot = previous.dot.clone();
+                    provenance = previous.provenance;
+                }
+                Ok(false)
+            })
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
     }

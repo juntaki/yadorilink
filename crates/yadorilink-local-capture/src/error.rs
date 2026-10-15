@@ -9,6 +9,10 @@
 pub enum LocalCaptureError {
     #[error(transparent)]
     SyncCore(#[from] yadorilink_sync_sqlite::SyncSqliteError),
+    /// The streaming consumer of a full rescan's committed chunks went away,
+    /// so the rescan stopped rather than keep committing unannounced chunks.
+    #[error("the rescan's chunk consumer is no longer running")]
+    StreamingConsumerClosed,
 }
 
 /// Routes every conversion through `SyncSqliteError`'s own `From` impl

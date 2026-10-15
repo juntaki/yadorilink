@@ -26,7 +26,39 @@ pub type ContentHash = String;
 pub struct MaterializationCounts {
     pub hydrated: u64,
     pub placeholder: u64,
+    /// Files being fetched (not evicted).
     pub hydrating: u64,
+    /// Files being evicted: not a request for content.
+    pub evicting: u64,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static FAIL_STATE_READS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Test seam: while `path` is set, [`MaterializationStateRepository::get_materialization_state`]
+/// fails for that path as a database read error would. Keyed by path so tests
+/// running in parallel do not disturb each other.
+#[cfg(any(test, feature = "test-support"))]
+pub fn fail_state_reads_for_path(path: &str, fail: bool) {
+    let mut paths = FAIL_STATE_READS.lock().unwrap_or_else(|p| p.into_inner());
+    paths.retain(|p| p != path);
+    if fail {
+        paths.push(path.to_string());
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static FAIL_PLACEHOLDER_READS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Test seam: like [`fail_state_reads_for_path`], for
+/// [`MaterializationStateRepository::get_placeholder_generation`].
+#[cfg(any(test, feature = "test-support"))]
+pub fn fail_placeholder_reads_for_path(path: &str, fail: bool) {
+    let mut paths = FAIL_PLACEHOLDER_READS.lock().unwrap_or_else(|p| p.into_inner());
+    paths.retain(|p| p != path);
+    if fail {
+        paths.push(path.to_string());
+    }
 }
 
 pub struct MaterializationStateRepository {
@@ -43,6 +75,12 @@ impl MaterializationStateRepository {
         group_id: &str,
         path: &str,
     ) -> Result<Option<MaterializationState>, SyncSqliteError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if FAIL_STATE_READS.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|p| p == path) {
+            return Err(SyncSqliteError::CorruptState(
+                "injected materialization state read failure".into(),
+            ));
+        }
         self.database.read::<_, SyncSqliteError>(|conn| {
             let state: Option<String> = conn
                 .query_row(
@@ -476,7 +514,7 @@ impl MaterializationStateRepository {
                     MaterializationState::Present => counts.hydrated = count,
                     MaterializationState::Remote => counts.placeholder = count,
                     MaterializationState::Hydrating => counts.hydrating = count,
-                    MaterializationState::Evicting => counts.hydrating += count,
+                    MaterializationState::Evicting => counts.evicting = count,
                 }
             }
             Ok(counts)
@@ -508,29 +546,100 @@ impl MaterializationStateRepository {
         })
     }
 
-    /// Block hashes referenced by any retained row other than the exact
-    /// current row being considered for cache eviction. The block store is
-    /// device-global, so this scan crosses groups and includes placeholder,
-    /// superseded, and trashed rows. A placeholder elsewhere may still retain
-    /// the only local copy because its own custody check failed.
+    /// Block hashes referenced by any retained row (or live native head) other than the exact
+    /// current row (and its own native head at `version`) being considered for cache eviction, and
+    /// other than the current rows (and their heads) of `custodied_siblings`: placeholders whose
+    /// own exact-version custody the caller has just confirmed, so that their cached blocks are
+    /// no longer anyone's only local copy. The block store is device-global, so this scan crosses
+    /// groups and includes placeholder, superseded, and trashed rows. A placeholder elsewhere
+    /// whose custody is NOT confirmed (not in `custodied_siblings`) may still retain the only
+    /// local copy because its own custody check failed.
     pub fn blocks_referenced_outside_current_file(
         &self,
         group_id: &str,
         path: &str,
+        version: &yadorilink_replica_domain::ids::VersionHash,
+        custodied_siblings: &[(String, String, yadorilink_replica_domain::ids::VersionHash)],
     ) -> Result<HashSet<ContentHash>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT blocks_json FROM files \
-                 WHERE deleted = 0 \
-                   AND NOT (group_id = ?1 AND path = ?2 AND state = 'current')",
+                "SELECT group_id, path, state, blocks_json FROM files WHERE deleted = 0",
             )?;
-            let rows = stmt.query_map([group_id, path], |r| r.get::<_, String>(0))?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
             let mut referenced = HashSet::new();
             for row in rows {
-                let blocks: Vec<BlockInfo> = serde_json::from_str(&row?)?;
+                let (row_group, row_path, row_state, blocks_json) = row?;
+                let excluded = row_state == "current"
+                    && ((row_group == group_id && row_path == path)
+                        || custodied_siblings
+                            .iter()
+                            .any(|(g, p, _)| *g == row_group && *p == row_path));
+                if excluded {
+                    continue;
+                }
+                let blocks: Vec<BlockInfo> = serde_json::from_str(&blocks_json)?;
                 referenced.extend(blocks.into_iter().map(|block| hex::encode(block.hash)));
             }
+            // A custody lease held for another device roots its blocks too.
+            referenced.extend(crate::remote_custody_lease::retained_block_hashes_all_groups(conn)?);
+            // Blocks a recovery item keeps may be the only local copy of unsaved content.
+            referenced
+                .extend(crate::native_recovery_items::retained_block_hashes_all_groups(conn)?);
+            // A committed native head roots its version's blocks before any `files` row
+            // projects it, exactly as it does for the physical sweep. The heads of the very
+            // versions being decided about are excluded, like their current rows: otherwise every
+            // ordinary file (current row and head name the same blocks) would be unreclaimable.
+            let mut except: Vec<(&str, &str, &yadorilink_replica_domain::ids::VersionHash)> =
+                vec![(group_id, path, version)];
+            except.extend(custodied_siblings.iter().map(|(g, p, v)| (g.as_str(), p.as_str(), v)));
+            referenced
+                .extend(crate::dag_store::native_head_retained_block_hashes_except(conn, &except)?);
             Ok(referenced)
+        })
+    }
+
+    /// The other current, non-deleted regular-file rows that are placeholders (`Remote`) and
+    /// share at least one of `blocks` with the file at `(group_id, path)`, as `(group, path)`.
+    /// Their cached blocks are exactly what an eviction of that file would otherwise have to
+    /// retain, until something asks whether they are safe to free too.
+    pub fn remote_rows_sharing_blocks(
+        &self,
+        group_id: &str,
+        path: &str,
+        blocks: &[yadorilink_replica_domain::file::VersionBlock],
+    ) -> Result<Vec<(String, String)>, SyncSqliteError> {
+        let wanted: HashSet<String> = blocks.iter().map(|b| hex::encode(&b.hash.0)).collect();
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT group_id, path, blocks_json FROM files \
+                 WHERE deleted = 0 AND state = 'current' AND materialization_state = ?1 \
+                   AND record_kind = ?2 AND NOT (group_id = ?3 AND path = ?4)",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![
+                    MaterializationState::Remote.as_db_str(),
+                    RecordKind::File.as_db_str(),
+                    group_id,
+                    path
+                ],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (g, p, json) = row?;
+                let row_blocks: Vec<BlockInfo> = serde_json::from_str(&json)?;
+                if row_blocks.iter().any(|b| wanted.contains(&hex::encode(&b.hash))) {
+                    out.push((g, p));
+                }
+            }
+            Ok(out)
         })
     }
 
@@ -1085,6 +1194,17 @@ impl MaterializationStateRepository {
         group_id: &str,
         path: &str,
     ) -> Result<Option<RecordedPlaceholderGeneration>, SyncSqliteError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if FAIL_PLACEHOLDER_READS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|p| p == path)
+        {
+            return Err(SyncSqliteError::CorruptState(
+                "injected placeholder generation read failure".into(),
+            ));
+        }
         self.database.read::<_, SyncSqliteError>(|conn| {
             let row: Option<(Option<i64>, Option<i64>, Option<String>)> = conn
                 .query_row(
@@ -1291,6 +1411,7 @@ pub(crate) fn live_set(
 ) -> Result<HashSet<ContentHash>, SyncSqliteError> {
     let mut live = crate::dag_store::native_head_retained_block_hashes_all_groups(conn)?;
     live.extend(crate::native_recovery_items::retained_block_hashes_all_groups(conn)?);
+    live.extend(crate::remote_custody_lease::retained_block_hashes_all_groups(conn)?);
     between_reads();
     live.extend(files_block_hashes(conn)?);
     Ok(live)

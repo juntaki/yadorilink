@@ -103,10 +103,21 @@ public struct NoticeView: View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: notice.kind == .success ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
                 .foregroundStyle(notice.kind == .success ? .green : .red)
+                .accessibilityHidden(true)
             Text(notice.text)
                 .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .accessibilityLabel(notice.spokenText)
                 .help(notice.detail ?? "")
             Spacer()
+            if let detail = notice.detail, !detail.isEmpty {
+                Button("Copy Details") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(detail, forType: .string)
+                }
+                .buttonStyle(.link)
+                .font(.caption)
+            }
             Button {
                 dismiss()
             } label: {
@@ -164,6 +175,34 @@ public struct LoadingRow: View {
         HStack(spacing: 8) {
             ProgressView().controlSize(.small)
             Text(text).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 4)
+    }
+}
+
+/// A failed list read: one line, the common error wording as secondary text,
+/// and one Retry that re-runs only that read.
+public struct RetryRow: View {
+    let title: String
+    let notice: Notice
+    let retry: () async -> Void
+    public init(_ title: String, notice: Notice, retry: @escaping () async -> Void) {
+        self.title = title
+        self.notice = notice
+        self.retry = retry
+    }
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title).foregroundStyle(.secondary)
+                Spacer()
+                Button(LoadWording.retry) { Task { await retry() } }
+            }
+            Text(notice.text).font(.caption).foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .accessibilityLabel(notice.spokenText)
+                .help(notice.detail ?? "")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 4)
@@ -237,5 +276,22 @@ struct WarningList: View {
 extension View {
     func overrideAlert(_ prompt: Binding<OverridePrompt?>, confirm: @escaping () async -> Void) -> some View {
         modifier(OverrideAlert(prompt: prompt, confirm: confirm))
+    }
+}
+
+/// Visible trailing "…" menu for infrequent row actions, so none is reachable only by right-click.
+struct RowActionsMenu<Content: View>: View {
+    let label: String
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        Menu(content: content) {
+            Image(systemName: "ellipsis.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .accessibilityLabel(label)
+        .help(label)
     }
 }

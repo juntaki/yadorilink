@@ -462,3 +462,27 @@ async fn a_provider_group_never_reaches_peer_reconciliation_roots() {
     assert!(!std::path::Path::new("provider:").exists());
     assert!(!std::path::Path::new(locator).exists());
 }
+
+/// Space is given back only by a ready provider folder: an ordinary folder is refused by the
+/// ordinary eviction gate with a reason, and the menu flag agrees with the gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_ready_provider_root_may_give_space_back() {
+    let state = test_state();
+    // An ordinary folder.
+    state.replica_coordinator.link_repository().add_link("/plain", GROUP).unwrap();
+    let refused = crate::hydration::evict_gate(&state, GROUP, "a.bin").unwrap_err();
+    assert!(refused.to_string().contains("only available for provider folders"), "{refused}");
+    assert!(!state.root_allows_on_demand(GROUP));
+
+    // A provider root that is not ready yet.
+    let state = test_state();
+    let root = declare(&state, "/provider");
+    assert!(!state.root_allows_on_demand(GROUP));
+    assert!(crate::hydration::evict_gate(&state, GROUP, "a.bin").is_err());
+
+    // Ready: the provider eviction path serves it; the ordinary gate (plain roots) still refuses,
+    // so a request can never be half-served by both.
+    make_ready(&state, &root);
+    assert!(state.root_allows_on_demand(GROUP));
+    assert!(crate::hydration::evict_gate(&state, GROUP, "a.bin").is_err());
+}

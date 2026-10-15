@@ -16,9 +16,80 @@ use super::*;
 /// directory out from under a later `SegmentBlockStore` operation.
 fn test_state() -> (Arc<DaemonState>, tempfile::TempDir) {
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
+    let store =
+        Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap().with_volume_verdict(|_| true));
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     (DaemonState::new("device-a".into(), sync_state, store), store_dir)
+}
+
+/// A state whose block store sits on a volume that is not known durable (Windows: unsupported or
+/// unknown): every physical deletion must be refused.
+fn refused_volume_state() -> (Arc<DaemonState>, tempfile::TempDir) {
+    let store_dir = tempfile::tempdir().unwrap();
+    let store =
+        Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap().with_volume_verdict(|_| false));
+    let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+    (DaemonState::new("device-a".into(), sync_state, store), store_dir)
+}
+
+#[tokio::test]
+async fn a_manual_gc_on_a_refused_volume_deletes_nothing() {
+    let (state, _dir) = refused_volume_state();
+    let hash = state.block_store.put(b"orphaned block, never referenced").unwrap();
+    let future_cutoff = SystemTime::now() + Duration::from_secs(1);
+
+    let refused = run_sweep_with_grace_cutoff(state.clone(), false, future_cutoff).await;
+
+    let Err(GcTriggerError::Failed(message)) = refused else { panic!("expected a refusal") };
+    assert!(message.contains("deletion refused"), "{message}");
+    assert!(state.block_store.exists(&hash).unwrap());
+    assert_eq!(state.gc.last_run_unix(), 0);
+    // A dry run only reports.
+    let dry = run_sweep_with_grace_cutoff(state.clone(), true, future_cutoff).await.unwrap();
+    assert_eq!(dry.blocks_deleted, 1);
+}
+
+#[tokio::test]
+async fn an_idle_gc_on_a_refused_volume_deletes_nothing() {
+    let (state, _dir) = refused_volume_state();
+    let held = state.block_store.put(b"the only copy of a dropped version").unwrap();
+    let loose = state.block_store.put(b"referenced by nothing at all").unwrap();
+    hold_with_a_recovery_item(&state, &held);
+    let future_cutoff = SystemTime::now() + Duration::from_secs(1);
+
+    let refused = run_idle_sweep_with_grace_cutoff(state.clone(), future_cutoff).await;
+
+    let Err(GcTriggerError::Failed(message)) = refused else { panic!("expected a refusal") };
+    assert!(message.contains("deletion refused"), "{message}");
+    assert!(state.block_store.exists(&loose).unwrap(), "an unreferenced block stays too");
+    assert!(state.block_store.exists(&held).unwrap());
+    assert_eq!(state.gc.last_run_unix(), 0);
+}
+
+fn hold_with_a_recovery_item(state: &DaemonState, held: &str) {
+    state
+        .replica_coordinator
+        .database()
+        .write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            conn.execute(
+                "INSERT INTO native_recovery_item \
+                 (group_id, item_id, kind, path, author_device, author_incarnation, seq, \
+                  provenance, version_hash, content, size, content_sha256, retained_blocks, \
+                  source_recovery_id, created_at) \
+                 VALUES ('group-a', ?1, 'remote_only', 'gone.txt', 'device-b', ?2, 1, ?3, ?4, \
+                         'unavailable', 0, ?5, ?6, 'recovery', 0)",
+                rusqlite::params![
+                    "a".repeat(64),
+                    vec![0u8; 16],
+                    vec![1u8; 32],
+                    vec![2u8; 32],
+                    vec![3u8; 32],
+                    serde_json::to_string(&[held]).unwrap(),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
 }
 
 struct BarrierBlockStore {
@@ -75,7 +146,7 @@ impl BlockStore for BarrierBlockStore {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn eviction_without_remote_lease_never_reaches_physical_reclaim() {
+async fn eviction_without_custody_confirmation_never_reaches_physical_reclaim() {
     use yadorilink_filesystem_sync::materialization_eviction::{
         evict_file, MaterializationContext,
     };
@@ -85,7 +156,7 @@ async fn eviction_without_remote_lease_never_reaches_physical_reclaim() {
     let store_dir = tempfile::tempdir().unwrap();
     let (reclaim_started_tx, reclaim_started_rx) = std::sync::mpsc::sync_channel(1);
     let store = Arc::new(BarrierBlockStore {
-        inner: SegmentBlockStore::new(store_dir.path()).unwrap(),
+        inner: SegmentBlockStore::new(store_dir.path()).unwrap().with_volume_verdict(|_| true),
         sweep_started: reclaim_started_tx,
         sweep_release: Arc::new((Mutex::new(false), Condvar::new())),
     });
@@ -162,8 +233,9 @@ async fn eviction_without_remote_lease_never_reaches_physical_reclaim() {
         &materialized_root.path().join("evicted.txt"),
         true,
     );
+    // No full replica confirms custody of this version.
     state.set_custody_confirmer(Arc::new(
-        |_: &str, _: &str, _: &VersionHash, _: &[VersionBlock]| true,
+        |_: &str, _: &str, _: &VersionHash, _: &[VersionBlock]| false,
     ));
 
     let reclaim_state = state.clone();
@@ -193,7 +265,7 @@ async fn eviction_without_remote_lease_never_reaches_physical_reclaim() {
     assert!(matches!(reclaim_started_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
     assert!(
         state.block_store.exists(&hash).unwrap(),
-        "instantaneous custody without a durable remote lease must retain the local block"
+        "without a custody confirmation the local block must be retained"
     );
 }
 
@@ -203,7 +275,7 @@ async fn gc_must_not_delete_old_deduplicated_block_adopted_after_live_snapshot()
     let (sweep_started_tx, sweep_started_rx) = std::sync::mpsc::sync_channel(1);
     let sweep_release = Arc::new((Mutex::new(false), Condvar::new()));
     let store = Arc::new(BarrierBlockStore {
-        inner: SegmentBlockStore::new(store_dir.path()).unwrap(),
+        inner: SegmentBlockStore::new(store_dir.path()).unwrap().with_volume_verdict(|_| true),
         sweep_started: sweep_started_tx,
         sweep_release: sweep_release.clone(),
     });
@@ -318,7 +390,7 @@ async fn only_one_sweep_runs_at_a_time_across_multiple_linked_folders() {
     let (sweep_started_tx, sweep_started_rx) = std::sync::mpsc::sync_channel(1);
     let sweep_release = Arc::new((Mutex::new(false), Condvar::new()));
     let store = Arc::new(BarrierBlockStore {
-        inner: SegmentBlockStore::new(store_dir.path()).unwrap(),
+        inner: SegmentBlockStore::new(store_dir.path()).unwrap().with_volume_verdict(|_| true),
         sweep_started: sweep_started_tx,
         sweep_release: sweep_release.clone(),
     });
@@ -504,29 +576,7 @@ async fn the_real_sweep_keeps_the_blocks_a_recovery_item_holds() {
     let (state, _dir) = test_state();
     let held = state.block_store.put(b"the only copy of a dropped version").unwrap();
     let loose = state.block_store.put(b"referenced by nothing at all").unwrap();
-    state
-        .replica_coordinator
-        .database()
-        .write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
-            conn.execute(
-                "INSERT INTO native_recovery_item \
-                 (group_id, item_id, kind, path, author_device, author_incarnation, seq, \
-                  provenance, version_hash, content, size, content_sha256, retained_blocks, \
-                  source_recovery_id, created_at) \
-                 VALUES ('group-a', ?1, 'remote_only', 'gone.txt', 'device-b', ?2, 1, ?3, ?4, \
-                         'unavailable', 0, ?5, ?6, 'recovery', 0)",
-                rusqlite::params![
-                    "a".repeat(64),
-                    vec![0u8; 16],
-                    vec![1u8; 32],
-                    vec![2u8; 32],
-                    vec![3u8; 32],
-                    serde_json::to_string(&[&held]).unwrap(),
-                ],
-            )?;
-            Ok(())
-        })
-        .unwrap();
+    hold_with_a_recovery_item(&state, &held);
     let future_cutoff = SystemTime::now() + Duration::from_secs(1);
 
     let report = run_idle_sweep_with_grace_cutoff(state.clone(), future_cutoff).await.unwrap();

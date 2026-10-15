@@ -36,14 +36,18 @@ pub(crate) use scan::ReconcileMode;
 pub use semantic_delete::SemanticDelete;
 
 #[cfg(any(test, feature = "test-support"))]
-pub use record_builder::{arm_content_read_race_hook, disarm_content_read_race_hook};
+pub use record_builder::{
+    arm_content_read_race_hook, arm_post_capture_race_hook, arm_post_identity_race_hook,
+    disarm_content_read_race_hook, disarm_post_capture_race_hook, disarm_post_identity_race_hook,
+};
 
 // The in-module tests below reach helpers from every submodule through
 // `use super::*`.
+#[cfg(all(test, unix))]
+use self::path_policy::*;
 #[cfg(test)]
 use self::{
-    dirty_journal::*, disk_observation::*, event_ingest::*, flush::*, path_policy::*,
-    record_builder::*, scan::*,
+    dirty_journal::*, disk_observation::*, event_ingest::*, flush::*, record_builder::*, scan::*,
 };
 
 /// Same shape as this crate's other private `now_unix_nanos` helpers —

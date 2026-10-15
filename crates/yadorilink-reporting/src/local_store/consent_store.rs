@@ -70,14 +70,14 @@ impl ConsentStore {
         }
     }
 
-    /// Writes `state` to disk, creating the reporting directory if needed.
+    /// Writes `state` to disk, creating the reporting directory (durably) if needed.
     /// Writes to a temp file, flushes it and publishes it over the target by a
     /// durable move, so a crash mid-write can't leave a half-written,
     /// unparseable consent file behind (`load` would otherwise treat that as a
     /// hard error), and a withdrawn consent can't come back after a power loss.
     pub fn save(&self, state: &ConsentState) -> ReportingResult<()> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            yadorilink_fs_platform::durable_dir::create_dir_all_durably(parent)?;
         }
         let json = serde_json::to_string_pretty(state)?;
         let tmp_path = self.path.with_extension("json.tmp");

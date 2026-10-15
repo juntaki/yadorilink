@@ -176,6 +176,18 @@ impl SyncRuntime {
         self.node.watch_local_address()
     }
 
+    /// Serve the lane streams the peer opens on a connection THIS side dialled.
+    ///
+    /// A link is symmetric: either end may open streams on it. Which of a
+    /// pair's connections a device opens its own lanes on is decided by its
+    /// link cache, and that can be the connection the peer dialled; the peer
+    /// then has to answer on the connection it dialled, not only on the ones
+    /// it accepted. Ends with the connection.
+    pub fn serve_dialed(&self, link: &PeerLink) {
+        let (lanes, link) = (self.lanes.clone(), link.clone());
+        tokio::spawn(async move { serve_link(link, lanes).await });
+    }
+
     /// Serve inbound connections for as long as the returned task lives.
     ///
     /// Each accepted connection gets its own task, and each lane stream within

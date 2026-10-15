@@ -66,6 +66,10 @@ impl BlockContentStore for BlockStorePortsAdapter {
 }
 
 impl BlockReclamationStore for BlockStorePortsAdapter {
+    fn storage_root(&self) -> Option<&std::path::Path> {
+        self.0.storage_root()
+    }
+
     fn sweep(
         &self,
         live: &HashSet<ContentHash>,

@@ -74,6 +74,11 @@ pub enum StorageError {
     /// recognise.
     #[error("block store is corrupt: {0}")]
     CorruptStore(String),
+
+    /// Removing bytes was refused because the volume holding them is not known to offer durable
+    /// namespace changes. Nothing was removed.
+    #[error("byte deletion refused: {0}")]
+    DeletionRefused(String),
 }
 
 impl StorageError {
@@ -109,6 +114,9 @@ impl StorageError {
             StorageError::Chunking(message) => StorageError::Chunking(message.clone()),
             StorageError::Index(message) => StorageError::Index(message.clone()),
             StorageError::CorruptStore(message) => StorageError::CorruptStore(message.clone()),
+            StorageError::DeletionRefused(message) => {
+                StorageError::DeletionRefused(message.clone())
+            }
         }
     }
 }

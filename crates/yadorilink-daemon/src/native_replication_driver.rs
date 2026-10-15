@@ -49,6 +49,8 @@ pub type ActivitySignal = dyn Fn() + Send + Sync;
 #[derive(Clone)]
 pub struct ReplicationEnv {
     pub db: Arc<SyncDatabase>,
+    /// This device's id, naming whose join timeline a milestone belongs to.
+    pub local_device_id: String,
     /// Whether `group` is hosted here and shared with this peer.
     pub shares_group: Arc<SharesGroup>,
     pub key_for: Arc<KeyLookup>,
@@ -322,6 +324,11 @@ async fn serve_stream(
     if let Some(report) = &answer.ingested {
         log_ingest(report);
         if report.admitted > 0 {
+            yadorilink_fs_platform::join_timeline::mark(
+                &env.local_device_id,
+                &report.group,
+                yadorilink_fs_platform::join_timeline::Milestone::MetadataAdmitted,
+            );
             (env.activity)();
         }
     }
@@ -336,6 +343,11 @@ async fn serve_stream(
                 tokio::task::spawn_blocking(move || port.apply(&group_owned, &bundle)).await;
             match applied {
                 Ok(Ok(changed)) => {
+                    yadorilink_fs_platform::join_timeline::mark(
+                        &env.local_device_id,
+                        &group.0,
+                        yadorilink_fs_platform::join_timeline::Milestone::SealedStateApplied,
+                    );
                     (env.activity)();
                     tracing::info!(group = %group.0, changed, "native recovery: joined a peer's sealed state");
                 }
@@ -454,6 +466,12 @@ pub async fn request_recovery(
     let asked = ask_recovery(connection, request_id, group).await;
     if !asked {
         env.recovery_state.abandon(request_id);
+    } else {
+        yadorilink_fs_platform::join_timeline::mark(
+            &env.local_device_id,
+            &group.0,
+            yadorilink_fs_platform::join_timeline::Milestone::RecoveryRequestAccepted,
+        );
     }
     asked
 }
@@ -559,6 +577,19 @@ pub(crate) async fn reconcile_group(
     connection: &NativeReplicationConnection,
     group: &FolderGroupId,
 ) -> GroupRound {
+    yadorilink_fs_platform::join_timeline::note_reconcile_round(&env.local_device_id, &group.0);
+    // A round running means a session to this peer is usable for the group,
+    // including one attached before the group was linked here.
+    yadorilink_fs_platform::join_timeline::mark(
+        &env.local_device_id,
+        &group.0,
+        yadorilink_fs_platform::join_timeline::Milestone::PeerSessionUsable,
+    );
+    yadorilink_fs_platform::join_timeline::mark(
+        &env.local_device_id,
+        &group.0,
+        yadorilink_fs_platform::join_timeline::Milestone::FirstReconcileRound,
+    );
     let Ok((_, summary_bytes)) = session::summary_request(group) else { return GroupRound::Failed };
     let Some(response) = request(connection, &summary_bytes).await else {
         return GroupRound::Failed;
@@ -566,6 +597,11 @@ pub(crate) async fn reconcile_group(
     if let Message::Refused { reason, .. } = response {
         return GroupRound::Refused(reason);
     }
+    yadorilink_fs_platform::join_timeline::mark(
+        &env.local_device_id,
+        &group.0,
+        yadorilink_fs_platform::join_timeline::Milestone::SummaryReceived,
+    );
     let (db, group_owned) = (env.db.clone(), group.clone());
     let compared = tokio::task::spawn_blocking(move || {
         // Matching roots do not mean complete: a head whose content version
@@ -613,7 +649,15 @@ pub(crate) async fn reconcile_group(
     if matches!(needs_sealed_state, Ok(Ok(true))) {
         request_recovery(env, connection, group).await;
     }
-    match request(connection, &diff_bytes).await {
+    let diff_reply = request(connection, &diff_bytes).await;
+    if diff_reply.is_some() {
+        yadorilink_fs_platform::join_timeline::mark(
+            &env.local_device_id,
+            &group.0,
+            yadorilink_fs_platform::join_timeline::Milestone::FrontierDiffAnswered,
+        );
+    }
+    match diff_reply {
         Some(Message::FrontierDiffResponse { entries, .. }) if entries.is_empty() => {
             GroupRound::Divergent
         }

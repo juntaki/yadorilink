@@ -29,6 +29,48 @@ fn a_response_round_trips() {
 }
 
 #[test]
+fn custody_messages_round_trip_and_reject_every_truncation() {
+    let requests = [
+        ServiceRequest::CustodyAcquire {
+            group_id: "g".into(),
+            file_path: "dir/a.bin".into(),
+            version_hash: VersionHash([4u8; 32]),
+            blocks: vec![VersionBlock { hash: BlockHash(vec![3u8; 32]), size: 9 }],
+            membership_generation: 77,
+            attempt_token: [6u8; 16],
+        },
+        ServiceRequest::CustodyRelease {
+            group_id: "g".into(),
+            file_path: "dir/a.bin".into(),
+            version_hash: VersionHash([4u8; 32]),
+            attempt_token: [6u8; 16],
+        },
+        ServiceRequest::CustodyRehome {
+            group_id: "g".into(),
+            file_path: "dir/a.bin".into(),
+            version_hash: VersionHash([4u8; 32]),
+            attempt_token: [6u8; 16],
+        },
+    ];
+    for request in requests {
+        let encoded = encode_request(&request);
+        assert_eq!(decode_request(&encoded).unwrap(), request);
+        for cut in 0..encoded.len() {
+            assert!(decode_request(&encoded[..cut]).is_err());
+        }
+    }
+    for flag in [true, false] {
+        for response in [
+            ServiceResponse::CustodyAcquire { granted: flag },
+            ServiceResponse::CustodyRelease { released: flag },
+            ServiceResponse::CustodyRehome { moved: flag },
+        ] {
+            assert_eq!(decode_response(&encode_response(&response)).unwrap(), response);
+        }
+    }
+}
+
+#[test]
 fn a_truncated_request_is_rejected_at_every_offset() {
     let encoded = encode_request(&a_request());
     for cut in 0..encoded.len() {

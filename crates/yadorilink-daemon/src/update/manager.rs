@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use super::install_source;
 use super::manifest::{self, Applicability, LocalContext};
-use super::policy::{AutoInstallMode, UpdatePolicy, UpdatePolicyStore, UpdateState};
+use super::policy::{UpdatePolicy, UpdatePolicyStore, UpdateState};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum UpdateError {
@@ -332,14 +332,10 @@ impl UpdateManager {
 pub fn apply_config(
     store: &UpdatePolicyStore,
     automatic_checks_enabled: Option<bool>,
-    automatic_install_mode: Option<AutoInstallMode>,
 ) -> std::io::Result<UpdatePolicy> {
     store.update(|p| {
         if let Some(enabled) = automatic_checks_enabled {
             p.automatic_checks_enabled = enabled;
-        }
-        if let Some(mode) = automatic_install_mode {
-            p.automatic_install_mode = mode;
         }
     })
 }

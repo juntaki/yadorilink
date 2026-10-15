@@ -9,16 +9,23 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::local_author::LocalAuthor;
 use crate::native_checkpoint_install::{CLEARED_BY_INSTALL, PRESERVED_BY_INSTALL};
 use crate::native_rebootstrap::{
     rebootstrap_status, recover_after_restart, BlockedReason, CaptureBarrier, Crash,
     PreservationFailure, PreserveContext, Preserved, RebootstrapState, RestartOutcome,
 };
 use crate::native_rebootstrap_install::{
-    install_rebootstrap, quarantined_items, InstallContext, InstallError, InstallPoint,
-    InstallStep, Installed, Observed, QuarantineRoot, QuarantineStatus,
+    install_rebootstrap, open_excluding_writers, quarantined_items, unlink_exclusively,
+    InstallContext, InstallError, InstallPoint, InstallStep, Installed, Observed, QuarantineRoot,
+    QuarantineStatus, Removal, Unlinked, WriteExclusion,
 };
 use crate::native_rebootstrap_recovery::RecoveryArea;
+use crate::native_rebootstrap_replay::held_own_units;
+use crate::native_recovery_items::{
+    groups_with_preserved_data, list_recovery_items, read_item_content, restore_recovery_item,
+    ItemKind, ItemOrigin, RecoveryItem,
+};
 
 use super::history_lifecycle_red::{
     dots_at, frontier_seq, incarnation_of, offline_base, put_op, rem, scenario, signed, Scenario,
@@ -38,11 +45,42 @@ pub(super) struct FsRoot<'a> {
     pub(super) removed: RefCell<Vec<String>>,
     /// Run just before anything is removed.
     before_remove: Option<&'a dyn Fn(&str)>,
+    /// A crash just after the object was moved aside, before it is verified: the move stays,
+    /// the call fails, and nothing else runs.
+    pub(super) crash_after_move: std::cell::Cell<bool>,
+    /// Run between the move aside and the verification: the object under the private name is
+    /// written, as a program holding it open could.
+    after_move: Option<&'a dyn Fn(&Path)>,
+    /// Run after the moved object was verified and before it is unlinked: a program that held
+    /// the object open for writing since before the move writes into it.
+    before_unlink: Option<&'a dyn Fn(&Path)>,
+    /// Run when the unlink is about to happen (the exclusion held and nothing is kept).
+    pub(super) crash_before_unlink: std::cell::Cell<bool>,
+    /// Use the platform's real exclusion. Off, the root stands in for a platform that grants it,
+    /// so the removal tests mean the same on every host.
+    real_exclusion: bool,
 }
 
 impl<'a> FsRoot<'a> {
     pub(super) fn new(dir: &Path) -> Self {
-        Self { dir: dir.to_path_buf(), removed: RefCell::new(Vec::new()), before_remove: None }
+        Self {
+            dir: dir.to_path_buf(),
+            removed: RefCell::new(Vec::new()),
+            before_remove: None,
+            crash_after_move: std::cell::Cell::new(false),
+            after_move: None,
+            before_unlink: None,
+            crash_before_unlink: std::cell::Cell::new(false),
+            real_exclusion: false,
+        }
+    }
+
+    pub(super) fn writing_after_move(dir: &Path, after_move: &'a dyn Fn(&Path)) -> Self {
+        Self { after_move: Some(after_move), ..Self::new(dir) }
+    }
+
+    pub(super) fn writing_before_unlink(dir: &Path, before_unlink: &'a dyn Fn(&Path)) -> Self {
+        Self { before_unlink: Some(before_unlink), real_exclusion: true, ..Self::new(dir) }
     }
 
     fn checking(dir: &Path, before_remove: &'a dyn Fn(&str)) -> Self {
@@ -55,19 +93,25 @@ impl FsRoot<'_> {
         let Ok(meta) = fs::symlink_metadata(full) else { return Ok(Observed::Absent) };
         if meta.file_type().is_symlink() {
             let target = fs::read_link(full).map_err(|e| e.to_string())?;
-            return Ok(Observed::Symlink { target: target.to_string_lossy().as_bytes().to_vec() });
+            return Ok(Observed::Symlink {
+                target: yadorilink_fs_platform::fs_identity::target_to_bytes(&target),
+            });
         }
         if meta.is_dir() {
             return Ok(Observed::Directory);
         }
         if meta.is_file() {
-            let bytes = fs::read(full).map_err(|e| e.to_string())?;
-            return Ok(Observed::File {
-                size: bytes.len() as u64,
-                sha256: Sha256::digest(&bytes).into(),
-            });
+            return crate::native_rebootstrap_install::observe_regular_file(
+                fs::File::open(full).map_err(|e| e.to_string())?,
+            );
         }
         Ok(Observed::Other)
+    }
+}
+
+impl FsRoot<'_> {
+    pub(super) fn aside(&self, path: &str, claim: &str) -> PathBuf {
+        self.dir.join(format!(".{}.{claim}.quarantining", path.replace('/', "_")))
     }
 }
 
@@ -76,11 +120,11 @@ impl QuarantineRoot for FsRoot<'_> {
         self.observe_at(&self.dir.join(path))
     }
 
-    fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
-        fs::read(self.dir.join(path)).map_err(|e| e.to_string())
+    fn open_file(&self, path: &str) -> Result<Box<dyn std::io::Read>, String> {
+        Ok(Box::new(fs::File::open(self.dir.join(path)).map_err(|e| e.to_string())?))
     }
 
-    fn remove(&self, path: &str, expected: &Observed) -> Result<(), String> {
+    fn remove(&self, path: &str, expected: &Observed, claim: &str) -> Result<Removal, String> {
         if self.observe(path)? != *expected {
             return Err(format!("{path} changed since it was observed"));
         }
@@ -89,16 +133,65 @@ impl QuarantineRoot for FsRoot<'_> {
         }
         // As a real root does: rename aside inside the root, verify, then unlink.
         let full = self.dir.join(path);
-        let aside = self.dir.join(format!(".{}.quarantining", path.replace('/', "_")));
+        let aside = self.aside(path, claim);
         fs::rename(&full, &aside).map_err(|e| e.to_string())?;
-        let now = FsRoot::new(&self.dir).observe_at(&aside)?;
-        if now != *expected {
-            fs::rename(&aside, &full).map_err(|e| e.to_string())?;
-            return Err(format!("{path} changed while it was being removed"));
+        if let Some(after_move) = self.after_move {
+            after_move(&aside);
         }
-        fs::remove_file(&aside).map_err(|e| e.to_string())?;
-        self.removed.borrow_mut().push(path.to_owned());
-        Ok(())
+        if self.crash_after_move.get() {
+            return Err("crash after the move aside".into());
+        }
+        let removal = if fs::symlink_metadata(&aside).map_err(|e| e.to_string())?.is_file() {
+            let hook = || {
+                if let Some(before_unlink) = self.before_unlink {
+                    before_unlink(&aside);
+                }
+            };
+            let unlink = |p: &Path| {
+                if self.crash_before_unlink.get() {
+                    // The process dies as the unlink begins: the name stays.
+                    return Err(std::io::Error::other("crash at the unlink"));
+                }
+                fs::remove_file(p)
+            };
+            let open = |p: &Path| -> std::io::Result<WriteExclusion> {
+                if self.real_exclusion {
+                    open_excluding_writers(p)
+                } else {
+                    Ok(WriteExclusion::assumed(fs::File::open(p)?))
+                }
+            };
+            match unlink_exclusively(&aside, expected, &open, &hook, &unlink)? {
+                Unlinked::Done(removal) => removal,
+                Unlinked::ChangedBeforeUnlink => {
+                    fs::rename(&aside, &full).map_err(|e| e.to_string())?;
+                    return Err(format!("{path} changed while it was being removed"));
+                }
+            }
+        } else {
+            if FsRoot::new(&self.dir).observe_at(&aside)? != *expected {
+                fs::rename(&aside, &full).map_err(|e| e.to_string())?;
+                return Err(format!("{path} changed while it was being removed"));
+            }
+            fs::remove_file(&aside).map_err(|e| e.to_string())?;
+            Removal::Removed
+        };
+        if removal == Removal::Removed {
+            self.removed.borrow_mut().push(path.to_owned());
+        }
+        Ok(removal)
+    }
+
+    fn release_claim(&self, path: &str, claim: &str) -> Result<(), String> {
+        let aside = self.aside(path, claim);
+        if !aside.exists() {
+            return Ok(());
+        }
+        let full = self.dir.join(path);
+        if full.symlink_metadata().is_ok() {
+            return Err(format!("{path} is occupied again"));
+        }
+        fs::rename(&aside, &full).map_err(|e| e.to_string())
     }
 }
 
@@ -341,7 +434,7 @@ fn a_crash_after_the_commit_finds_the_install_done() {
 fn the_quarantine_is_recorded_before_the_first_original_leaves_the_root() {
     let p = preserved_scenario(&Viewer);
     let fs_root = FsRoot::new(p.root.path());
-    fs::write(p.root.path().join("x"), [2]).unwrap();
+    write_original(&p.root.path().join("x"));
 
     let crashed = install_with(
         &p.w.b,
@@ -377,7 +470,7 @@ fn an_unauthorable_original_leaves_the_root_after_its_copy_is_verified() {
         );
     };
     let fs_root = FsRoot::checking(p.root.path(), &hold_stands);
-    fs::write(p.root.path().join("x"), [2]).unwrap();
+    write_original(&p.root.path().join("x"));
 
     let installed =
         install_with(&p.w.b, p.recovery_root.path(), &fs_root, &Viewer, &mut |_| Ok(())).unwrap();
@@ -408,10 +501,440 @@ fn an_edit_made_after_the_barrier_is_kept_before_the_original_leaves() {
 
     assert!(!p.root.path().join("x").exists());
     let digest: [u8; 32] = Sha256::digest(b"typed after the barrier").into();
-    let area = RecoveryArea::open_dir(&p.preserved.dir).unwrap();
-    assert_eq!(area.read_late_edit(&digest).unwrap(), b"typed after the barrier");
     let items = quarantined_items(&p.w.b, &group(), None).unwrap();
     assert_eq!(items[0].status, QuarantineStatus::RemovedLateEdit { sha256: digest });
+    let saved = late_edits_of(&p.w.b);
+    assert_eq!(saved.len(), 1, "the edit is a permanent recovery item before the install ends");
+    assert_eq!(saved[0].path.as_str(), "x");
+    assert_eq!(late_content(&p, &saved[0]), b"typed after the barrier");
+}
+
+/// A regular file's late edit prepared from bytes held by the test.
+fn prepare_late_edit_of_bytes(
+    conn: &Connection,
+    items_root: &Path,
+    path: &str,
+    bytes: &[u8],
+    meta: Option<crate::native_recovery_items::LateEditMeta>,
+) -> Result<
+    crate::native_recovery_items::PreparedLateEdit,
+    crate::native_recovery_items::LateEditError,
+> {
+    let edit = crate::native_recovery_items::LateEdit {
+        path,
+        symlink: false,
+        size: bytes.len() as u64,
+        sha256: crate::native_rebootstrap_recovery::sha256(bytes),
+        symlink_target: &[],
+        meta,
+    };
+    let open = || -> Result<Box<dyn std::io::Read + '_>, String> { Ok(Box::new(bytes)) };
+    crate::native_recovery_items::prepare_late_edit(
+        conn,
+        items_root,
+        &[],
+        &group(),
+        &edit,
+        &open,
+        1,
+    )
+}
+
+struct RefusesRemoval<'a>(FsRoot<'a>);
+impl QuarantineRoot for RefusesRemoval<'_> {
+    fn observe(&self, path: &str) -> Result<Observed, String> {
+        self.0.observe(path)
+    }
+    fn open_file(&self, path: &str) -> Result<Box<dyn std::io::Read>, String> {
+        self.0.open_file(path)
+    }
+    fn remove(&self, _: &str, _: &Observed, _: &str) -> Result<Removal, String> {
+        Err("crash before the removal".into())
+    }
+    fn release_claim(&self, path: &str, claim: &str) -> Result<(), String> {
+        self.0.release_claim(path, claim)
+    }
+}
+
+fn late_edits_of(c: &Connection) -> Vec<RecoveryItem> {
+    list_recovery_items(c, &group())
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind == ItemKind::LateEdit)
+        .collect()
+}
+
+fn late_content(p: &Preserved2, item: &RecoveryItem) -> Vec<u8> {
+    let items_root = super::rebootstrap_preserve::items_root_of(p.recovery_root.path());
+    read_item_content(&p.w.b, &items_root, &group(), &item.item_id).unwrap()
+}
+
+/// The edit stays listed and restorable after the rebootstrap finished and its
+/// transient recovery area is gone; no sweep takes it.
+#[test]
+fn a_late_edit_outlives_the_finished_rebootstrap_and_can_be_restored() {
+    let p = preserved_scenario(&Viewer);
+    let fs_root = FsRoot::new(p.root.path());
+    fs::write(p.root.path().join("x"), b"typed after the barrier").unwrap();
+    install_with(&p.w.b, p.recovery_root.path(), &fs_root, &Viewer, &mut |_| Ok(())).unwrap();
+    super::rebootstrap_replay::complete_machine(
+        &p.w.b,
+        p.recovery_root.path(),
+        &p.preserved.recovery_id,
+        &Viewer,
+    );
+    fs::remove_dir_all(&p.preserved.dir).unwrap();
+    let items_root = super::rebootstrap_preserve::items_root_of(p.recovery_root.path());
+    crate::native_recovery_items::sweep_unregistered(&p.w.b, &items_root, &group()).unwrap();
+
+    let saved = late_edits_of(&p.w.b);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(saved[0].origin, ItemOrigin::LateEdit);
+    assert_eq!(late_content(&p, &saved[0]), b"typed after the barrier");
+    assert!(groups_with_preserved_data(&p.w.b).unwrap().contains(&group()));
+
+    let author = crate::author_incarnation::current_author(&p.w.b).unwrap();
+    let key = device_key(2);
+    let local = LocalAuthor { author: author.clone(), signing_key: &key, capture: None };
+    let mut imported = Vec::new();
+    restore_recovery_item(
+        &p.w.b,
+        &items_root,
+        &group(),
+        &saved[0].item_id,
+        &local,
+        &mut |version, bytes| {
+            imported.push((version.version_hash, bytes.to_vec()));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(imported, vec![(saved[0].version, b"typed after the barrier".to_vec())]);
+    let state = crate::native_store::load_state(&p.w.b, &group()).unwrap();
+    assert!(
+        state.heads[&SyncPath("x".into())]
+            .iter()
+            .any(|(dot, payload)| dot.author == author && payload.version == saved[0].version),
+        "the restore authored no put of the saved bytes: {state:?}"
+    );
+    assert_eq!(late_edits_of(&p.w.b), saved, "restoring removed the item");
+}
+
+/// What the saved late edit would restore as: the metadata of its version record.
+#[cfg(unix)]
+fn late_meta(p: &Preserved2, item: &RecoveryItem) -> yadorilink_replica_domain::file::FileMeta {
+    let items_root = super::rebootstrap_preserve::items_root_of(p.recovery_root.path());
+    let author = crate::author_incarnation::current_author(&p.w.b).unwrap();
+    let key = device_key(2);
+    let local = LocalAuthor { author, signing_key: &key, capture: None };
+    let mut meta = None;
+    restore_recovery_item(&p.w.b, &items_root, &group(), &item.item_id, &local, &mut |v, _| {
+        meta = Some(v.meta.clone());
+        Ok(())
+    })
+    .unwrap();
+    meta.expect("the restore imported the version")
+}
+
+/// Ends the rebootstrap and drops its transient area, as a finished one is.
+#[cfg(unix)]
+fn finish(p: &Preserved2) {
+    super::rebootstrap_replay::complete_machine(
+        &p.w.b,
+        p.recovery_root.path(),
+        &p.preserved.recovery_id,
+        &Viewer,
+    );
+    fs::remove_dir_all(&p.preserved.dir).unwrap();
+}
+
+/// The preserved version of `x` has these bytes and this mtime (the scenario's version 2).
+#[cfg(unix)]
+const PRESERVED_MTIME: i64 = 2_000;
+
+/// Writes a file as it was when preserved as version `seed`: the same bytes and the same
+/// mtime, so it is no edit.
+fn write_original_of(path: &std::path::Path, seed: u8) {
+    fs::write(path, [seed]).unwrap();
+    // The version's mode is 0o644; the umask must not decide whether this is an edit.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(seed as u64 * 1_000);
+    fs::OpenOptions::new().write(true).open(path).unwrap().set_modified(at).unwrap();
+}
+
+fn write_original(path: &std::path::Path) {
+    write_original_of(path, 2);
+}
+
+/// Installs over a root whose `x` the user left as `content` with `mode` and `mtime` (ns).
+#[cfg(unix)]
+fn install_over_x(content: &[u8], mode: u32, mtime: i64) -> (Preserved2, FsRoot<'static>) {
+    use std::os::unix::fs::PermissionsExt;
+    let p = preserved_scenario(&Viewer);
+    let x = p.root.path().join("x");
+    fs::write(&x, content).unwrap();
+    fs::set_permissions(&x, fs::Permissions::from_mode(mode)).unwrap();
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(mtime as u64);
+    fs::OpenOptions::new().write(true).open(&x).unwrap().set_modified(at).unwrap();
+    let fs_root = FsRoot::new(p.root.path());
+    install_with(&p.w.b, p.recovery_root.path(), &fs_root, &Viewer, &mut |_| Ok(())).unwrap();
+    (p, fs_root)
+}
+
+/// A chmod after the barrier leaves the bytes of the preserved version, and is still an
+/// edit nobody captured.
+#[cfg(unix)]
+#[test]
+fn a_mode_only_edit_after_the_barrier_is_kept_as_a_late_edit() {
+    let (p, _root) = install_over_x(&[2], 0o755, PRESERVED_MTIME);
+    finish(&p);
+
+    assert!(!p.root.path().join("x").exists());
+    let saved = late_edits_of(&p.w.b);
+    assert_eq!(saved.len(), 1, "the chmod was lost with the original: {saved:?}");
+    assert_eq!(late_content(&p, &saved[0]), [2]);
+    assert_eq!(late_meta(&p, &saved[0]).unix_mode, Some(0o755));
+}
+
+/// Bytes and mode both changed: the item restores both.
+#[cfg(unix)]
+#[test]
+fn a_late_edit_keeps_the_mode_and_mtime_the_file_had() {
+    let mtime = 5_000_000_000;
+    let (p, _root) = install_over_x(b"typed after the barrier", 0o750, mtime);
+    finish(&p);
+
+    let saved = late_edits_of(&p.w.b);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let meta = late_meta(&p, &saved[0]);
+    assert_eq!(meta.unix_mode, Some(0o750));
+    assert_eq!(meta.mtime_unix_nanos, mtime, "the mtime was the install clock");
+}
+
+/// A touch: the same bytes, mode and xattrs under another mtime is a distinct version for
+/// ordinary capture, so it is an edit here too, and restores with the touched mtime.
+#[cfg(unix)]
+#[test]
+fn a_touch_only_edit_after_the_barrier_is_kept_as_a_late_edit() {
+    let touched = 9_000_000_000;
+    let (p, _root) = install_over_x(&[2], 0o644, touched);
+    finish(&p);
+
+    assert!(!p.root.path().join("x").exists());
+    let saved = late_edits_of(&p.w.b);
+    assert_eq!(saved.len(), 1, "the touch was lost with the original: {saved:?}");
+    assert_eq!(late_content(&p, &saved[0]), [2]);
+    assert_eq!(late_meta(&p, &saved[0]).mtime_unix_nanos, touched);
+}
+
+/// The cheap path stays cheap: the same bytes and the same mode are the preserved copy.
+#[cfg(unix)]
+#[test]
+fn an_unchanged_original_is_removed_without_a_late_edit() {
+    let (p, _root) = install_over_x(&[2], 0o644, PRESERVED_MTIME);
+
+    assert!(!p.root.path().join("x").exists());
+    assert!(late_edits_of(&p.w.b).is_empty());
+    let items = quarantined_items(&p.w.b, &group(), None).unwrap();
+    assert_eq!(items[0].status, QuarantineStatus::Removed);
+}
+
+/// An extended attribute set after the barrier is an edit as well.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_xattr_only_edit_after_the_barrier_is_kept_as_a_late_edit() {
+    let p = preserved_scenario(&Viewer);
+    let x = p.root.path().join("x");
+    fs::write(&x, [2]).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&x, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(PRESERVED_MTIME as u64);
+    fs::OpenOptions::new().write(true).open(&x).unwrap().set_modified(at).unwrap();
+    yadorilink_local_storage::apply_xattrs(&x, &[("user.note".to_owned(), b"kept".to_vec())])
+        .unwrap();
+    let fs_root = FsRoot::new(p.root.path());
+    install_with(&p.w.b, p.recovery_root.path(), &fs_root, &Viewer, &mut |_| Ok(())).unwrap();
+    finish(&p);
+
+    let saved = late_edits_of(&p.w.b);
+    assert_eq!(saved.len(), 1, "the xattr was lost with the original: {saved:?}");
+    assert_eq!(late_meta(&p, &saved[0]).xattrs, vec![("user.note".to_owned(), b"kept".to_vec())]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_late_symlink_edit_is_kept_as_an_item_too() {
+    let p = preserved_scenario(&Viewer);
+    let fs_root = FsRoot::new(p.root.path());
+    std::os::unix::fs::symlink("elsewhere", p.root.path().join("x")).unwrap();
+    install_with(&p.w.b, p.recovery_root.path(), &fs_root, &Viewer, &mut |_| Ok(())).unwrap();
+    super::rebootstrap_replay::complete_machine(
+        &p.w.b,
+        p.recovery_root.path(),
+        &p.preserved.recovery_id,
+        &Viewer,
+    );
+    fs::remove_dir_all(&p.preserved.dir).unwrap();
+
+    let saved = late_edits_of(&p.w.b);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(late_content(&p, &saved[0]), b"elsewhere");
+}
+
+/// The row is registered, the original not yet removed: the item is listed and the
+/// original still stands. Retrying the crashed path leaves one item.
+#[test]
+fn a_failed_removal_after_the_item_is_registered_keeps_one_item_and_the_original() {
+    let p = preserved_scenario(&Viewer);
+    fs::write(p.root.path().join("x"), b"typed after the barrier").unwrap();
+    for _ in 0..2 {
+        let refused = RefusesRemoval(FsRoot::new(p.root.path()));
+        let result =
+            install_with(&p.w.b, p.recovery_root.path(), &refused, &Viewer, &mut |_| Ok(()));
+        assert!(matches!(result, Err(InstallError::Blocked(_))), "{result:?}");
+        assert_eq!(late_edits_of(&p.w.b).len(), 1);
+        assert!(p.root.path().join("x").exists(), "the original left before its item landed");
+    }
+    install_with(&p.w.b, p.recovery_root.path(), &FsRoot::new(p.root.path()), &Viewer, &mut |_| {
+        Ok(())
+    })
+    .unwrap();
+    assert!(!p.root.path().join("x").exists());
+    assert_eq!(late_edits_of(&p.w.b).len(), 1, "a retry made a second item");
+}
+
+/// Files written for an item whose row never landed are crash residue the store's sweep owns,
+/// and the install runs it before saving anything; the install never infers an edit from them.
+#[test]
+fn item_files_without_a_row_are_swept_by_the_install_and_never_become_an_edit() {
+    let p = preserved_scenario(&Viewer);
+    let items_root = super::rebootstrap_preserve::items_root_of(p.recovery_root.path());
+    prepare_late_edit_of_bytes(&p.w.b, &items_root, "x", b"written, never registered", None)
+        .unwrap();
+    assert!(late_edits_of(&p.w.b).is_empty(), "no row was registered");
+    fs::write(p.root.path().join("x"), b"typed after the barrier").unwrap();
+
+    install_with(&p.w.b, p.recovery_root.path(), &FsRoot::new(p.root.path()), &Viewer, &mut |_| {
+        Ok(())
+    })
+    .unwrap();
+
+    let saved = late_edits_of(&p.w.b);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(late_content(&p, &saved[0]), b"typed after the barrier");
+    let group_dir = fs::read_dir(&items_root).unwrap().next().unwrap().unwrap().path();
+    assert_eq!(fs::read_dir(group_dir).unwrap().count(), 1, "the orphan's files stayed");
+}
+
+/// The user saves again between a crash and its resume: both edits are kept, each as its own
+/// item.
+#[test]
+fn an_edit_changed_again_after_a_crash_is_kept_beside_the_first() {
+    let p = preserved_scenario(&Viewer);
+    fs::write(p.root.path().join("x"), b"first").unwrap();
+    let refused = RefusesRemoval(FsRoot::new(p.root.path()));
+    install_with(&p.w.b, p.recovery_root.path(), &refused, &Viewer, &mut |_| Ok(())).unwrap_err();
+    fs::write(p.root.path().join("x"), b"second").unwrap();
+
+    install_with(&p.w.b, p.recovery_root.path(), &FsRoot::new(p.root.path()), &Viewer, &mut |_| {
+        Ok(())
+    })
+    .unwrap();
+
+    let mut contents: Vec<Vec<u8>> =
+        late_edits_of(&p.w.b).iter().map(|item| late_content(&p, item)).collect();
+    contents.sort();
+    assert_eq!(contents, vec![b"first".to_vec(), b"second".to_vec()]);
+}
+
+/// The removal happened and its status did not, but the item is gone: nothing may continue
+/// on the strength of a leftover file.
+#[test]
+fn a_recorded_late_edit_without_its_item_blocks_instead_of_continuing() {
+    let p = preserved_scenario(&Viewer);
+    let fs_root = FsRoot::new(p.root.path());
+    fs::write(p.root.path().join("x"), b"typed after the barrier").unwrap();
+    let crashed = install_with(
+        &p.w.b,
+        p.recovery_root.path(),
+        &fs_root,
+        &Viewer,
+        &mut crash_on(InstallPoint::AfterOriginalRemoved(0)),
+    );
+    assert!(matches!(crashed, Err(InstallError::Crashed)), "{crashed:?}");
+    p.w.b.execute("DELETE FROM native_recovery_item WHERE kind = 'late_edit'", []).unwrap();
+
+    let resumed = install_with(&p.w.b, p.recovery_root.path(), &fs_root, &Viewer, &mut |_| Ok(()));
+    assert!(matches!(resumed, Err(InstallError::Blocked(_))), "{resumed:?}");
+}
+
+/// Two late edits of one path can share bytes and differ only in metadata. The crash-resume
+/// confirms the exact item the quarantine row recorded, so the other version's item, though
+/// durable and of the same path and bytes, confirms nothing.
+#[test]
+fn a_same_bytes_late_edit_of_other_metadata_does_not_confirm_the_recorded_item() {
+    let p = preserved_scenario(&Viewer);
+    let fs_root = FsRoot::new(p.root.path());
+    let bytes: &[u8] = b"typed after the barrier";
+    fs::write(p.root.path().join("x"), bytes).unwrap();
+    let crashed = install_with(
+        &p.w.b,
+        p.recovery_root.path(),
+        &fs_root,
+        &Viewer,
+        &mut crash_on(InstallPoint::AfterOriginalRemoved(0)),
+    );
+    assert!(matches!(crashed, Err(InstallError::Crashed)), "{crashed:?}");
+    // The recorded item is lost; the other version of the same path and bytes is durable.
+    p.w.b.execute("DELETE FROM native_recovery_item WHERE kind = 'late_edit'", []).unwrap();
+    let items_root = super::rebootstrap_preserve::items_root_of(p.recovery_root.path());
+    let prepared = prepare_late_edit_of_bytes(
+        &p.w.b,
+        &items_root,
+        "x",
+        bytes,
+        Some(crate::native_recovery_items::LateEditMeta {
+            mtime_unix_nanos: 42_000_000_000,
+            unix_mode: Some(0o600),
+            xattrs: Vec::new(),
+        }),
+    )
+    .unwrap();
+    prepared.register(&p.w.b, &group(), "another-source", 1).unwrap();
+    assert_eq!(late_edits_of(&p.w.b).len(), 1);
+
+    let resumed = install_with(&p.w.b, p.recovery_root.path(), &fs_root, &Viewer, &mut |_| Ok(()));
+
+    assert!(matches!(resumed, Err(InstallError::Blocked(_))), "{resumed:?}");
+}
+
+/// A held own unit says whether an original really left the folder: a directory in its place
+/// is left alone, so nothing was moved although the plan judged the unit not replayable.
+#[test]
+fn a_held_unit_reports_originals_quarantined_from_what_the_quarantine_did() {
+    let moved = preserved_scenario(&Viewer);
+    write_original(&moved.root.path().join("x"));
+    let kept = preserved_scenario(&Viewer);
+    fs::create_dir(kept.root.path().join("x")).unwrap();
+    for (p, expected) in [(&moved, true), (&kept, false)] {
+        let fs_root = FsRoot::new(p.root.path());
+        install_with(&p.w.b, p.recovery_root.path(), &fs_root, &Viewer, &mut |_| Ok(())).unwrap();
+        super::rebootstrap_replay::complete_machine(
+            &p.w.b,
+            p.recovery_root.path(),
+            &p.preserved.recovery_id,
+            &Viewer,
+        );
+        let held = held_own_units(&p.w.b, p.recovery_root.path(), &group()).unwrap();
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].originals_quarantined, expected, "{held:?}");
+    }
 }
 
 /// An original already gone, or a directory in its place, is never an error and
@@ -443,7 +966,7 @@ fn an_absent_original_and_a_directory_in_its_place_are_handled() {
 fn a_reassertable_original_is_never_removed() {
     let p = preserved_scenario(&Writer);
     let fs_root = FsRoot::new(p.root.path());
-    fs::write(p.root.path().join("x"), [2]).unwrap();
+    write_original(&p.root.path().join("x"));
 
     install(&p.w.b, p.recovery_root.path(), &fs_root).unwrap();
 
@@ -464,8 +987,8 @@ fn a_crash_between_quarantine_steps_removes_each_original_exactly_once() {
     }
     let recovery_root = private_tempdir();
     let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("p"), [2]).unwrap();
-    fs::write(root.path().join("q"), [3]).unwrap();
+    write_original_of(&root.path().join("p"), 2);
+    write_original_of(&root.path().join("q"), 3);
     let setup = Setup { authority: &Viewer, ..Setup::default() };
     begin_custom(&o.b, built(&o.sealer), recovery_root.path(), &setup, &mut no_hook).unwrap();
     let fs_root = FsRoot::new(root.path());
@@ -613,7 +1136,7 @@ fn a_partial_capture_pass_blocks_the_install() {
 fn a_restart_in_quarantining_resumes_and_no_other_target_is_accepted() {
     let p = preserved_scenario(&Viewer);
     let fs_root = FsRoot::new(p.root.path());
-    fs::write(p.root.path().join("x"), [2]).unwrap();
+    write_original(&p.root.path().join("x"));
     let _ = install_with(
         &p.w.b,
         p.recovery_root.path(),
@@ -814,7 +1337,7 @@ fn a_damaged_copy_stops_the_quarantine_before_the_original_leaves() {
     for damaged_before_the_install in [true, false] {
         let p = preserved_scenario(&Viewer);
         let fs_root = FsRoot::new(p.root.path());
-        fs::write(p.root.path().join("x"), [2]).unwrap();
+        write_original(&p.root.path().join("x"));
         let area = RecoveryArea::open_dir(&p.preserved.dir).unwrap();
         let manifest = area.read_intent().unwrap().manifest;
         let version = manifest.items.iter().find_map(|item| item.put_version).unwrap();
@@ -986,7 +1509,7 @@ fn make_manifest_readable(dir: &Path) {
 fn a_block_raised_while_quarantining_keeps_the_stage_and_the_area() {
     let p = preserved_scenario(&Viewer);
     let fs_root = FsRoot::new(p.root.path());
-    fs::write(p.root.path().join("x"), [2]).unwrap();
+    write_original(&p.root.path().join("x"));
     let crashed = install_with(
         &p.w.b,
         p.recovery_root.path(),
@@ -1278,7 +1801,7 @@ fn a_second_call_while_an_install_is_running_is_turned_away() {
 fn a_quarantine_row_of_another_rebootstrap_does_not_skip_this_ones() {
     let p = preserved_scenario(&Viewer);
     let fs_root = FsRoot::new(p.root.path());
-    fs::write(p.root.path().join("x"), [2]).unwrap();
+    write_original(&p.root.path().join("x"));
     p.w.b
         .execute(
             "INSERT INTO native_rebootstrap_quarantine (group_id, recovery_id, path, status) \
@@ -1302,7 +1825,7 @@ fn a_file_changed_between_observation_and_removal_is_put_back() {
     let observed = root.observe("x").unwrap();
     fs::write(dir.path().join("x"), b"saved a moment later").unwrap();
 
-    assert!(root.remove("x", &observed).is_err());
+    assert!(root.remove("x", &observed, "0011223344556677").is_err());
 
     assert_eq!(fs::read(dir.path().join("x")).unwrap(), b"saved a moment later");
     assert!(root.removed.borrow().is_empty());
@@ -1474,4 +1997,729 @@ fn an_existing_closure_row_survives_the_install() {
 
     let held = crate::native_closure::all_closures(&w.b, &group()).unwrap();
     assert!(held.contains(&closure), "the install cleared a verified closure");
+}
+
+// --- bounded-memory file content -------------------------------------------------------------------
+
+/// Forces a tiny I/O buffer for the thread, so small files cross buffer boundaries.
+struct TinyChunk;
+impl TinyChunk {
+    fn of(size: usize) -> Self {
+        crate::native_rebootstrap_recovery::IO_CHUNK_OVERRIDE.with(|c| c.set(Some(size)));
+        Self
+    }
+}
+impl Drop for TinyChunk {
+    fn drop(&mut self) {
+        crate::native_rebootstrap_recovery::IO_CHUNK_OVERRIDE.with(|c| c.set(None));
+    }
+}
+
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i.wrapping_mul(131) ^ (i >> 2)) as u8).collect()
+}
+
+#[test]
+fn observing_a_file_hashes_it_identically_at_every_buffer_boundary() {
+    const CHUNK: usize = 8;
+    let _tiny = TinyChunk::of(CHUNK);
+    let dir = tempfile::tempdir().unwrap();
+    for len in [0, 1, CHUNK - 1, CHUNK, CHUNK + 1, 5 * CHUNK + 3] {
+        let bytes = pattern(len);
+        let path = dir.path().join(format!("f{len}"));
+        fs::write(&path, &bytes).unwrap();
+        let observed =
+            crate::native_rebootstrap_install::observe_regular_file(fs::File::open(&path).unwrap())
+                .unwrap();
+        let Observed::File { size, sha256, .. } = observed else { panic!("{observed:?}") };
+        assert_eq!(size, len as u64);
+        assert_eq!(sha256, crate::native_rebootstrap_recovery::sha256(&bytes), "len {len}");
+    }
+}
+
+/// The read-back of the preserved copies and the unchanged-original path run through the
+/// forced tiny buffer too.
+#[cfg(unix)]
+#[test]
+fn an_unchanged_original_is_removed_through_a_tiny_buffer() {
+    let _tiny = TinyChunk::of(1);
+    let (p, _root) = install_over_x(&[2], 0o644, PRESERVED_MTIME);
+
+    assert!(!p.root.path().join("x").exists());
+    assert!(late_edits_of(&p.w.b).is_empty());
+}
+
+/// The version record of a saved late edit, read from its item directory.
+fn late_record(
+    p: &Preserved2,
+    item: &RecoveryItem,
+) -> yadorilink_replica_domain::file::FileVersion {
+    let items_root = super::rebootstrap_preserve::items_root_of(p.recovery_root.path());
+    let dir = crate::native_recovery_items::item_dir(&items_root, &group(), &item.item_id);
+    yadorilink_replica_domain::file::FileVersion::from_canonical_encoding(
+        &fs::read(dir.join("record.bin")).unwrap(),
+    )
+    .unwrap()
+}
+
+/// A late edit larger than several buffers is streamed into the item store: same bytes, and the
+/// block descriptors of the ordinary fixed-size rule, through the real quarantine path.
+#[test]
+fn a_multi_chunk_late_edit_round_trips_through_the_quarantine() {
+    let _tiny = TinyChunk::of(5);
+    let p = preserved_scenario(&Viewer);
+    let bytes = pattern(1013);
+    fs::write(p.root.path().join("x"), &bytes).unwrap();
+
+    install_with(&p.w.b, p.recovery_root.path(), &FsRoot::new(p.root.path()), &Viewer, &mut |_| {
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(!p.root.path().join("x").exists());
+    let saved = late_edits_of(&p.w.b);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(late_content(&p, &saved[0]), bytes);
+    let record = late_record(&p, &saved[0]);
+    let block_size = yadorilink_local_storage::block_size_for(bytes.len() as u64);
+    let expected: Vec<_> = bytes
+        .chunks(block_size)
+        .map(|c| yadorilink_replica_domain::file::VersionBlock {
+            hash: yadorilink_replica_domain::ids::BlockHash(
+                crate::native_rebootstrap_recovery::sha256(c).to_vec(),
+            ),
+            size: c.len() as u32,
+        })
+        .collect();
+    assert_eq!(record.blocks, expected);
+    assert_eq!(record.size, bytes.len() as u64);
+    let items = quarantined_items(&p.w.b, &group(), None).unwrap();
+    assert_eq!(
+        items[0].status,
+        QuarantineStatus::RemovedLateEdit {
+            sha256: crate::native_rebootstrap_recovery::sha256(&bytes)
+        }
+    );
+}
+
+/// How a root's file stream misbehaves.
+#[derive(Clone, Copy)]
+enum Fault {
+    /// A read error after this many bytes.
+    ErrorAfter(usize),
+    /// The file's bytes differ from what was observed (a save between observing and copying).
+    OtherBytes,
+}
+
+struct FaultyRoot<'a>(FsRoot<'a>, Fault);
+struct FaultyStream {
+    inner: fs::File,
+    read: usize,
+    fault: Fault,
+}
+impl std::io::Read for FaultyStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.fault {
+            Fault::ErrorAfter(limit) => {
+                if self.read >= limit {
+                    return Err(std::io::Error::other("injected read error"));
+                }
+                let room = buf.len().min(limit - self.read);
+                let n = self.inner.read(&mut buf[..room])?;
+                self.read += n;
+                Ok(n)
+            }
+            Fault::OtherBytes => {
+                let n = self.inner.read(buf)?;
+                buf[..n].iter_mut().for_each(|b| *b ^= 1);
+                Ok(n)
+            }
+        }
+    }
+}
+impl QuarantineRoot for FaultyRoot<'_> {
+    fn observe(&self, path: &str) -> Result<Observed, String> {
+        self.0.observe(path)
+    }
+    fn open_file(&self, path: &str) -> Result<Box<dyn std::io::Read>, String> {
+        let inner = fs::File::open(self.0.dir.join(path)).map_err(|e| e.to_string())?;
+        Ok(Box::new(FaultyStream { inner, read: 0, fault: self.1 }))
+    }
+    fn remove(&self, path: &str, expected: &Observed, claim: &str) -> Result<Removal, String> {
+        self.0.remove(path, expected, claim)
+    }
+    fn release_claim(&self, path: &str, claim: &str) -> Result<(), String> {
+        self.0.release_claim(path, claim)
+    }
+}
+
+/// Fail closed: a file that cannot be read in full, or is not what was observed, stays where it
+/// is, nothing is registered for it, and the install is blocked; a healthy retry then saves it.
+#[test]
+fn a_failure_while_streaming_a_late_edit_keeps_the_original_and_blocks() {
+    let _tiny = TinyChunk::of(5);
+    for fault in [Fault::ErrorAfter(0), Fault::ErrorAfter(500), Fault::OtherBytes] {
+        let p = preserved_scenario(&Viewer);
+        let bytes = pattern(1013);
+        fs::write(p.root.path().join("x"), &bytes).unwrap();
+        let faulty = FaultyRoot(FsRoot::new(p.root.path()), fault);
+
+        let blocked =
+            install_with(&p.w.b, p.recovery_root.path(), &faulty, &Viewer, &mut |_| Ok(()));
+
+        assert!(
+            matches!(
+                blocked,
+                Err(InstallError::Blocked(BlockedReason::PreservationFailed(
+                    PreservationFailure::Io { .. }
+                )))
+            ),
+            "{blocked:?}"
+        );
+        assert_eq!(fs::read(p.root.path().join("x")).unwrap(), bytes, "the original was lost");
+        assert!(late_edits_of(&p.w.b).is_empty(), "an item was registered");
+        let items = quarantined_items(&p.w.b, &group(), None).unwrap();
+        assert!(
+            !matches!(items[0].status, QuarantineStatus::RemovedLateEdit { .. }),
+            "{:?}",
+            items[0].status
+        );
+
+        install_with(
+            &p.w.b,
+            p.recovery_root.path(),
+            &FsRoot::new(p.root.path()),
+            &Viewer,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        let saved = late_edits_of(&p.w.b);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(late_content(&p, &saved[0]), bytes);
+    }
+}
+
+/// The original is moved aside, the user's newer save lands in the moved object, and the
+/// process dies before the verification. The path is absent, but the moved object is owned by the
+/// quarantine row: the resume gives it back and keeps its bytes as a late edit instead of
+/// accepting the earlier item and leaving the newer bytes under an unrecorded name.
+#[test]
+fn a_crash_after_the_move_aside_never_loses_the_newer_bytes_of_the_moved_object() {
+    let p = preserved_scenario(&Viewer);
+    fs::write(p.root.path().join("x"), b"first late edit").unwrap();
+    let write_newer = |aside: &Path| fs::write(aside, b"newer bytes after the move").unwrap();
+    let crashing = FsRoot::writing_after_move(p.root.path(), &write_newer);
+    crashing.crash_after_move.set(true);
+    let crashed = install_with(&p.w.b, p.recovery_root.path(), &crashing, &Viewer, &mut |_| Ok(()));
+    assert!(matches!(crashed, Err(InstallError::Blocked(_))), "{crashed:?}");
+    assert!(!p.root.path().join("x").exists());
+
+    install_with(&p.w.b, p.recovery_root.path(), &FsRoot::new(p.root.path()), &Viewer, &mut |_| {
+        Ok(())
+    })
+    .unwrap();
+
+    let mut contents: Vec<Vec<u8>> =
+        late_edits_of(&p.w.b).iter().map(|item| late_content(&p, item)).collect();
+    contents.sort();
+    assert_eq!(contents, vec![b"first late edit".to_vec(), b"newer bytes after the move".to_vec()]);
+    let leftovers: Vec<_> = fs::read_dir(p.root.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".quarantining"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+/// A resume that finds the path taken again while the claimed object is still aside blocks
+/// rather than choosing between the two.
+#[test]
+fn a_claimed_object_whose_path_is_occupied_again_blocks_the_resume() {
+    let p = preserved_scenario(&Viewer);
+    fs::write(p.root.path().join("x"), b"first late edit").unwrap();
+    let crashing = FsRoot::new(p.root.path());
+    crashing.crash_after_move.set(true);
+    install_with(&p.w.b, p.recovery_root.path(), &crashing, &Viewer, &mut |_| Ok(())).unwrap_err();
+    fs::write(p.root.path().join("x"), b"saved again").unwrap();
+
+    let resumed = install_with(
+        &p.w.b,
+        p.recovery_root.path(),
+        &FsRoot::new(p.root.path()),
+        &Viewer,
+        &mut |_| Ok(()),
+    );
+
+    assert!(matches!(resumed, Err(InstallError::Blocked(_))), "{resumed:?}");
+    assert_eq!(fs::read(p.root.path().join("x")).unwrap(), b"saved again");
+}
+
+/// A symlink target that is not UTF-8 is observed and saved as its exact bytes.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_symlink_target_is_observed_and_kept_byte_for_byte() {
+    use std::os::unix::ffi::OsStrExt;
+    let p = preserved_scenario(&Viewer);
+    let target = [b'e', 0xff, 0xfe, b'x'];
+    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), p.root.path().join("x"))
+        .unwrap();
+    let fs_root = FsRoot::new(p.root.path());
+    assert_eq!(fs_root.observe("x").unwrap(), Observed::Symlink { target: target.to_vec() });
+    install_with(&p.w.b, p.recovery_root.path(), &fs_root, &Viewer, &mut |_| Ok(())).unwrap();
+    super::rebootstrap_replay::complete_machine(
+        &p.w.b,
+        p.recovery_root.path(),
+        &p.preserved.recovery_id,
+        &Viewer,
+    );
+    fs::remove_dir_all(&p.preserved.dir).unwrap();
+
+    let saved = late_edits_of(&p.w.b);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(late_content(&p, &saved[0]), target);
+}
+
+/// A program that opened the file for writing before the move writes after the moved object was
+/// verified. Its bytes must stay reachable: no platform can fence such a writer, so the object is
+/// not unlinked, it stays under its claim (the row records that) and the install completes.
+#[test]
+fn a_write_through_a_handle_opened_before_the_move_lands_after_verification_and_is_kept() {
+    use std::io::{Seek, Write};
+    let p = preserved_scenario(&Viewer);
+    let path = p.root.path().join("x");
+    fs::write(&path, b"first late edit").unwrap();
+    let external = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let write_newer = |_aside: &Path| {
+        let mut handle = &external;
+        handle.rewind().unwrap();
+        handle.write_all(b"NEWER bytes written after the verification").unwrap();
+        handle.sync_all().unwrap();
+    };
+    let root = FsRoot::writing_before_unlink(p.root.path(), &write_newer);
+
+    install_with(&p.w.b, p.recovery_root.path(), &root, &Viewer, &mut |_| Ok(())).unwrap();
+
+    assert!(!path.exists());
+    let retained = retained_objects(p.root.path());
+    assert_eq!(retained.len(), 1, "{retained:?}");
+    assert_eq!(fs::read(&retained[0]).unwrap(), b"NEWER bytes written after the verification");
+    // The external program keeps writing; it still reaches the retained object.
+    {
+        let mut handle = &external;
+        handle.rewind().unwrap();
+        handle.write_all(b"AND LATER STILL").unwrap();
+    }
+    assert!(fs::read(&retained[0]).unwrap().starts_with(b"AND LATER STILL"));
+    let items = quarantined_items(&p.w.b, &group(), None).unwrap();
+    assert_eq!(items[0].status, QuarantineStatus::Retained);
+    let claim: Option<String> =
+        p.w.b
+            .query_row("SELECT removal_claim FROM native_rebootstrap_quarantine", [], |r| r.get(0))
+            .unwrap();
+    assert!(claim.is_some(), "a retained object must stay owned by its row");
+
+    // Finishing the rebootstrap clears its bookkeeping, but not the record of a retained object.
+    super::rebootstrap_replay::complete_machine(
+        &p.w.b,
+        p.recovery_root.path(),
+        &p.preserved.recovery_id,
+        &Viewer,
+    );
+    let rows: i64 =
+        p.w.b
+            .query_row(
+                "SELECT COUNT(*) FROM native_rebootstrap_quarantine WHERE status = 'retained' \
+             AND removal_claim IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert_eq!(rows, 1, "the retained object lost its owner when the rebootstrap finished");
+}
+
+/// The process dies after a writer's bytes landed and the install was interrupted anywhere
+/// between the removal and its record: the resume gives the retained object back and saves the
+/// bytes as a late edit.
+#[test]
+fn a_crash_after_a_retained_removal_keeps_the_writers_bytes() {
+    use std::io::{Seek, Write};
+    let p = preserved_scenario(&Viewer);
+    let path = p.root.path().join("x");
+    fs::write(&path, b"first late edit").unwrap();
+    let external = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let write_newer = |_aside: &Path| {
+        let mut handle = &external;
+        handle.rewind().unwrap();
+        handle.write_all(b"NEWER bytes before the crash!").unwrap();
+        handle.sync_all().unwrap();
+    };
+    let root = FsRoot::writing_before_unlink(p.root.path(), &write_newer);
+    let crashed = install_with(
+        &p.w.b,
+        p.recovery_root.path(),
+        &root,
+        &Viewer,
+        &mut crash_on(InstallPoint::AfterOriginalRemoved(0)),
+    );
+    assert!(matches!(crashed, Err(InstallError::Crashed)), "{crashed:?}");
+
+    install_with(&p.w.b, p.recovery_root.path(), &FsRoot::new(p.root.path()), &Viewer, &mut |_| {
+        Ok(())
+    })
+    .unwrap();
+
+    let mut contents: Vec<Vec<u8>> =
+        late_edits_of(&p.w.b).iter().map(|item| late_content(&p, item)).collect();
+    contents.sort();
+    let mut expected = vec![b"first late edit".to_vec(), b"NEWER bytes before the crash!".to_vec()];
+    expected.sort();
+    assert_eq!(contents, expected);
+}
+
+/// The crash falls exactly as the unlink begins (only where the platform grants the exclusion
+/// that makes it): the object is still under its claim, the resume gives it back and removes it.
+#[test]
+fn a_crash_at_the_unlink_leaves_the_claimed_object_for_the_resume() {
+    let p = preserved_scenario(&Viewer);
+    fs::write(p.root.path().join("x"), b"first late edit").unwrap();
+    let crashing = FsRoot::new(p.root.path());
+    crashing.crash_before_unlink.set(true);
+    let first = install_with(&p.w.b, p.recovery_root.path(), &crashing, &Viewer, &mut |_| Ok(()));
+    assert!(first.is_err(), "{first:?}");
+    install_with(&p.w.b, p.recovery_root.path(), &FsRoot::new(p.root.path()), &Viewer, &mut |_| {
+        Ok(())
+    })
+    .unwrap();
+    let saved = late_edits_of(&p.w.b);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(late_content(&p, &saved[0]), b"first late edit");
+}
+
+fn retained_objects(dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(".quarantining"))
+        .collect()
+}
+
+/// With no other program holding the object, it is unlinked where the platform can prove that
+/// (Linux, Windows) and retained where it cannot (anywhere else); never lost either way.
+#[test]
+fn an_unheld_original_is_unlinked_only_where_the_platform_proves_no_writer() {
+    let p = preserved_scenario(&Viewer);
+    fs::write(p.root.path().join("x"), b"first late edit").unwrap();
+    let nothing = |_: &Path| {};
+    let real = FsRoot::writing_before_unlink(p.root.path(), &nothing);
+    install_with(&p.w.b, p.recovery_root.path(), &real, &Viewer, &mut |_| Ok(())).unwrap();
+    let kept = retained_objects(p.root.path());
+    let items = quarantined_items(&p.w.b, &group(), None).unwrap();
+    if cfg!(any(target_os = "linux", windows)) {
+        assert!(kept.is_empty(), "{kept:?}");
+        assert!(matches!(items[0].status, QuarantineStatus::RemovedLateEdit { .. }));
+    } else {
+        assert_eq!(kept.len(), 1);
+        assert_eq!(items[0].status, QuarantineStatus::Retained);
+    }
+}
+
+#[test]
+fn unlink_exclusively_keeps_a_file_a_writer_still_holds_and_refuses_a_changed_one() {
+    use std::io::{Seek, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("f");
+    fs::write(&file_path, b"before").unwrap();
+    let external = fs::OpenOptions::new().write(true).open(&file_path).unwrap();
+    let expected = crate::native_rebootstrap_install::observe_regular_file(
+        fs::File::open(&file_path).unwrap(),
+    )
+    .unwrap();
+    let write = || {
+        let mut handle = &external;
+        handle.rewind().unwrap();
+        handle.write_all(b"AFTER!").unwrap();
+    };
+    let unlinked = unlink_exclusively(
+        &file_path,
+        &expected,
+        &open_excluding_writers,
+        &write,
+        &yadorilink_fs_platform::durable_dir::remove_file_durably,
+    )
+    .unwrap();
+    assert_eq!(unlinked, Unlinked::Done(Removal::Retained));
+    assert_eq!(fs::read(&file_path).unwrap(), b"AFTER!");
+
+    // The file is not what was verified: nothing is unlinked.
+    let unlinked =
+        unlink_exclusively(&file_path, &expected, &open_excluding_writers, &|| {}, &|p| {
+            fs::remove_file(p)
+        })
+        .unwrap();
+    assert_eq!(unlinked, Unlinked::ChangedBeforeUnlink);
+    assert!(file_path.exists());
+}
+
+/// The identity comparison before an unlink fails closed: an identity that cannot be read,
+/// or a different object, is never "the same".
+#[test]
+fn the_name_check_fails_closed_when_an_identity_is_unreadable_or_different() {
+    use crate::native_rebootstrap_install::{judge_identities, NameCheck};
+    use yadorilink_fs_platform::fs_identity::FileIdentity;
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    fs::write(&a, b"one").unwrap();
+    fs::write(&b, b"two").unwrap();
+    let by_name = |p: &Path| FileIdentity::observe_path(p);
+    let by_handle = |p: &Path| FileIdentity::observe_handle(&fs::File::open(p).unwrap());
+    assert_eq!(judge_identities(by_name(&a), by_handle(&a)), NameCheck::Same);
+    assert_eq!(judge_identities(by_name(&b), by_handle(&a)), NameCheck::Different);
+    let unreadable = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    assert_eq!(judge_identities(unreadable(), by_handle(&a)), NameCheck::Unverifiable);
+    assert_eq!(judge_identities(by_name(&a), unreadable()), NameCheck::Unverifiable);
+    assert_eq!(judge_identities(unreadable(), unreadable()), NameCheck::Unverifiable);
+    // A name that no longer exists cannot be proved to be the verified object either.
+    let held = fs::File::open(&a).unwrap();
+    fs::remove_file(&a).unwrap();
+    assert_ne!(crate::native_rebootstrap_install::name_check(&a, &held), NameCheck::Same);
+}
+
+/// The claimed name is swapped for another file between the verification and the unlink:
+/// nothing is unlinked. On Windows the held handle shares delete, so the swap succeeds.
+#[test]
+fn a_name_swapped_after_the_verification_is_not_unlinked() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("f");
+    fs::write(&file_path, b"verified").unwrap();
+    let expected = crate::native_rebootstrap_install::observe_regular_file(
+        fs::File::open(&file_path).unwrap(),
+    )
+    .unwrap();
+    let swap = || {
+        fs::rename(&file_path, dir.path().join("moved")).unwrap();
+        fs::write(&file_path, b"someone else's").unwrap();
+    };
+    let unlinked = std::cell::Cell::new(false);
+    let result = unlink_exclusively(&file_path, &expected, &open_excluding_writers, &swap, &|p| {
+        unlinked.set(true);
+        fs::remove_file(p)
+    });
+    if cfg!(any(unix, windows)) {
+        // Where the platform refuses the exclusion the object is retained before the check.
+        match result {
+            Ok(Unlinked::Done(Removal::Retained)) => {}
+            other => assert!(other.is_err(), "{other:?}"),
+        }
+        assert!(!unlinked.get(), "the swapped-in file must not be unlinked");
+        assert_eq!(fs::read(&file_path).unwrap(), b"someone else's");
+    }
+}
+
+// --- retained originals: listing and cleanup ----------------------------------------------------
+
+mod retained {
+    use super::*;
+    use crate::native_rebootstrap_retained::{
+        cleanup_retained, retained_originals, unlink_claimed_exclusively, ClaimedUnlink,
+        RetainedContext, RetainedOutcome, RetainedRoot,
+    };
+    use std::io::{Seek, Write};
+
+    struct RetainedFs<'a> {
+        fs: FsRoot<'a>,
+        /// A platform that grants the exclusion; off, the platform's real one (which an open
+        /// writer defeats everywhere).
+        assume_exclusion: bool,
+    }
+
+    impl RetainedRoot for RetainedFs<'_> {
+        fn observe_claimed(&self, path: &str, claim: &str) -> Result<Observed, String> {
+            self.fs.observe_at(&self.fs.aside(path, claim))
+        }
+        fn open_claimed(&self, path: &str, claim: &str) -> Result<Box<dyn std::io::Read>, String> {
+            Ok(Box::new(fs::File::open(self.fs.aside(path, claim)).map_err(|e| e.to_string())?))
+        }
+        fn unlink_claimed(
+            &self,
+            path: &str,
+            claim: &str,
+            expected: &[u8; 32],
+        ) -> Result<ClaimedUnlink, String> {
+            let open = |p: &Path| -> std::io::Result<WriteExclusion> {
+                if self.assume_exclusion {
+                    Ok(WriteExclusion::assumed(fs::File::open(p)?))
+                } else {
+                    open_excluding_writers(p)
+                }
+            };
+            unlink_claimed_exclusively(&self.fs.aside(path, claim), expected, &open, &|p| {
+                fs::remove_file(p)
+            })
+        }
+    }
+
+    /// A finished rebootstrap that kept the original of `x` because a program holds it open for
+    /// writing (the program is the returned handle).
+    fn finished_with_a_retained_original() -> (Preserved2, fs::File) {
+        let p = preserved_scenario(&Viewer);
+        let path = p.root.path().join("x");
+        fs::write(&path, b"first late edit").unwrap();
+        let external = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let root = FsRoot::writing_before_unlink(p.root.path(), &|_: &Path| {});
+        install_with(&p.w.b, p.recovery_root.path(), &root, &Viewer, &mut |_| Ok(())).unwrap();
+        super::super::rebootstrap_replay::complete_machine(
+            &p.w.b,
+            p.recovery_root.path(),
+            &p.preserved.recovery_id,
+            &Viewer,
+        );
+        assert!(rebootstrap_status(&p.w.b, &group()).unwrap().is_none(), "the rebootstrap ended");
+        (p, external)
+    }
+
+    fn cleanup(p: &Preserved2, assume_exclusion: bool) -> Vec<RetainedOutcome> {
+        let root = RetainedFs { fs: FsRoot::new(p.root.path()), assume_exclusion };
+        let items_root = super::super::rebootstrap_preserve::items_root_of(p.recovery_root.path());
+        let ctx = RetainedContext {
+            items_root: &items_root,
+            sync_roots: &[],
+            now_unix: 3000,
+            root: &root,
+        };
+        cleanup_retained(&p.w.b, &ctx, &group()).unwrap().into_iter().map(|(_, o)| o).collect()
+    }
+
+    #[test]
+    fn a_retained_original_is_listed_after_the_rebootstrap_finished() {
+        let (p, _external) = finished_with_a_retained_original();
+        let listed = retained_originals(&p.w.b, &group()).unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].path, "x");
+        assert_eq!(listed[0].recovery_id, p.preserved.recovery_id);
+        assert_eq!(retained_objects(p.root.path()).len(), 1);
+    }
+
+    #[test]
+    fn an_unchanged_object_is_removed_only_under_a_proven_exclusion_and_the_row_cleared() {
+        let (p, external) = finished_with_a_retained_original();
+        // The program still holds the file open: the platform's own exclusion is refused.
+        assert_eq!(cleanup(&p, false), vec![RetainedOutcome::StillRetained]);
+        assert_eq!(retained_originals(&p.w.b, &group()).unwrap().len(), 1);
+        assert_eq!(retained_objects(p.root.path()).len(), 1);
+        drop(external);
+        // Exclusion proved (a stand-in for a platform that grants it): removed, and idempotent.
+        assert_eq!(cleanup(&p, true), vec![RetainedOutcome::Removed]);
+        assert!(retained_objects(p.root.path()).is_empty());
+        assert!(retained_originals(&p.w.b, &group()).unwrap().is_empty());
+        assert!(cleanup(&p, true).is_empty());
+    }
+
+    #[test]
+    fn changed_bytes_are_saved_as_a_recovery_item_before_the_object_is_removed() {
+        let (p, external) = finished_with_a_retained_original();
+        {
+            let mut handle = &external;
+            handle.rewind().unwrap();
+            handle.write_all(b"NEWER bytes the program wrote").unwrap();
+            handle.sync_all().unwrap();
+        }
+        let before = late_edits_of(&p.w.b).len();
+        assert_eq!(cleanup(&p, true), vec![RetainedOutcome::PreservedChange { removed: true }]);
+        let saved = late_edits_of(&p.w.b);
+        assert_eq!(saved.len(), before + 1, "{saved:?}");
+        assert!(saved.iter().any(|item| late_content(&p, item).starts_with(b"NEWER bytes")));
+        assert!(retained_objects(p.root.path()).is_empty());
+        assert!(retained_originals(&p.w.b, &group()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn changed_bytes_are_saved_once_when_the_exclusion_is_still_refused() {
+        let (p, external) = finished_with_a_retained_original();
+        {
+            let mut handle = &external;
+            handle.rewind().unwrap();
+            handle.write_all(b"NEWER bytes the program wrote").unwrap();
+            handle.sync_all().unwrap();
+        }
+        let before = late_edits_of(&p.w.b).len();
+        assert_eq!(cleanup(&p, false), vec![RetainedOutcome::PreservedChange { removed: false }]);
+        assert_eq!(late_edits_of(&p.w.b).len(), before + 1);
+        assert_eq!(retained_objects(p.root.path()).len(), 1);
+        // The object is still owned, and its new bytes are not saved a second time.
+        assert_eq!(cleanup(&p, false), vec![RetainedOutcome::StillRetained]);
+        assert_eq!(late_edits_of(&p.w.b).len(), before + 1);
+        drop(external);
+        assert_eq!(cleanup(&p, true), vec![RetainedOutcome::Removed]);
+        assert_eq!(late_edits_of(&p.w.b).len(), before + 1);
+    }
+
+    #[test]
+    fn a_row_without_a_recorded_digest_is_left_alone() {
+        let (p, _external) = finished_with_a_retained_original();
+        p.w.b.execute("DELETE FROM native_rebootstrap_retained_digest", []).unwrap();
+        let outcomes = cleanup(&p, true);
+        assert!(matches!(outcomes.as_slice(), [RetainedOutcome::Left(_)]), "{outcomes:?}");
+        assert_eq!(retained_objects(p.root.path()).len(), 1);
+        assert_eq!(retained_originals(&p.w.b, &group()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn nothing_under_the_claim_clears_the_row() {
+        let (p, external) = finished_with_a_retained_original();
+        drop(external);
+        for object in retained_objects(p.root.path()) {
+            fs::remove_file(object).unwrap();
+        }
+        assert_eq!(cleanup(&p, true), vec![RetainedOutcome::Gone]);
+        assert!(retained_originals(&p.w.b, &group()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_object_whose_recovery_item_was_discarded_is_saved_again_before_it_is_removed() {
+        let (p, external) = finished_with_a_retained_original();
+        drop(external);
+        assert_eq!(late_edits_of(&p.w.b).len(), 1);
+        p.w.b.execute("DELETE FROM native_recovery_item", []).unwrap();
+        assert!(late_edits_of(&p.w.b).is_empty());
+        assert_eq!(cleanup(&p, true), vec![RetainedOutcome::PreservedChange { removed: true }]);
+        let saved = late_edits_of(&p.w.b);
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert_eq!(late_content(&p, &saved[0]), b"first late edit");
+        assert!(retained_objects(p.root.path()).is_empty());
+    }
+
+    #[test]
+    fn a_name_that_leads_to_another_object_than_the_verified_one_is_not_unlinked() {
+        let (p, external) = finished_with_a_retained_original();
+        drop(external);
+        let kept = retained_objects(p.root.path()).remove(0);
+        let digest = crate::native_rebootstrap_retained::kept_fingerprint(
+            &FsRoot::new(p.root.path()).observe_at(&kept).unwrap(),
+        )
+        .unwrap();
+        let open = |path: &Path| -> std::io::Result<WriteExclusion> {
+            let held = WriteExclusion::assumed(fs::File::open(path)?);
+            // Between the verification and the unlink the name is given to another file.
+            fs::rename(path, path.with_extension("moved"))?;
+            fs::write(path, b"first late edit")?;
+            Ok(held)
+        };
+        let result = unlink_claimed_exclusively(&kept, &digest, &open, &|p| fs::remove_file(p));
+        assert!(result.is_err(), "{result:?}");
+        assert!(kept.exists());
+    }
+
+    #[test]
+    fn a_metadata_only_edit_is_saved_before_the_object_is_removed() {
+        let (p, external) = finished_with_a_retained_original();
+        drop(external);
+        let kept = retained_objects(p.root.path()).remove(0);
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        fs::File::options().write(true).open(&kept).unwrap().set_modified(later).unwrap();
+        let before = late_edits_of(&p.w.b).len();
+        assert_eq!(cleanup(&p, true), vec![RetainedOutcome::PreservedChange { removed: true }]);
+        assert_eq!(late_edits_of(&p.w.b).len(), before + 1);
+        assert!(retained_objects(p.root.path()).is_empty());
+    }
 }

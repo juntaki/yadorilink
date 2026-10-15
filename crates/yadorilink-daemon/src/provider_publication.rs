@@ -347,15 +347,25 @@ impl Shared {
                             .filter(|id| !in_flight.contains(id) && !waiting.contains_key(id));
                         enqueue_new(&mut queued, &mut queue, fresh);
                     }
-                    Err(error) => {
+                    // Only state that is known to be corrupt replaces the root. Any other read
+                    // error (busy, pool, I/O) says nothing about the state: keep the root, retry.
+                    Err(error @ yadorilink_sync_sqlite::SyncSqliteError::CorruptState(_)) => {
                         self.rebootstrap_root(root_id, &error.to_string()).await;
                         break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(root_id, %error, "could not read the pending publications; will retry");
+                        tokio::time::sleep(self.config.backoff_initial).await;
+                        rescan = true;
+                        continue;
                     }
                 }
                 if !root_signal_in_flight
                     && root_signal.is_none()
-                    && matches!(repo.unannounced_changes(root_id), Ok(Some(_)))
+                    && !matches!(repo.unannounced_changes(root_id), Ok(None))
                 {
+                    // A failed read schedules the signal too: it is retried (with backoff) until
+                    // the read can say whether anything is unannounced.
                     root_signal = Some((Instant::now(), self.config.backoff_initial));
                 }
             }
@@ -392,7 +402,7 @@ impl Shared {
             {
                 let mut runners = self.runners.lock().unwrap_or_else(|p| p.into_inner());
                 let more = repo.pending_items(root_id).map(|p| !p.is_empty()).unwrap_or(true)
-                    || matches!(repo.unannounced_changes(root_id), Ok(Some(_)));
+                    || !matches!(repo.unannounced_changes(root_id), Ok(None));
                 if !more {
                     runners.remove(root_id);
                     return;
@@ -463,7 +473,16 @@ impl Shared {
     /// version, a create, a delete, a parent change). True when the host acknowledged it.
     async fn signal_root(&self, root_id: &str) -> bool {
         let repo = self.coordinator.provider_repository();
-        let Ok(Some(changes)) = repo.unannounced_changes(root_id) else { return true };
+        // Only a successful read that finds nothing unannounced is "done"; a failed read is not
+        // acknowledged, so the signal is retried with backoff.
+        let changes = match repo.unannounced_changes(root_id) {
+            Ok(Some(changes)) => changes,
+            Ok(None) => return true,
+            Err(error) => {
+                tracing::warn!(root_id, %error, "could not read the unannounced changes; will retry");
+                return false;
+            }
+        };
         // The revision only advances with logged events: this signal announces the latest one.
         let Ok(Some(revision)) = repo.namespace_revision(root_id) else { return false };
         if !self.host.signal(root_id, revision, Vec::new(), vec![Vec::new()]).await {
@@ -495,8 +514,16 @@ impl Shared {
 
     async fn attempt(&self, root_id: &str, item: ItemId) -> Attempt {
         let repo = self.coordinator.provider_repository();
-        let lost =
-            |error: yadorilink_sync_sqlite::SyncSqliteError| Attempt::Lost(error.to_string());
+        // Only corrupt state loses the root; any other read error is retried with backoff.
+        let lost = |error: yadorilink_sync_sqlite::SyncSqliteError| match error {
+            yadorilink_sync_sqlite::SyncSqliteError::CorruptState(_) => {
+                Attempt::Lost(error.to_string())
+            }
+            error => {
+                tracing::warn!(root_id, %error, "could not read the publication state; will retry");
+                Attempt::Retry
+            }
+        };
         let after_ms = self.config.release_after.as_millis() as i64;
         let now = || (self.config.now_ms)();
         // The timer is checked first: a version announced long enough ago is released whatever

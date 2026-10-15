@@ -132,6 +132,9 @@ impl<T: BlockStore + ?Sized> BlockContentStore for T {
 /// owners named on each method; the eviction path reaches these through
 /// them rather than calling a `BlockStore` directly.
 pub trait BlockReclamationStore: Send + Sync {
+    /// See [`BlockStore::storage_root`].
+    fn storage_root(&self) -> Option<&std::path::Path>;
+
     /// Mark-and-sweep GC, called from filesystem-sync's
     /// `block_deletion::sweep_globally_unreferenced_blocks`, which requires
     /// a `BlockPhysicalDeletionGuard` before delegating here.
@@ -152,6 +155,10 @@ pub trait BlockReclamationStore: Send + Sync {
 }
 
 impl<T: BlockStore + ?Sized> BlockReclamationStore for T {
+    fn storage_root(&self) -> Option<&std::path::Path> {
+        BlockStore::storage_root(self)
+    }
+
     fn sweep(
         &self,
         live: &HashSet<ContentHash>,

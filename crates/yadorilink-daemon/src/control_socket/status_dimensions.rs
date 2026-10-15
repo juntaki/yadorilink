@@ -1,0 +1,104 @@
+//! Derives the two product dimensions of a link (`LinkStatus.availability` and
+//! `LinkStatus.protection`) from daemon truth already in the status message: the link's
+//! durability, custody and fetch facts and the peer list. Nothing is recomputed per file and
+//! nothing is remembered between calls; a fact that is not in the message is not claimed. The
+//! meaning of each value, and how several links aggregate, is documented in
+//! `yadorilink-product-view`.
+
+use std::collections::BTreeSet;
+
+use yadorilink_ipc_proto::daemonctl::{
+    DurabilityEvidence, FetchAvailability, GroupDurabilityStatus, LinkStatus, PeerReachability,
+    PeerStatus, StatusResponse,
+};
+
+use yadorilink_ipc_proto::daemonctl::{DataProtection, ProductAvailability};
+
+/// One link's two dimensions, as the wire carries them.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LinkDimensions {
+    pub availability: ProductAvailability,
+    pub reachable_device_ids: Vec<String>,
+    pub offline_device_ids: Vec<String>,
+    pub protection: DataProtection,
+    pub protection_device_ids: Vec<String>,
+}
+
+/// Fills every link's availability and protection fields from the link and the peer list.
+pub(crate) fn fill_link_dimensions(response: &mut StatusResponse) {
+    let peers = std::mem::take(&mut response.peers);
+    for link in &mut response.links {
+        let dimensions = link_dimensions(link, &peers);
+        link.availability = dimensions.availability as i32;
+        link.availability_reachable_device_ids = dimensions.reachable_device_ids;
+        link.availability_offline_device_ids = dimensions.offline_device_ids;
+        link.protection = dimensions.protection as i32;
+        link.protection_device_ids = dimensions.protection_device_ids;
+    }
+    response.peers = peers;
+}
+
+/// The two dimensions of one link.
+///
+/// Availability reads the link's fetch availability and splits the other devices recorded as
+/// full copies by whether the peer list says they are connected. A device is named as the one
+/// being waited for only when the group's custody is currently confirmed, since a recorded full
+/// copy alone does not show it holds the exact current version.
+///
+/// Protection reads the link's durability status, which the daemon computes from confirmed
+/// custody and the recorded full copies. Reachability is deliberately not an input: a confirmed
+/// copy on an offline device is still a copy. A distrusted policy is never protected.
+pub(crate) fn link_dimensions(link: &LinkStatus, peers: &[PeerStatus]) -> LinkDimensions {
+    let holders: BTreeSet<&String> = link.full_replica_device_ids.iter().collect();
+    let connected = |id: &String| {
+        peers.iter().any(|p| &p.device_id == id && p.reachability() == PeerReachability::Connected)
+    };
+    let (reachable, offline): (Vec<&String>, Vec<&String>) =
+        holders.iter().copied().partition(|id| connected(id));
+    let custody_confirmed = matches!(
+        link.durability_evidence(),
+        DurabilityEvidence::CorroboratedIndex | DurabilityEvidence::VerifiedPayload
+    ) && link.durability_status() == GroupDurabilityStatus::Protected;
+
+    let availability = match link.fetch_availability() {
+        FetchAvailability::AvailableNow => ProductAvailability::Available,
+        FetchAvailability::UnavailableNow
+            if reachable.is_empty() && !offline.is_empty() && custody_confirmed =>
+        {
+            ProductAvailability::WaitingForPeer
+        }
+        FetchAvailability::UnavailableNow => ProductAvailability::WaitingForExactContent,
+        FetchAvailability::Unknown | FetchAvailability::Unspecified => ProductAvailability::Unknown,
+    };
+
+    let (protection, awaited_or_holding) = if link.policy_stale {
+        (DataProtection::Unknown, false)
+    } else {
+        match link.durability_status() {
+            GroupDurabilityStatus::Protected => (DataProtection::Protected, true),
+            GroupDurabilityStatus::AtRisk => (DataProtection::AtRisk, false),
+            GroupDurabilityStatus::Protecting => (DataProtection::Pending, false),
+            GroupDurabilityStatus::Unknown if link.durability_check_pending => {
+                (DataProtection::Pending, true)
+            }
+            GroupDurabilityStatus::Unknown | GroupDurabilityStatus::Unspecified => {
+                (DataProtection::Unknown, false)
+            }
+        }
+    };
+
+    LinkDimensions {
+        availability,
+        reachable_device_ids: reachable.into_iter().cloned().collect(),
+        offline_device_ids: offline.into_iter().cloned().collect(),
+        protection,
+        protection_device_ids: if awaited_or_holding {
+            holders.iter().map(|id| (*id).clone()).collect()
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests;

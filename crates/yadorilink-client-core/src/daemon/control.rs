@@ -56,6 +56,7 @@ fn reply_budget(payload: &ReqPayload) -> Option<Duration> {
         | ReqPayload::ListTrash(_)
         | ReqPayload::ListVersions(_)
         | ReqPayload::MaterializationStatus(_)
+        | ReqPayload::UnpinItem(_)
         | ReqPayload::LimitsShow(_)
         | ReqPayload::UpdateStatus(_)
         | ReqPayload::ReportingStatus(_)

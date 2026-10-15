@@ -141,6 +141,7 @@ fn build(r: &Value, root: Vec<u8>) -> Option<Payload> {
             root_id: root,
             item_id: bytes(r, "item")?,
             requested_version_hash: bytes(r, "requested_hash")?,
+            ..Default::default()
         }),
         "apply" => Payload::ProviderApplyChangeRequest(build_apply(r, root)?),
         "activity" => Payload::ProviderActivity(ProviderActivity {

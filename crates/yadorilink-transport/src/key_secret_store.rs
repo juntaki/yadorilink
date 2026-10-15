@@ -142,7 +142,7 @@ fn write_secret_file(
         // within one filesystem.
         _ => PathBuf::from("."),
     };
-    std::fs::create_dir_all(&parent)?;
+    yadorilink_fs_platform::durable_dir::create_dir_all_durably(&parent)?;
 
     let (temp_path, file) = create_temp_secret_file(&parent, path)?;
     let published = write_and_publish(file, &temp_path, path, secret, publish);

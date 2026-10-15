@@ -114,6 +114,58 @@ fn combine_status(info: ipc_client::StatusInfo) -> YadoriLinkBadgeStatus {
     }
 }
 
+/// What the Finder context menu needs to know about one path, as plain facts. The menu decision
+/// itself is Swift (`FinderMenu`); nothing here invents state: every field is the daemon's own
+/// answer, and an unreachable daemon or an unknown path is `tracked == false`, which the menu
+/// treats as "no YadoriLink actions".
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct YadoriLinkItemFacts {
+    /// The daemon knows the path (a sync state or a local state came back).
+    pub tracked: bool,
+    /// The user paused this path, or an item above it.
+    pub paused: bool,
+    /// An item above it is paused and it is not itself: neither Pause nor Resume applies.
+    pub paused_by_ancestor: bool,
+    /// The daemon's eviction gate accepts this path's root (Free Up Space is not a promise the
+    /// daemon would refuse).
+    pub reclaim_supported: bool,
+    /// A usable proof names the current version and its bytes are on this device. Never true
+    /// during a hydrate or evict transition.
+    pub current_content_present: bool,
+    /// A hydrate or evict is under way.
+    pub in_transition: bool,
+}
+
+fn item_facts(info: &ipc_client::StatusInfo) -> YadoriLinkItemFacts {
+    let transition = info.local_state.as_ref().map(|s| s.transition());
+    let in_transition =
+        matches!(transition, Some(LocalTransition::Hydrating | LocalTransition::Evicting));
+    YadoriLinkItemFacts {
+        // A file row has a local state. A directory has none of its own and takes the aggregate
+        // sync state. `Pending` without a local state is a file the daemon has not indexed yet.
+        tracked: info.local_state.is_some()
+            || matches!(info.sync_state, SyncState::Synced | SyncState::Syncing | SyncState::Error),
+        paused: info.item_paused,
+        paused_by_ancestor: info.paused_by_ancestor,
+        reclaim_supported: info.reclaim_supported,
+        current_content_present: !in_transition
+            && info.local_state.as_ref().is_some_and(|s| s.current_content_present),
+        in_transition,
+    }
+}
+
+/// Queries the daemon for the facts behind `path`'s context menu. Fails soft to all-false
+/// (untracked) on a null/invalid path or an unreachable daemon, within the bounded timeout.
+///
+/// # Safety
+/// See `path_from_c_str`.
+#[no_mangle]
+pub unsafe extern "C" fn yadorilink_query_item(path: *const c_char) -> YadoriLinkItemFacts {
+    let Some(path) = path_from_c_str(path) else { return YadoriLinkItemFacts::default() };
+    catch_unwind(|| item_facts(&ipc_client::query_status(&path))).unwrap_or_default()
+}
+
 /// Queries the daemon for `path`'s combined badge status.
 /// Fails soft to `YadoriLinkBadgeStatus::Unspecified` (Finder shows no
 /// overlay) on a null/invalid path, an unreachable daemon, or any other
@@ -159,13 +211,64 @@ pub unsafe extern "C" fn yadorilink_send_context_action(
     catch_unwind(|| ipc_client::send_context_action(&path, action.into())).unwrap_or(false)
 }
 
+/// One confirmed snapshot of the ordinary linked folders. Opaque to C; read with
+/// `yadorilink_linked_roots_count` / `_path` and released with `_free`.
+pub struct YadoriLinkRoots(Vec<std::ffi::CString>);
+
+/// Asks the daemon for the ordinary linked folders. Returns NULL when the daemon could not
+/// confirm them (unreachable, timeout, `snapshot_available == false`): the caller keeps the set
+/// it last confirmed. A non-NULL handle is authoritative, even with zero paths.
+#[no_mangle]
+pub extern "C" fn yadorilink_linked_roots_open() -> *mut YadoriLinkRoots {
+    let Ok(Some(paths)) = catch_unwind(ipc_client::list_linked_roots) else {
+        return std::ptr::null_mut();
+    };
+    // A path with an interior NUL cannot cross the C boundary; drop it rather than the snapshot.
+    let paths = paths.into_iter().filter_map(|p| std::ffi::CString::new(p).ok()).collect();
+    Box::into_raw(Box::new(YadoriLinkRoots(paths)))
+}
+
+/// # Safety
+/// `roots` must be a live handle from `yadorilink_linked_roots_open` (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn yadorilink_linked_roots_count(roots: *const YadoriLinkRoots) -> usize {
+    roots.as_ref().map_or(0, |r| r.0.len())
+}
+
+/// The i-th path (valid until `yadorilink_linked_roots_free`), or NULL if out of range.
+///
+/// # Safety
+/// `roots` must be a live handle from `yadorilink_linked_roots_open` (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn yadorilink_linked_roots_path(
+    roots: *const YadoriLinkRoots,
+    index: usize,
+) -> *const c_char {
+    roots.as_ref().and_then(|r| r.0.get(index)).map_or(std::ptr::null(), |p| p.as_ptr())
+}
+
+/// # Safety
+/// `roots` must be a handle from `yadorilink_linked_roots_open` not yet freed (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn yadorilink_linked_roots_free(roots: *mut YadoriLinkRoots) {
+    if !roots.is_null() {
+        drop(Box::from_raw(roots));
+    }
+}
+
 #[cfg(test)]
 mod combine_status_tests {
     use super::*;
     use yadorilink_ipc_proto::shellipc::LocalState;
 
-    fn info(local: Option<(bool, bool, LocalTransition)>, sync: SyncState) -> ipc_client::StatusInfo {
+    fn info(
+        local: Option<(bool, bool, LocalTransition)>,
+        sync: SyncState,
+    ) -> ipc_client::StatusInfo {
         ipc_client::StatusInfo {
+            item_paused: false,
+            paused_by_ancestor: false,
+            reclaim_supported: false,
             sync_state: sync,
             local_state: local.map(|(object, current, transition)| LocalState {
                 local_object_present: object,
@@ -197,8 +300,93 @@ mod combine_status_tests {
             YadoriLinkBadgeStatus::Unspecified
         );
         assert_eq!(
-            combine_status(info(Some((false, false, LocalTransition::Hydrating)), SyncState::Unspecified)),
+            combine_status(info(
+                Some((false, false, LocalTransition::Hydrating)),
+                SyncState::Unspecified
+            )),
             YadoriLinkBadgeStatus::Syncing
         );
+    }
+}
+
+#[cfg(test)]
+mod item_facts_tests {
+    use super::*;
+    use yadorilink_ipc_proto::shellipc::LocalState;
+
+    fn info(
+        sync: SyncState,
+        local: Option<(bool, bool, LocalTransition)>,
+    ) -> ipc_client::StatusInfo {
+        ipc_client::StatusInfo {
+            sync_state: sync,
+            item_paused: false,
+            paused_by_ancestor: false,
+            reclaim_supported: true,
+            local_state: local.map(|(object, current, transition)| LocalState {
+                local_object_present: object,
+                current_content_present: current,
+                transition: transition as i32,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_path_the_daemon_knows_nothing_about_is_untracked() {
+        let facts = item_facts(&info(SyncState::Unspecified, None));
+        assert!(!facts.tracked);
+        assert!(!facts.paused && !facts.current_content_present && !facts.in_transition);
+    }
+
+    #[test]
+    fn a_new_unindexed_file_is_untracked() {
+        // The daemon answers Pending, with no local state, for a file under a linked folder that
+        // has no index row yet; it gets no actions until it is indexed.
+        assert!(!item_facts(&info(SyncState::Pending, None)).tracked);
+    }
+
+    #[test]
+    fn an_indexed_folder_without_a_row_of_its_own_is_tracked() {
+        // A directory (or the link root) takes the aggregate sync state and has no local state.
+        for sync in [SyncState::Synced, SyncState::Syncing, SyncState::Error] {
+            assert!(item_facts(&info(sync, None)).tracked, "{sync:?}");
+        }
+    }
+
+    #[test]
+    fn a_synced_local_file_is_tracked_with_current_content() {
+        let facts = item_facts(&info(SyncState::Synced, Some((true, true, LocalTransition::None))));
+        assert!(facts.tracked && facts.current_content_present && facts.reclaim_supported);
+        assert!(!facts.paused && !facts.in_transition);
+    }
+
+    #[test]
+    fn a_remote_file_is_tracked_without_current_content() {
+        let facts =
+            item_facts(&info(SyncState::Synced, Some((false, false, LocalTransition::None))));
+        assert!(facts.tracked);
+        assert!(!facts.current_content_present);
+    }
+
+    #[test]
+    fn a_transition_is_reported_and_never_current_content() {
+        for transition in [LocalTransition::Hydrating, LocalTransition::Evicting] {
+            let facts = item_facts(&info(SyncState::Syncing, Some((true, true, transition))));
+            assert!(facts.tracked && facts.in_transition);
+            assert!(!facts.current_content_present, "{transition:?}");
+        }
+    }
+
+    #[test]
+    fn pause_and_reclaim_facts_are_carried_as_the_daemon_said_them() {
+        let mut i = info(SyncState::Synced, Some((true, true, LocalTransition::None)));
+        i.item_paused = true;
+        i.reclaim_supported = false;
+        let facts = item_facts(&i);
+        assert!(facts.paused && !facts.paused_by_ancestor && !facts.reclaim_supported);
+        let mut i = info(SyncState::Synced, Some((true, true, LocalTransition::None)));
+        i.paused_by_ancestor = true;
+        let facts = item_facts(&i);
+        assert!(!facts.paused && facts.paused_by_ancestor);
     }
 }

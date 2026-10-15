@@ -20,6 +20,7 @@
 		51A4227622E1099713CB33EE /* YadoriLinkFFI.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 3C4FAA49F59793402265CF4A /* YadoriLinkFFI.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		5E2B195A277198A7222A6174 /* LiveClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B81C7FEF033EEB6733BF09C9 /* LiveClientTests.swift */; };
 		60B9FA0FD9879B0B634052AC /* ClientFactory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 927716FB5075DC6EB3A19031 /* ClientFactory.swift */; };
+		61785C1C40409903FC3293BC /* FinderMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF37EA1E2743F9EC5D05B694 /* FinderMenu.swift */; };
 		65730C41BE48C9DCAF5DC43E /* YadoriLinkFixtures in Frameworks */ = {isa = PBXBuildFile; productRef = 274970BD01D68F608E915878 /* YadoriLinkFixtures */; };
 		6EEE5BBAC6C59B60D6189947 /* ProviderTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 063C03EB753CF29AD189EBFF /* ProviderTransport.swift */; };
 		7DA3A059C9F33D7CC5F6BC5C /* FFIMapping.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7B989B7AF2D72BF4DC1442D /* FFIMapping.swift */; };
@@ -35,6 +36,7 @@
 		E530B322AB283420E629CD9E /* YadoriLinkApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA7C0855FB53B2E94F4B608D /* YadoriLinkApp.swift */; };
 		E655CBBD7A123973BB119A7B /* YadoriLinkFFI.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 3C4FAA49F59793402265CF4A /* YadoriLinkFFI.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		ED0C89E264106398323C16E6 /* FinderSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03C18D6B33051972D27DFB91 /* FinderSync.swift */; };
+		EF3358A3D96569EA002F7D3B /* EagerRoots.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58AA0238B26B4DFB7DFC13FD /* EagerRoots.swift */; };
 		F0F1E9B7C22451A458B7EB5F /* YadoriLinkFileProvider.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F47B539D9A20D96672049D5E /* YadoriLinkFileProvider.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
@@ -114,6 +116,8 @@
 		3C4FAA49F59793402265CF4A /* YadoriLinkFFI.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = YadoriLinkFFI.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		46E3E507F0A862932B7FB16D /* FileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderExtension.swift; sourceTree = "<group>"; };
 		4F3FC41FB2F427FA21EAD3D1 /* FileProviderCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = FileProviderCore; path = ../FileProviderCore; sourceTree = SOURCE_ROOT; };
+		58AA0238B26B4DFB7DFC13FD /* EagerRoots.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EagerRoots.swift; sourceTree = "<group>"; };
+		6CDE6DE44A726A6263528DEB /* App.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = App.entitlements; sourceTree = "<group>"; };
 		78E8A12AEEB0790F521214A8 /* ProviderEnumerators.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderEnumerators.swift; sourceTree = "<group>"; };
 		83615BE5D5B7707298BD6470 /* SystemServices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemServices.swift; sourceTree = "<group>"; };
 		927716FB5075DC6EB3A19031 /* ClientFactory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientFactory.swift; sourceTree = "<group>"; };
@@ -124,6 +128,7 @@
 		B81C7FEF033EEB6733BF09C9 /* LiveClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveClientTests.swift; sourceTree = "<group>"; };
 		B87FC8331B35282BA4546DD6 /* YadoriLinkAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = YadoriLinkAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		BA7C0855FB53B2E94F4B608D /* YadoriLinkApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YadoriLinkApp.swift; sourceTree = "<group>"; };
+		BF37EA1E2743F9EC5D05B694 /* FinderMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderMenu.swift; sourceTree = "<group>"; };
 		C12ACE39418DEC9A34C81018 /* YadoriLink.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = YadoriLink.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		CC4DD06C309E4145F9D733BB /* LiveYadoriLinkClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveYadoriLinkClient.swift; sourceTree = "<group>"; };
 		CF875B1FD41021C7A8472594 /* YadoriLinkFinderSync.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = YadoriLinkFinderSync.appex; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -179,6 +184,7 @@
 		087D84EBF43386B39DF24451 /* App */ = {
 			isa = PBXGroup;
 			children = (
+				6CDE6DE44A726A6263528DEB /* App.entitlements */,
 				927716FB5075DC6EB3A19031 /* ClientFactory.swift */,
 				2996F3DBB6D533152DD87F67 /* ProviderHostService.swift */,
 				83615BE5D5B7707298BD6470 /* SystemServices.swift */,
@@ -246,12 +252,23 @@
 			path = ../YadoriLinkApp/FFI/Generated;
 			sourceTree = "<group>";
 		};
+		C3FF2E1920F6AE8ED88D9DE9 /* FileProviderCore */ = {
+			isa = PBXGroup;
+			children = (
+				58AA0238B26B4DFB7DFC13FD /* EagerRoots.swift */,
+				BF37EA1E2743F9EC5D05B694 /* FinderMenu.swift */,
+			);
+			name = FileProviderCore;
+			path = ../FileProviderCore/Sources/FileProviderCore;
+			sourceTree = "<group>";
+		};
 		F4BC46116C195C6D7CE8FC67 = {
 			isa = PBXGroup;
 			children = (
 				087D84EBF43386B39DF24451 /* App */,
 				2957D0F95A4D1D104451326C /* Extension */,
 				069E5D4EC305F5151304E8F3 /* Extension */,
+				C3FF2E1920F6AE8ED88D9DE9 /* FileProviderCore */,
 				BFF91F66722FA743E0C409E8 /* Generated */,
 				4A7F16FE29785AFA49DAC64B /* Packages */,
 				1125AC2C23312985A6BE7C6A /* YadoriLinkAppTests */,
@@ -534,6 +551,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				EF3358A3D96569EA002F7D3B /* EagerRoots.swift in Sources */,
+				61785C1C40409903FC3293BC /* FinderMenu.swift in Sources */,
 				ED0C89E264106398323C16E6 /* FinderSync.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -714,6 +733,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = ../YadoriLinkApp/App/App.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				HEADER_SEARCH_PATHS = "../fileprovider-core/include";
 				INFOPLIST_FILE = ../YadoriLinkApp/App/Info.plist;
@@ -725,6 +745,7 @@
 				OTHER_LDFLAGS = "-lyadorilink_fileprovider_core -liconv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink;
 				PRODUCT_NAME = YadoriLink;
+				PROVISIONING_PROFILE_SPECIFIER = "$(YADORILINK_HOST_PROFILE)";
 				SDKROOT = macosx;
 				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/../YadoriLinkApp/FFI/Generated/include";
 				SWIFT_OBJC_BRIDGING_HEADER = "HostApp/YadoriLinkFinderSyncHost-Bridging-Header.h";
@@ -795,6 +816,7 @@
 				OTHER_LDFLAGS = "-lyadorilink_fileprovider_core -liconv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.FileProvider;
 				PRODUCT_NAME = YadoriLinkFileProvider;
+				PROVISIONING_PROFILE_SPECIFIER = "$(YADORILINK_FILEPROVIDER_PROFILE)";
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "../YadoriLinkFileProvider/Extension/YadoriLinkFileProvider-Bridging-Header.h";
 			};
@@ -816,6 +838,7 @@
 				OTHER_LDFLAGS = "-lyadorilink_shell_core -liconv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.FinderSync;
 				PRODUCT_NAME = YadoriLinkFinderSync;
+				PROVISIONING_PROFILE_SPECIFIER = "$(YADORILINK_FINDERSYNC_PROFILE)";
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Extension/YadoriLinkFinderSync-Bridging-Header.h";
 			};
@@ -825,6 +848,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = ../YadoriLinkApp/App/App.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				HEADER_SEARCH_PATHS = "../fileprovider-core/include";
 				INFOPLIST_FILE = ../YadoriLinkApp/App/Info.plist;
@@ -836,6 +860,7 @@
 				OTHER_LDFLAGS = "-lyadorilink_fileprovider_core -liconv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink;
 				PRODUCT_NAME = YadoriLink;
+				PROVISIONING_PROFILE_SPECIFIER = "$(YADORILINK_HOST_PROFILE)";
 				SDKROOT = macosx;
 				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/../YadoriLinkApp/FFI/Generated/include";
 				SWIFT_OBJC_BRIDGING_HEADER = "HostApp/YadoriLinkFinderSyncHost-Bridging-Header.h";
@@ -877,6 +902,7 @@
 				OTHER_LDFLAGS = "-lyadorilink_fileprovider_core -liconv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.FileProvider;
 				PRODUCT_NAME = YadoriLinkFileProvider;
+				PROVISIONING_PROFILE_SPECIFIER = "$(YADORILINK_FILEPROVIDER_PROFILE)";
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "../YadoriLinkFileProvider/Extension/YadoriLinkFileProvider-Bridging-Header.h";
 			};
@@ -898,6 +924,7 @@
 				OTHER_LDFLAGS = "-lyadorilink_shell_core -liconv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.FinderSync;
 				PRODUCT_NAME = YadoriLinkFinderSync;
+				PROVISIONING_PROFILE_SPECIFIER = "$(YADORILINK_FINDERSYNC_PROFILE)";
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Extension/YadoriLinkFinderSync-Bridging-Header.h";
 			};

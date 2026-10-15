@@ -87,8 +87,6 @@ pub fn disk_content_comparison(
     path: &Path,
     blocks: &[BlockInfo],
 ) -> Result<DiskContentComparison, StorageError> {
-    use std::io::Read;
-
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -96,6 +94,17 @@ pub fn disk_content_comparison(
         }
         Err(e) => return Err(e.into()),
     };
+    file_content_comparison(&mut file, blocks)
+}
+
+/// [`disk_content_comparison`] for an already open file, read from its current offset: the
+/// bytes are those of the object the handle names, whatever its path has become since.
+pub fn file_content_comparison(
+    file: &mut std::fs::File,
+    blocks: &[BlockInfo],
+) -> Result<DiskContentComparison, StorageError> {
+    use std::io::Read;
+
     for block in blocks {
         let mut bytes = vec![0u8; block.size as usize];
         if let Err(error) = file.read_exact(&mut bytes) {

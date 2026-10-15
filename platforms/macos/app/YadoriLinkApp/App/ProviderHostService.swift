@@ -116,7 +116,7 @@ final class FFIHostLink: HostLink {
         }
         let folders: [HostFolder] = snapshot.folders.compactMap { folder in
             Data(hexString: folder.root_id).map {
-                HostFolder(root: $0, displayName: folder.display_name, eager: folder.hydration_policy == "eager",
+                HostFolder(root: $0, displayName: folder.display_name,
                            ready: folder.registration_ready, latestEvidenceSeq: folder.latest_evidence_seq)
             }
         }
@@ -414,7 +414,7 @@ final class ProviderHostService: @unchecked Sendable {
         guard let driver else { return }
         for folder in driver.knownFolders {
             driver.reportTick(root: folder.root)
-            if folder.eager && ticks % 3 == 0 { driver.eagerTick(root: folder.root) }
+            if ticks % 3 == 0 { driver.eagerTick(root: folder.root) }
         }
         if ticks % 15 == 0 { driver.reconcile() }
     }

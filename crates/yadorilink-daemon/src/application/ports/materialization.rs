@@ -68,6 +68,17 @@ pub(crate) struct TempMaterialization<'a> {
     pub requested_version: Option<yadorilink_replica_domain::ids::VersionHash>,
     /// A file name inside the daemon's staging directory; the assembly is built beside it.
     pub staging_file: &'a std::path::Path,
+    /// `Some`: only the bytes of this window of the version, not the whole file. Only the blocks
+    /// covering it are fetched; the file's materialization state is untouched either way.
+    pub range: Option<ByteRange>,
+}
+
+/// A byte window `[offset, offset + len)` of one file version. The end is clamped to the file's
+/// size; an offset past the size cannot be satisfied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ByteRange {
+    pub offset: u64,
+    pub len: u64,
 }
 
 /// A fully written, verified, fsynced file in the staging directory.
@@ -75,7 +86,11 @@ pub(crate) struct TempMaterialization<'a> {
 pub(crate) struct TempAssembly {
     pub assembled: std::path::PathBuf,
     pub version_hash: yadorilink_replica_domain::ids::VersionHash,
+    /// The size of the whole file version.
     pub size: u64,
+    /// For a ranged request, the window the file holds (clamped to the size); `None`: the whole
+    /// file.
+    pub range: Option<ByteRange>,
 }
 
 #[derive(Debug)]
@@ -84,6 +99,26 @@ pub(crate) enum TempOutcome {
     /// The named version is not the current one, or the version kept moving while it was
     /// assembled. Old bytes are never returned.
     VersionOutOfDate,
+    /// A ranged request whose offset is past the end of the version. Nothing was fetched.
+    RangeNotSatisfiable,
+}
+
+/// The retention policy in force at one path, apart from what is stored there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetentionState {
+    /// Local space for the path must not be reclaimed.
+    pub pinned: bool,
+    /// The pin was set at exactly this path; otherwise it is inherited from a folder above.
+    pub explicit: bool,
+}
+
+/// What pinning a path did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PinOutcome {
+    pub retention: RetentionState,
+    /// Why the path's content could not be downloaded just now, when it could not. The pin
+    /// stands regardless.
+    pub download_error: Option<String>,
 }
 
 pub(crate) trait MaterializationPort: Send + Sync {
@@ -104,6 +139,10 @@ pub(crate) trait MaterializationPort: Send + Sync {
     /// remote round trip, unlike `hydrate`.
     fn evict(&self, group_id: &str, path: &str) -> Result<EvictOutcome, SyncError>;
 
+    /// Whether `evict` may run for this root at all: the same gate `evict` applies first, so a
+    /// menu can decline to offer an action the daemon would refuse. Fails closed.
+    fn evict_supported(&self, group_id: &str) -> bool;
+
     /// Synchronous, same reasoning as `evict`: a plain local index read,
     /// never a peer round trip. `None` means the daemon has no
     /// materialization-state row for this path at all.
@@ -112,4 +151,19 @@ pub(crate) trait MaterializationPort: Send + Sync {
         group_id: &str,
         path: &str,
     ) -> Result<Option<MaterializationStatusSummary>, SyncError>;
+
+    /// Marks `path` "always keep on this device" and fetches what is not here yet through the
+    /// ordinary hydration path. The pin is recorded first and stands even when the download
+    /// fails. A provider folder's content is fetched by the OS, so there it only records.
+    fn pin<'a>(
+        &'a self,
+        group_id: &'a str,
+        path: &'a str,
+    ) -> BoxFuture<'a, Result<PinOutcome, SyncError>>;
+
+    /// Removes the pin set at exactly `path`, touching no content, and reports the policy in
+    /// force afterwards (still pinned when a folder above is).
+    fn unpin(&self, group_id: &str, path: &str) -> Result<RetentionState, SyncError>;
+
+    fn retention(&self, group_id: &str, path: &str) -> Result<RetentionState, SyncError>;
 }

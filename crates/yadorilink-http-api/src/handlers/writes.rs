@@ -49,7 +49,10 @@ pub async fn pause(
     let path = require_path(&body)?;
     let resp = state
         .control
-        .send(ReqPayload::Pause(PauseRequest { local_path: path.to_string() }))
+        .send(ReqPayload::Pause(PauseRequest {
+            local_path: path.to_string(),
+            ..Default::default()
+        }))
         .await?;
     match resp.payload {
         Some(RespPayload::Pause(_)) => Ok(Json(json!({ "ok": true }))),

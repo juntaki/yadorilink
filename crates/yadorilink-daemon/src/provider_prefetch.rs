@@ -208,14 +208,32 @@ impl PrefetchScheduler {
             return actions;
         }
         let after = state.cursor.as_ref().map(|(depth, path)| (*depth, path.as_str()));
-        let candidates = repo
-            .prefetch_candidates(root, self.config.depth, self.config.children, after, 1)
-            .unwrap_or_default();
+        // Only a successful, empty read proves there is nothing left to warm. A failed read is
+        // retried on a later tick and never finishes the session.
+        let candidates = match repo.prefetch_candidates(
+            root,
+            self.config.depth,
+            self.config.children,
+            after,
+            1,
+        ) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                tracing::warn!(root, %error, "could not read the prefetch candidates; will retry");
+                return actions;
+            }
+        };
         let Some((depth, path, children)) = candidates.into_iter().next() else {
             state.finished = true;
             return actions;
         };
-        let Ok(folder) = repo.mint_item(root, &path) else { return actions };
+        let folder = match repo.mint_item(root, &path) {
+            Ok(folder) => folder,
+            Err(error) => {
+                tracing::warn!(root, %error, "could not mint the prefetch folder; will retry");
+                return actions;
+            }
+        };
         state.next_hint_id += 1;
         let hint_id = state.next_hint_id;
         state.hint = Some(Outstanding {
@@ -262,7 +280,13 @@ pub(crate) async fn run(context: std::sync::Arc<crate::shell_context::ShellConte
             continue;
         }
         let repo = context.replica_coordinator.provider_repository();
-        let Ok(roots) = repo.list_declared_roots() else { continue };
+        let roots = match repo.list_declared_roots() {
+            Ok(roots) => roots,
+            Err(error) => {
+                tracing::warn!(%error, "could not list the provider roots for prefetch; will retry");
+                continue;
+            }
+        };
         for root in roots {
             let ready =
                 root.readiness() == yadorilink_replica_domain::session_state::Readiness::Ready;
@@ -334,5 +358,37 @@ mod tests {
         let roots = s.roots.lock().unwrap();
         assert!(roots["r"].hint.is_none());
         assert_eq!(roots["r"].backoff_until, Some(t + Duration::from_secs(60)));
+    }
+
+    /// A failed candidate read is not "no candidates": the session is not finished and the next
+    /// tick that can read offers the folder without any new user activity.
+    #[test]
+    fn a_candidate_read_error_does_not_finish_the_session() {
+        use crate::provider_read_fault::{declared_root, Fault, GROUP};
+        let (coordinator, root) = declared_root();
+        coordinator
+            .database()
+            .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
+                tx.execute(
+                    "INSERT INTO provider_dirs (group_id, path, parent_path) VALUES (?1, 'd', '')",
+                    [GROUP],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let repo = coordinator.provider_repository();
+        let s = scheduler();
+        let t = Instant::now();
+
+        let fault = Fault::inject(&coordinator, "provider_dirs", "parent_path");
+        assert!(s.tick(&root, repo, true, t).is_empty());
+        assert!(
+            !s.roots.lock().unwrap()[&root].finished,
+            "an unreadable candidate list finished the session"
+        );
+        fault.restore();
+
+        let actions = s.tick(&root, repo, true, t);
+        assert!(matches!(actions.as_slice(), [Action::Hint { .. }]), "{} actions", actions.len());
     }
 }

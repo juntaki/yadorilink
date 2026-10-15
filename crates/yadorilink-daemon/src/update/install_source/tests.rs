@@ -159,3 +159,13 @@ fn guidance_for_a_standalone_install_is_the_download_page() {
     assert!(g.starts_with("Download the new version"));
     assert!(g.contains(DOWNLOAD_PAGE_URL));
 }
+
+#[test]
+fn the_page_to_open_is_set_only_for_installs_nobody_else_manages() {
+    for managed in ["homebrew", "apt", "winget", "microsoft_store"] {
+        assert_eq!(manual_update_page(managed), None, "{managed}");
+    }
+    for own in ["standalone", "unknown", ""] {
+        assert_eq!(manual_update_page(own), Some(DOWNLOAD_PAGE_URL), "{own}");
+    }
+}

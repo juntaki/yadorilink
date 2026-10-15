@@ -152,7 +152,7 @@ impl ErrorCandidateStore {
         if summary.is_empty() {
             return Ok(()); // nothing redacted — no sidecar file needed
         }
-        std::fs::create_dir_all(&self.dir)?;
+        yadorilink_fs_platform::durable_dir::create_dir_all_durably(&self.dir)?;
         let serializable: Vec<(String, usize)> = summary
             .categories
             .iter()

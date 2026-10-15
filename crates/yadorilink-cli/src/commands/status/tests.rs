@@ -20,9 +20,11 @@ fn base_link() -> LinkStatus {
         hydrated_count: 0,
         placeholder_count: 0,
         hydrating_count: 0,
+        requested_content_count: 0,
         held_file_count: 0,
         held_files: vec![],
         skipped_symlink_count: 0,
+        stranded_directory_count: 0,
         degraded: false,
         degraded_reason: String::new(),
         has_active_transfer: false,
@@ -41,6 +43,7 @@ fn base_link() -> LinkStatus {
         local_storage_state: LocalStorageState::FullCopy as i32,
         fetch_availability: FetchAvailability::AvailableNow as i32,
         full_replica_device_ids: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -150,9 +153,9 @@ fn held_files_render_count_and_per_file_reason() {
     let lines = held_file_detail_lines(&link, false);
     assert_eq!(lines.len(), 2);
     assert!(lines[0].contains("photo.jpg"));
-    assert!(lines[0].contains("upper/lower case"));
+    assert!(lines[0].contains("collides with another file"));
     assert!(lines[1].contains("CON.txt"));
-    assert!(lines[1].contains("not allowed on this device"));
+    assert!(lines[1].contains("not allowed here"));
 }
 
 /// A healthy (non-degraded) link renders no degraded-related output,
@@ -366,6 +369,8 @@ fn mandatory_update_says_so() {
     status.update_mandatory = true;
     let lines = update_summary_lines(&status);
     assert!(lines[0].contains("mandatory"));
+    assert!(!lines[0].contains("automatic"), "{lines:?}");
+    assert!(lines[0].contains("yadorilink update download"), "{lines:?}");
 }
 
 /// A held-back update shows the holdback reason as a second line.
@@ -380,16 +385,6 @@ fn held_back_update_shows_its_reason() {
     assert!(lines[1].contains("staged rollout at 10%"));
 }
 
-/// Install waits for a safe point.
-#[test]
-fn update_waiting_for_safe_point_says_so() {
-    let mut status = base_status();
-    status.update_available_version = "0.2.0".into();
-    status.update_waiting_for_safe_point = true;
-    let lines = update_summary_lines(&status);
-    assert!(lines[0].contains("waiting for a safe point"));
-}
-
 /// spec "Status surfaces failed update": a recorded update failure is
 /// surfaced with a pointer to `update status` for more detail, even
 /// with no update currently available.
@@ -399,7 +394,8 @@ fn update_failure_is_surfaced_with_a_pointer_to_update_status() {
     status.update_last_error_category = "update_manifest_fetch_failed".into();
     let lines = update_summary_lines(&status);
     assert_eq!(lines.len(), 1);
-    assert!(lines[0].contains("update_manifest_fetch_failed"));
+    assert!(!lines[0].contains("update_manifest_fetch_failed"), "{lines:?}");
+    assert!(lines[0].contains("did not finish"), "{lines:?}");
     assert!(lines[0].contains("yadorilink update status"));
 }
 
@@ -750,6 +746,23 @@ fn preserved_data_renders_one_line_and_warns_above_the_threshold() {
     assert!(line.contains("yadorilink preserved list") && line.contains("discard"), "{line}");
 }
 
+/// Retained originals are named with the disk they take and the command that releases them;
+/// none render nothing.
+#[test]
+fn retained_originals_render_one_line_naming_the_release_command() {
+    use yadorilink_ipc_proto::daemonctl::PreservedSummary;
+    let mut status = base_status();
+    assert_eq!(retained_line(&status), None);
+    status.preserved = Some(PreservedSummary::default());
+    assert_eq!(retained_line(&status), None);
+
+    status.preserved = Some(PreservedSummary { retained_originals: 2, ..Default::default() });
+    let line = retained_line(&status).unwrap();
+    assert!(line.contains("2 original(s)"), "{line}");
+    assert!(line.contains("yadorilink preserved retained"), "{line}");
+    assert!(status_lines(&status, false).contains(&line), "shown by status");
+}
+
 /// A group whose rebootstrap runs says so, so a paused folder is explained.
 #[test]
 fn a_rebootstrapping_group_is_named() {
@@ -820,12 +833,14 @@ fn provider_folders_removals_and_orphans_are_rendered_without_a_path() {
             display_name: "Old".into(),
             removed: true,
             preserved_location: "/Users/u/kept".into(),
+            unreadable: false,
         },
         ProviderRemovalStatus {
             root_id: "bbbbbbbb".into(),
             display_name: "Going".into(),
             removed: false,
             preserved_location: String::new(),
+            unreadable: false,
         },
     ];
     status.orphan_domains = vec!["cccccccc".into()];
@@ -841,6 +856,26 @@ fn provider_folders_removals_and_orphans_are_rendered_without_a_path() {
     );
 }
 
+/// The row standing in for an unreadable removals list is not a removal in progress, and its
+/// attention reason names what could not be read.
+#[test]
+fn an_unreadable_removals_list_is_not_rendered_as_a_removal() {
+    use yadorilink_ipc_proto::daemonctl::ProviderRemovalStatus;
+    let mut status = base_status();
+    status.provider_removals = vec![ProviderRemovalStatus {
+        display_name: "removals unreadable: boom".into(),
+        unreadable: true,
+        ..Default::default()
+    }];
+    status.overall_state = "attention".into();
+    status.attention_reasons = vec!["provider_not_ready:removals".into()];
+    let lines = status_lines(&status, false);
+    let has = |needle: &str| lines.iter().any(|l| l.contains(needle));
+    assert!(has("provider folder removals: removals unreadable: boom"), "{lines:?}");
+    assert!(!has("removing"), "{lines:?}");
+    assert!(has("[provider folder removals]"), "{lines:?}");
+}
+
 /// Every code the daemon can emit (`overall_status` in the daemon's control socket and the held-file
 /// reasons) maps to a sentence and a next step; none leaks its raw code outside verbose mode.
 #[test]
@@ -854,6 +889,7 @@ fn every_known_reason_code_has_a_sentence_and_a_next_step() {
         "fetch_availability_unknown:g",
         "conflict:g",
         "held:g",
+        "stranded_directory:g",
         "provider_not_ready:r",
         "provider_stuck:r",
         "kept_edits:r",
@@ -871,22 +907,31 @@ fn every_known_reason_code_has_a_sentence_and_a_next_step() {
         "case_and_normalization_collision",
         "metadata_unprovable: unreadable",
     ];
-    for raw in attention.iter().chain(held.iter()) {
-        let text = reasons::explain(raw, "", false);
+    for raw in attention {
+        let text = reasons::explain_reason(raw, "", false);
         assert!(text.contains(" Next: "), "{raw}: {text}");
         assert!(!text.contains("Needs attention"), "{raw}: {text}");
         assert!(!text.contains(raw), "{raw} leaked: {text}");
-        assert!(reasons::explain(raw, "", true).contains(&format!("(code: {raw})")));
+        assert!(reasons::explain_reason(raw, "", true).contains(&format!("(code: {raw})")));
+    }
+    for raw in held {
+        let text = reasons::explain_held(raw);
+        assert!(text.contains(" Next: "), "{raw}: {text}");
+        assert!(!text.contains("Needs attention"), "{raw}: {text}");
+        assert!(!text.contains(raw), "{raw} leaked: {text}");
     }
 }
 
 #[test]
 fn an_unknown_reason_falls_back_and_shows_the_code_only_when_verbose() {
     assert_eq!(
-        reasons::explain("brand_new:x", "", false),
+        reasons::explain_reason("brand_new:x", "", false),
         "Needs attention Next: yadorilink status --details"
     );
-    assert_eq!(reasons::explain("brand_new:x", "", true), "Needs attention (code: brand_new:x)");
+    assert_eq!(
+        reasons::explain_reason("brand_new:x", "", true),
+        "Needs attention (code: brand_new:x)"
+    );
 }
 
 #[test]
@@ -919,4 +964,12 @@ fn timestamps_render_as_readable_times() {
     let text = format_local_time(1_750_000_000);
     assert!(text.starts_with("2025-06-1"), "{text}");
     assert_eq!(format_local_time(0), "unknown time");
+}
+
+#[test]
+fn a_timed_pause_says_when_it_ends_and_other_pauses_say_nothing_more() {
+    assert_eq!(timed_pause_label(0, 1000), "paused");
+    assert_eq!(timed_pause_label(1000 + 29 * 60, 1000), "paused (resumes in 29m)");
+    assert_eq!(timed_pause_label(1000 + 61 * 60, 1000), "paused (resumes in 1h 1m)");
+    assert_eq!(timed_pause_label(900, 1000), "paused (resumes in 0m)");
 }

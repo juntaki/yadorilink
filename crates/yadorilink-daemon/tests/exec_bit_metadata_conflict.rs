@@ -38,7 +38,9 @@ use support::{
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::SegmentBlockStore;
+#[cfg(unix)]
 use yadorilink_replica_domain::ids::DeltaHash;
+#[cfg(unix)]
 use yadorilink_transport::QuicPeerChannel;
 
 /// This device's own indexed owner-exec bit for `path`, read directly from
@@ -139,6 +141,7 @@ async fn two_synced_devices(test_name: &str) -> (TestDevice, TestDevice, String)
 /// `support::connect_two_daemons_with_channels`'s doc comment for why
 /// `revoke()`, not `JoinHandle::abort()`, is the correct disconnect
 /// primitive here.
+#[cfg(unix)]
 async fn two_synced_devices_with_channels(
     test_name: &str,
 ) -> (TestDevice, TestDevice, String, [Arc<QuicPeerChannel>; 2]) {

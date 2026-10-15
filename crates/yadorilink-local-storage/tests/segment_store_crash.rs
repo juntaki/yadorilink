@@ -119,7 +119,9 @@ fn crash_scenario(point: CommitPoint) {
         (0..8).map(|i| block(&format!("victim-{i}"), 600)).collect();
 
     {
-        let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+        let store = SegmentBlockStore::with_limits(dir.path(), limits())
+            .unwrap()
+            .with_volume_verdict(|_| true);
         store.put_durable_batch(&baseline).unwrap();
         for committed in &baseline {
             assert!(store.exists(committed.hash()).unwrap());
@@ -147,7 +149,7 @@ fn crash_scenario(point: CommitPoint) {
         drop(store);
     }
 
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
 
     // Claim 2: everything the caller was told was durable, still is.
     for committed in &baseline {
@@ -206,7 +208,9 @@ fn crashing_mid_record_leaves_a_tail_recovery_truncates() {
         (0..4).map(|i| block(&format!("half-written-{i}"), 400)).collect();
 
     let (segment_id, durable_end) = {
-        let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+        let store = SegmentBlockStore::with_limits(dir.path(), limits())
+            .unwrap()
+            .with_volume_verdict(|_| true);
         store.put_durable_batch(std::slice::from_ref(&baseline)).unwrap();
         let segment_id = store.segment_ids().unwrap()[0];
         let (_, durable_end, _) = testing::segment_row(dir.path(), segment_id).unwrap().unwrap();
@@ -228,7 +232,7 @@ fn crashing_mid_record_leaves_a_tail_recovery_truncates() {
         "the half-written record should still be on disk before recovery runs"
     );
 
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     assert_eq!(
         store.recovery_report().truncated_segments,
         vec![segment_id],
@@ -249,7 +253,9 @@ fn a_segment_created_by_an_uncommitted_group_is_removed_on_the_next_open() {
     let dir = tempfile::tempdir().unwrap();
     let baseline = block("baseline", 300);
     {
-        let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+        let store = SegmentBlockStore::with_limits(dir.path(), limits())
+            .unwrap()
+            .with_volume_verdict(|_| true);
         store.put_durable_batch(std::slice::from_ref(&baseline)).unwrap();
         store.seal_active_segment().unwrap();
         store.arm_commit_fault_for_tests(FaultPlan::crash_at(CommitPoint::AfterFsyncBeforeIndex));
@@ -260,7 +266,7 @@ fn a_segment_created_by_an_uncommitted_group_is_removed_on_the_next_open() {
     let on_disk_before = testing::segment_ids_on_disk(dir.path()).unwrap();
     assert_eq!(on_disk_before.len(), 2, "the orphaned segment file should still be there");
 
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     assert_eq!(
         store.recovery_report().removed_orphan_segments.len(),
         1,
@@ -281,14 +287,16 @@ fn durable_bytes_whose_transaction_never_committed_are_never_served() {
     let victim: Vec<LocallyHashedBlock> =
         (0..4).map(|i| block(&format!("fsynced-but-uncommitted-{i}"), 300)).collect();
     {
-        let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+        let store = SegmentBlockStore::with_limits(dir.path(), limits())
+            .unwrap()
+            .with_volume_verdict(|_| true);
         store.put(b"something committed first").unwrap();
         store.arm_commit_fault_for_tests(FaultPlan::crash_at(CommitPoint::AfterFsyncBeforeIndex));
         assert!(store.put_durable_batch(&victim).is_err());
         drop(store);
     }
 
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     for interrupted in &victim {
         assert!(
             !store.exists(interrupted.hash()).unwrap(),
@@ -306,13 +314,15 @@ fn a_crash_inside_the_index_transaction_rolls_the_whole_group_back() {
     let victim: Vec<LocallyHashedBlock> =
         (0..16).map(|i| block(&format!("rolled-back-{i}"), 200)).collect();
     {
-        let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+        let store = SegmentBlockStore::with_limits(dir.path(), limits())
+            .unwrap()
+            .with_volume_verdict(|_| true);
         store.arm_commit_fault_for_tests(FaultPlan::crash_at(CommitPoint::DuringIndexTransaction));
         assert!(store.put_durable_batch(&victim).is_err());
         drop(store);
     }
 
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     assert!(
         testing::indexed_hashes(dir.path()).unwrap().is_empty(),
         "an aborted transaction must leave no row at all, not the rows it had staged"
@@ -330,7 +340,7 @@ fn a_crash_inside_the_index_transaction_rolls_the_whole_group_back() {
 
 fn io_failure_scenario(point: CommitPoint) {
     let dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     let baseline = block("baseline", 300);
     store.put_durable_batch(std::slice::from_ref(&baseline)).unwrap();
     if needs_a_fresh_segment(point) {
@@ -371,7 +381,7 @@ fn io_failure_scenario(point: CommitPoint) {
 
     // And it all still holds across a restart.
     drop(store);
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     for retried in &victim {
         assert_eq!(store.get(retried.hash()).unwrap(), retried.bytes());
     }
@@ -399,7 +409,7 @@ fn a_survivable_failure_after_the_append_leaves_no_orphan_tail() {
     // the abandoned one kept an orphan tail and an "active" row until the
     // next open.
     let dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     store.put(b"a committed block the segment starts with").unwrap();
     let segment_id = store.segment_ids().unwrap()[0];
     let (_, durable_end, _) = testing::segment_row(dir.path(), segment_id).unwrap().unwrap();
@@ -447,7 +457,7 @@ fn a_headroom_rejection_writes_nothing_at_all() {
     // out, so a rejected batch must not move the physical size by one
     // byte.
     let dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     let existing = store.put(b"written while there was room").unwrap();
     let before = store.detailed_usage().unwrap();
 
@@ -487,7 +497,7 @@ fn a_headroom_rejection_writes_nothing_at_all() {
 fn store_with_a_compactable_segment(
     dir: &std::path::Path,
 ) -> (SegmentBlockStore, Vec<LocallyHashedBlock>) {
-    let store = SegmentBlockStore::with_limits(dir, limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir, limits(), |_| true).unwrap();
     let blocks: Vec<LocallyHashedBlock> =
         (0..32).map(|i| block(&format!("compaction-source-{i}"), 200)).collect();
     store.put_durable_batch(&blocks).unwrap();
@@ -514,7 +524,7 @@ fn compaction_crash_scenario(point: CommitPoint) {
         survivors
     };
 
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     for survivor in &survivors {
         assert_eq!(
             store.get(survivor.hash()).unwrap(),
@@ -544,6 +554,66 @@ fn a_crash_at_any_point_in_a_compaction_keeps_every_live_block_reachable() {
     }
 }
 
+/// Opening runs recovery, which unlinks retired segments and cuts torn tails. On a volume that is
+/// not known durable that is a byte deletion like any other: the open is refused and nothing on
+/// disk changes.
+#[test]
+fn opening_a_store_on_a_refused_volume_deletes_and_truncates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (store, _) = store_with_a_compactable_segment(dir.path());
+        store.compact_without_reclaim_for_tests(0.5, 1).unwrap();
+        assert!(store.detailed_usage().unwrap().retired_segments > 0);
+    }
+    let files_before = testing::segment_ids_on_disk(dir.path()).unwrap();
+
+    let refused = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| false);
+
+    assert!(matches!(refused, Err(StorageError::DeletionRefused(_))), "the open must be refused");
+    assert_eq!(testing::segment_ids_on_disk(dir.path()).unwrap(), files_before);
+
+    // Where the volume is durable the same open recovers as before.
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
+    assert!(!store.recovery_report().reclaimed_segments.is_empty());
+}
+
+/// The reclaim's verdict is taken where it unlinks, not from an earlier look at the index: a
+/// retired segment is never deleted on a volume that is not known durable, and a reclaim that
+/// finds nothing retired asks nothing.
+#[test]
+fn reclaiming_retired_segments_asks_the_verdict_at_each_unlink() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let durable = Arc::new(AtomicBool::new(false));
+    let store = {
+        let (store, _) = store_with_a_compactable_segment(dir.path());
+        drop(store);
+        let (asked, durable) = (asked.clone(), durable.clone());
+        SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), move |_| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            durable.load(Ordering::SeqCst)
+        })
+        .unwrap()
+    };
+    assert_eq!(store.reclaim_retired().unwrap(), 0, "nothing retired yet");
+    assert_eq!(asked.load(Ordering::SeqCst), 0, "nothing to delete, nothing to ask");
+
+    durable.store(true, Ordering::SeqCst);
+    store.compact_without_reclaim_for_tests(0.5, 1).unwrap();
+    assert!(store.detailed_usage().unwrap().retired_segments > 0);
+    let files = testing::segment_ids_on_disk(dir.path()).unwrap();
+    durable.store(false, Ordering::SeqCst);
+
+    assert!(matches!(store.reclaim_retired(), Err(StorageError::DeletionRefused(_))));
+    assert_eq!(testing::segment_ids_on_disk(dir.path()).unwrap(), files);
+
+    durable.store(true, Ordering::SeqCst);
+    assert!(store.reclaim_retired().unwrap() > 0);
+}
+
 #[test]
 fn a_crash_between_the_mapping_swap_and_the_old_files_deletion_is_finished_by_recovery() {
     let dir = tempfile::tempdir().unwrap();
@@ -565,7 +635,7 @@ fn a_crash_between_the_mapping_swap_and_the_old_files_deletion_is_finished_by_re
     };
 
     let segments_before = testing::segment_ids_on_disk(dir.path()).unwrap().len();
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
     assert!(
         !store.recovery_report().reclaimed_segments.is_empty(),
         "recovery must delete a segment the index already retired"
@@ -586,7 +656,9 @@ fn a_missing_index_beside_surviving_segments_fails_closed_and_keeps_them() {
     let dir = tempfile::tempdir().unwrap();
     let kept = block("kept", 300);
     {
-        let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+        let store = SegmentBlockStore::with_limits(dir.path(), limits())
+            .unwrap()
+            .with_volume_verdict(|_| true);
         store.put_durable_batch(std::slice::from_ref(&kept)).unwrap();
     }
     assert!(SegmentBlockStore::holds_segment_data(dir.path()).unwrap());
@@ -624,7 +696,9 @@ fn a_segment_still_under_its_stage_name_is_removed_on_the_next_open_and_its_id_i
     let dir = tempfile::tempdir().unwrap();
     let baseline = block("baseline", 300);
     let committed_ids = {
-        let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+        let store = SegmentBlockStore::with_limits(dir.path(), limits())
+            .unwrap()
+            .with_volume_verdict(|_| true);
         store.put_durable_batch(std::slice::from_ref(&baseline)).unwrap();
         store.seal_active_segment().unwrap();
         let committed = testing::segment_ids_on_disk(dir.path()).unwrap();
@@ -644,7 +718,7 @@ fn a_segment_still_under_its_stage_name_is_removed_on_the_next_open_and_its_id_i
     // name; elsewhere it was created in place and the ordinary orphan rule applies.
     let staged = leftovers(dir.path());
 
-    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
 
     assert!(leftovers(dir.path()).is_empty(), "{staged:?} was left");
     assert_eq!(testing::segment_ids_on_disk(dir.path()).unwrap(), committed_ids);
@@ -655,4 +729,189 @@ fn a_segment_still_under_its_stage_name_is_removed_on_the_next_open_and_its_id_i
         assert!(!staged.iter().any(|n| n.ends_with(&format!("seg-{id:016}"))), "id {id} reused");
     }
     assert_index_names_only_readable_blocks(&store);
+}
+
+// ---------------------------------------------------------------------
+// Rollback authority: bytes are deleted only on proof the failed batch
+// created them. An index read failure is uncertainty, never absence.
+// ---------------------------------------------------------------------
+
+fn segment_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<_> = std::fs::read_dir(dir.join("segments"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .collect();
+    files.sort();
+    files
+}
+
+fn segment_file(dir: &std::path::Path, id: u64) -> std::path::PathBuf {
+    dir.join("segments").join(format!("{id:016}.seg"))
+}
+
+#[test]
+fn an_index_read_failure_during_rollback_never_deletes_committed_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
+    let committed = block("committed-before-the-failure", 300);
+    store.put_durable_batch(std::slice::from_ref(&committed)).unwrap();
+    let segment_id = store.segment_ids().unwrap()[0];
+
+    // One small block: the failed batch continues the committed segment.
+    let victim = block("failed-append", 200);
+    store.arm_commit_fault_for_tests(
+        FaultPlan::io_failure_at(CommitPoint::AfterFsyncBeforeIndex)
+            .with_rollback_index_read_failure(),
+    );
+    assert!(store.put_durable_batch(std::slice::from_ref(&victim)).is_err());
+    store.clear_commit_fault_for_tests();
+
+    assert!(
+        segment_file(dir.path(), segment_id).exists(),
+        "a committed segment must survive an index read failure during rollback"
+    );
+    drop(store);
+
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
+    assert_eq!(store.get(committed.hash()).unwrap(), committed.bytes());
+    assert!(!store.exists(victim.hash()).unwrap());
+    assert_index_names_only_readable_blocks(&store);
+}
+
+#[test]
+fn a_rollback_with_a_readable_index_removes_only_the_segment_it_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
+    store.put_durable_batch(&[block("baseline", 300)]).unwrap();
+    store.seal_active_segment().unwrap();
+    let before = store.segment_ids().unwrap();
+    let files_before = segment_files(dir.path());
+
+    let victim = block("fresh-segment-victim", 200);
+    store.arm_commit_fault_for_tests(FaultPlan::io_failure_at(CommitPoint::AfterFsyncBeforeIndex));
+    assert!(store.put_durable_batch(std::slice::from_ref(&victim)).is_err());
+    store.clear_commit_fault_for_tests();
+
+    assert_eq!(store.segment_ids().unwrap(), before);
+    assert_eq!(
+        segment_files(dir.path()),
+        files_before,
+        "the segment the failed batch created must be removed by rollback itself"
+    );
+    drop(store);
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
+    assert!(!store.exists(victim.hash()).unwrap());
+    assert_index_names_only_readable_blocks(&store);
+}
+
+#[test]
+fn an_index_read_failure_on_a_freshly_created_segment_preserves_it_and_reopens_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
+    let baseline = block("baseline", 300);
+    store.put_durable_batch(std::slice::from_ref(&baseline)).unwrap();
+    store.seal_active_segment().unwrap();
+    let files_before = segment_files(dir.path());
+
+    let victim = block("fresh-segment-victim", 200);
+    store.arm_commit_fault_for_tests(
+        FaultPlan::io_failure_at(CommitPoint::AfterFsyncBeforeIndex)
+            .with_rollback_index_read_failure(),
+    );
+    assert!(store.put_durable_batch(std::slice::from_ref(&victim)).is_err());
+    store.clear_commit_fault_for_tests();
+    assert!(
+        segment_files(dir.path()).len() > files_before.len(),
+        "an unproven segment must be preserved by rollback, not deleted"
+    );
+    drop(store);
+
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
+    assert_eq!(store.get(baseline.hash()).unwrap(), baseline.bytes());
+    assert!(!store.exists(victim.hash()).unwrap());
+    assert_index_names_only_readable_blocks(&store);
+    store.put_durable_batch(std::slice::from_ref(&victim)).unwrap();
+}
+
+fn verdict_flag(
+    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> impl Fn(Option<&std::path::Path>) -> bool + Send + Sync + 'static {
+    let flag = std::sync::Arc::clone(flag);
+    move |_| flag.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[test]
+fn a_rollback_on_a_volume_without_a_verdict_neither_truncates_nor_unlinks() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let flag = std::sync::Arc::new(AtomicBool::new(true));
+    let store =
+        SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), verdict_flag(&flag))
+            .unwrap();
+    let committed = block("committed", 300);
+    store.put_durable_batch(std::slice::from_ref(&committed)).unwrap();
+    let continued = store.segment_ids().unwrap()[0];
+    let (_, durable_end, _) = testing::segment_row(dir.path(), continued).unwrap().unwrap();
+
+    // Case 1: the failed batch continues a committed segment (rollback would truncate).
+    flag.store(false, Ordering::SeqCst);
+    let victim = block("continues-committed", 200);
+    store.arm_commit_fault_for_tests(FaultPlan::io_failure_at(CommitPoint::AfterFsyncBeforeIndex));
+    assert!(store.put_durable_batch(std::slice::from_ref(&victim)).is_err());
+    store.clear_commit_fault_for_tests();
+    assert!(
+        segment_file(dir.path(), continued).metadata().unwrap().len() > durable_end,
+        "without a Supported verdict the rollback must not truncate"
+    );
+
+    // Case 2: the failed batch creates a segment (rollback would unlink it).
+    flag.store(true, Ordering::SeqCst);
+    store.seal_active_segment().unwrap();
+    let files_before = segment_files(dir.path());
+    flag.store(false, Ordering::SeqCst);
+    let fresh = block("fresh-segment-victim", 200);
+    store.arm_commit_fault_for_tests(FaultPlan::io_failure_at(CommitPoint::AfterFsyncBeforeIndex));
+    assert!(store.put_durable_batch(std::slice::from_ref(&fresh)).is_err());
+    store.clear_commit_fault_for_tests();
+    assert!(
+        segment_files(dir.path()).len() > files_before.len(),
+        "without a Supported verdict the rollback must not unlink"
+    );
+    drop(store);
+
+    // A supported volume recovers both on the next open.
+    flag.store(true, Ordering::SeqCst);
+    let store =
+        SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), verdict_flag(&flag))
+            .unwrap();
+    assert_eq!(store.get(committed.hash()).unwrap(), committed.bytes());
+    assert!(!store.exists(victim.hash()).unwrap());
+    assert!(!store.exists(fresh.hash()).unwrap());
+    assert_index_names_only_readable_blocks(&store);
+}
+
+/// Recovery's other deletion, cutting a torn tail, is gated the same way: on a refused volume the
+/// open fails and the file keeps its length.
+#[test]
+fn opening_a_store_with_a_torn_tail_on_a_refused_volume_truncates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store =
+            SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
+        store.put_durable_batch(&[block("committed", 300)]).unwrap();
+        store.arm_commit_fault_for_tests(FaultPlan::crash_at(CommitPoint::AfterAppendBeforeFsync));
+        assert!(store.put_durable_batch(&[block("torn", 200)]).is_err());
+    }
+    let segment_id = testing::segment_ids_on_disk(dir.path()).unwrap()[0];
+    let len = segment_file(dir.path(), segment_id).metadata().unwrap().len();
+    let (_, durable_end, _) = testing::segment_row(dir.path(), segment_id).unwrap().unwrap();
+    assert!(len > durable_end, "the crash must leave a tail");
+
+    let refused = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| false);
+    assert!(matches!(refused, Err(StorageError::DeletionRefused(_))));
+    assert_eq!(segment_file(dir.path(), segment_id).metadata().unwrap().len(), len);
+
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits(), |_| true).unwrap();
+    assert_eq!(store.recovery_report().truncated_segments, vec![segment_id]);
 }

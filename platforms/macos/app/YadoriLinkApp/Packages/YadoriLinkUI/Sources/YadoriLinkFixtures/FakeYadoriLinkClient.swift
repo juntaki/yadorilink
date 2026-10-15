@@ -13,15 +13,21 @@ public final class FakeYadoriLinkClient: YadoriLinkClient, @unchecked Sendable {
     // State. Read and written only under `lock`.
     private var _daemonRunning: Bool
     private var _snapshot: StatusSnapshot
+    private var _resolvedConflicts: [(path: String, choice: ConflictChoice)] = []
+    private var _retained: [RetainedOriginal] = []
     private var _account: AccountStatus
     private var _devices: [DeviceSummary]
     private var _inbox: [IncomingTransfer]
+    private var _spaceManagement = SpaceManagement(enabled: false)
     private var _limits: BandwidthLimits
     private var _update: UpdateStatus
     private var _members: [String: [MemberSummary]]
     private var _approvals: [PendingApprovalSummary]
     private var _invites: [PendingInviteSummary]
     private var _availability: [String: FileAvailability] = [:]
+    private var _pinned: Set<String> = []
+    private var _downloadURL: String? = Fixtures.releasesPage
+    private var _downloadGuidance = "Download the new version from \(Fixtures.releasesPage)"
     private var _failures: [String: DesktopError] = [:]
     private var _calls: [String] = []
     private var _durabilityBlocksRemoval: Bool
@@ -251,29 +257,68 @@ public final class FakeYadoriLinkClient: YadoriLinkClient, @unchecked Sendable {
         }
     }
 
+    // MARK: conflicts and kept originals
+
+    public func resolveConflict(copyPath: String, choice: ConflictChoice) async throws -> String {
+        try await enter()
+        lock.withLock { _resolvedConflicts.append((copyPath, choice)) }
+        return copyPath
+    }
+
+    public func listRetainedOriginals() async throws -> [RetainedOriginal] {
+        try await enter()
+        return lock.withLock { _retained }
+    }
+
+    public func releaseRetainedOriginals(groupId: String) async throws -> [RetainedRelease] {
+        try await enter()
+        return lock.withLock {
+            let released = _retained.filter { $0.groupId == groupId }.map { RetainedRelease(path: $0.path, outcome: .removed, detail: "") }
+            _retained.removeAll { $0.groupId == groupId }
+            return released
+        }
+    }
+
+    /// Originals the fake reports as kept; tests set them.
+    public func setRetainedOriginals(_ items: [RetainedOriginal]) { lock.withLock { _retained = items } }
+
+    public var resolvedConflicts: [(path: String, choice: ConflictChoice)] { lock.withLock { _resolvedConflicts } }
+
     // MARK: folder control
 
-    public func pauseFolder(localPath: String) async throws {
+    /// The deadline the daemon would report for a timed pause; midnight is the next 00:00.
+    static func pauseEnd(_ duration: PauseDuration) -> Date? {
+        switch duration {
+        case .untilResumed: nil
+        case .thirtyMinutes: Date().addingTimeInterval(30 * 60)
+        case .oneHour: Date().addingTimeInterval(60 * 60)
+        case .untilTomorrow: Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: Date()))
+        }
+    }
+
+    public func pauseFolder(localPath: String, duration: PauseDuration) async throws {
         try await enter()
-        try mutate { try $0.updateFolder(localPath: localPath) { $0.paused = true; $0.state = .paused } }
+        let until = Self.pauseEnd(duration)
+        try mutate { try $0.updateFolder(localPath: localPath) { $0.paused = true; $0.pausedUntil = until; $0.state = .paused } }
     }
 
     public func resumeFolder(localPath: String) async throws {
         try await enter()
-        try mutate { try $0.updateFolder(localPath: localPath) { $0.paused = false; $0.state = .upToDate } }
+        try mutate { try $0.updateFolder(localPath: localPath) { $0.paused = false; $0.pausedUntil = nil; $0.state = .upToDate } }
     }
 
-    public func pauseAll() async throws {
+    public func pauseAll(duration: PauseDuration) async throws {
         try await enter()
+        let until = Self.pauseEnd(duration)
         mutate { c in
-            for i in c._snapshot.folders.indices { c._snapshot.folders[i].paused = true; c._snapshot.folders[i].state = .paused }
+            for i in c._snapshot.folders.indices { c._snapshot.folders[i].paused = true; c._snapshot.folders[i].pausedUntil = until; c._snapshot.folders[i].state = .paused }
         }
     }
 
     public func resumeAll() async throws {
         try await enter()
         mutate { c in
-            for i in c._snapshot.folders.indices { c._snapshot.folders[i].paused = false; c._snapshot.folders[i].state = .upToDate }
+            for i in c._snapshot.folders.indices { c._snapshot.folders[i].paused = false; c._snapshot.folders[i].pausedUntil = nil; c._snapshot.folders[i].state = .upToDate }
         }
     }
 
@@ -357,6 +402,25 @@ public final class FakeYadoriLinkClient: YadoriLinkClient, @unchecked Sendable {
         return EvictOutcome(evicted: true, blocksReclaimed: 4, bytesReclaimed: 12 * Fixtures.mib)
     }
 
+    public func fileRetention(absolutePath: String) async throws -> FileRetention {
+        try await enter()
+        let pinned = lock.withLock { _pinned.contains(absolutePath) }
+        return FileRetention(policy: pinned ? .pinned : .reclaimable, inherited: false)
+    }
+
+    public func pinFile(absolutePath: String) async throws -> PinOutcome {
+        try await enter()
+        lock.withLock { _pinned.insert(absolutePath) }
+        setAvailability(absolutePath) { $0.state = .hydrated }
+        return PinOutcome(retention: FileRetention(policy: .pinned, inherited: false), downloadError: nil)
+    }
+
+    public func unpinFile(absolutePath: String) async throws -> FileRetention {
+        try await enter()
+        lock.withLock { _pinned.remove(absolutePath) }
+        return FileRetention(policy: .reclaimable, inherited: false)
+    }
+
     // MARK: devices
 
     public func listFolderDevices() async throws -> [DeviceSummary] {
@@ -402,7 +466,39 @@ public final class FakeYadoriLinkClient: YadoriLinkClient, @unchecked Sendable {
         }
     }
 
+    public func cancelTransfer(transferId: String) async throws {
+        try await enter()
+        try lock.withLock {
+            guard let i = _inbox.firstIndex(where: { $0.transferId == transferId }) else {
+                throw DesktopError.invalidInput(message: "no such transfer", field: "transfer_id")
+            }
+            if _inbox[i].status != .completed { _inbox[i].status = .canceled }
+        }
+    }
+
+    public func retryTransfer(transferId: String) async throws -> ReceivedTransfer {
+        try await receiveTransfer(transferId: transferId, destinationDir: nil)
+    }
+
     // MARK: storage / settings / daemon
+
+    public func spaceManagement() async throws -> SpaceManagement {
+        try await enter()
+        return lock.withLock { _spaceManagement }
+    }
+
+    public func setSpaceManagement(enabled: Bool) async throws -> SpaceManagement {
+        try await enter()
+        return lock.withLock {
+            _spaceManagement = SpaceManagement(enabled: enabled)
+            return _spaceManagement
+        }
+    }
+
+    public func previewSpaceReclaim() async throws -> SpaceReclaimPreview {
+        try await enter()
+        return SpaceReclaimPreview(items: [], unreadableRoots: 0)
+    }
 
     public func runGc(dryRun: Bool) async throws -> GcReport {
         try await enter()
@@ -462,18 +558,29 @@ public final class FakeYadoriLinkClient: YadoriLinkClient, @unchecked Sendable {
         return lock.withLock { _update.lastCheckedAt = Fixtures.now; return _update }
     }
 
-    public func installUpdate() async throws -> UpdateInstallOutcome {
+    public func downloadGuidance() async throws -> UpdateDownloadGuidance {
         try await enter()
-        return .installing
+        let guidance = lock.withLock { _downloadGuidance }
+        // The page is structured, never read out of the sentence.
+        return UpdateDownloadGuidance(guidance: guidance, url: lock.withLock { _downloadURL })
     }
 
-    public func setUpdateConfig(automaticChecks: Bool?, installMode: UpdateInstallMode?) async throws -> UpdateConfig {
+    public func setAutomaticUpdateChecks(_ enabled: Bool) async throws -> UpdateConfig {
         try await enter()
         return lock.withLock {
-            if let automaticChecks { _update.config.automaticChecks = automaticChecks }
-            if let installMode { _update.config.installMode = installMode }
+            _update.config.automaticChecks = enabled
             return _update.config
         }
+    }
+
+    /// What `downloadGuidance` answers: a download page URL, or a package-manager command.
+    public func setDownloadGuidance(_ guidance: String, url: String? = nil) {
+        lock.withLock { _downloadGuidance = guidance; _downloadURL = url }
+    }
+
+    /// Replace the update status the next read reports.
+    public func setUpdateStatus(_ status: UpdateStatus) {
+        lock.withLock { _update = status }
     }
 
     // MARK: account

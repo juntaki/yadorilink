@@ -94,5 +94,85 @@ pub(crate) fn format_item(item: &PreservedItem) -> String {
     }
 }
 
+pub async fn retained_list() -> Result<(), CliError> {
+    let items = storage::list_retained_originals().await?;
+    if items.is_empty() {
+        println!("No originals are kept.");
+        return Ok(());
+    }
+    println!("{RETAINED_EXPLANATION}");
+    for item in &items {
+        println!("{}", format_retained(item));
+    }
+    Ok(())
+}
+
+/// Tries to release the kept originals of `group`, or of every group that has any.
+pub async fn retained_release(group: Option<String>) -> Result<(), CliError> {
+    let groups = match group {
+        Some(group) => vec![group],
+        None => {
+            let mut groups: Vec<String> = storage::list_retained_originals()
+                .await?
+                .into_iter()
+                .map(|item| item.group_id)
+                .collect();
+            groups.dedup();
+            groups
+        }
+    };
+    if groups.is_empty() {
+        println!("No originals are kept.");
+        return Ok(());
+    }
+    for group in groups {
+        println!("group={group}");
+        for release in storage::release_retained_originals(&group).await? {
+            println!("  {}", format_release(&release));
+        }
+    }
+    Ok(())
+}
+
+/// Why the files are kept and when they can go.
+const RETAINED_EXPLANATION: &str = "These files were kept as they were because it could not be \
+     proved safe to remove them. Each can be released once nothing is writing to it: run \
+     `yadorilink preserved retained release`. A file that changed meanwhile is saved first.";
+
+/// One line of `retained list`.
+pub(crate) fn format_retained(item: &yadorilink_ipc_proto::daemonctl::RetainedOriginal) -> String {
+    let removed = if item.group_removed { " (group removed)" } else { "" };
+    let size = if item.reachable {
+        super::status::format_bytes(item.size)
+    } else {
+        "size unknown (the folder is not watched)".to_string()
+    };
+    format!("group={}{removed}  {}  {size}", item.group_id, item.path)
+}
+
+/// One line of `retained release`.
+pub(crate) fn format_release(release: &yadorilink_ipc_proto::daemonctl::RetainedRelease) -> String {
+    let what = match release.outcome.as_str() {
+        "removed" => "released".to_string(),
+        "gone" => "nothing was left to release".to_string(),
+        "still_retained" => {
+            "kept: it may still be written to, or it changed; try again later".to_string()
+        }
+        "saved_then_removed" => {
+            "it had changed: the new bytes are saved (see `yadorilink preserved list`), then it \
+             was released"
+                .to_string()
+        }
+        "saved_still_retained" => {
+            "it had changed: the new bytes are saved (see `yadorilink preserved list`); the \
+             original is still kept"
+                .to_string()
+        }
+        "left" => format!("left as it is: {}", release.detail),
+        other => format!("{other} {}", release.detail),
+    };
+    format!("{}  {what}", release.path)
+}
+
 #[cfg(test)]
 mod tests;

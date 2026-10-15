@@ -31,7 +31,9 @@ use yadorilink_local_capture::LocalChangeProcessor;
 use yadorilink_root_authority::root_identity::RootVerificationStatePort;
 
 use crate::link_runtime::dependencies::LinkRuntimeDependencies;
-use crate::link_runtime::operations::capture_local_change::announce_local_change;
+use crate::link_runtime::operations::capture_local_change::{
+    announce_local_change, link_should_propagate,
+};
 use crate::link_runtime::startup::GroupStartupReadyGuard;
 
 /// How often the live dirty-path-journal redrive pass runs for this link.
@@ -529,49 +531,57 @@ pub(crate) fn spawn_executor_task(
         // still alive and draining flushes, or stuck?
         let mut flushes_received: u64 = 0;
         let mut flushes_completed: u64 = 0;
+        // Set when a streaming rescan stopped early because its announcer
+        // died: chunks after the failure were never committed, so the next
+        // iteration runs another full rescan to capture that tail.
+        let mut rescan_retry = false;
         loop {
-            let flush = match late_startup_retry {
-                None => flush_rx.recv().await,
-                Some((due, failures)) => {
-                    tokio::select! {
-                        flush = flush_rx.recv() => flush,
-                        () = tokio::time::sleep_until(due) => {
-                            let generation = executor_deps
-                                .replica_coordinator
-                                .startup_readiness()
-                                .begin_group_startup(&executor_group_id);
-                            startup_ready_guard.begin_generation(generation);
-                            match startup_scan_and_redrive(
-                                executor_deps.clone(),
-                                executor_local_path.clone(),
-                                executor_group_id.clone(),
-                                executor_processor.clone(),
-                                executor_root.clone(),
-                                executor_ignore_set.clone(),
-                                executor_emit_tombstones,
-                            )
-                            .await
-                            {
-                                None => {
-                                    tracing::info!(
-                                        local_path = %executor_local_path,
-                                        group_id = %executor_group_id,
-                                        "group startup completed on a later attempt; peer apply \
-                                         is admitted again"
-                                    );
-                                    startup_ready_guard.mark_ready();
-                                    late_startup_retry = None;
+            let flush = if std::mem::take(&mut rescan_retry) {
+                Some(DebounceFlush::RescanRequired)
+            } else {
+                match late_startup_retry {
+                    None => flush_rx.recv().await,
+                    Some((due, failures)) => {
+                        tokio::select! {
+                            flush = flush_rx.recv() => flush,
+                            () = tokio::time::sleep_until(due) => {
+                                let generation = executor_deps
+                                    .replica_coordinator
+                                    .startup_readiness()
+                                    .begin_group_startup(&executor_group_id);
+                                startup_ready_guard.begin_generation(generation);
+                                match startup_scan_and_redrive(
+                                    executor_deps.clone(),
+                                    executor_local_path.clone(),
+                                    executor_group_id.clone(),
+                                    executor_processor.clone(),
+                                    executor_root.clone(),
+                                    executor_ignore_set.clone(),
+                                    executor_emit_tombstones,
+                                )
+                                .await
+                                {
+                                    None => {
+                                        tracing::info!(
+                                            local_path = %executor_local_path,
+                                            group_id = %executor_group_id,
+                                            "group startup completed on a later attempt; peer apply \
+                                             is admitted again"
+                                        );
+                                        startup_ready_guard.mark_ready();
+                                        late_startup_retry = None;
+                                    }
+                                    Some(reason) => {
+                                        startup_ready_guard.mark_failed(reason);
+                                        late_startup_retry = Some((
+                                            tokio::time::Instant::now()
+                                                + startup_retry_delay(failures + 1),
+                                            failures + 1,
+                                        ));
+                                    }
                                 }
-                                Some(reason) => {
-                                    startup_ready_guard.mark_failed(reason);
-                                    late_startup_retry = Some((
-                                        tokio::time::Instant::now()
-                                            + startup_retry_delay(failures + 1),
-                                        failures + 1,
-                                    ));
-                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
                 }
@@ -687,21 +697,15 @@ pub(crate) fn spawn_executor_task(
                 // without changing what gets committed, in what
                 // order, or when: only when each already-durable chunk
                 // becomes peer-visible.
-                let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<
-                    Vec<yadorilink_replica_domain::file::FileRecord>,
-                >();
                 let announce_deps = executor_deps.clone();
                 let announce_local_path = executor_local_path.clone();
                 let announce_group_id = executor_group_id.clone();
-                let announce_task = tokio::spawn(async move {
-                    while let Some(records) = chunk_rx.recv().await {
-                        announce_local_change(
-                            &announce_deps,
-                            &announce_local_path,
-                            &announce_group_id,
-                            records,
-                        )
-                        .await;
+                let (chunk_tx, announce_task) = spawn_chunk_announcer(move |records| {
+                    let deps = announce_deps.clone();
+                    let local_path = announce_local_path.clone();
+                    let group_id = announce_group_id.clone();
+                    async move {
+                        announce_local_change(&deps, &local_path, &group_id, records).await;
                     }
                 });
 
@@ -713,9 +717,7 @@ pub(crate) fn spawn_executor_task(
                             flush,
                             executor_ignore_set.as_ref(),
                             live_emit_tombstones,
-                            &mut |chunk_records| {
-                                let _ = chunk_tx.send(chunk_records.to_vec());
-                            },
+                            &mut |chunk_records| send_committed_chunk(&chunk_tx, chunk_records),
                         ),
                     )
                 });
@@ -727,7 +729,36 @@ pub(crate) fn spawn_executor_task(
                 // own writes never race this one's still-in-flight
                 // announcements).
                 drop(chunk_tx);
-                let _ = announce_task.await;
+                let announce_joined = announce_task.await;
+                let announce_failed = announce_joined.is_err()
+                    || matches!(
+                        flush_result,
+                        Err(yadorilink_local_capture::LocalCaptureError::StreamingConsumerClosed)
+                    );
+                if announce_failed {
+                    tracing::error!(
+                        error = ?announce_joined.as_ref().err(),
+                        local_path = %executor_local_path,
+                        group_id = %executor_group_id,
+                        "the full-rescan announcement consumer died; re-announcing the \
+                         group's committed state"
+                    );
+                    // Everything the scan committed is durable; the peer
+                    // announce is group-level, so one fresh announce covers
+                    // the chunks the dead consumer never delivered.
+                    if link_should_propagate(
+                        &executor_deps.replica_coordinator,
+                        &executor_local_path,
+                        &executor_group_id,
+                    ) {
+                        executor_deps.on_local_native_commit(&executor_group_id).await;
+                    }
+                    // The scan stopped at the failed hand-off, so later
+                    // chunks were never committed. Wait out a short delay
+                    // (a consumer that keeps dying must not spin) and rescan.
+                    tokio::time::sleep(ANNOUNCE_FAILURE_RESCAN_DELAY).await;
+                    rescan_retry = true;
+                }
 
                 flushes_completed += 1;
                 tracing::debug!(
@@ -735,7 +766,7 @@ pub(crate) fn spawn_executor_task(
                     flushes_received_total = flushes_received,
                     flushes_completed_total = flushes_completed,
                     elapsed_ms = start.elapsed().as_millis() as u64,
-                    ok = flush_result.is_ok(),
+                    ok = flush_result.is_ok() && !announce_failed,
                     records = flush_result.as_ref().map(|o| o.records.len()).unwrap_or(0),
                     "executor flush completed"
                 );
@@ -858,6 +889,51 @@ pub(crate) fn flush_touches_ignore_file(root: &std::path::Path, flush: &Debounce
         }),
         DebounceFlush::RescanRequired => false,
     }
+}
+
+/// Committed-but-not-yet-announced chunks a full rescan may buffer. Each
+/// chunk is already bounded by the reconcile op/byte limits, so the memory
+/// held by the queue is independent of tree size.
+const ANNOUNCE_QUEUE_CAPACITY: usize = 2;
+
+/// Pause before the rescan that follows a dead announcer.
+const ANNOUNCE_FAILURE_RESCAN_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+type CommittedChunkSender =
+    std::sync::mpsc::SyncSender<Vec<yadorilink_replica_domain::file::FileRecord>>;
+
+/// Starts the consumer that announces each durably committed chunk of a
+/// streaming full rescan, in commit order. The queue is bounded, so a slow
+/// consumer blocks the scan (backpressure) instead of letting it buffer the
+/// whole tree. If the consumer dies its receiver is dropped, which makes
+/// every later send fail (see `send_committed_chunk`).
+fn spawn_chunk_announcer<F, Fut>(announce: F) -> (CommittedChunkSender, tokio::task::JoinHandle<()>)
+where
+    F: Fn(Vec<yadorilink_replica_domain::file::FileRecord>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(ANNOUNCE_QUEUE_CAPACITY);
+    let handle = tokio::runtime::Handle::current();
+    // A blocking-pool thread, not an async task: the scan callback blocks on
+    // the queue from inside a runtime context, where tokio's own
+    // `blocking_send` is not allowed.
+    let task = tokio::task::spawn_blocking(move || {
+        while let Ok(records) = rx.recv() {
+            handle.block_on(announce(records));
+        }
+    });
+    (tx, task)
+}
+
+/// Hands one committed chunk to the announcer, blocking while the queue is
+/// full. One chunk is one durable commit (a removed directory's descendants
+/// commit together), so the bound is on chunk count, not on any single commit. Fails closed when the consumer is gone so the scan stops.
+fn send_committed_chunk(
+    tx: &CommittedChunkSender,
+    records: &[yadorilink_replica_domain::file::FileRecord],
+) -> Result<(), yadorilink_local_capture::LocalCaptureError> {
+    tx.send(records.to_vec())
+        .map_err(|_| yadorilink_local_capture::LocalCaptureError::StreamingConsumerClosed)
 }
 
 #[cfg(test)]

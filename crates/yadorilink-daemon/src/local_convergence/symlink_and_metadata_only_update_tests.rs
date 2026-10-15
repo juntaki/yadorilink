@@ -11,6 +11,7 @@ use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
+#[cfg(unix)]
 use yadorilink_replica_domain::session_state::MaterializationState;
 
 /// The version a materialization is applying, built from the values
@@ -84,6 +85,7 @@ fn file_record_with_block(path: &str, hash_byte: u8) -> FileRecord {
     }
 }
 
+#[cfg(unix)]
 /// Seeds `path` as a symlink row whose target is `row_target`.
 fn seed_symlink_row(state: &ReplicaCoordinator, record: &FileRecord, row_target: &[u8]) {
     seed_file(state, record);
@@ -102,6 +104,7 @@ fn seed_symlink_row(state: &ReplicaCoordinator, record: &FileRecord, row_target:
         .unwrap();
 }
 
+#[cfg(unix)]
 fn materialize_link(
     state: &ReplicaCoordinator,
     root: &std::path::Path,

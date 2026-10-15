@@ -29,12 +29,16 @@ public struct FolderDetailView: View {
                 DisclosureGroup("Details", isExpanded: $showsDetails) {
                     LabeledContent("Availability", value: model.folder.fetchAvailability == .availableNow ? "Files can be downloaded now" : "Some files can't be downloaded right now")
                     if let free = model.freeSpace { LabeledContent("Free space", value: free) }
-                    LabeledContent("Location") {
-                        Text(model.folder.localPath).textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+                    if model.folder.provider {
+                        LabeledContent("Location", value: "Finder, under Locations")
+                    } else {
+                        LabeledContent("Location") {
+                            Text(model.folder.localPath).textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+                        }
                     }
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Devices with a complete copy (as configured)").font(.subheadline.weight(.medium))
-                        if model.copies.isEmpty {
+                        if model.showsNoCopies {
                             Text("None yet").foregroundStyle(.secondary)
                         }
                         ForEach(model.copies) { copy in
@@ -62,6 +66,12 @@ public struct FolderDetailView: View {
                 }
             }
 
+            if let failure = model.loadFailure {
+                Section {
+                    RetryRow(LoadWording.folderDetails, notice: failure) { await model.load() }
+                }
+            }
+
             if !model.conflicts.isEmpty {
                 Section("Conflicts") {
                     if let why = model.conflictExplanation {
@@ -75,13 +85,32 @@ public struct FolderDetailView: View {
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
-                            // Keep this version / Keep both need daemon operations that do not exist yet.
+                            if conflict.canResolve {
+                                Button("Keep This Version") { Task { await model.resolve(conflict, .keepThis) } }
+                                Button("Keep Both") { Task { await model.resolve(conflict, .keepBoth) } }
+                            }
                             if !model.folder.provider {
                                 Button("Show in Finder") { context.revealInFinder(model.conflictFilePath(conflict)) }
                             }
                         }
-                        .help(conflict.path)
+                        .disabled(model.isWorking)
+                        .help(conflict.savedAt.map { "Saved \($0)" } ?? "")
                     }
+                }
+            }
+
+            if !model.retained.isEmpty {
+                Section("Kept originals") {
+                    Text(FolderDetailViewModel.retainedExplanation).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    ForEach(model.retained) { item in
+                        HStack {
+                            Text(item.path)
+                            Spacer()
+                            Text(item.size).foregroundStyle(.secondary)
+                        }
+                    }
+                    Button("Release") { Task { await model.releaseRetained() } }
+                        .disabled(model.isWorking)
                 }
             }
 
@@ -121,8 +150,14 @@ public struct FolderDetailView: View {
                     Button("Choose File or Folder…") { picksFile = true }
                         .help("A folder is kept, downloaded or freed up as a whole. A folder kept on this Mac also keeps what is added to it later.")
                 }
+                if let failure = model.historyFailure {
+                    RetryRow(LoadWording.fileHistory, notice: failure) { await model.retryFileHistory() }
+                }
                 if let state = model.fileStateTitle {
                     LabeledContent("Status", value: state)
+                }
+                if let kept = model.retentionLine {
+                    LabeledContent("On this device", value: kept)
                 }
                 if !model.fileActions.isEmpty {
                     HStack {
@@ -148,6 +183,13 @@ public struct FolderDetailView: View {
                     }
                 }
             }
+
+            Section {
+                Button(UnlinkWording.menuTitle, role: .destructive) { context.unlink.request(model.folder) }
+                    .disabled(context.unlink.isWorking)
+            } footer: {
+                Text("Stops syncing this folder on this Mac only. You can link it again later.")
+            }
         }
         .formStyle(.grouped)
         .noticeBar($model.notice)
@@ -156,7 +198,20 @@ public struct FolderDetailView: View {
         .fileImporter(isPresented: $picksFile, allowedContentTypes: [.item, .folder]) { result in
             if case .success(let url) = result { Task { await model.selectFile(url.path) } }
         }
-        .task { await model.load() }
+        .task {
+            await model.load()
+            await selectRequestedFile()
+        }
+        .onChange(of: context.fileSelection) { _, _ in
+            Task { await selectRequestedFile() }
+        }
+    }
+
+    /// A Finder item link opened this folder with a file already chosen: no second file picker.
+    private func selectRequestedFile() async {
+        if let path = context.takeFileSelection(for: model.folder.localPath) {
+            await model.selectFile(path)
+        }
     }
 }
 

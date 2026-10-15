@@ -85,6 +85,11 @@ async fn follow_authorized_peers(
             }
             keep
         });
+        // A native connection authenticated as a key the netmap replaced goes
+        // whether or not a successor keeper already registered its session.
+        if let Some(state) = state.upgrade() {
+            state.native_replication.detach_unpinned(&pinned);
+        }
         for (device, key) in pinned {
             if let std::collections::hash_map::Entry::Vacant(slot) = keepers.0.entry(device) {
                 let device = slot.key().clone();
@@ -171,7 +176,16 @@ async fn keep_session(state: Weak<DaemonState>, stack: Weak<SyncStack>, device: 
         if started.elapsed() > HEALTHY_CONNECTION {
             attempt = 0;
         }
-        tokio::time::sleep(BackoffConfig::RECONNECT.next(attempt)).await;
+        // The backoff is for a peer that cannot be reached. One that opened
+        // a connection to this device meanwhile (its dial can succeed while
+        // ours was refused or timed out) can be, so that ends the wait.
+        let Some(waiting) = stack.upgrade() else { return };
+        let backoff = BackoffConfig::RECONNECT.next(attempt);
+        tokio::select! {
+            () = tokio::time::sleep(backoff) => {}
+            () = waiting.endpoint().wait_for_link(&device) => {}
+        }
+        drop(waiting);
         attempt = attempt.saturating_add(1);
     }
 }
@@ -278,6 +292,16 @@ fn open_session(
     // the session up to date with it. One that runs after this point finds
     // the session and updates it itself.
     session.set_authorized_groups(servable_groups(&state.authority, device));
+    if yadorilink_fs_platform::join_timeline::is_active() {
+        for group in servable_groups(&state.authority, device) {
+            yadorilink_fs_platform::join_timeline::mark_with_peer(
+                &state.device_id,
+                &group,
+                yadorilink_fs_platform::join_timeline::Milestone::PeerSyncSessionRegistered,
+                device,
+            );
+        }
+    }
     // A first session for this peer: its groups just went from none to its servable set.
     state.native_replication.wake_reconcile();
     if state.authority.peer_signing_key(device).is_none() {
@@ -290,5 +314,7 @@ fn open_session(
     Some(session)
 }
 
+#[cfg(test)]
+mod inbound_tests;
 #[cfg(test)]
 mod tests;

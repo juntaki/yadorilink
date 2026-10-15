@@ -56,18 +56,32 @@ final class LiveYadoriLinkClient: YadoriLinkClient {
         try await mapped { try await core.folderPeerCounts() }
     }
 
+    // MARK: conflicts and kept originals
+
+    func resolveConflict(copyPath: String, choice: YadoriLinkModel.ConflictChoice) async throws -> String {
+        try await mapped { try await core.resolveConflict(copyPath: copyPath, choice: YadoriLinkFFI.ConflictChoice(choice)) }
+    }
+
+    func listRetainedOriginals() async throws -> [YadoriLinkModel.RetainedOriginal] {
+        try await mapped { try await core.listRetainedOriginals().map { YadoriLinkModel.RetainedOriginal($0) } }
+    }
+
+    func releaseRetainedOriginals(groupId: String) async throws -> [YadoriLinkModel.RetainedRelease] {
+        try await mapped { try await core.releaseRetainedOriginals(groupId: groupId).map { YadoriLinkModel.RetainedRelease($0) } }
+    }
+
     // MARK: folder control
 
-    func pauseFolder(localPath: String) async throws {
-        try await mapped { try await core.pauseFolder(localPath: localPath) }
+    func pauseFolder(localPath: String, duration: YadoriLinkModel.PauseDuration) async throws {
+        try await mapped { try await core.pauseFolder(localPath: localPath, duration: YadoriLinkFFI.PauseDuration(duration)) }
     }
 
     func resumeFolder(localPath: String) async throws {
         try await mapped { try await core.resumeFolder(localPath: localPath) }
     }
 
-    func pauseAll() async throws {
-        try await mapped { try await core.pauseAll() }
+    func pauseAll(duration: YadoriLinkModel.PauseDuration) async throws {
+        try await mapped { try await core.pauseAll(duration: YadoriLinkFFI.PauseDuration(duration)) }
     }
 
     func resumeAll() async throws {
@@ -122,6 +136,18 @@ final class LiveYadoriLinkClient: YadoriLinkClient {
         try await mapped { YadoriLinkModel.EvictOutcome(try await core.evictFile(absolutePath: absolutePath)) }
     }
 
+    func fileRetention(absolutePath: String) async throws -> YadoriLinkModel.FileRetention {
+        try await mapped { YadoriLinkModel.FileRetention(try await core.fileRetention(absolutePath: absolutePath)) }
+    }
+
+    func pinFile(absolutePath: String) async throws -> YadoriLinkModel.PinOutcome {
+        try await mapped { YadoriLinkModel.PinOutcome(try await core.pinFile(absolutePath: absolutePath)) }
+    }
+
+    func unpinFile(absolutePath: String) async throws -> YadoriLinkModel.FileRetention {
+        try await mapped { YadoriLinkModel.FileRetention(try await core.unpinFile(absolutePath: absolutePath)) }
+    }
+
     // MARK: devices
 
     func listFolderDevices() async throws -> [YadoriLinkModel.DeviceSummary] {
@@ -154,7 +180,27 @@ final class LiveYadoriLinkClient: YadoriLinkClient {
         }
     }
 
+    func cancelTransfer(transferId: String) async throws {
+        try await mapped { try await core.cancelTransfer(transferId: transferId) }
+    }
+
+    func retryTransfer(transferId: String) async throws -> YadoriLinkModel.ReceivedTransfer {
+        try await mapped { YadoriLinkModel.ReceivedTransfer(try await core.retryTransfer(transferId: transferId)) }
+    }
+
     // MARK: storage / settings / daemon
+
+    func spaceManagement() async throws -> YadoriLinkModel.SpaceManagement {
+        try await mapped { YadoriLinkModel.SpaceManagement(try await core.spaceManagement()) }
+    }
+
+    func setSpaceManagement(enabled: Bool) async throws -> YadoriLinkModel.SpaceManagement {
+        try await mapped { YadoriLinkModel.SpaceManagement(try await core.setSpaceManagement(enabled: enabled)) }
+    }
+
+    func previewSpaceReclaim() async throws -> YadoriLinkModel.SpaceReclaimPreview {
+        try await mapped { YadoriLinkModel.SpaceReclaimPreview(try await core.previewSpaceReclaim()) }
+    }
 
     func runGc(dryRun: Bool) async throws -> YadoriLinkModel.GcReport {
         try await mapped { YadoriLinkModel.GcReport(try await core.runGc(dryRun: dryRun)) }
@@ -192,17 +238,12 @@ final class LiveYadoriLinkClient: YadoriLinkClient {
         try await mapped { YadoriLinkModel.UpdateStatus(try await core.checkForUpdates()) }
     }
 
-    func installUpdate() async throws -> YadoriLinkModel.UpdateInstallOutcome {
-        try await mapped { YadoriLinkModel.UpdateInstallOutcome(try await core.installUpdate()) }
+    func downloadGuidance() async throws -> YadoriLinkModel.UpdateDownloadGuidance {
+        try await mapped { YadoriLinkModel.UpdateDownloadGuidance(try await core.downloadGuidance()) }
     }
 
-    func setUpdateConfig(automaticChecks: Bool?, installMode: YadoriLinkModel.UpdateInstallMode?) async throws -> YadoriLinkModel.UpdateConfig {
-        try await mapped {
-            YadoriLinkModel.UpdateConfig(try await core.setUpdateConfig(
-                automaticChecks: automaticChecks,
-                installMode: installMode.map { YadoriLinkFFI.UpdateInstallMode($0) }
-            ))
-        }
+    func setAutomaticUpdateChecks(_ enabled: Bool) async throws -> YadoriLinkModel.UpdateConfig {
+        try await mapped { YadoriLinkModel.UpdateConfig(try await core.setAutomaticUpdateChecks(enabled: enabled)) }
     }
 
     // MARK: account

@@ -676,7 +676,10 @@ fn the_barrier_holds_and_leaves_the_replica_untouched() {
     let intent = RecoveryArea::open_dir(&preserved.dir).unwrap().read_intent().unwrap();
     assert_eq!(intent.deltas.len(), 1);
     assert_eq!(intent.deltas[0].1, w.undelivered.to_wire_bytes());
-    assert_eq!(intent.versions.values().collect::<Vec<_>>(), vec![&vec![2u8]]);
+    let held: Vec<_> = intent.manifest.versions.iter().filter(|v| v.has_bytes).collect();
+    assert_eq!(held.len(), 1);
+    let area = RecoveryArea::open_dir(&preserved.dir).unwrap();
+    assert_eq!(area.read_version(&held[0].version).unwrap(), vec![2u8]);
     assert_eq!(intent.manifest.target_checkpoint_hash, preserved.checkpoint_hash);
     assert!(intent.manifest.items.iter().all(|item| item.reassertable));
 }
@@ -822,7 +825,8 @@ fn a_crash_after_preserved_resumes_from_the_manifest() {
         rebootstrap_status(&w.b, &group()).unwrap().unwrap().state,
         RebootstrapState::Preserved
     );
-    // A leftover temporary from an interrupted write does not matter.
+    // A leftover temporary from an interrupted write does not matter, and is not deleted by
+    // its name alone; it goes with the whole area.
     let dir = recovery_dirs_of(area.path()).remove(0);
     fs::write(dir.join(".yadorilink-v1-stage.0123456789abcdef"), b"partial").unwrap();
 
@@ -831,8 +835,8 @@ fn a_crash_after_preserved_resumes_from_the_manifest() {
     let RestartOutcome::Preserved(preserved) = restart else { panic!("{restart:?}") };
     assert_eq!(preserved.dir, dir);
     assert!(
-        !dir.join(".yadorilink-v1-stage.0123456789abcdef").exists(),
-        "temporaries are removed on resume"
+        dir.join(".yadorilink-v1-stage.0123456789abcdef").exists(),
+        "a Stage-shaped entry is left on resume"
     );
     assert_eq!(preserved.manifest_sha256, sha256(&fs::read(dir.join("manifest.json")).unwrap()));
 }
@@ -1160,25 +1164,30 @@ pub(super) fn preserved_area(w: &Scenario, root: &Path) -> (Preserved, RecoveryA
     (preserved, area)
 }
 
-/// A temporary file left by an interrupted write is removed when the machine
-/// resumes, wherever in the area it was.
+/// A Stage-shaped name is not deletion authority. Nothing recorded these entries, so the
+/// resume leaves them (a bounded leak is preferred to ownership inferred from a filename).
+/// RED until `remove_temporaries` stops parsing reserved names.
 #[test]
-fn temporaries_left_by_an_interrupted_write_are_removed_on_resume() {
+fn an_unrecorded_stage_shaped_entry_is_not_removed_on_resume() {
     let w = scenario(|b1, h1| vec![put_op("x", 2, vec![rem(b1, 1, h1)])]);
     let root = private_tempdir();
     let (preserved, _) = preserved_area(&w, root.path());
-    let leftovers: Vec<PathBuf> = ["", "versions", "deltas", "verification-material"]
+    let lookalikes: Vec<PathBuf> = ["", "versions", "deltas", "verification-material"]
         .iter()
         .map(|sub| preserved.dir.join(sub).join(".yadorilink-v1-stage.0123456789abcdef"))
         .collect();
-    for leftover in &leftovers {
-        fs::write(leftover, b"half a file").unwrap();
+    for lookalike in &lookalikes {
+        fs::write(lookalike, b"not recorded by any operation").unwrap();
     }
 
     recover_after_restart(&w.b, root.path(), &group()).unwrap();
 
-    for leftover in &leftovers {
-        assert!(!leftover.exists(), "{} survived the resume", leftover.display());
+    for lookalike in &lookalikes {
+        assert!(
+            lookalike.exists(),
+            "{} was deleted on a filename shape alone",
+            lookalike.display()
+        );
     }
 }
 
@@ -1718,10 +1727,10 @@ fn a_missing_or_altered_version_record_is_refused() {
 // --- a platform that cannot flush a directory entry --------------------------------------
 
 #[test]
-fn only_a_unix_platform_claims_directory_durability() {
+fn only_unix_and_windows_claim_directory_durability() {
     assert_eq!(
         crate::native_rebootstrap_recovery::platform_supports_directory_durability(),
-        cfg!(unix)
+        cfg!(any(unix, windows))
     );
 }
 

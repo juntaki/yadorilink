@@ -95,6 +95,11 @@ pub enum InboundStatus {
     Pending,
     InProgress,
     Completed,
+    /// The receive stopped without finishing (an error, or the daemon
+    /// stopping mid-receive). Resumable by `receive` or retry.
+    Failed,
+    /// The user abandoned it. Only a retry resumes it.
+    Canceled,
 }
 
 impl InboundStatus {
@@ -103,6 +108,8 @@ impl InboundStatus {
             InboundStatus::Pending => "pending",
             InboundStatus::InProgress => "in_progress",
             InboundStatus::Completed => "completed",
+            InboundStatus::Failed => "failed",
+            InboundStatus::Canceled => "canceled",
         }
     }
 
@@ -110,6 +117,8 @@ impl InboundStatus {
         match s {
             "in_progress" => InboundStatus::InProgress,
             "completed" => InboundStatus::Completed,
+            "failed" => InboundStatus::Failed,
+            "canceled" => InboundStatus::Canceled,
             _ => InboundStatus::Pending,
         }
     }
@@ -321,14 +330,96 @@ impl SendStore {
         })
     }
 
-    pub fn list_inbound(&self) -> Result<Vec<InboundTransfer>> {
+    /// Every unfinished inbound transfer, plus the `finished_limit` most
+    /// recently offered finished ones (completed, failed or canceled), oldest
+    /// first. This is the bounded history: older finished rows stay in the
+    /// store, addressable by id, but are not listed.
+    pub fn list_inbound_recent(&self, finished_limit: usize) -> Result<Vec<InboundTransfer>> {
         self.db.read(|conn| -> Result<Vec<InboundTransfer>> {
             let mut stmt = conn.prepare(
                 "SELECT transfer_id, sender_device_id, manifest_encoded, status, destination_dir, offered_at_unix_nanos
-                 FROM send_inbound_transfers ORDER BY offered_at_unix_nanos ASC",
+                 FROM send_inbound_transfers
+                 WHERE status IN ('pending', 'in_progress')
+                    OR transfer_id IN (
+                        SELECT transfer_id FROM send_inbound_transfers
+                        WHERE status NOT IN ('pending', 'in_progress')
+                        ORDER BY offered_at_unix_nanos DESC, transfer_id DESC LIMIT ?1)
+                 ORDER BY offered_at_unix_nanos ASC, transfer_id ASC",
             )?;
-            let rows = stmt.query_map([], row_to_inbound)?;
+            let rows = stmt.query_map(params![finished_limit as i64], row_to_inbound)?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    /// Startup recovery: a receive runs only inside the daemon that started
+    /// it, so any `in_progress` row found when the store is opened has
+    /// nothing driving it. Marks them failed (resumable) and returns how
+    /// many there were.
+    pub fn interrupt_in_progress_inbound(&self) -> Result<usize> {
+        self.transition_inbound_where_status_in(
+            None,
+            &[InboundStatus::InProgress],
+            InboundStatus::Failed,
+        )
+    }
+
+    /// Marks an unfinished transfer canceled. False (and no change) when it
+    /// was already canceled or has completed, which is what makes cancel
+    /// idempotent.
+    pub fn cancel_inbound(&self, transfer_id: &str) -> Result<bool> {
+        Ok(self.transition_inbound_where_status_in(
+            Some(transfer_id),
+            &[InboundStatus::Pending, InboundStatus::InProgress, InboundStatus::Failed],
+            InboundStatus::Canceled,
+        )? > 0)
+    }
+
+    /// Records that a running receive stopped with an error. Only an
+    /// `in_progress` row changes: a transfer canceled underneath the receive
+    /// stays canceled.
+    pub fn fail_inbound(&self, transfer_id: &str) -> Result<bool> {
+        Ok(self.transition_inbound_where_status_in(
+            Some(transfer_id),
+            &[InboundStatus::InProgress],
+            InboundStatus::Failed,
+        )? > 0)
+    }
+
+    /// A failed transfer starts receiving again. A canceled one is never
+    /// resumed here, so a cancel that lands while a receive is starting
+    /// cannot be undone by it.
+    pub fn resume_inbound(&self, transfer_id: &str) -> Result<bool> {
+        Ok(self.transition_inbound_where_status_in(
+            Some(transfer_id),
+            &[InboundStatus::Failed],
+            InboundStatus::InProgress,
+        )? > 0)
+    }
+
+    /// Makes a canceled transfer resumable again (failed). The explicit
+    /// retry is the only caller.
+    pub fn uncancel_inbound(&self, transfer_id: &str) -> Result<bool> {
+        Ok(self.transition_inbound_where_status_in(
+            Some(transfer_id),
+            &[InboundStatus::Canceled],
+            InboundStatus::Failed,
+        )? > 0)
+    }
+
+    fn transition_inbound_where_status_in(
+        &self,
+        transfer_id: Option<&str>,
+        from: &[InboundStatus],
+        to: InboundStatus,
+    ) -> Result<usize> {
+        let from_list =
+            from.iter().map(|s| format!("'{}'", s.as_str())).collect::<Vec<_>>().join(", ");
+        self.db.write(|conn| -> Result<usize> {
+            let sql = format!(
+                "UPDATE send_inbound_transfers SET status = ?1
+                 WHERE status IN ({from_list}) AND (?2 IS NULL OR transfer_id = ?2)"
+            );
+            Ok(conn.execute(&sql, params![to.as_str(), transfer_id])?)
         })
     }
 

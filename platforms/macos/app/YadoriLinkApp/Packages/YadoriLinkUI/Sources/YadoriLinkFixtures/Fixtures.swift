@@ -94,6 +94,10 @@ public enum Fixtures {
             durabilityEvidence: durability == .protected ? .verifiedPayload : .none,
             localStorage: mode == .keepAll ? .fullCopy : .partiallyMaterialized,
             fetchAvailability: .availableNow,
+            protection: ProtectionSummary(
+                protection: durability == .protected ? .protected : durability == .protecting ? .pending : durability == .atRisk ? .atRisk : .unknown,
+                deviceIds: durability == .atRisk || durability == .unknown ? [] : replicas
+            ),
             fullReplicaDeviceIds: replicas,
             policyStale: false,
             ambiguous: false,
@@ -111,7 +115,6 @@ public enum Fixtures {
             state: available == nil ? .upToDate : .available,
             availableVersion: available,
             mandatory: false,
-            waitingForSafePoint: false,
             lastErrorCategory: nil,
             channel: "stable",
             installSource: "pkg",
@@ -123,6 +126,8 @@ public enum Fixtures {
         overall: OverallState = .healthy,
         reasons: [AttentionReason] = [],
         folders: [FolderSummary],
+        availability: AvailabilitySummary = AvailabilitySummary(availability: .available, reachableDeviceIds: [studioId, officeId], offlineDeviceIds: []),
+        protection: ProtectionSummary = ProtectionSummary(protection: .protected, deviceIds: [studioId]),
         transfers: [TransferSummary] = [],
         peers: [PeerSummary]? = nil,
         update: UpdateBadge = updateBadge(),
@@ -134,6 +139,8 @@ public enum Fixtures {
             attentionReasons: reasons,
             thisDeviceId: thisDeviceId,
             folders: folders,
+            availability: availability,
+            protection: protection,
             peers: peers ?? [
                 PeerSummary(deviceId: studioId, reachability: .connected, unreachableCategory: nil, route: .direct),
                 PeerSummary(deviceId: officeId, reachability: .connected, unreachableCategory: nil, route: .relay),
@@ -164,6 +171,7 @@ public enum Fixtures {
         folders[1].state = .syncing
         folders[1].transfer = progress
         folders[1].durability = .protecting
+        folders[1].protection = ProtectionSummary(protection: .pending, deviceIds: [officeId])
         return snapshot(
             folders: folders,
             transfers: [
@@ -179,17 +187,20 @@ public enum Fixtures {
         folders[0].state = .attention
         folders[0].conflictCount = 2
         folders[0].durability = .atRisk
+        folders[0].protection = ProtectionSummary(protection: .atRisk, deviceIds: [])
         folders[0].durabilityEvidence = .none
         folders[0].fullReplicaDeviceIds = []
         return snapshot(
             overall: .attention,
             reasons: [
-                AttentionReason(category: .conflict, subject: folders[0].groupId, folderLocalPath: folders[0].localPath, raw: "conflict:\(folders[0].groupId)"),
-                AttentionReason(category: .durabilityAtRisk, subject: folders[0].groupId, folderLocalPath: folders[0].localPath, raw: "durability_at_risk:\(folders[0].groupId)"),
-                AttentionReason(category: .peerDisconnected, subject: officeId, folderLocalPath: nil, raw: "peer_disconnected:\(officeId)"),
-                AttentionReason(category: .lowDisk, subject: "/", folderLocalPath: nil, raw: "low_disk:/"),
+                AttentionReason(category: .conflict, subject: folders[0].groupId, folderLocalPath: folders[0].localPath, raw: "conflict:\(folders[0].groupId)", kind: .permanent, primaryAction: .reviewConflict),
+                AttentionReason(category: .durabilityAtRisk, subject: folders[0].groupId, folderLocalPath: folders[0].localPath, raw: "durability_at_risk:\(folders[0].groupId)", kind: .permanent, primaryAction: .viewDetails),
+                AttentionReason(category: .peerDisconnected, subject: officeId, folderLocalPath: nil, raw: "peer_disconnected:\(officeId)", kind: .waiting, primaryAction: .viewDetails),
+                AttentionReason(category: .lowDisk, subject: "/", folderLocalPath: nil, raw: "low_disk:/", kind: .permanent, primaryAction: .freeUpSpace),
             ],
             folders: folders,
+            availability: AvailabilitySummary(availability: .waitingForPeer, reachableDeviceIds: [studioId], offlineDeviceIds: [officeId]),
+            protection: ProtectionSummary(protection: .atRisk, deviceIds: []),
             peers: [
                 PeerSummary(deviceId: studioId, reachability: .connected, unreachableCategory: nil, route: .direct),
                 PeerSummary(deviceId: officeId, reachability: .unreachable, unreachableCategory: .noResponse, route: .unknown),
@@ -257,21 +268,24 @@ public enum Fixtures {
         ], totalSize: 18 * mib + 2_048, offeredAt: now.addingTimeInterval(-600), status: .pending),
     ]
 
-    public static func updateStatus(available: String? = nil) -> UpdateStatus {
+    /// What the daemon's download guidance says for a manually installed build.
+    public static let releasesPage = "https://github.com/juntaki/yadorilink/releases"
+
+    public static func updateStatus(available: String? = nil, packageManaged: Bool = false) -> UpdateStatus {
         UpdateStatus(
             currentVersion: "0.4.2",
             channel: "stable",
-            installSource: "pkg",
+            installSource: packageManaged ? "homebrew" : "standalone",
             lastCheckedAt: now.addingTimeInterval(-3_600),
             state: available == nil ? .upToDate : .available,
             availableVersion: available,
             releaseNotesUrl: nil,
             mandatory: false,
             holdbackReason: nil,
-            waitingForSafePoint: false,
             lastErrorCategory: nil,
             lastErrorMessage: nil,
-            config: UpdateConfig(automaticChecks: true, installMode: .automatic)
+            packageManaged: packageManaged,
+            config: UpdateConfig(automaticChecks: true)
         )
     }
 

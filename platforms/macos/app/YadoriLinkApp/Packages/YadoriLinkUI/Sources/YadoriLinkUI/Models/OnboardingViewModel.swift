@@ -49,7 +49,17 @@ public final class OnboardingViewModel {
     public let signIn: SignInModel
     public private(set) var steps: [Step] = []
     public private(set) var step: Step
-    public private(set) var destinations: [Destination] = [Destination(kind: .newSharedFolder)]
+    /// Where the destination read stands. "New shared folder" is only offered
+    /// once the list of existing shared folders is known: a failed read is not
+    /// an empty list.
+    public private(set) var destinationsPhase: FetchPhase<[Destination]> = .notLoaded
+    public var destinations: [Destination] { destinationsPhase.value ?? [Destination(kind: .newSharedFolder)] }
+    public var destinationsError: Notice? {
+        if case .failed(let notice) = destinationsPhase { return notice }
+        return nil
+    }
+    /// The destination list is not known: not read yet (signed out), still being read, or unreadable.
+    public var destinationsUnavailable: Bool { destinationsPhase.value == nil }
     public var destinationId = "new"
     public var newFolderName = ""
     public private(set) var folderPath: String?
@@ -104,8 +114,18 @@ public final class OnboardingViewModel {
     }
 
     private func loadDestinations() async {
-        let groups = (try? await client.listJoinableGroups()) ?? []
-        destinations = [Destination(kind: .newSharedFolder)] + groups.map { Destination(kind: .existing($0)) }
+        destinationsPhase = .loading
+        do {
+            let groups = try await client.listJoinableGroups()
+            destinationsPhase = .loaded([Destination(kind: .newSharedFolder)] + groups.map { Destination(kind: .existing($0)) })
+        } catch {
+            destinationsPhase = .failed(.failure(error))
+        }
+    }
+
+    /// Re-runs only the destination read.
+    public func retryDestinations() async {
+        await loadDestinations()
     }
 
     // MARK: Navigation
@@ -203,6 +223,7 @@ public final class OnboardingViewModel {
     private var destination: Destination? { destinations.first { $0.id == destinationId } }
 
     public var canLink: Bool {
+        if destinationsUnavailable { return false }
         if useProviderFolder {
             return !isWorking && destination != nil && !providerDisplayName.trimmingCharacters(in: .whitespaces).isEmpty
         }

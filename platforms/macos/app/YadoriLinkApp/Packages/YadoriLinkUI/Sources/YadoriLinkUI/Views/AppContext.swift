@@ -36,11 +36,20 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Hashable, Sendable 
     }
 }
 
+public enum SettingsTab: Hashable, Sendable { case general, updates, bandwidth, account, diagnostics }
+
 /// A folder the share sheet is open for.
 public struct ShareTarget: Identifiable, Hashable, Sendable {
     public var id: String { groupId }
     public var groupId: String
     public var folderName: String
+}
+
+/// A file an item link wants preselected in one folder's detail.
+public struct FileSelectionRequest: Equatable, Sendable {
+    public var folderLocalPath: String
+    public var path: String
+    fileprivate let id = UUID()
 }
 
 /// Everything the scenes share: the app model, the login-item model, the
@@ -50,19 +59,32 @@ public struct ShareTarget: Identifiable, Hashable, Sendable {
 public final class AppContext {
     public let app: AppModel
     public let loginItem: LoginItemModel
+    public let unlink: UnlinkModel
     public var sidebar: SidebarItem? = .home
+    /// The Settings tab to show; set before opening Settings from elsewhere.
+    public var settingsTab: SettingsTab = .general
     public var folderPath: [String] = []
     public var shareTarget: ShareTarget?
     public var showsSignIn = false
     /// An invite link received from the system (a clicked `yadorilink://` link),
     /// waiting for the Join window to pick it up.
     public var pendingInviteLink: String?
+    /// A Finder "View YadoriLink Status" request, waiting for the first status so it can be
+    /// resolved against the linked folders.
+    public private(set) var pendingItemPath: String?
+    /// The file a routed item link wants preselected in a folder's detail; taken once by that folder.
+    public private(set) var fileSelection: FileSelectionRequest?
+    /// Bumped when something outside the window (a notification) wants the main window shown.
+    public private(set) var mainWindowRequests = 0
     @ObservationIgnored public let openURL: (URL) -> Void
 
     public init(app: AppModel, loginItem: LoginItemModel, openURL: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) }) {
         self.app = app
         self.loginItem = loginItem
         self.openURL = openURL
+        self.unlink = UnlinkModel(app: app)
+        // Leave any folder screen that points at what was just unlinked.
+        unlink.onUnlinked = { [weak self] path in self?.folderPath.removeAll { $0 == path } }
     }
 
     /// True when the app runs on the fake client: everything shown is made up.
@@ -71,6 +93,39 @@ public final class AppContext {
     public func showFolder(_ localPath: String) {
         sidebar = .folders
         folderPath = [localPath]
+    }
+
+    /// Takes a link the system delivered.
+    public func receive(_ link: AppLink) {
+        switch link {
+        case .invite(let url): pendingInviteLink = url
+        case .item(let path): pendingItemPath = path
+        }
+    }
+
+    /// Opens the folder an item link leads to, once the linked folders are known. Returns `false`
+    /// while it must keep waiting for the first status; `true` once it is decided, whether it
+    /// opened something or the path belongs to no linked folder (then nothing opens).
+    @discardableResult
+    public func routePendingItem() -> Bool {
+        guard let path = pendingItemPath else { return true }
+        guard let snapshot = app.snapshot else { return false }
+        pendingItemPath = nil
+        guard let destination = ItemLinkRouting.destination(for: path, linkedFolders: snapshot.folders.map(\.localPath), canonicalize: ItemLinkRouting.realPath) else {
+            return true
+        }
+        showFolder(destination.folderLocalPath)
+        fileSelection = destination.selectedPath.map {
+            FileSelectionRequest(folderLocalPath: destination.folderLocalPath, path: $0)
+        }
+        return true
+    }
+
+    /// The file to preselect in `folderLocalPath`'s detail, if a link asked for one there.
+    public func takeFileSelection(for folderLocalPath: String) -> String? {
+        guard let request = fileSelection, request.folderLocalPath == folderLocalPath else { return nil }
+        fileSelection = nil
+        return request.path
     }
 
     /// Runs the banner's single action.
@@ -104,6 +159,18 @@ public final class AppContext {
     /// from an earlier run.
     public func inviteURL(forQRCode inviteId: String) -> String? {
         invitesForQRCode[inviteId]
+    }
+
+    /// Carries out where a notification or its button leads.
+    public func handle(_ route: NotificationRoute) {
+        switch route {
+        case .showFolder(let path): showFolder(path); mainWindowRequests += 1
+        case .openStorage: sidebar = .storage; mainWindowRequests += 1
+        case .openHome: sidebar = .home; mainWindowRequests += 1
+        case .revealInFinder(let path): revealInFinder(path)
+        case .openSettings: NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil); NSApp.activate()
+        case .refresh: app.refresh()
+        }
     }
 
     public func revealInFinder(_ path: String) {

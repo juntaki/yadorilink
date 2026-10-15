@@ -84,7 +84,10 @@ SignTool={#YadoriLinkSignTool}
 SignedUninstaller=yes
 #else
 ; Local/interim builds may remain unsigned, but release builds must pass a
-; SignTool profile via build-installer.ps1. Unsigned artifacts get a
+; SignTool profile via build-installer.ps1. SignTool here signs only the
+; installer and uninstaller; build-installer.ps1 signs every shipped PE file
+; (shipped-binaries.txt) in a staging dir before {#BinDir}/{#ShellExtDir}
+; point at it. Unsigned artifacts get a
 ; yadorilink-setup.exe.sha256 sidecar from that wrapper.
 #endif
 

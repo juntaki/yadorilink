@@ -22,14 +22,16 @@ use tokio::runtime::Runtime;
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
-    ContextAction, ContextActionRequest, LocalState, ShellIpcMessage, StatusQuery,
-    SyncState,
+    ContextAction, ContextActionRequest, ListLinkedRootsRequest, LocalState, ShellIpcMessage,
+    StatusQuery, SyncState,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(200);
 // Context actions (pause/resume/pin/evict) can involve the daemon doing
 // real work (e.g. hydrating a file for pin) before it replies, unlike a
 // pure status read — same 10x allowance `platforms/windows/shell` grants.
+// A small local read, but off Finder's callback path (the extension polls on a background queue).
+const ROOTS_TIMEOUT: Duration = Duration::from_millis(2000);
 const ACTION_TIMEOUT: Duration = Duration::from_millis(2000);
 
 fn runtime() -> &'static Runtime {
@@ -135,12 +137,21 @@ async fn connect() -> std::io::Result<UnixStream> {
 pub struct StatusInfo {
     pub sync_state: SyncState,
     pub local_state: Option<LocalState>,
+    /// The user paused exactly this path from the shell.
+    pub item_paused: bool,
+    /// An item above this path is paused, and this path is not itself.
+    pub paused_by_ancestor: bool,
+    /// The daemon's eviction gate accepts this path's root.
+    pub reclaim_supported: bool,
 }
 
 impl StatusInfo {
     const UNSPECIFIED: StatusInfo = StatusInfo {
         sync_state: SyncState::Unspecified,
         local_state: None,
+        item_paused: false,
+        paused_by_ancestor: false,
+        reclaim_supported: false,
     };
 }
 
@@ -169,6 +180,9 @@ async fn query_status_inner(path: &str) -> StatusInfo {
         Ok(Some(ShellIpcMessage { payload: Some(Payload::StatusResponse(r)) })) => StatusInfo {
             sync_state: SyncState::try_from(r.state).unwrap_or(SyncState::Unspecified),
             local_state: r.local_state,
+            item_paused: r.item_paused,
+            paused_by_ancestor: r.paused_by_ancestor,
+            reclaim_supported: r.reclaim_supported,
         },
         _ => StatusInfo::UNSPECIFIED,
     }
@@ -203,4 +217,81 @@ async fn send_context_action_inner(path: &str, action: ContextAction) -> bool {
         read_message::<ShellIpcMessage>(&mut stream).await,
         Ok(Some(ShellIpcMessage { payload: Some(Payload::ContextActionResponse(r)) })) if r.ok
     )
+}
+
+/// The ordinary linked folders' absolute paths, as the daemon confirmed them. `None` is "could
+/// not find out" (unreachable daemon, timeout, malformed reply, or `snapshot_available: false`)
+/// and is distinct from `Some(vec![])`, a confirmed "no linked folders": the caller keeps its
+/// last confirmed set on `None`.
+pub fn list_linked_roots() -> Option<Vec<String>> {
+    runtime().block_on(async {
+        tokio::time::timeout(ROOTS_TIMEOUT, async {
+            let mut stream = connect().await.ok()?;
+            list_linked_roots_over(&mut stream).await
+        })
+        .await
+        .ok()?
+    })
+}
+
+async fn list_linked_roots_over<S>(stream: &mut S) -> Option<Vec<String>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let msg = ShellIpcMessage {
+        payload: Some(Payload::ListLinkedRootsRequest(ListLinkedRootsRequest {})),
+    };
+    write_message(stream, &msg).await.ok()?;
+    match read_message::<ShellIpcMessage>(stream).await {
+        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListLinkedRootsResponse(r)) }))
+            if r.snapshot_available =>
+        {
+            Some(r.local_paths)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod linked_roots_tests {
+    use super::*;
+    use yadorilink_ipc_proto::shellipc::ListLinkedRootsResponse;
+
+    async fn ask(reply: Option<ListLinkedRootsResponse>) -> Option<Vec<String>> {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let daemon = tokio::spawn(async move {
+            let request = read_message::<ShellIpcMessage>(&mut server).await.unwrap().unwrap();
+            assert!(matches!(request.payload, Some(Payload::ListLinkedRootsRequest(_))));
+            if let Some(reply) = reply {
+                let msg =
+                    ShellIpcMessage { payload: Some(Payload::ListLinkedRootsResponse(reply)) };
+                write_message(&mut server, &msg).await.unwrap();
+            }
+        });
+        let result = list_linked_roots_over(&mut client).await;
+        daemon.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_snapshot_is_returned() {
+        let roots = vec!["/Users/x/Work".to_string(), "/Volumes/D/P".to_string()];
+        let reply =
+            ListLinkedRootsResponse { local_paths: roots.clone(), snapshot_available: true };
+        assert_eq!(ask(Some(reply)).await, Some(roots));
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_empty_snapshot_is_some_empty() {
+        let reply = ListLinkedRootsResponse { local_paths: vec![], snapshot_available: true };
+        assert_eq!(ask(Some(reply)).await, Some(vec![]));
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_or_missing_reply_is_none() {
+        let unconfirmed =
+            ListLinkedRootsResponse { local_paths: vec![], snapshot_available: false };
+        assert_eq!(ask(Some(unconfirmed)).await, None);
+        assert_eq!(ask(None).await, None);
+    }
 }

@@ -28,7 +28,7 @@ pub fn is_foreign_device_dir(root: &Path, dir: &Path) -> bool {
             return r.dev() != d.dev();
         }
     }
-    let _ = root;
+    let _ = (root, dir);
     false
 }
 

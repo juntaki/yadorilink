@@ -24,7 +24,13 @@ struct YadoriLinkApp: App {
         // completed; setup's checkbox only turns it off again.
         loginItem.applyDefaultOnce()
         let context = AppContext(app: app, loginItem: loginItem)
-        InviteLinkDelegate.deliver = { context.pendingInviteLink = $0 }
+        InviteLinkDelegate.deliver = { context.receive($0) }
+        if !context.isFixture {
+            let notifier = SystemNotifier(planner: CriticalNotificationPlanner(store: DefaultsNotifiedStore())) { [weak context] route in
+                context?.handle(route)
+            }
+            app.onSnapshot = { notifier.post(for: $0) }
+        }
         _context = State(initialValue: context)
     }
 
@@ -88,19 +94,19 @@ struct YadoriLinkApp: App {
     }
 }
 
-/// Receives `yadorilink://invite/<code>` links the system hands to the app
-/// (a link clicked anywhere, or opened with `open`). A link that arrives
-/// before the app has finished starting is held until it has.
+/// Receives `yadorilink://` links the system hands to the app (an invite clicked anywhere, the
+/// Finder extension's item link, or `open`), whether the app was launched by the link or was
+/// already running. A link that arrives before the app has finished starting is held until it has.
 final class InviteLinkDelegate: NSObject, NSApplicationDelegate {
-    @MainActor static var deliver: ((String) -> Void)? {
+    @MainActor static var deliver: ((AppLink) -> Void)? {
         didSet { if let held = heldLink, let deliver { heldLink = nil; deliver(held) } }
     }
-    @MainActor private static var heldLink: String?
+    @MainActor private static var heldLink: AppLink?
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        guard let url = urls.first(where: { $0.scheme?.lowercased() == "yadorilink" }) else { return }
+        guard let link = urls.lazy.compactMap({ AppLink(url: $0) }).first else { return }
         MainActor.assumeIsolated {
-            if let deliver = Self.deliver { deliver(url.absoluteString) } else { Self.heldLink = url.absoluteString }
+            if let deliver = Self.deliver { deliver(link) } else { Self.heldLink = link }
         }
     }
 }
@@ -124,6 +130,19 @@ struct MenuBarLabel: View {
         }
             .accessibilityLabel("YadoriLink\(context.isFixture ? " (Fixture)" : ""): \(app.headline)")
             .task { openLaunchWindows() }
+            .onChange(of: context.pendingItemPath) { _, path in
+                // A Finder "View YadoriLink Status": open the main window, then route as soon as
+                // the linked folders are known.
+                guard path != nil else { return }
+                openWindow(id: WindowID.main)
+                NSApp.activate()
+                context.routePendingItem()
+            }
+            .onChange(of: context.app.snapshot != nil) { _, _ in context.routePendingItem() }
+            .onChange(of: context.mainWindowRequests) { _, _ in
+                openWindow(id: WindowID.main)
+                NSApp.activate()
+            }
             .onChange(of: context.pendingInviteLink) { _, link in
                 // A clicked yadorilink://invite/ link: the Join window picks it up.
                 guard link != nil else { return }
@@ -154,6 +173,13 @@ struct MenuBarLabel: View {
         if plan.showsSettings {
             openSettings()
             NSApp.activate()
+        }
+        // A Finder item link that launched the app arrived before this label existed, so
+        // `onChange` never saw it.
+        if context.pendingItemPath != nil {
+            openWindow(id: WindowID.main)
+            NSApp.activate()
+            context.routePendingItem()
         }
     }
 

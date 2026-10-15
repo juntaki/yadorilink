@@ -34,6 +34,7 @@ use crate::maintenance::degraded_link_recheck::DegradedLinkRecheckJob;
 use crate::maintenance::disk_reconcile_backstop::DiskReconcileBackstopJob;
 use crate::maintenance::durability_confirmation::DurabilityConfirmationJob;
 use crate::maintenance::gc_idle::GcIdleJob;
+use crate::maintenance::pause_expiry::PauseExpiryJob;
 use crate::maintenance::recovery::RecoveryJob;
 use crate::maintenance::retention_expiry::RetentionExpiryJob;
 #[cfg(not(test))]
@@ -193,6 +194,17 @@ pub(crate) fn start(state: &Arc<DaemonState>) -> Arc<RecoveryJob> {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 degraded_link_recheck_job.run_once();
+            }
+        });
+    }
+    // Ends timed pauses whose deadline has passed. The first pass runs at once,
+    // so a pause that ended while the daemon was down ends at startup.
+    {
+        let pause_expiry_job = PauseExpiryJob::new(controller.clone());
+        supervise::spawn_logged("daemon-state-pause-expiry", async move {
+            loop {
+                pause_expiry_job.run_once().await;
+                tokio::time::sleep(crate::maintenance::pause_expiry::TICK).await;
             }
         });
     }

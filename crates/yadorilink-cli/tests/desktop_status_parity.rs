@@ -230,7 +230,7 @@ async fn paused_link_still_reports_healthy_over_the_real_socket() {
     }))
     .await
     .expect("linking a fresh folder should succeed");
-    yadorilink_cli::commands::daemon::pause().await.expect("pause should succeed");
+    yadorilink_cli::commands::daemon::pause(None).await.expect("pause should succeed");
 
     let status = fetch_status().await;
     assert_eq!(status.links.len(), 1);

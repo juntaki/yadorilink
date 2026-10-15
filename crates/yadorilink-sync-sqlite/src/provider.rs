@@ -949,6 +949,31 @@ impl ProviderRepository {
         })
     }
 
+    /// Whether the version last handed over for the item has exactly the content of its current
+    /// version (the metadata may differ). False when nothing was handed over or either version is
+    /// unreadable.
+    pub fn handoff_has_current_content(
+        &self,
+        root_id: &str,
+        item_id: &ItemId,
+    ) -> Result<bool, SyncSqliteError> {
+        self.read_settled(|conn| {
+            let row: Option<(Vec<u8>, String, String)> = conn
+                .query_row(
+                    "SELECT h.version_hash, i.group_id, i.path FROM provider_handoffs h \
+                     JOIN provider_items i ON i.root_id = h.root_id AND i.item_id = h.item_id \
+                     WHERE h.root_id = ?1 AND h.item_id = ?2 AND i.live = 1",
+                    rusqlite::params![root_id, &item_id[..]],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((handed, group_id, path)) = row else { return Ok(false) };
+            let handed = crate::dag_store::get_file_version(conn, &group_id, &hash_from(&handed)?)?;
+            let current = current_version(conn, &group_id, &path)?;
+            Ok(matches!((handed, current), (Some(handed), Some(current)) if same_content(&handed, &current)))
+        })
+    }
+
     /// The latest evidence sequence of the root (replayable state: the host reads it on connect).
     pub fn latest_evidence_seq(&self, root_id: &str) -> Result<Option<u64>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
@@ -1300,24 +1325,33 @@ impl ProviderRepository {
     pub fn eager_page(
         &self,
         root_id: &str,
+        kept_only: bool,
         after: Option<(u64, &str)>,
         limit: usize,
     ) -> Result<Vec<FileCandidate>, SyncSqliteError> {
+        // `kept_only`: only the files at or beneath a path the user keeps on this device (a pin;
+        // the empty path is the whole root).
+        let filter = if kept_only {
+            " AND EXISTS (SELECT 1 FROM pinned_items p WHERE p.group_id = r.group_id AND \
+             (p.path = '' OR p.path = f.path OR substr(f.path, 1, length(p.path) + 1) = p.path || '/'))"
+        } else {
+            ""
+        };
         self.read_settled(|conn| {
             let (after_size, after_path) = match after {
                 Some((size, path)) => (size as i64, path.to_string()),
                 None => (-1, String::new()),
             };
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT f.path, f.size, i.item_id \
                  FROM provider_roots r \
                  JOIN files f ON f.group_id = r.group_id AND f.state = 'current' \
                       AND f.deleted = 0 AND f.record_kind = 'file' AND f.version_seq > 0 \
                  LEFT JOIN provider_items i ON i.root_id = r.root_id AND i.path = f.path \
                       AND i.live = 1 \
-                 WHERE r.root_id = ?1 AND (f.size > ?2 OR (f.size = ?2 AND f.path > ?3)) \
-                 ORDER BY f.size, f.path LIMIT ?4",
-            )?;
+                 WHERE r.root_id = ?1 AND (f.size > ?2 OR (f.size = ?2 AND f.path > ?3)){filter} \
+                 ORDER BY f.size, f.path LIMIT ?4"
+            ))?;
             let rows = stmt.query_map(
                 rusqlite::params![root_id, after_size, after_path, limit as i64],
                 |r| {

@@ -2054,7 +2054,33 @@ pub type DiskRaceFingerprint = (u64, Option<SystemTime>, i64, i64);
 /// as "something touched this path, decline and re-resolve" rather than
 /// filtered out.
 pub fn disk_race_fingerprint(path: &Path) -> Option<DiskRaceFingerprint> {
-    Some(disk_race_fingerprint_of(&std::fs::symlink_metadata(path).ok()?))
+    Some(disk_race_fingerprint_of_at(&std::fs::symlink_metadata(path).ok()?, path))
+}
+
+/// [`disk_race_fingerprint_of`] for a caller that holds the `lstat` AND the
+/// path it came from. Identical on Unix. On Windows the std `Metadata` carries
+/// no change time, so the path is asked for NTFS `ChangeTime` (the `ctime`
+/// counterpart: every write moves it and no API sets it back), which closes a
+/// same-length rewrite that restores the mtime. When the change time cannot
+/// be read the fingerprint carries a value that equals no other sample, so a
+/// comparison involving it never reports "unchanged" (fail-closed: the cost is
+/// a re-capture, never a missed edit).
+pub fn disk_race_fingerprint_of_at(meta: &Metadata, path: &Path) -> DiskRaceFingerprint {
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        disk_race_fingerprint_of(meta)
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static UNOBSERVABLE: AtomicI64 = AtomicI64::new(0);
+        let (len, mtime, _, _) = disk_race_fingerprint_of(meta);
+        match win_identity::query_path(path).ok().and_then(|fields| fields.change_time) {
+            Some(change_time) => (len, mtime, change_time, 0),
+            None => (len, mtime, i64::MIN, UNOBSERVABLE.fetch_add(1, Ordering::Relaxed)),
+        }
+    }
 }
 
 /// What [`disk_race_fingerprint`] would report for an `lstat` the caller

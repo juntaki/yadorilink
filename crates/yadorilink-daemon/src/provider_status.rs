@@ -10,14 +10,14 @@ use yadorilink_ipc_proto::daemonctl::{
 };
 use yadorilink_ipc_proto::shellipc::DriverState;
 use yadorilink_replica_domain::session_state::{NotReady, Readiness};
-use yadorilink_sync_sqlite::provider::ProviderRoot;
+use yadorilink_sync_sqlite::provider::{ProviderRepository, ProviderRoot};
 
 use crate::provider_eager::{EagerDriver, EagerInputs, EagerStatus};
 use crate::replica_coordinator::ReplicaCoordinator;
 
 type Builder = Arc<dyn Fn() -> Vec<ProviderRootStatus> + Send + Sync>;
 type ExtrasBuilder = Arc<dyn Fn() -> (Vec<ProviderRemovalStatus>, Vec<String>) + Send + Sync>;
-type PendingBuilder = Arc<dyn Fn(u32) -> Vec<PendingPublication> + Send + Sync>;
+type PendingBuilder = Arc<dyn Fn(u32) -> Result<Vec<PendingPublication>, String> + Send + Sync>;
 
 /// Where the control socket gets the provider lines; empty until the shell side installs a builder.
 #[derive(Default)]
@@ -47,9 +47,9 @@ impl ProviderStatusSource {
     }
 
     /// Up to `limit` waiting publications per root, oldest first.
-    pub(crate) fn pending_items(&self, limit: u32) -> Vec<PendingPublication> {
+    pub(crate) fn pending_items(&self, limit: u32) -> Result<Vec<PendingPublication>, String> {
         let builder = self.pending.read().unwrap_or_else(|p| p.into_inner()).clone();
-        builder.map_or_else(Vec::new, |build| build(limit))
+        builder.map_or_else(|| Ok(Vec::new()), |build| build(limit))
     }
 
     pub(crate) fn snapshot(&self) -> Vec<ProviderRootStatus> {
@@ -96,6 +96,72 @@ fn encode_eager(status: &EagerStatus, line: &mut ProviderRootStatus) {
         .collect();
 }
 
+/// The line for a read that failed. The status must not look emptier or healthier precisely when
+/// the provider state cannot be read, so it is never a zero line: the readiness is not "ready",
+/// which also makes the rollup ask for attention.
+fn unreadable_line(
+    root_id: &str,
+    display_name: &str,
+    what: &str,
+    error: &dyn std::fmt::Display,
+) -> ProviderRootStatus {
+    ProviderRootStatus {
+        root_id: root_id.chars().take(8).collect(),
+        display_name: display_name.to_owned(),
+        readiness: format!("{what} unreadable: {error}"),
+        ..Default::default()
+    }
+}
+
+/// One line per declared provider root, with the root's full id (the line carries only a prefix).
+/// Only the repository half of the line; the Eager progress is added by the caller.
+fn repository_lines(repo: &ProviderRepository, now_ms: i64) -> Vec<(String, ProviderRootStatus)> {
+    let roots = match repo.list_declared_roots() {
+        Ok(roots) => roots,
+        Err(error) => {
+            return vec![(
+                String::new(),
+                unreadable_line("", "provider roots", "the provider roots", &error),
+            )];
+        }
+    };
+    roots
+        .iter()
+        .map(|root| {
+            let counters = repo.kept_edits(&root.root_id).map_err(|e| format!("{e:?}")).and_then(
+                |kept| {
+                    let (pending, _) = repo
+                        .pending_publications(&root.root_id, now_ms, 0)
+                        .map_err(|e| e.to_string())?;
+                    let unconfirmed = repo
+                        .unresolved_publications(&root.root_id, now_ms)
+                        .map_err(|e| e.to_string())?;
+                    Ok((kept, pending, unconfirmed))
+                },
+            );
+            let line = match counters {
+                Ok(((kept, first), pending, unconfirmed)) => ProviderRootStatus {
+                    pending_publications: pending.count,
+                    pending_oldest_ms: pending.oldest_age_ms,
+                    unconfirmed_publications: unconfirmed.count,
+                    unconfirmed_oldest_ms: unconfirmed.oldest_age_ms,
+                    root_id: root.root_id.chars().take(8).collect(),
+                    display_name: root.display_name.clone(),
+                    readiness: readiness_text(root),
+                    kept_edits: kept,
+                    kept_edits_oldest_ms: first.map_or(0, |at| (now_ms - at).max(0) as u64),
+                    ..Default::default()
+                },
+                Err(error) => {
+                    tracing::warn!(root = %root.root_id, %error, "could not read the provider root's state for status");
+                    unreadable_line(&root.root_id, &root.display_name, "the provider state", &error)
+                }
+            };
+            (root.root_id.clone(), line)
+        })
+        .collect()
+}
+
 /// One line per declared provider root.
 pub(crate) fn provider_root_lines(
     coordinator: &ReplicaCoordinator,
@@ -103,59 +169,42 @@ pub(crate) fn provider_root_lines(
     inputs: &EagerInputs<'_>,
     now_ms: i64,
 ) -> Vec<ProviderRootStatus> {
-    let repo = coordinator.provider_repository();
-    let Ok(roots) = repo.list_declared_roots() else { return Vec::new() };
-    roots
-        .iter()
-        .map(|root| {
-            let (kept, first) = repo.kept_edits(&root.root_id).unwrap_or((0, None));
-            let (pending, _) =
-                repo.pending_publications(&root.root_id, now_ms, 0).unwrap_or_default();
-            let unconfirmed =
-                repo.unresolved_publications(&root.root_id, now_ms).unwrap_or_default();
-            let mut line = ProviderRootStatus {
-                pending_publications: pending.count,
-                pending_oldest_ms: pending.oldest_age_ms,
-                unconfirmed_publications: unconfirmed.count,
-                unconfirmed_oldest_ms: unconfirmed.oldest_age_ms,
-                root_id: root.root_id.chars().take(8).collect(),
-                display_name: root.display_name.clone(),
-                readiness: readiness_text(root),
-                kept_edits: kept,
-                kept_edits_oldest_ms: first.map_or(0, |at| (now_ms - at).max(0) as u64),
-                ..Default::default()
-            };
-            if let Some(status) = eager.status(inputs, &root.root_id) {
+    repository_lines(coordinator.provider_repository(), now_ms)
+        .into_iter()
+        .map(|(root_id, mut line)| {
+            if let Some(status) = eager.status(inputs, &root_id) {
                 encode_eager(&status, &mut line);
+                if status.unreadable {
+                    // Partial counters are not progress: the line is not "ready".
+                    line.readiness = "the Eager progress unreadable: see the daemon log".into();
+                }
             }
             line
         })
         .collect()
 }
 
-/// Up to `limit` publications waiting on the OS per declared root, oldest first.
+/// Up to `limit` publications waiting on the OS per declared root, oldest first. A read that fails
+/// is an error, never an empty list: an empty list says nothing is waiting.
 pub(crate) fn pending_items(
     coordinator: &ReplicaCoordinator,
     limit: u32,
     now_ms: i64,
-) -> Vec<PendingPublication> {
+) -> Result<Vec<PendingPublication>, String> {
     let repo = coordinator.provider_repository();
-    let Ok(roots) = repo.list_declared_roots() else { return Vec::new() };
-    roots
-        .iter()
-        .flat_map(|root| {
-            let items = repo
-                .pending_publications(&root.root_id, now_ms, limit)
-                .map(|(_, items)| items)
-                .unwrap_or_default();
-            let id: String = root.root_id.chars().take(8).collect();
-            items.into_iter().map(move |(path, age_ms)| PendingPublication {
-                root_id: id.clone(),
-                path,
-                age_ms,
-            })
-        })
-        .collect()
+    let mut all = Vec::new();
+    for root in repo.list_declared_roots().map_err(|e| e.to_string())? {
+        let (_, items) = repo
+            .pending_publications(&root.root_id, now_ms, limit)
+            .map_err(|e| format!("the pending publications of {}: {e}", root.root_id))?;
+        let id: String = root.root_id.chars().take(8).collect();
+        all.extend(items.into_iter().map(|(path, age_ms)| PendingPublication {
+            root_id: id.clone(),
+            path,
+            age_ms,
+        }));
+    }
+    Ok(all)
 }
 
 #[cfg(test)]

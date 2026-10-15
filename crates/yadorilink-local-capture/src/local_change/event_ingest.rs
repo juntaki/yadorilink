@@ -15,7 +15,7 @@ use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, Effe
 use yadorilink_sync_sqlite::file_index::ImportedActualState;
 
 use super::disk_observation::{
-    closed_disk_observation_if_unraced, error_means_absent, exact_leaf_exists_as_directory,
+    closed_disk_observation_if_unraced, error_means_absent, try_exact_leaf_exists_as_directory,
     try_exact_leaf_exists_as_file_or_symlink,
 };
 use super::flush::PendingBatchedCommit;
@@ -313,6 +313,14 @@ impl LocalChangeProcessor {
         // own lstat-first convention elsewhere (see
         // `build_record_for_created_or_modified`'s identical check just
         // below, and `is_real_directory` in `watcher.rs`).
+        // The disk as it stood BEFORE this event's own observation of the
+        // path (and, below, before its content is read). A batched mutation
+        // is revalidated against exactly this at commit, so a change landing
+        // anywhere between the observation and the commit is seen. Taken
+        // once the mutation was fully built it would describe the changed
+        // file as "what was prepared against", and the stale mutation would
+        // revalidate against itself.
+        let fingerprint_before_observation = disk_race_fingerprint(&event.path);
         let effective_kind = match event.path.symlink_metadata() {
             // Nothing answers to this name at all: a genuine removal.
             Err(error) if error_means_absent(&error) => FsChangeKind::ObservedRemoval,
@@ -334,15 +342,22 @@ impl LocalChangeProcessor {
             // A directory, captured as an entry of its own below -- under
             // its exact name only, for the same case-fold reason as a file.
             Ok(meta) if meta.is_dir() => {
-                if exact_leaf_exists_as_directory(&root, &rel_path) {
-                    return Ok(EventOutcome::Ready(self.capture_directory(
-                        group_id,
-                        &root,
-                        &rel_path,
-                        &event.path,
-                    )?));
+                // Where the exact leaf is not a directory the lookup answered to a
+                // sibling spelling: this leaf is observed absent, as for a file (a case-only
+                // directory rename is exactly that), and `removal_is_a_delete` and the
+                // capture authority decide below whether it is a delete.
+                match try_exact_leaf_exists_as_directory(&root, &rel_path) {
+                    Ok(true) => {
+                        return Ok(EventOutcome::Ready(self.capture_directory(
+                            group_id,
+                            &root,
+                            &rel_path,
+                            &event.path,
+                        )?));
+                    }
+                    Ok(false) => FsChangeKind::ObservedRemoval,
+                    Err(_) => return Ok(EventOutcome::Ready(LocalChangeOutcome::RetryLater)),
                 }
-                return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
             }
             Ok(_) => {
                 // Something answers to this name, but on a case- or
@@ -495,7 +510,7 @@ impl LocalChangeProcessor {
                                 rel_path: rel_path.clone(),
                                 event_path: event.path.clone(),
                                 observed_at_unix_nanos: observed,
-                                disk_fingerprint_at_prepare: disk_race_fingerprint(&event.path),
+                                disk_fingerprint_at_prepare: fingerprint_before_observation,
                                 mutation:
                                     yadorilink_replica_domain::session_state::PreparedLocalMutation::Delete {
                                         record,
@@ -629,6 +644,8 @@ impl LocalChangeProcessor {
                         // exactly as before.
                         None,
                     )?;
+                #[cfg(any(test, feature = "test-support"))]
+                super::record_builder::fire_post_capture_race_hook(&event.path);
                 if outcome == LocalChangeOutcome::RetryLater {
                     // Nothing was captured, but the path holds a local edit:
                     // keep it journaled dirty, on every route. The debounced
@@ -720,7 +737,7 @@ impl LocalChangeProcessor {
                                         event_path: event.path.clone(),
                                         observed_at_unix_nanos: observed_at_unix_nanos
                                             .unwrap_or_else(now_unix_nanos),
-                                        disk_fingerprint_at_prepare: disk_race_fingerprint(&event.path),
+                                        disk_fingerprint_at_prepare: fingerprint_before_content_read,
                                         mutation:
                                             yadorilink_replica_domain::session_state::PreparedLocalMutation::Upsert {
                                                 record: record.clone(),

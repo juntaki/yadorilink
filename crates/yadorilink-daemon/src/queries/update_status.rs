@@ -19,11 +19,9 @@ pub(crate) struct UpdateStatusView {
     pub(crate) release_notes_url: String,
     pub(crate) mandatory: bool,
     pub(crate) holdback_reason: String,
-    pub(crate) waiting_for_safe_point: bool,
     pub(crate) last_error_category: String,
     pub(crate) last_error_message: String,
     pub(crate) automatic_checks_enabled: bool,
-    pub(crate) automatic_install_mode: String,
 }
 
 pub(crate) struct UpdateStatusQueryService {
@@ -47,11 +45,9 @@ impl UpdateStatusQueryService {
             release_notes_url: policy.available_release_notes_url.clone().unwrap_or_default(),
             mandatory: policy.mandatory,
             holdback_reason: policy.holdback_reason.clone().unwrap_or_default(),
-            waiting_for_safe_point: false,
             last_error_category: policy.last_error_category.clone().unwrap_or_default(),
             last_error_message: policy.last_error_message.clone().unwrap_or_default(),
             automatic_checks_enabled: policy.automatic_checks_enabled,
-            automatic_install_mode: policy.automatic_install_mode.as_str().to_string(),
         }
     }
 }

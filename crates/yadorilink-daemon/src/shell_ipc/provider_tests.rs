@@ -927,3 +927,125 @@ fn warn_lines_of_the_provider_paths_do_not_carry_messages_or_paths() {
         }
     }
 }
+
+/// The OS dropping its copy without being asked (the user removed the download) reaches the
+/// reclaim: the item's blocks are freed once the host reports it left the materialized set, and
+/// not before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_download_the_user_removed_frees_the_daemons_blocks() {
+    use crate::provider_reclaim::tests::{data_of, eventually, Fx};
+    use crate::provider_reclaim::ReclaimQueue;
+
+    let fx = Fx::new();
+    let blocks = fx.commit("a.bin", 1, &[&data_of(1, 4096)]);
+    let item = fx.held_item("a.bin");
+    let queue = Arc::new(ReclaimQueue::new(fx.state.clone(), fx.reclaim()));
+    let context = ShellContext::from_state(fx.state.clone()).with_reclaim_queue(queue);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ShellIpcMessage>();
+    assert!(context.provider_host.try_attach(tx.clone()));
+    let root_id = hex::decode(&fx.root).unwrap();
+
+    // The OS holds the item: nothing is reclaimed.
+    let listed_at = fx
+        .state
+        .replica_coordinator
+        .provider_repository()
+        .latest_evidence_seq(&fx.root)
+        .unwrap()
+        .unwrap();
+    provider_channel_message(
+        &context,
+        &tx,
+        &report_message(&root_id, 5, 1, true, listed_at, &[item]),
+    )
+    .await;
+    let Payload::ProviderReportAck(ack) = next_payload(&mut rx).await else { panic!("no ack") };
+    assert!(!ack.needs_full);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(fx.cached(&blocks[0]));
+    assert_eq!(fx.custody.acquires.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // The next report takes it out of the materialized set.
+    let mut gone = report_message(&root_id, 5, 2, false, listed_at, &[]);
+    if let Some(Payload::ProviderMaterializedReport(report)) = gone.payload.as_mut() {
+        report.removed = vec![item.to_vec()];
+    }
+    provider_channel_message(&context, &tx, &gone).await;
+    eventually("the blocks of the dropped item are freed", || !fx.cached(&blocks[0])).await;
+}
+
+fn domain_state_with(
+    root: &str,
+    evidence: DomainEvidence,
+    last_acked_namespace_revision: u64,
+) -> ShellIpcMessage {
+    ShellIpcMessage {
+        payload: Some(Payload::ProviderDomainState(ProviderDomainState {
+            root_id: hex::decode(root).unwrap(),
+            evidence: evidence as i32,
+            preserved_location: String::new(),
+            last_acked_namespace_revision,
+        })),
+    }
+}
+
+/// A root lookup that fails is not an unknown root: an orphan report is not recorded on it, and
+/// the host is not attached on a guess either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_root_lookup_is_not_an_unknown_root() {
+    use crate::provider_read_fault::Fault;
+    let (state, root) = state_with_root();
+    let context = ShellContext::from_state(state.clone());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ShellIpcMessage>();
+    assert!(context.provider_host.try_attach(tx.clone()));
+
+    let fault = Fault::inject(&state.replica_coordinator, "provider_roots", "group_id");
+    let consumed = provider_channel_message(
+        &context,
+        &tx,
+        &domain_state_with(&root, DomainEvidence::Orphan, 0),
+    )
+    .await;
+    assert!(consumed);
+    assert!(
+        context.provider_host.orphans().is_empty(),
+        "a failed lookup recorded an orphan domain"
+    );
+    fault.restore();
+}
+
+/// The rollback check cannot be skipped by a failed revision read: the host is not attached and
+/// the message is not accepted until the revision can be compared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_revision_does_not_skip_the_rollback_check() {
+    use crate::provider_read_fault::Fault;
+    let (state, root) = state_with_root();
+    let context = ShellContext::from_state(state.clone());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ShellIpcMessage>();
+
+    let fault = Fault::inject(&state.replica_coordinator, "provider_roots", "namespace_revision");
+    let consumed = provider_channel_message(
+        &context,
+        &tx,
+        &domain_state_with(&root, DomainEvidence::Registered, 7),
+    )
+    .await;
+    assert!(consumed, "the message must not fall through to be recorded as evidence");
+    assert!(!context.provider_host.is_attached(&tx), "the host was attached unchecked");
+    fault.restore();
+    assert_eq!(readiness_root(&state), root, "the root was replaced on a failed read");
+}
+
+/// A removal list that cannot be read makes the whole folder snapshot unavailable; an empty
+/// removal list says no removal is requested.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_removal_list_makes_the_snapshot_unavailable() {
+    use crate::provider_read_fault::Fault;
+    let (state, _root) = state_with_root();
+    let fault = Fault::inject(&state.replica_coordinator, "provider_removals", "state");
+    let response = folders(&state).await;
+    assert!(!response.snapshot_available, "an unreadable removal list was listed as none");
+    assert!(response.folders.is_empty() && response.removals.is_empty());
+    fault.restore();
+    assert!(folders(&state).await.snapshot_available);
+}

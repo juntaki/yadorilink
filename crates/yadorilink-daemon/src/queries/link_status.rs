@@ -109,6 +109,8 @@ pub(crate) struct LinkStatusView {
     pub(crate) provider: Option<(String, String)>,
     pub(crate) group_id: String,
     pub(crate) paused: bool,
+    /// Unix time a timed pause ends; 0 when not paused or paused until resumed.
+    pub(crate) paused_until_unix: i64,
     pub(crate) conflict_count: u64,
     /// Paths contested in the replicated state, not yet resolved by their fork.
     pub(crate) conflicts_pending: u64,
@@ -120,8 +122,13 @@ pub(crate) struct LinkStatusView {
     pub(crate) hydrated_count: u64,
     pub(crate) placeholder_count: u64,
     pub(crate) hydrating_count: u64,
+    /// Content fetches requested and not finished (see `LinkStatus.requested_content_count`).
+    pub(crate) requested_content_count: u64,
     pub(crate) held_files: Vec<HeldFileView>,
     pub(crate) skipped_symlink_count: u64,
+    /// Directories a removal moved aside and could not put back; each still
+    /// stands, with its contents, under a reserved name beside its old place.
+    pub(crate) stranded_directory_count: u64,
     pub(crate) degraded: Option<DegradedLinkView>,
     pub(crate) transfer: Option<LinkTransferView>,
     pub(crate) durability_status: GroupDurabilityStatus,

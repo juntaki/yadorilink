@@ -444,6 +444,79 @@ async fn an_on_demand_root_is_not_driven_and_a_provider_root_never_reads_as_eage
     assert_eq!(Fx::state_of(&response), DriverState::Unspecified);
 }
 
+/// An On-Demand root downloads exactly what the user keeps on this device (a pin, on a file or
+/// on a folder above it) and nothing else; what the OS drops later (Finder's Remove Download) is
+/// offered again while the pin stands; once the pin is gone the root is not driven.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_on_demand_root_downloads_only_what_is_kept_on_this_device() {
+    let fx = Fx::new();
+    fx.state
+        .replica_coordinator
+        .link_repository()
+        .set_materialization_policy("/provider/p", MaterializationPolicy::OnDemand)
+        .unwrap();
+    let loose = fx.item("loose.bin", 5);
+    let kept_file = fx.item("kept.bin", 30);
+    let in_folder = fx.item("docs/a.bin", 20);
+    let in_folder2 = fx.item("docs/sub/b.bin", 10);
+    let sibling = fx.item("docs2/c.bin", 1);
+    let pins = fx.state.replica_coordinator.pinned_item_repository();
+
+    // Nothing kept: nothing is driven.
+    let response = fx.query(&[], 2);
+    assert!(response.downloads.is_empty());
+    assert_eq!(Fx::state_of(&response), DriverState::Unspecified);
+
+    pins.pin(GROUP, "docs").unwrap();
+    pins.pin(GROUP, "kept.bin").unwrap();
+    let response = fx.query(&[], 2);
+    assert_eq!(Fx::state_of(&response), DriverState::Running);
+    // Smallest first among the kept files only; a folder pin covers descendants by prefix, not
+    // a sibling that merely shares the name's start.
+    assert_eq!(Fx::offered(&response), vec![in_folder2.to_vec(), in_folder.to_vec()]);
+    let rest = fx.query(&[in_folder2, in_folder], 2);
+    assert_eq!(Fx::offered(&rest), vec![kept_file.to_vec()]);
+
+    fx.make_present(&[in_folder2, in_folder, kept_file]);
+    let done = fx.query(&[], 2);
+    assert!(done.downloads.is_empty());
+    assert_eq!(Fx::state_of(&done), DriverState::Done);
+
+    // The OS drops a kept file (Remove Download): the next query offers it again.
+    fx.make_present(&[in_folder2, kept_file]);
+    let again = fx.query(&[], 2);
+    assert_eq!(Fx::offered(&again), vec![in_folder.to_vec()]);
+
+    // Not kept any more: an item the host still counts as outstanding settles (it frees its slot
+    // for whatever is kept next), the root is not driven, and nothing is evicted by this.
+    pins.unpin(GROUP, "docs").unwrap();
+    let still_kept = fx.query(&[in_folder], 2);
+    assert_eq!(still_kept.settled_item_ids, vec![in_folder.to_vec()]);
+    assert!(still_kept.downloads.is_empty());
+    pins.unpin(GROUP, "kept.bin").unwrap();
+    let nothing_kept = fx.query(&[kept_file], 2);
+    assert_eq!(nothing_kept.settled_item_ids, vec![kept_file.to_vec()]);
+    assert!(nothing_kept.downloads.is_empty());
+    assert!(!Fx::offered(&fx.query(&[], 2)).contains(&loose.to_vec()));
+    assert!(!Fx::offered(&fx.query(&[], 2)).contains(&sibling.to_vec()));
+}
+
+/// A pin on a folder whose name is not ASCII still covers exactly its descendants.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pin_on_a_non_ascii_folder_covers_its_descendants_only() {
+    let fx = Fx::new();
+    fx.state
+        .replica_coordinator
+        .link_repository()
+        .set_materialization_policy("/provider/p", MaterializationPolicy::OnDemand)
+        .unwrap();
+    let inside = fx.item("資料/日本.bin", 3);
+    let _sibling = fx.item("資料集/日本.bin", 1);
+    let _other = fx.item("資.bin", 2);
+    fx.state.replica_coordinator.pinned_item_repository().pin(GROUP, "資料").unwrap();
+    assert_eq!(Fx::offered(&fx.query(&[], 2)), vec![inside.to_vec()]);
+}
+
 /// The limiter: at most `ASSEMBLIES` at once, at most `EAGER_ASSEMBLIES` of them Eager, and an
 /// Open always finds a slot while Eager work saturates its class.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -714,4 +787,54 @@ async fn a_folder_that_never_finishes_is_given_up_after_a_bound() {
         offered.iter().any(|f| *f != offered[0]),
         "the queue never moved past the failing folder"
     );
+}
+
+/// A read that fails is never "nothing left to download": the status is not Done, the query does
+/// not conclude Done, and an exclusion is not settled because its lookup could not be answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_candidate_list_is_not_done() {
+    let fx = Fx::new();
+    let a = fx.item("a.bin", 10);
+    let b = fx.item("b.bin", 20);
+    fx.make_present(&[a, b]);
+    assert_eq!(fx.driver.status(&fx.inputs(), &fx.root).unwrap().state, DriverState::Done);
+
+    let fault = crate::provider_read_fault::Fault::inject(
+        &fx.state.replica_coordinator,
+        "provider_items",
+        "live",
+    );
+    let status = fx.driver.status(&fx.inputs(), &fx.root).unwrap();
+    assert_eq!(status.state, DriverState::Running);
+    assert!(status.unreadable);
+    let response = fx.query(&[a], 2);
+    assert_eq!(Fx::state_of(&response), DriverState::Running);
+    assert!(response.settled_item_ids.is_empty(), "an unanswerable exclusion settled");
+    fault.restore();
+
+    assert_eq!(fx.driver.status(&fx.inputs(), &fx.root).unwrap().state, DriverState::Done);
+    let response = fx.query(&[a], 2);
+    assert_eq!(response.settled_item_ids, [a.to_vec()]);
+    assert_eq!(Fx::state_of(&response), DriverState::Done);
+}
+
+/// A hold, pause or policy that cannot be read is not "nothing wanted": never Done, and the
+/// status says the progress is unreadable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_holds_and_policy_are_not_done() {
+    let fx = Fx::new();
+    let a = fx.item("a.bin", 10);
+    fx.make_present(&[a]);
+    assert_eq!(fx.driver.status(&fx.inputs(), &fx.root).unwrap().state, DriverState::Done);
+
+    for (table, column) in [("held_paths", "path"), ("links", "materialization_policy")] {
+        let fault =
+            crate::provider_read_fault::Fault::inject(&fx.state.replica_coordinator, table, column);
+        let status = fx.driver.status(&fx.inputs(), &fx.root).unwrap();
+        assert!(status.unreadable, "{table}.{column}");
+        assert_ne!(status.state, DriverState::Done, "{table}.{column}");
+        assert_ne!(Fx::state_of(&fx.query(&[], 2)), DriverState::Done, "{table}.{column}");
+        fault.restore();
+        assert_eq!(fx.driver.status(&fx.inputs(), &fx.root).unwrap().state, DriverState::Done);
+    }
 }

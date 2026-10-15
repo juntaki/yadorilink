@@ -24,10 +24,15 @@ public protocol YadoriLinkClient: AnyObject, Sendable {
     func folderDetail(localPath: String) async throws -> FolderDetail
     func folderPeerCounts() async throws -> [String: UInt32]
 
+    // conflicts and kept originals
+    func resolveConflict(copyPath: String, choice: ConflictChoice) async throws -> String
+    func listRetainedOriginals() async throws -> [RetainedOriginal]
+    func releaseRetainedOriginals(groupId: String) async throws -> [RetainedRelease]
+
     // folder control
-    func pauseFolder(localPath: String) async throws
+    func pauseFolder(localPath: String, duration: PauseDuration) async throws
     func resumeFolder(localPath: String) async throws
-    func pauseAll() async throws
+    func pauseAll(duration: PauseDuration) async throws
     func resumeAll() async throws
     func unlinkFolder(localPath: String, force: Bool) async throws -> UnlinkOutcome
     func setStorageMode(groupId: String, mode: FolderMode) async throws -> StorageModeOutcome
@@ -42,6 +47,9 @@ public protocol YadoriLinkClient: AnyObject, Sendable {
     func fileAvailability(absolutePath: String) async throws -> FileAvailability
     func hydrateFile(absolutePath: String) async throws
     func evictFile(absolutePath: String) async throws -> EvictOutcome
+    func fileRetention(absolutePath: String) async throws -> FileRetention
+    func pinFile(absolutePath: String) async throws -> PinOutcome
+    func unpinFile(absolutePath: String) async throws -> FileRetention
 
     // devices
     func listFolderDevices() async throws -> [DeviceSummary]
@@ -52,8 +60,13 @@ public protocol YadoriLinkClient: AnyObject, Sendable {
     func sendToDevice(sourcePath: String, targetDeviceId: String) async throws -> SentTransfer
     func listInbox() async throws -> [IncomingTransfer]
     func receiveTransfer(transferId: String, destinationDir: String?) async throws -> ReceivedTransfer
+    func cancelTransfer(transferId: String) async throws
+    func retryTransfer(transferId: String) async throws -> ReceivedTransfer
 
     // storage / settings / daemon
+    func spaceManagement() async throws -> SpaceManagement
+    func setSpaceManagement(enabled: Bool) async throws -> SpaceManagement
+    func previewSpaceReclaim() async throws -> SpaceReclaimPreview
     func runGc(dryRun: Bool) async throws -> GcReport
     func bandwidthLimits() async throws -> BandwidthLimits
     func setBandwidthLimits(limits: BandwidthLimits) async throws -> BandwidthLimits
@@ -64,8 +77,8 @@ public protocol YadoriLinkClient: AnyObject, Sendable {
     // updates
     func updateStatus() async throws -> UpdateStatus
     func checkForUpdates() async throws -> UpdateStatus
-    func installUpdate() async throws -> UpdateInstallOutcome
-    func setUpdateConfig(automaticChecks: Bool?, installMode: UpdateInstallMode?) async throws -> UpdateConfig
+    func downloadGuidance() async throws -> UpdateDownloadGuidance
+    func setAutomaticUpdateChecks(_ enabled: Bool) async throws -> UpdateConfig
 
     // account
     func accountDeletionStatus() async throws -> AccountDeletionStatus
@@ -122,4 +135,10 @@ public protocol StatusWatchHandle: AnyObject, Sendable {
     func next() async -> StatusUpdate?
     func refresh()
     func cancel()
+}
+
+extension YadoriLinkClient {
+    /// Pauses until the user resumes.
+    public func pauseFolder(localPath: String) async throws { try await pauseFolder(localPath: localPath, duration: .untilResumed) }
+    public func pauseAll() async throws { try await pauseAll(duration: .untilResumed) }
 }

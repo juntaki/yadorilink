@@ -487,6 +487,19 @@ impl LinkRuntimeController {
         runtime.shutdown().await;
     }
 
+    /// Links whose timed pause is over; see `LinkRepository::timed_pauses_due`.
+    pub(crate) fn timed_pauses_due(
+        &self,
+        now_unix: i64,
+        latest_plausible_unix: i64,
+    ) -> Result<Vec<String>, crate::sync_error::SyncError> {
+        Ok(self
+            .state
+            .replica_coordinator
+            .link_repository()
+            .timed_pauses_due(now_unix, latest_plausible_unix)?)
+    }
+
     /// Resumes a paused link and re-raises the group's commit follow-up so
     /// connected peers catch up. Unpausing alone only lifts the gate on
     /// *future* propagation — any change indexed *while* paused was queued

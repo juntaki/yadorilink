@@ -70,18 +70,26 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     C + "yadorilink-fs-platform/src/durable_dir.rs": {
         "fs::hard_link": 1,
         "fs::remove_dir": 2,
-        "fs::remove_file": 4,
+        "fs::remove_file": 6,
         "fs::rename": 1,
     },
+    # Generation files: the removal of generations older than the previous one, of a retired
+    # record, and of a generation published below the newest; a lost removal leaves an old
+    # generation no reader prefers.
+    C + "yadorilink-fs-platform/src/generation.rs": {"fs::remove_file": 3},
     C + "yadorilink-fs-platform/src/durable_dir/raw.rs": {"MoveFileExW": 1, "fs::rename": 1},
-    C + "yadorilink-fs-platform/src/durable_dir/probe.rs": {"fs::remove_dir_all": 2},
+    C + "yadorilink-fs-platform/src/durable_dir/probe.rs": {"fs::remove_dir_all": 1},
+    # The non-Windows arm of the judged segment-file unlink: the unlink of a block-store
+    # segment is not a namespace publish, and a lost one leaves a segment the next collection
+    # removes again.
+    C + "yadorilink-fs-platform/src/durable_dir/judged_remove.rs": {"fs::remove_file": 1},
     C + "yadorilink-fs-platform/src/fs_capabilities.rs": {"fs::remove_file": 20, "fs::rename": 1},
     C + "yadorilink-peer-session/src/hazard.rs": {"fs::remove_dir_all": 1},
     # The local-storage seam: the removal and replace primitives behind the
-    # durable operations, and the plain Windows rename a writer falls back to on
-    # a volume with no durable move.
+    # durable operations, and the plain rename a writer takes only while the Windows gate is closed, on
+    # a volume with no durable move. The Windows directory-symlink temp is removed as a directory.
     C + "yadorilink-local-storage/src/fs_ops.rs": {
-        "fs::remove_dir": 1,
+        "fs::remove_dir": 2,
         "fs::remove_file": 1,
         "fs::rename": 1,
     },
@@ -102,7 +110,7 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # file, and the area itself leaves by a durable move.
     C + "yadorilink-sync-sqlite/src/native_rebootstrap_recovery.rs": {
         "fs::remove_dir": 1,
-        "fs::remove_file": 3,
+        "fs::remove_file": 2,
     },
     # Startup recovery of the temp-file ledger: it removes what a record names.
     C + "yadorilink-daemon/src/replica_coordinator/materialization_owner/repair.rs": {
@@ -111,16 +119,20 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     },
     # The quarantined object of a rebootstrap removal: the move that quarantined
     # it is the durable step; unlinking it is not.
-    C + "yadorilink-daemon/src/native_rebootstrap.rs": {"fs::remove_file": 1},
     # Unix-only eviction: its own quarantine with a barrier after each step; the
     # native Windows provider never reaches it.
     C + "yadorilink-filesystem-sync/src/materialization_eviction.rs": {
         "fs::hard_link": 1,
         "fs::remove_file": 2,
     },
+    # The user'"'"'s own conflict resolution inside a synced folder: the kept copy is renamed
+    # over or beside the original, and the scanner then publishes it as an ordinary edit;
+    # a lost rename leaves the conflict copy in place to resolve again.
+    C + "yadorilink-client-core/src/ops/files.rs": {"fs::rename": 2},
     # Configuration, logs, counters and caches whose loss or reversion
     # costs nothing that a restart does not redo.
     C + "yadorilink-daemon/src/governance_config.rs": {"fs::rename": 1},
+    C + "yadorilink-daemon/src/space_management_config.rs": {"fs::rename": 1},
     C + "yadorilink-daemon/src/log_roll.rs": {"fs::rename": 1},
     C + "yadorilink-daemon/src/reporting/counters.rs": {"fs::rename": 1},
     C + "yadorilink-daemon/src/update/policy.rs": {"fs::rename": 1},
@@ -137,30 +149,43 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # whose replacement was published durably is only garbage.
     C + "yadorilink-daemon/src/provider_handoff.rs": {"fs::remove_dir_all": 1, "fs::remove_file": 1},
     C + "yadorilink-daemon/src/shell_ipc/provider_apply.rs": {"fs::remove_file": 7},
-    C + "yadorilink-daemon/src/shell_ipc/provider_materialize.rs": {"fs::remove_file": 5},
+    C + "yadorilink-daemon/src/shell_ipc/provider_materialize.rs": {"fs::remove_file": 6},
     # The Windows shell crate: the cleanup of its own temporary and ingest copies,
     # the host's unregistration, and an old placeholder that is removed so it
     # can be recreated (a rerun redoes it).
-    S + "bin/cfapi_host.rs": {"fs::remove_file": 1},
-    S + "cfapi.rs": {"fs::remove_file": 1},
+    # The removals are the failed publish's Stage placeholder (its ledger record stays
+    # for the recovery) and the handoff file the fetch consumed.
+    S + "cfapi.rs": {
+        "fs::remove_dir": 1,
+        "fs::remove_file": 2,
+        # The one placeholder-creating call. It is reached only through
+        # `create_item_placeholder`, which records the Stage path in the host's explicit
+        # ledger (`stage_ledger.rs`) before the placeholder exists, publishes it by a durable
+        # no-replace move, and drops the record after that move; a crash leaves a record that
+        # the next walk retires by exact path. (`create_item_placeholder_at`, the unrecorded
+        # direct create, is used by tests only.)
+        "CfCreatePlaceholders": 1,
+    },
+    # The ledger's own records: a record is created by a durable no-replace publish, a
+    # released record is a best-effort removal (a record that outlives its Stage only names a
+    # path that is absent, which the recovery drops), and the recovery removes the exact
+    # recorded Stage placeholder (non-recursive) and unfinished record writes in its own
+    # private directory.
+    S + "stage_ledger.rs": {"fs::remove_dir": 1, "fs::remove_file": 4},
     S + "provider_authoring.rs": {"fs::remove_file": 5},
     S + "provider_namespace.rs": {
         "CfConvertToPlaceholder": 1,
-        "fs::remove_dir": 1,
-        "fs::remove_file": 1,
+        # `flush_state`: the flush of a dehydrate or revert through its own handle before it is
+        # reported done. It adds durability; a failed flush is an error to the caller,
+        # so nothing is reported done that is not on the disk.
+        "FlushFileBuffers": 1,
     },
 }
 
 # Sites the Windows design says must be durable steps and are not yet. Empty
 # before the gate may be opened.
-PENDING: dict[str, dict[str, int]] = {
-    # A placeholder is created by an API with no write-through flag. Creating it
-    # under a Stage name and moving it needs the placeholder state to survive a
-    # rename inside the sync root, which has to be shown on a Windows host first;
-    # until then `save_shown` and the acknowledgement that follow it have nothing
-    # durable to stand on.
-    S + "cfapi.rs": {"CfCreatePlaceholders": 1},
-}
+PENDING: dict[str, dict[str, int]] = {}
+
 
 
 def scan(root: Path) -> list[tuple[str, int, str, str]]:

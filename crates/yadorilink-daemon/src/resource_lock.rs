@@ -275,7 +275,9 @@ fn take_exclusive_lock(
 /// Create `dir` if needed and return its canonical path (resolving `..`,
 /// symlinked components, and a symlink to the directory itself).
 fn canonicalize_dir(dir: &Path) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
+    // Created durably where the volume offers it: a plain `create_dir_all` here would leave the
+    // root's own entry unpublished, and the store's later creation trusts an existing root.
+    yadorilink_fs_platform::durable_dir::create_dir_all_durably(dir)?;
     dir.canonicalize()
 }
 
@@ -296,7 +298,7 @@ fn canonicalize_file_target(path: &Path) -> std::io::Result<PathBuf> {
     let file_name = path.file_name().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
     })?;
-    std::fs::create_dir_all(&parent)?;
+    yadorilink_fs_platform::durable_dir::create_dir_all_durably(&parent)?;
     Ok(parent.canonicalize()?.join(file_name))
 }
 

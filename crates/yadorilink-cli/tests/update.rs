@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_daemon::update::policy::{AutoInstallMode, UpdateState};
+use yadorilink_daemon::update::policy::UpdateState;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::UpdateStatusRequest;
@@ -89,7 +89,6 @@ async fn update_status_reflects_fresh_daemon_defaults() {
         panic!("expected an UpdateStatus response");
     };
     assert!(status.automatic_checks_enabled);
-    assert_eq!(status.automatic_install_mode, "manual");
     assert!(status.available_version.is_empty(), "no update should ever appear out of nowhere");
 }
 
@@ -177,13 +176,10 @@ async fn update_config_persists_and_is_reflected_by_status() {
     let _guard = TEST_MUTEX.lock().await;
     let (_dir, state) = start_daemon().await;
 
-    yadorilink_cli::commands::update::config(Some("off".into()), Some("manual".into()))
-        .await
-        .unwrap();
+    yadorilink_cli::commands::update::config(Some("off".into())).await.unwrap();
 
     let policy = state.update_manager.policy.load().unwrap();
     assert!(!policy.automatic_checks_enabled);
-    assert_eq!(policy.automatic_install_mode, AutoInstallMode::Manual);
 
     let resp = yadorilink_client_core::daemon::control::send(ReqPayload::UpdateStatus(
         UpdateStatusRequest {},
@@ -194,7 +190,6 @@ async fn update_config_persists_and_is_reflected_by_status() {
         panic!("expected an UpdateStatus response");
     };
     assert!(!status.automatic_checks_enabled);
-    assert_eq!(status.automatic_install_mode, "manual");
 }
 
 /// v1 ships manual updates: `update download` round-trips to the daemon

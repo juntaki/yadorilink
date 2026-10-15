@@ -7,6 +7,7 @@
 //! settings are validated and persisted by the daemon, not only by this
 //! UI.
 
+use yadorilink_client_core::dto::PauseDuration;
 use yadorilink_client_core::ops::{
     auth, daemon, devices, diagnostics, files, folders, links, shares, storage, transfers, updates,
 };
@@ -15,10 +16,11 @@ use yadorilink_ipc_proto::daemonctl::{
     ConflictedFileInfo, FileVersionInfo, GcResponse, InboxTransfer, LimitsSetResponse,
     LimitsShowResponse, MaterializationStatusResponse, ReceiveTransferResponse,
     RestoreTrashOperationResponse, SendFileResponse, TrashedFileInfo, UpdateConfigResponse,
-    UpdateStatusResponse,
+    UpdateInstallResponse, UpdateStatusResponse,
 };
 
 use crate::ipc_client::{self, IpcError};
+pub use crate::status_model::UpdateDownload;
 
 /// "pause/resume... for linked folders": pauses every currently
 /// linked folder — mirrors `yadorilink-cli`'s `commands/daemon::pause`
@@ -28,7 +30,7 @@ use crate::ipc_client::{self, IpcError};
 /// request surface unchanged (spec's non-goal: no new sync policy logic
 /// in the desktop app).
 pub async fn pause_all() -> Result<(), IpcError> {
-    Ok(folders::pause_all().await?)
+    Ok(folders::pause_all(PauseDuration::UntilResumed).await?)
 }
 
 pub async fn resume_all() -> Result<(), IpcError> {
@@ -40,7 +42,7 @@ pub async fn resume_all() -> Result<(), IpcError> {
 /// per-link path already sends; a Home/Folder screen's per-folder
 /// pause control (the tray so far only offers "Pause All").
 pub async fn pause_link(local_path: String) -> Result<(), IpcError> {
-    Ok(folders::pause_folder(local_path).await?)
+    Ok(folders::pause_folder(local_path, PauseDuration::UntilResumed).await?)
 }
 
 /// Resumes sync for exactly one linked folder — the single-link
@@ -202,12 +204,35 @@ pub async fn check_for_updates() -> Result<(), IpcError> {
     Ok(())
 }
 
+/// What a checked download reply asks this app to do.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UpdatePlan {
+    /// Open the official release page.
+    Open(String),
+    /// Show the steps of a package-managed install.
+    Show(String),
+}
+
+/// Applies the client core's checks (manual download only; a page to open
+/// only from the structured official-page field) to a daemon reply.
+pub(crate) fn plan_update_download(reply: &UpdateInstallResponse) -> Result<UpdatePlan, IpcError> {
+    match updates::check_download_reply(reply).map_err(IpcError::DaemonError)? {
+        (_, Some(url)) => Ok(UpdatePlan::Open(url)),
+        (steps, None) => Ok(UpdatePlan::Show(steps)),
+    }
+}
+
 /// "updates": v1 ships manual updates, so "download the new version" opens
-/// the official download page in the browser; nothing is installed by the
-/// daemon or this app.
-pub async fn download_update() -> Result<(), IpcError> {
-    let _ = opener::open(updates::DOWNLOAD_PAGE_URL);
-    Ok(())
+/// the official release page; nothing is installed by the daemon or this
+/// app. A package-managed install gets its steps back to show instead.
+pub async fn download_update() -> Result<UpdateDownload, IpcError> {
+    match plan_update_download(&updates::download_guidance().await?)? {
+        UpdatePlan::Open(url) => {
+            opener::open(url).map_err(|e| IpcError::Io(e.to_string()))?;
+            Ok(UpdateDownload::OpenedPage)
+        }
+        UpdatePlan::Show(steps) => Ok(UpdateDownload::Guidance(steps)),
+    }
 }
 
 /// "resource limit" actions: a small, fixed set of bandwidth
@@ -523,16 +548,13 @@ pub async fn update_status() -> Result<UpdateStatusResponse, IpcError> {
     Ok(updates::update_status().await?)
 }
 
-/// Configures automatic update checks and/or the install mode (only
-/// `manual` is supported) -- identical request `yadorilink update config
-/// --checks --install` sends.
-/// `None` for either argument means "leave that setting unchanged" (same
+/// Configures automatic update checks -- identical request `yadorilink update config
+/// --checks` sends. `None` means "leave that setting unchanged" (same
 /// discipline the wire request itself documents).
 pub async fn set_update_config(
     automatic_checks_enabled: Option<bool>,
-    automatic_install_mode: Option<String>,
 ) -> Result<UpdateConfigResponse, IpcError> {
-    Ok(updates::set_update_config(automatic_checks_enabled, automatic_install_mode).await?)
+    Ok(updates::set_update_config(automatic_checks_enabled).await?)
 }
 
 /// Triggers an immediate block-store mark-and-sweep, or (when `dry_run`)
@@ -544,6 +566,21 @@ pub async fn set_update_config(
 /// this wrapper never retries or masks that.
 pub async fn run_gc(dry_run: bool) -> Result<GcResponse, IpcError> {
     Ok(storage::run_gc(dry_run).await?)
+}
+
+/// The originals a rebootstrap kept under a claim: what `yadorilink preserved retained list`
+/// shows.
+pub async fn list_retained_originals(
+) -> Result<Vec<yadorilink_ipc_proto::daemonctl::RetainedOriginal>, IpcError> {
+    Ok(storage::list_retained_originals().await?)
+}
+
+/// Tries to release the kept originals of one group, as `yadorilink preserved retained
+/// release --group` does; what cannot be proved safe stays.
+pub async fn release_retained_originals(
+    group_id: &str,
+) -> Result<Vec<yadorilink_ipc_proto::daemonctl::RetainedRelease>, IpcError> {
+    Ok(storage::release_retained_originals(group_id).await?)
 }
 
 #[cfg(test)]

@@ -32,10 +32,29 @@ pub async fn inbox() -> Result<(), CliError> {
             transfer.total_size,
             transfer.status,
         );
+        if matches!(transfer.status.as_str(), "failed" | "canceled") {
+            println!("    resume with: yadorilink transfer retry {}", transfer.transfer_id);
+        }
         for file in &transfer.files {
             println!("    {}  ({} bytes)", file.relative_path, file.size);
         }
     }
+    Ok(())
+}
+
+pub async fn cancel(transfer_id: String) -> Result<(), CliError> {
+    transfers::cancel_transfer(transfer_id.clone()).await?;
+    println!("Transfer {transfer_id} canceled. Retry it to resume.");
+    Ok(())
+}
+
+pub async fn retry(transfer_id: String) -> Result<(), CliError> {
+    let result = transfers::retry_transfer(transfer_id).await?;
+    println!("Received into {}", result.destination_dir);
+    for file in &result.files_received {
+        println!("  {file}");
+    }
+    println!("Total {} bytes", result.bytes_received);
     Ok(())
 }
 

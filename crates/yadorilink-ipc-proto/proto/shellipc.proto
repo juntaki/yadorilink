@@ -75,6 +75,14 @@ message StatusResponse {
   // because it holds local content that was never synced
   // ("retained: local untracked content"). Empty otherwise.
   string status_detail = 5;
+  // The user paused exactly this path (or the root itself): Resume applies to it.
+  bool item_paused = 7;
+  // An item above this path is paused and this path is not itself: neither Pause nor Resume
+  // would change anything for it.
+  bool paused_by_ancestor = 8;
+  // The daemon's own eviction gate accepts this path's root, so Free Up Space is not a promise
+  // it would refuse. False for a path that is not under a linked folder.
+  bool reclaim_supported = 9;
 }
 
 // Daemon-initiated push so the shell extension can serve most queries from
@@ -316,6 +324,21 @@ message ProviderError {
   string description = 2;
 }
 
+// The ordinary (plain-folder) linked roots, for the Finder extension's
+// `directoryURLs`. Derived from the same live link table as ListFolderFiles; a provider
+// root has no folder path and is never listed here.
+message ListLinkedRootsRequest {}
+
+message ListLinkedRootsResponse {
+  // Absolute `local_path` of every live (non-orphaned) folder link.
+  repeated string local_paths = 1;
+  // Same contract as `ListProviderFoldersResponse.snapshot_available`: true only when the
+  // daemon read the link table without error. An empty `local_paths` is a confirmed "no
+  // linked folders" ONLY when this is true; false (or an absent response) means unknown and
+  // the caller keeps what it last confirmed.
+  bool snapshot_available = 2;
+}
+
 message ListFolderFilesRequest {
   // The linked folder's `local_path` (plain roots; a provider root is addressed by
   // `root_id` in later steps).
@@ -447,6 +470,15 @@ message MaterializeToTempRequest {
   bytes item_id = 3;
   // Empty = current. Set and not current => VERSION_OUT_OF_DATE (old bytes are never returned).
   bytes requested_version_hash = 4;
+  // Set: only the bytes [range_offset, range_offset + range_length) of that exact version are
+  // wanted, and `requested_version_hash` must be set too. The daemon fetches and verifies only the
+  // blocks covering the window and answers with a handoff file holding exactly those bytes (the
+  // end clamped to the file size). A ranged answer never makes the item present: the OS holds a
+  // window, not the file. A daemon that predates this field ignores it and answers with the whole
+  // file and `ranged` unset, which a caller must treat as the whole file.
+  bool ranged = 5;
+  uint64 range_offset = 6;
+  uint64 range_length = 7;
 }
 
 enum MaterializeFailure {
@@ -459,6 +491,8 @@ enum MaterializeFailure {
   MATERIALIZE_FAILURE_CANCELLED = 6;
   // The publication fence is on for the item: the extension answers .cannotSynchronize.
   MATERIALIZE_FAILURE_PUBLICATION_PENDING = 7;
+  // A ranged request whose offset is past the end of the version, or that did not name a version.
+  MATERIALIZE_FAILURE_RANGE_NOT_SATISFIABLE = 8;
 }
 
 message MaterializeToTempResponse {
@@ -477,6 +511,13 @@ message MaterializeToTempResponse {
   // with the bytes and echoes it as the base of a later edit or delete; it must never combine a
   // hash and a generation taken at different moments.
   bytes content_version = 8;
+  // Set when the handoff file holds only the window [range_offset, range_offset + range_length)
+  // of the version (the request's range clamped to the file size). `size` is then still the size
+  // of the whole version, `content_version` is empty (only a whole-version handoff is paired with
+  // an item generation), and the item is NOT recorded as handed over to the OS or as served.
+  bool ranged = 9;
+  uint64 range_offset = 10;
+  uint64 range_length = 11;
 }
 
 // Cancels one in-flight request, by request_id only.
@@ -833,5 +874,7 @@ message ShellIpcMessage {
     EnumerateWorkingSetResponse enumerate_working_set_response = 47;
     ProviderPrefetchHint provider_prefetch_hint = 48;
     ProviderPrefetchDone provider_prefetch_done = 49;
+    ListLinkedRootsRequest list_linked_roots_request = 50;
+    ListLinkedRootsResponse list_linked_roots_response = 51;
   }
 }

@@ -1,7 +1,19 @@
+use yadorilink_client_core::dto::PauseDuration;
 use yadorilink_client_core::ops::daemon::{self as ops, DaemonStartOutcome};
 use yadorilink_client_core::ops::folders;
 
 use crate::error::CliError;
+
+/// How long `daemon pause --for` pauses.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum PauseFor {
+    #[value(name = "30m")]
+    ThirtyMinutes,
+    #[value(name = "1h")]
+    OneHour,
+    #[value(name = "tomorrow")]
+    Tomorrow,
+}
 
 /// Launches the daemon if it isn't already running (per the `cli` spec's
 /// "Start daemon" scenario: "launched (or confirmed already running)").
@@ -23,10 +35,20 @@ pub async fn stop() -> Result<(), CliError> {
 /// "daemon pause/resume" is a whole-daemon action; the underlying control
 /// protocol tracks pause per-link, per the `sync-engine` spec, so this
 /// applies it to all of them).
-pub async fn pause() -> Result<(), CliError> {
-    folders::pause_all().await?;
-    println!("Sync paused.");
+pub async fn pause(duration: Option<PauseFor>) -> Result<(), CliError> {
+    let (duration, until) = pause_choice(duration);
+    folders::pause_all(duration).await?;
+    println!("Sync paused{until}.");
     Ok(())
+}
+
+fn pause_choice(duration: Option<PauseFor>) -> (PauseDuration, &'static str) {
+    match duration {
+        None => (PauseDuration::UntilResumed, ""),
+        Some(PauseFor::ThirtyMinutes) => (PauseDuration::ThirtyMinutes, " for 30 minutes"),
+        Some(PauseFor::OneHour) => (PauseDuration::OneHour, " for 1 hour"),
+        Some(PauseFor::Tomorrow) => (PauseDuration::UntilTomorrow, " until tomorrow"),
+    }
 }
 
 pub async fn resume() -> Result<(), CliError> {
@@ -72,4 +94,18 @@ pub fn metrics(
         config.bind_addr
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use PauseFor;
+
+    #[test]
+    fn pause_options_map_to_the_core_durations() {
+        assert_eq!(pause_choice(None).0, PauseDuration::UntilResumed);
+        assert_eq!(pause_choice(Some(PauseFor::ThirtyMinutes)).0, PauseDuration::ThirtyMinutes);
+        assert_eq!(pause_choice(Some(PauseFor::OneHour)).0, PauseDuration::OneHour);
+        assert_eq!(pause_choice(Some(PauseFor::Tomorrow)).0, PauseDuration::UntilTomorrow);
+    }
 }

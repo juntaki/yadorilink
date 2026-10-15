@@ -812,9 +812,16 @@ impl FileIndexRepository {
         group_id: &str,
         path: &str,
         planned: Option<&yadorilink_replica_domain::ids::VersionHash>,
+        folds_onto_path: &dyn Fn(&str) -> bool,
     ) -> Result<crate::displacement_guard::DisplacementGuard, SyncSqliteError> {
         self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
-            crate::displacement_guard::displacement_guard(conn, group_id, path, planned)
+            crate::displacement_guard::displacement_guard(
+                conn,
+                group_id,
+                path,
+                planned,
+                folds_onto_path,
+            )
         })
     }
 
@@ -1212,6 +1219,27 @@ impl FileIndexRepository {
                 rusqlite::params![group_id, path, now_unix_nanos_checked(), case_key, canonical_key],
             )?;
             Ok(())
+        })
+    }
+
+    /// Drops the `version_seq = 0` scaffold of `path` and nothing else: a real row, and every
+    /// version the path ever had, stay. For the scaffold a metadata step made of a path whose
+    /// head then went away, so the path is as it was before the step. Returns whether one was
+    /// dropped.
+    pub fn retire_bootstrap_scaffold(
+        &self,
+        group_id: &str,
+        path: &str,
+        permit: &RootCommitPermit,
+    ) -> Result<bool, SyncSqliteError> {
+        permit.verify()?;
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            crate::native_rebootstrap::refuse_materialization_if_frozen(conn, group_id)?;
+            Ok(conn.execute(
+                "DELETE FROM files WHERE group_id = ?1 AND path = ?2 \
+                 AND state = 'current' AND version_seq = 0",
+                rusqlite::params![group_id, path],
+            )? > 0)
         })
     }
 

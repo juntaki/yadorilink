@@ -3,9 +3,12 @@
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
-    DiscardPreservedRequest, GcRequest, GcResponse, LimitsSetRequest, LimitsSetResponse,
-    LimitsShowRequest, LimitsShowResponse, ListPreservedRequest, PreservedItem,
-    RestorePreservedRequest, RetryPreservedRequest,
+    DiscardPreservedRequest, GcRequest, GcResponse, GetSpaceManagementRequest, LimitsSetRequest,
+    LimitsSetResponse, LimitsShowRequest, LimitsShowResponse, ListPreservedRequest,
+    ListRetainedOriginalsRequest, PreservedItem, PreviewSpaceReclaimRequest,
+    PreviewSpaceReclaimResponse, ReleaseRetainedOriginalsRequest, RestorePreservedRequest,
+    RetainedOriginal, RetainedRelease, RetryPreservedRequest, SetSpaceManagementRequest,
+    SpaceManagementSettings,
 };
 
 use crate::daemon::control;
@@ -34,6 +37,29 @@ pub async fn list_preserved() -> Result<Vec<PreservedItem>, CoreError> {
         return Err(unexpected());
     };
     Ok(list.items)
+}
+
+/// The originals a rebootstrap kept under a claim instead of unlinking.
+pub async fn list_retained_originals() -> Result<Vec<RetainedOriginal>, CoreError> {
+    let resp =
+        control::send(ReqPayload::ListRetainedOriginals(ListRetainedOriginalsRequest {})).await?;
+    let Some(RespPayload::ListRetainedOriginals(list)) = resp.payload else {
+        return Err(unexpected());
+    };
+    Ok(list.items)
+}
+
+/// Tries to release the retained originals of one group; what cannot be proved safe stays.
+pub async fn release_retained_originals(group_id: &str) -> Result<Vec<RetainedRelease>, CoreError> {
+    let resp =
+        control::send(ReqPayload::ReleaseRetainedOriginals(ReleaseRetainedOriginalsRequest {
+            group_id: group_id.into(),
+        }))
+        .await?;
+    let Some(RespPayload::ReleaseRetainedOriginals(done)) = resp.payload else {
+        return Err(unexpected());
+    };
+    Ok(done.releases)
 }
 
 /// Provider publications waiting on the OS ("file in use"), up to `limit` per root.
@@ -111,4 +137,35 @@ pub async fn set_bandwidth_limits(up: u64, down: u64) -> Result<LimitsSetRespons
         return Err(unexpected());
     };
     Ok(applied)
+}
+
+/// The automatic space management setting, as the daemon holds it.
+pub async fn space_management() -> Result<SpaceManagementSettings, CoreError> {
+    let resp = control::send(ReqPayload::GetSpaceManagement(GetSpaceManagementRequest {})).await?;
+    let Some(RespPayload::GetSpaceManagement(result)) = resp.payload else {
+        return Err(unexpected());
+    };
+    result.settings.ok_or_else(unexpected)
+}
+
+/// Stores the setting and returns what the daemon stored.
+pub async fn set_space_management(enabled: bool) -> Result<SpaceManagementSettings, CoreError> {
+    let resp = control::send(ReqPayload::SetSpaceManagement(SetSpaceManagementRequest {
+        settings: Some(SpaceManagementSettings { enabled }),
+    }))
+    .await?;
+    let Some(RespPayload::SetSpaceManagement(result)) = resp.payload else {
+        return Err(unexpected());
+    };
+    result.settings.ok_or_else(unexpected)
+}
+
+/// The dry run: the verdict for each downloaded item with the stored setting. Removes nothing.
+pub async fn preview_space_reclaim() -> Result<PreviewSpaceReclaimResponse, CoreError> {
+    let resp =
+        control::send(ReqPayload::PreviewSpaceReclaim(PreviewSpaceReclaimRequest {})).await?;
+    let Some(RespPayload::PreviewSpaceReclaim(result)) = resp.payload else {
+        return Err(unexpected());
+    };
+    Ok(result)
 }

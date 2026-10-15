@@ -305,16 +305,50 @@ impl NativeReplicationHub {
         env: ReplicationEnv,
         connection: NativeReplicationConnection,
     ) {
+        self.attach_if(device, env, connection, || true);
+    }
+
+    /// [`Self::attach`], unless `admit` -- evaluated while the attachment is
+    /// being recorded, so no later attach can interleave between the check
+    /// and the record -- says the connection is no longer the device's. The
+    /// connection is then closed. Returns whether it was attached.
+    pub fn attach_if(
+        self: &Arc<Self>,
+        device: String,
+        env: ReplicationEnv,
+        connection: NativeReplicationConnection,
+        admit: impl FnOnce() -> bool,
+    ) -> bool {
         let (serving_env, serving_connection, serving_device) =
             (env.clone(), connection.clone(), device.clone());
         let hub = Arc::downgrade(self);
         let wake = self.reconcile_wake.0.subscribe();
-        self.attach_serving(device, env, connection, async move {
+        let marks = {
+            let (local, device, groups) =
+                (env.local_device_id.clone(), device.clone(), env.groups.clone());
+            move || {
+                if yadorilink_fs_platform::join_timeline::is_active() {
+                    for group in groups() {
+                        yadorilink_fs_platform::join_timeline::mark_with_peer(
+                            &local,
+                            &group.0,
+                            yadorilink_fs_platform::join_timeline::Milestone::PeerSessionUsable,
+                            &device,
+                        );
+                    }
+                }
+            }
+        };
+        let attached = self.attach_serving(device, env, connection, admit, async move {
             tokio::select! {
                 () = driver::serve(serving_env.clone(), serving_connection.clone()) => {}
                 () = reconcile_forever(&serving_env, &serving_connection, &serving_device, &hub, wake) => {}
             }
         });
+        if attached {
+            marks();
+        }
+        attached
     }
 
     /// Records `connection` as `device`'s and runs `serving` until it ends,
@@ -331,11 +365,17 @@ impl NativeReplicationHub {
         device: String,
         env: ReplicationEnv,
         connection: NativeReplicationConnection,
+        admit: impl FnOnce() -> bool,
         serving: impl std::future::Future<Output = ()> + Send + 'static,
-    ) {
+    ) -> bool {
         let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let hub = Arc::downgrade(self);
         let mut live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+        if !admit() {
+            drop(live);
+            connection.close(0, b"peer key changed");
+            return false;
+        }
         let task = {
             let device = device.clone();
             tokio::spawn(async move {
@@ -351,6 +391,7 @@ impl NativeReplicationHub {
             old.task.abort();
             old.connection.close(0, b"replaced");
         }
+        true
     }
 
     fn detach_if_current(&self, device: &str, id: u64) {
@@ -389,6 +430,37 @@ impl NativeReplicationHub {
             old.connection.close(0, b"detached");
         }
         *self.truncations.lock().unwrap_or_else(|p| p.into_inner()) = HistoryTruncations::default();
+    }
+
+    /// The authenticated peer of the connection attached for `device`.
+    pub(crate) fn attached_peer(&self, device: &str) -> Option<PeerId> {
+        self.live.lock().unwrap_or_else(|p| p.into_inner()).get(device).map(|l| l.connection.peer())
+    }
+
+    /// Whether a connection to `device` is attached AS `peer`: an attachment
+    /// authenticated as another key (one the netmap has since replaced) does
+    /// not count, so the keeper dials the current key's connection.
+    pub(crate) fn is_attached_as(&self, device: &str, peer: &PeerId) -> bool {
+        self.attached_peer(device).as_ref() == Some(peer)
+    }
+
+    /// Ends every attachment whose authenticated key is no longer the one
+    /// `pinned` names for its device (replaced, or the device unpinned),
+    /// whoever attached it and whatever session stands for the device.
+    pub(crate) fn detach_unpinned(&self, pinned: &std::collections::HashMap<String, [u8; 32]>) {
+        let stale: Vec<Live> = {
+            let mut live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+            let devices: Vec<String> = live
+                .iter()
+                .filter(|(device, l)| pinned.get(*device) != Some(l.connection.peer().as_bytes()))
+                .map(|(device, _)| device.clone())
+                .collect();
+            devices.iter().filter_map(|d| live.remove(d)).collect()
+        };
+        for old in stale {
+            old.task.abort();
+            old.connection.close(0, b"peer key changed");
+        }
     }
 
     /// Whether a connection to `device` is attached.
@@ -650,6 +722,7 @@ pub fn env_for_peer(state: &Arc<DaemonState>, device: &str) -> ReplicationEnv {
     };
     ReplicationEnv {
         db,
+        local_device_id: state.device_id.clone(),
         shares_group: Arc::new(shares_group),
         key_for: Arc::new(key_for),
         authority_key: Arc::new(authority_key),
@@ -689,10 +762,27 @@ pub fn spawn_inbound(
                 connection.close(1, b"unknown device");
                 continue;
             };
+            mark_native_connected(&state, &device);
             let env = env_for_peer(&state, &device);
             state.native_replication.attach(device, env, connection);
         }
     });
+}
+
+/// Measurement only: the native replication connection to `device` was
+/// dialled or accepted, before it is attached.
+fn mark_native_connected(state: &DaemonState, device: &str) {
+    if !yadorilink_fs_platform::join_timeline::is_active() {
+        return;
+    }
+    for group in state.authority.authorized_groups_for_peer(device) {
+        yadorilink_fs_platform::join_timeline::mark_with_peer(
+            &state.device_id,
+            &group,
+            yadorilink_fs_platform::join_timeline::Milestone::NativeConnected,
+            device,
+        );
+    }
 }
 
 /// What one dial attempt came to.
@@ -718,15 +808,37 @@ pub async fn dial_if_dialer(
         return DialOutcome::NotTheDialer;
     }
     match endpoint.connect_native_replication(peer).await {
-        Ok(connection) => {
-            let env = env_for_peer(state, device);
-            state.native_replication.attach(device.to_string(), env, connection);
-            DialOutcome::Attached
-        }
+        Ok(connection) => attach_dialed(state, device, connection),
         Err(error) => {
             tracing::debug!(peer = device, %error, "native replication: could not dial the peer");
             DialOutcome::Failed
         }
+    }
+}
+
+/// Attaches a connection this device dialled to `device`, unless the netmap
+/// no longer pins the key it was authenticated as.
+///
+/// The key a dial was made to is read before the dial and the dial is
+/// awaited, so a key replaced in between (the per-peer keeper is replaced,
+/// but stopping the old one is asynchronous) must be checked again here:
+/// a connection authenticated as the old key is not the device's.
+pub(crate) fn attach_dialed(
+    state: &Arc<DaemonState>,
+    device: &str,
+    connection: NativeReplicationConnection,
+) -> DialOutcome {
+    let still_pinned =
+        || state.authority.peer_signing_key(device) == Some(*connection.peer().as_bytes());
+    let env = env_for_peer(state, device);
+    // Checked where the attachment is recorded, so a replacement keeper's
+    // attach cannot slip in between this check and the record.
+    if state.native_replication.attach_if(device.to_string(), env, connection.clone(), still_pinned)
+    {
+        mark_native_connected(state, device);
+        DialOutcome::Attached
+    } else {
+        DialOutcome::Failed
     }
 }
 
@@ -745,7 +857,10 @@ pub async fn keep_dialed(
         if !state.peers.has_session(&device) {
             return;
         }
-        if state.native_replication.is_attached(&device) {
+        if state.native_replication.is_attached_as(
+            &device,
+            &PeerId::from_bytes(state.authority.peer_signing_key(&device).unwrap_or_default()),
+        ) {
             delay = Duration::from_secs(5);
         } else {
             match dial_if_dialer(&state, stack.endpoint(), &device).await {

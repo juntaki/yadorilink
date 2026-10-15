@@ -24,6 +24,8 @@ use yadorilink_sync_sqlite::exact_materialized_commit::{
 
 use crate::daemon_state::{run_blocking_sweep_offloaded, DaemonState};
 
+mod range_window;
+
 /// A single deadline for the *entire* multi-session dispatch —
 /// supersedes what used to be the former per-session hydrate's per-session
 /// timeout for the daemon-orchestrated hydration path. Same value as
@@ -1484,6 +1486,31 @@ async fn assembled_hook(group_id: &str, path: &str, assembled: &std::path::Path)
     }
 }
 
+/// Writes `len` bytes of `source` from `skip` into a new file `out` and fsyncs it. `source` is
+/// `None` only for an empty window. The caller's guard removes `out` when this fails.
+fn cut_range(
+    source: Option<&std::path::Path>,
+    out: &std::path::Path,
+    skip: u64,
+    len: u64,
+) -> Result<(), SyncError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let io = |error: std::io::Error| SyncError::HydrationFailed(error.to_string());
+    let mut target =
+        std::fs::OpenOptions::new().write(true).create_new(true).open(out).map_err(io)?;
+    if let Some(source) = source {
+        let mut file = std::fs::File::open(source).map_err(io)?;
+        file.seek(SeekFrom::Start(skip)).map_err(io)?;
+        let copied = std::io::copy(&mut file.by_ref().take(len), &mut target).map_err(io)?;
+        if copied != len {
+            return Err(SyncError::CorruptState(
+                "the verified window is shorter than its range".into(),
+            ));
+        }
+    }
+    target.sync_all().map_err(io)
+}
+
 /// How often an assembly starts over because the current version moved while it ran, before it
 /// reports the version out of date.
 const MAX_TEMP_RESTARTS: usize = 3;
@@ -1540,8 +1567,25 @@ async fn assemble_to_temp(
         if request.requested_version.is_some_and(|wanted| wanted != target) {
             return Ok(TempOutcome::VersionOutOfDate);
         }
-        let blocks = canonical.snapshot.blocks.clone();
         let size = canonical.snapshot.size;
+        // A ranged request works on the covering blocks only; everything below (the fetch from
+        // peers, the per-block and assembled-bytes verification) is the whole-file code applied
+        // to that shorter block list.
+        let window = match request.range {
+            None => None,
+            Some(range) => match range_window::plan(&canonical.snapshot.blocks, size, range)? {
+                Some(window) => Some(window),
+                None => return Ok(TempOutcome::RangeNotSatisfiable),
+            },
+        };
+        let blocks = match &window {
+            Some(window) => window.blocks.clone(),
+            None => canonical.snapshot.blocks.clone(),
+        };
+        // The covering blocks and the window cut from them exist side by side while it is cut.
+        let assembled_len = window
+            .as_ref()
+            .map_or(size, |window| window.window_len().saturating_add(window.served.len));
         let staging_dir =
             request.staging_file.parent().unwrap_or_else(|| std::path::Path::new("."));
         let headroom = if state.disk_headroom_enforcement_enabled() {
@@ -1551,7 +1595,7 @@ async fn assemble_to_temp(
                 crate::local_convergence::reserve_volume_headroom(
                     staging_dir,
                     request.staging_file,
-                    size,
+                    assembled_len,
                     headroom_override,
                 )
                 .map_err(SyncError::from)?,
@@ -1581,35 +1625,66 @@ async fn assemble_to_temp(
             continue;
         }
         // Assembled beside the staging file, fsynced, never visible to the extension. The
-        // assembly removes its own temp file if this future is dropped (a cancel).
-        let assembled = crate::local_convergence::types::reconstruct_file_to_temp_off_runtime(
-            Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                state.block_store.clone(),
-            )),
-            request.staging_file,
-            &blocks,
-            canonical.snapshot.mtime_unix_nanos,
-            headroom,
-            // A provider's staging directory is not a linked folder start recovers.
-            Arc::new(yadorilink_local_storage::NoTempLedger),
-        )
-        .await
-        .map_err(|error| SyncError::HydrationFailed(format!("{path}: {error}")))?;
-        // Removed again unless it is handed back: a cancel or an error leaves nothing in staging.
-        let assembled = StagedFile::new(assembled);
-        #[cfg(test)]
-        assembled_hook(group_id, path, assembled.path()).await;
-        let verified = {
-            let (assembled, blocks) = (assembled.path().to_path_buf(), blocks.clone());
-            run_blocking_sweep_offloaded(move || {
-                disk_bytes_match_indexed_blocks(&assembled, &blocks)
-            })
+        // assembly removes its own temp file if this future is dropped (a cancel). A window of
+        // no bytes needs no assembly at all.
+        let assembled = if blocks.is_empty() && window.is_some() {
+            None
+        } else {
+            Some(
+                crate::local_convergence::types::reconstruct_file_to_temp_off_runtime(
+                    Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                        state.block_store.clone(),
+                    )),
+                    request.staging_file,
+                    &blocks,
+                    canonical.snapshot.mtime_unix_nanos,
+                    // Kept here too: the reservation lasts until the window is cut.
+                    headroom.clone(),
+                    // A provider's staging directory is not a linked folder start recovers.
+                    Arc::new(yadorilink_local_storage::NoTempLedger),
+                )
+                .await
+                .map_err(|error| SyncError::HydrationFailed(format!("{path}: {error}")))?,
+            )
         };
-        if !verified? {
-            return Err(SyncError::CorruptState(format!(
-                "{path}: the assembled bytes do not match the version's blocks"
-            )));
+        // Removed again unless it is handed back: a cancel or an error leaves nothing in staging.
+        let assembled = assembled.map(StagedFile::new);
+        #[cfg(test)]
+        if let Some(assembled) = &assembled {
+            assembled_hook(group_id, path, assembled.path()).await;
         }
+        if let Some(assembled) = &assembled {
+            let verified = {
+                let (assembled, blocks) = (assembled.path().to_path_buf(), blocks.clone());
+                run_blocking_sweep_offloaded(move || {
+                    disk_bytes_match_indexed_blocks(&assembled, &blocks)
+                })
+            };
+            if !verified? {
+                return Err(SyncError::CorruptState(format!(
+                    "{path}: the assembled bytes do not match the version's blocks"
+                )));
+            }
+        }
+        // A range is cut out of the verified window only after the whole window verified.
+        // `headroom` stays held through the cut.
+        let assembled = match (&window, assembled) {
+            (Some(window), window_file) => {
+                let cut = StagedFile::new(request.staging_file.to_path_buf());
+                let (source, out, skip, len) = (
+                    window_file.as_ref().map(|file| file.path().to_path_buf()),
+                    request.staging_file.to_path_buf(),
+                    window.skip,
+                    window.served.len,
+                );
+                run_blocking_sweep_offloaded(move || {
+                    cut_range(source.as_deref(), &out, skip, len)
+                })?;
+                cut
+            }
+            (None, Some(whole)) => whole,
+            (None, None) => unreachable!("a whole-file assembly always has a file"),
+        };
         // The version may have moved while the bytes were assembled and verified: never hand
         // over bytes of a version that is no longer current.
         if current_version()? != Some(target) {
@@ -1624,6 +1699,7 @@ async fn assemble_to_temp(
             assembled: assembled.keep(),
             version_hash: target,
             size,
+            range: window.map(|window| window.served),
         }));
     }
     Ok(TempOutcome::VersionOutOfDate)
@@ -2489,6 +2565,26 @@ pub struct MaterializationStatusInfo {
     pub state: MaterializationState,
 }
 
+/// The gate `evict` applies before anything else, shared with the shell menu so Free Up Space is
+/// only offered where this passes.
+///
+/// This entry frees a file of a folder the daemon itself keeps on disk, and then leaves a
+/// placeholder in its place. That is only safe where an operating-system placeholder provider
+/// watches the result (the next open fetches the content again); an ordinary folder has none, so
+/// freeing a file there would simply make it disappear. A provider folder (macOS File Provider)
+/// is the only kind that can give space back, and it takes the provider eviction path instead
+/// (`provider_evict`): this gate therefore refuses every ordinary folder, and says why.
+pub(crate) fn evict_gate(state: &DaemonState, group_id: &str, path: &str) -> Result<(), SyncError> {
+    crate::provider_gate::require_filesystem_root(&state.replica_coordinator, group_id)?;
+    if !state.root_allows_on_demand(group_id) {
+        return Err(SyncError::EvictionRejected(format!(
+            "{path}: Free Up Space is only available for provider folders (File Provider on macOS); this is an \
+             ordinary folder, where freeing a file would remove it from the folder"
+        )));
+    }
+    Ok(())
+}
+
 /// Manually evicts `path` back to a placeholder (spec "Manual Eviction").
 /// Resolves `group_id` to its local root path via the registered link.
 ///
@@ -2508,21 +2604,7 @@ pub fn evict(
     group_id: &str,
     path: &str,
 ) -> Result<yadorilink_filesystem_sync::materialization_eviction::EvictionOutcome, SyncError> {
-    // Demoting a fully-materialized file to a placeholder is only safe to
-    // reverse (re-fetch on next access) if a real OS-transparent placeholder
-    // provider is actually watching the result; an ordinary sparse file does
-    // not qualify on its own. Checked here (the daemon-side entry
-    // point), not inside `materialization::evict_file` itself, mirroring
-    // where linking and `set_storage_mode` gate OnDemand creation --
-    // that function's own extensive test suite exercises the mechanism
-    // directly and must stay reachable without a live provider.
-    crate::provider_gate::require_filesystem_root(&state.replica_coordinator, group_id)?;
-    if !state.root_allows_on_demand(group_id) {
-        return Err(SyncError::EvictionRejected(format!(
-            "{path}: eviction is unavailable in this build (on-demand placeholder pipeline is \
-             not connected)"
-        )));
-    }
+    evict_gate(state, group_id, path)?;
     let root = local_root_for_group(state, group_id)?;
     let is_full_replica = state.is_local_full_replica(group_id);
     let root_lease = state.root_lease_for(group_id)?;
@@ -2595,6 +2677,40 @@ pub async fn restore_to_version_with_timeout(
         .unwrap_or_else(|_elapsed| {
             Err(SyncError::VersionContentUnavailable(format!("{group_id}/{path}@{version_seq}")))
         })
+}
+
+/// Writes the symlink a restore recreates, under the platform's own policy: Windows writes
+/// nothing unless the group opted in to symlinks.
+fn materialize_restored_symlink(
+    state: &DaemonState,
+    group_id: &str,
+    out_path: &std::path::Path,
+    target: &[u8],
+) -> Result<(), SyncError> {
+    #[cfg(unix)]
+    {
+        yadorilink_local_storage::materialize_symlink_in(
+            out_path,
+            target,
+            &state.replica_coordinator.temp_ledger(group_id),
+        )?;
+    }
+    #[cfg(windows)]
+    {
+        // Not opted in: writes nothing, same as `materialize_symlink_at`'s own policy skip.
+        if state.replica_coordinator.link_repository().windows_symlink_opt_in_for_group(group_id)? {
+            yadorilink_local_storage::materialize_symlink_windows_in(
+                out_path,
+                target,
+                &state.replica_coordinator.temp_ledger(group_id),
+            )?;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (state, group_id, out_path, target);
+    }
+    Ok(())
 }
 
 #[allow(
@@ -2962,38 +3078,7 @@ async fn restore_to_version_inner(
             }
         }
         yadorilink_replica_domain::file::RecordKind::Symlink => match &version.symlink_target {
-            Some(target) => {
-                #[cfg(unix)]
-                {
-                    yadorilink_local_storage::materialize_symlink_in(
-                        &out_path,
-                        target,
-                        &state.replica_coordinator.temp_ledger(group_id),
-                    )?;
-                }
-                #[cfg(windows)]
-                {
-                    // Not opted in: writes nothing, same as `materialize_
-                    // symlink_at`'s own policy skip -- see the `None` arm's
-                    // own comment just below for why this row's own
-                    // `materialization_state` is still safe despite that.
-                    if state
-                        .replica_coordinator
-                        .link_repository()
-                        .windows_symlink_opt_in_for_group(group_id)?
-                    {
-                        yadorilink_local_storage::materialize_symlink_windows_in(
-                            &out_path,
-                            target,
-                            &state.replica_coordinator.temp_ledger(group_id),
-                        )?;
-                    }
-                }
-                #[cfg(not(any(unix, windows)))]
-                {
-                    let _ = target;
-                }
-            }
+            Some(target) => materialize_restored_symlink(state, group_id, &out_path, target)?,
             None => {
                 // No target recorded for this version -- nothing safe to
                 // create on disk, matching `materialize_symlink_at`'s own

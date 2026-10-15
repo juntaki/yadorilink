@@ -601,17 +601,76 @@ impl LinkRepository {
         Ok(())
     }
 
+    /// Pauses (`true`, until the user resumes) or resumes (`false`) a link.
+    ///
+    /// The `links.paused` column holds the whole pause state: `0` running,
+    /// `1` paused until the user resumes, and any larger value a paused link
+    /// with an auto-resume deadline, as seconds since the Unix epoch (see
+    /// [`Self::pause_until`]). Resuming always clears the deadline with it.
     pub fn set_paused(&self, local_path: &str, paused: bool) -> Result<(), SyncSqliteError> {
+        self.write_paused_column(local_path, i64::from(paused))
+    }
+
+    /// Pauses a link until `resume_at_unix` (seconds since the Unix epoch).
+    /// A later call replaces the deadline, and [`Self::set_paused`] clears it.
+    pub fn pause_until(
+        &self,
+        local_path: &str,
+        resume_at_unix: i64,
+    ) -> Result<(), SyncSqliteError> {
+        if resume_at_unix <= 1 {
+            return Err(SyncSqliteError::InvalidInput(format!(
+                "resume deadline {resume_at_unix} is not a Unix timestamp"
+            )));
+        }
+        self.write_paused_column(local_path, resume_at_unix)
+    }
+
+    fn write_paused_column(&self, local_path: &str, value: i64) -> Result<(), SyncSqliteError> {
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
             Ok(conn.execute(
                 "UPDATE links SET paused = ?1 WHERE local_path = ?2",
-                rusqlite::params![paused as i64, local_path],
+                rusqlite::params![value, local_path],
             )?)
         })?;
         if affected == 0 {
             return Err(SyncSqliteError::NotFound(format!("link {local_path}")));
         }
         Ok(())
+    }
+
+    /// The auto-resume deadline of a paused link, if it has one.
+    pub fn paused_until(&self, local_path: &str) -> Result<Option<i64>, SyncSqliteError> {
+        let value = self.database.read::<_, SyncSqliteError>(|conn| {
+            Ok(conn
+                .query_row("SELECT paused FROM links WHERE local_path = ?1", [local_path], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()?)
+        })?;
+        Ok(value.filter(|v| *v > 1))
+    }
+
+    /// Live links whose timed pause is over: the deadline is at or before
+    /// `now_unix`, or so far past `latest_plausible_unix` that the clock must
+    /// have moved backwards since it was set.
+    pub fn timed_pauses_due(
+        &self,
+        now_unix: i64,
+        latest_plausible_unix: i64,
+    ) -> Result<Vec<String>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT local_path FROM links
+                 WHERE paused > 1 AND orphaned = 0 AND (paused <= ?1 OR paused > ?2)
+                 ORDER BY local_path",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![now_unix, latest_plausible_unix], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
     }
 
     /// Whether `group_id`'s next full scan must be additive — indexing what it

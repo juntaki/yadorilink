@@ -17,7 +17,7 @@ use yadorilink_local_storage::{
 
 fn store() -> (SegmentBlockStore, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::new(dir.path()).unwrap();
+    let store = SegmentBlockStore::new(dir.path()).unwrap().with_volume_verdict(|_| true);
     (store, dir)
 }
 
@@ -313,13 +313,13 @@ fn a_reopened_store_serves_everything_the_previous_one_committed() {
     let payloads: Vec<Vec<u8>> =
         (0..200u32).map(|i| format!("durable across restart: {i}").into_bytes()).collect();
     let hashes: Vec<String> = {
-        let store = SegmentBlockStore::new(dir.path()).unwrap();
+        let store = SegmentBlockStore::new(dir.path()).unwrap().with_volume_verdict(|_| true);
         let blocks: Vec<LocallyHashedBlock> =
             payloads.iter().map(|p| LocallyHashedBlock::from_bytes(p.clone())).collect();
         store.put_durable_batch(&blocks).unwrap().into_iter().map(|receipt| receipt.hash).collect()
     };
 
-    let store = SegmentBlockStore::new(dir.path()).unwrap();
+    let store = SegmentBlockStore::new(dir.path()).unwrap().with_volume_verdict(|_| true);
     assert!(store.recovery_report().is_clean(), "a clean shutdown needs no repair");
     assert_eq!(store.usage().unwrap().block_count, 200);
     for (hash, payload) in hashes.iter().zip(&payloads) {
@@ -339,13 +339,13 @@ fn a_reopened_store_starts_a_new_segment_rather_than_resuming_the_old_one() {
     // tail of one segment and removes the shared append target entirely.
     let dir = tempfile::tempdir().unwrap();
     let before = {
-        let store = SegmentBlockStore::new(dir.path()).unwrap();
+        let store = SegmentBlockStore::new(dir.path()).unwrap().with_volume_verdict(|_| true);
         store.put(b"written before the restart").unwrap();
         store.segment_ids().unwrap()
     };
     assert_eq!(before.len(), 1);
 
-    let store = SegmentBlockStore::new(dir.path()).unwrap();
+    let store = SegmentBlockStore::new(dir.path()).unwrap().with_volume_verdict(|_| true);
     store.put(b"written after the restart").unwrap();
     let after = store.segment_ids().unwrap();
     assert_eq!(after.len(), 2, "the reopened store must append somewhere new");
@@ -368,16 +368,16 @@ fn reopening_a_store_that_wrote_nothing_does_not_accumulate_empty_segments() {
     // machine that reboots daily grows a segment a day forever.
     let dir = tempfile::tempdir().unwrap();
     {
-        let store = SegmentBlockStore::new(dir.path()).unwrap();
+        let store = SegmentBlockStore::new(dir.path()).unwrap().with_volume_verdict(|_| true);
         store.put(b"the only block this store will ever hold").unwrap();
     }
     for _ in 0..8 {
-        let store = SegmentBlockStore::new(dir.path()).unwrap();
+        let store = SegmentBlockStore::new(dir.path()).unwrap().with_volume_verdict(|_| true);
         store.reclaim_retired().unwrap();
         drop(store);
     }
 
-    let store = SegmentBlockStore::new(dir.path()).unwrap();
+    let store = SegmentBlockStore::new(dir.path()).unwrap().with_volume_verdict(|_| true);
     store.reclaim_retired().unwrap();
     assert_eq!(
         store.segment_ids().unwrap().len(),
@@ -405,7 +405,7 @@ fn sealing_forces_the_next_group_onto_a_new_segment() {
 fn a_group_larger_than_the_segment_target_rolls_over_without_splitting_a_record() {
     let dir = tempfile::tempdir().unwrap();
     let limits = GroupCommitLimits { segment_target_bytes: 4096, ..GroupCommitLimits::default() };
-    let store = SegmentBlockStore::with_limits(dir.path(), limits).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits, |_| true).unwrap();
 
     let blocks: Vec<LocallyHashedBlock> = (0..32u32).map(distinct_block_of(1000)).collect();
     let receipts = store.put_durable_batch(&blocks).unwrap();
@@ -420,7 +420,7 @@ fn a_group_larger_than_the_segment_target_rolls_over_without_splitting_a_record(
     // And the same after a restart: roll-over is recorded durably, not
     // held only in the writer's head.
     drop(store);
-    let store = SegmentBlockStore::with_limits(dir.path(), limits).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits, |_| true).unwrap();
     assert!(store.recovery_report().is_clean());
     for block in &blocks {
         assert_eq!(store.get(block.hash()).unwrap(), block.bytes());
@@ -437,7 +437,7 @@ fn a_store_written_one_block_at_a_time_still_rolls_over() {
     // segment, and compaction would have nothing it could ever act on.
     let dir = tempfile::tempdir().unwrap();
     let limits = GroupCommitLimits { segment_target_bytes: 4096, ..GroupCommitLimits::default() };
-    let store = SegmentBlockStore::with_limits(dir.path(), limits).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits, |_| true).unwrap();
 
     let blocks: Vec<LocallyHashedBlock> = (0..40u32).map(distinct_block_of(500)).collect();
     for block in &blocks {
@@ -461,7 +461,7 @@ fn a_store_written_one_block_at_a_time_still_rolls_over() {
 fn a_block_larger_than_the_segment_target_still_stores_in_one_record() {
     let dir = tempfile::tempdir().unwrap();
     let limits = GroupCommitLimits { segment_target_bytes: 1024, ..GroupCommitLimits::default() };
-    let store = SegmentBlockStore::with_limits(dir.path(), limits).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits, |_| true).unwrap();
 
     let big = vec![0xA5u8; 64 * 1024];
     let hash = store.put(&big).unwrap();
@@ -514,7 +514,7 @@ fn a_missing_block_is_reported_not_found() {
 #[test]
 fn sweep_deletes_unreferenced_blocks_outside_the_grace_window_only() {
     let dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::new(dir.path()).unwrap();
+    let store = SegmentBlockStore::new(dir.path()).unwrap().with_volume_verdict(|_| true);
     let live_hash = store.put(b"referenced by a retained version").unwrap();
     let old_orphan = store.put(b"unreferenced and old").unwrap();
     let fresh_orphan = store.put(b"unreferenced but written just now").unwrap();
@@ -536,6 +536,105 @@ fn sweep_deletes_unreferenced_blocks_outside_the_grace_window_only() {
     assert!(!store.exists(&old_orphan).unwrap());
     assert!(store.exists(&live_hash).unwrap(), "a referenced block survives the sweep");
     assert!(store.exists(&fresh_orphan).unwrap(), "the grace window protects a fresh block");
+}
+
+/// Putting a block the store already holds is a new reference to it: the grace window starts
+/// again, so a sweep right after cannot take what the caller was just told is stored.
+#[test]
+fn a_dedup_hit_restarts_the_grace_window() {
+    let (store, _dir) = store();
+    let hash = store.put(b"stored long ago, unreferenced until now").unwrap();
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+    store.backdate_block_for_tests(&hash, long_ago).unwrap();
+
+    assert_eq!(store.put(b"stored long ago, unreferenced until now").unwrap(), hash);
+
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    let report = store.sweep(&HashSet::new(), cutoff, false).unwrap();
+    assert_eq!(report.blocks_deleted, 0);
+    assert!(store.exists(&hash).unwrap());
+    store.get(&hash).unwrap();
+}
+
+/// The sweep removes a block only if it is still outside the grace window when it is removed:
+/// a put that lands between choosing the candidates and removing them keeps its block.
+#[test]
+fn a_put_between_choosing_and_removing_sweep_candidates_keeps_the_block() {
+    let (store, _dir) = store();
+    let store = Arc::new(store);
+    let hash = store.put(b"a candidate that is put back mid-sweep").unwrap();
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+    store.backdate_block_for_tests(&hash, long_ago).unwrap();
+    let again = store.clone();
+    store.install_sweep_candidates_hook_for_tests(move || {
+        again.put(b"a candidate that is put back mid-sweep").unwrap();
+    });
+
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    let report = store.sweep(&HashSet::new(), cutoff, false).unwrap();
+
+    assert_eq!(report.blocks_deleted, 0, "the put refreshed the block before it was removed");
+    assert!(store.exists(&hash).unwrap());
+    store.get(&hash).unwrap();
+}
+
+/// The grace window of a dedup hit starts when the put is about to return its receipt, not when
+/// its group began: if the group's other work is slow, a sweep right after the receipt still
+/// finds the block inside the window.
+#[test]
+fn a_dedup_hit_is_stamped_after_the_slow_work_of_its_group() {
+    let (store, _dir) = store();
+    let old = store.put(b"stored long ago").unwrap();
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+    store.backdate_block_for_tests(&old, long_ago).unwrap();
+    let slow_started = Arc::new(std::sync::Mutex::new(None));
+    let started = slow_started.clone();
+    store.install_before_dedup_stamp_hook_for_tests(move || {
+        *started.lock().unwrap() = Some(std::time::SystemTime::now());
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    });
+
+    store
+        .put_durable_batch(&[prepared(b"stored long ago"), prepared(b"new in the same group")])
+        .unwrap();
+
+    // The window a sweep that began while the group was still working would have used.
+    let cutoff = slow_started.lock().unwrap().expect("the hook ran");
+    let report = store.sweep(&HashSet::new(), cutoff, false).unwrap();
+    assert!(store.exists(&old).unwrap(), "{report:?}");
+    store.get(&old).unwrap();
+}
+
+#[test]
+fn a_malformed_live_hash_refuses_both_sweeps_and_deletes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(dir.path()).unwrap().with_volume_verdict(|_| true);
+    let live_hash = store.put(b"referenced by a retained version").unwrap();
+    let old_orphan = store.put(b"unreferenced and old").unwrap();
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+    store.backdate_block_for_tests(&old_orphan, long_ago).unwrap();
+    store.backdate_block_for_tests(&live_hash, long_ago).unwrap();
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+
+    // An incomplete liveness set is evidence uncertainty, not non-liveness:
+    // a malformed entry must stop the sweep, valid siblings notwithstanding.
+    for malformed in ["not-hex", "abcd", ""] {
+        let live: HashSet<String> =
+            [live_hash.clone(), malformed.to_string()].into_iter().collect();
+        for dry_run in [true, false] {
+            assert!(
+                store.sweep(&live, cutoff, dry_run).is_err(),
+                "malformed live hash {malformed:?} must refuse the sweep (dry_run={dry_run})"
+            );
+        }
+        assert!(store.exists(&old_orphan).unwrap(), "nothing may be deleted on refusal");
+        assert!(store.exists(&live_hash).unwrap());
+    }
+
+    // The same set without the malformed entry still sweeps as before.
+    let live: HashSet<String> = [live_hash.clone()].into_iter().collect();
+    assert_eq!(store.sweep(&live, cutoff, false).unwrap().blocks_deleted, 1);
+    assert!(!store.exists(&old_orphan).unwrap());
 }
 
 #[test]
@@ -562,7 +661,7 @@ fn reclaiming_cached_blocks_frees_exactly_the_named_hashes() {
 fn compaction_reclaims_dead_space_and_keeps_every_live_block_readable() {
     let dir = tempfile::tempdir().unwrap();
     let limits = GroupCommitLimits { segment_target_bytes: 8192, ..GroupCommitLimits::default() };
-    let store = SegmentBlockStore::with_limits(dir.path(), limits).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits, |_| true).unwrap();
 
     // Two segments' worth, so at least one gets sealed and becomes
     // eligible; compaction never touches the segment still being appended
@@ -608,7 +707,7 @@ fn compaction_reclaims_dead_space_and_keeps_every_live_block_readable() {
 
     // And it all survives a restart.
     drop(store);
-    let store = SegmentBlockStore::with_limits(dir.path(), limits).unwrap();
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits, |_| true).unwrap();
     for block in &survivors {
         assert_eq!(store.get(block.hash()).unwrap(), block.bytes());
     }
@@ -617,7 +716,7 @@ fn compaction_reclaims_dead_space_and_keeps_every_live_block_readable() {
 #[test]
 fn a_fully_dead_segment_is_retired_and_its_file_removed() {
     let dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::new(dir.path()).unwrap();
+    let store = SegmentBlockStore::new(dir.path()).unwrap().with_volume_verdict(|_| true);
     let blocks: Vec<LocallyHashedBlock> =
         (0..16u32).map(|i| prepared(format!("doomed block {i}").as_bytes())).collect();
     store.put_durable_batch(&blocks).unwrap();
@@ -673,7 +772,8 @@ fn reads_proceed_while_a_group_commit_is_in_flight() {
 fn reads_and_deletes_proceed_while_compaction_rewrites_a_segment() {
     let dir = tempfile::tempdir().unwrap();
     let limits = GroupCommitLimits { segment_target_bytes: 16384, ..GroupCommitLimits::default() };
-    let store = Arc::new(SegmentBlockStore::with_limits(dir.path(), limits).unwrap());
+    let store =
+        Arc::new(SegmentBlockStore::with_limits_and_verdict(dir.path(), limits, |_| true).unwrap());
 
     let blocks: Vec<LocallyHashedBlock> = (0..512u32).map(distinct_block_of(200)).collect();
     store.put_durable_batch(&blocks).unwrap();
@@ -812,8 +912,82 @@ fn a_store_directory_stamped_with_a_foreign_format_is_refused() {
 #[test]
 fn a_fresh_store_stamps_its_own_format_marker() {
     let dir = tempfile::tempdir().unwrap();
-    let _store = SegmentBlockStore::new(dir.path()).unwrap();
+    let _store = SegmentBlockStore::new(dir.path()).unwrap().with_volume_verdict(|_| true);
     let marker = std::fs::read_to_string(dir.path().join("FORMAT")).unwrap();
     assert!(marker.starts_with("yadorilink-block-store"));
     assert!(marker.contains("format_version="));
+}
+
+/// The verdict that gates deletion is taken on `root/segments` (where the segment files live),
+/// afresh for every deletion, and a refusal removes nothing on any path that deletes bytes.
+#[test]
+fn every_physical_deletion_needs_a_positive_verdict_on_the_segments_directory() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use std::time::SystemTime;
+
+    let dir = tempfile::tempdir().unwrap();
+    let asked: Arc<Mutex<Vec<Option<std::path::PathBuf>>>> = Arc::default();
+    let durable = Arc::new(AtomicBool::new(false));
+    let limits = GroupCommitLimits { segment_target_bytes: 8192, ..GroupCommitLimits::default() };
+    let store = SegmentBlockStore::with_limits(dir.path(), limits).unwrap().with_volume_verdict({
+        let (asked, durable) = (asked.clone(), durable.clone());
+        move |d| {
+            asked.lock().unwrap().push(d.map(|d| d.to_path_buf()));
+            durable.load(Ordering::SeqCst)
+        }
+    });
+    assert_eq!(store.storage_root(), Some(dir.path().join("segments").as_path()));
+
+    let blocks: Vec<LocallyHashedBlock> = (0..64u32).map(distinct_block_of(500)).collect();
+    store.put_durable_batch(&blocks).unwrap();
+    store.seal_active_segment().unwrap();
+    let all: HashSet<String> = blocks.iter().map(|b| b.hash().to_string()).collect();
+    let none = HashSet::new();
+    let later = SystemTime::now() + std::time::Duration::from_secs(60);
+    let refused = |r: Result<_, StorageError>| {
+        assert!(matches!(r, Err(StorageError::DeletionRefused(_))), "expected a refusal");
+    };
+
+    // Refused: nothing is removed, by any path.
+    refused(store.sweep(&none, later, false).map(|_| ()));
+    refused(store.delete(blocks[0].hash()));
+    refused(store.reclaim_cached_blocks(&[blocks[1].hash().to_string()]).map(|_| ()));
+    refused(store.compact_with_thresholds(0.0, 0).map(|_| ()));
+    assert_eq!(store.reclaim_retired().unwrap(), 0, "nothing retired, nothing to delete");
+    for block in &blocks {
+        assert!(store.exists(block.hash()).unwrap());
+    }
+    assert!(store.sweep(&none, later, true).is_ok(), "a dry run deletes nothing");
+    assert!(all.len() == 64);
+    for asked in asked.lock().unwrap().iter() {
+        assert_eq!(asked.as_deref(), Some(dir.path().join("segments").as_path()));
+    }
+
+    // Verdict flips positive: the same calls delete. Flip back: refused again at once.
+    durable.store(true, Ordering::SeqCst);
+    store.delete(blocks[0].hash()).unwrap();
+    durable.store(false, Ordering::SeqCst);
+    refused(store.delete(blocks[1].hash()));
+    assert!(store.exists(blocks[1].hash()).unwrap());
+}
+
+/// With the Windows durability gate open, a store with the production verdict deletes bytes
+/// exactly where the volume holding them is judged durable, and nowhere else.
+#[cfg(windows)]
+#[test]
+fn a_store_on_windows_deletes_only_on_a_volume_the_production_verdict_accepts() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(dir.path()).unwrap();
+    let hash = store.put(b"kept").unwrap();
+    let offered = yadorilink_fs_platform::durable_dir::volume_offers_durable_namespace(Some(
+        &dir.path().join("segments"),
+    ));
+    if offered {
+        store.delete(&hash).unwrap();
+        assert!(!store.exists(&hash).unwrap());
+    } else {
+        assert!(matches!(store.delete(&hash), Err(StorageError::DeletionRefused(_))));
+        assert!(store.exists(&hash).unwrap());
+    }
 }

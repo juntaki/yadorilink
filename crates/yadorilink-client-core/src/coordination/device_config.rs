@@ -45,7 +45,7 @@ pub fn control_pipe_name() -> String {
 pub fn save(cfg: &DeviceConfig) -> std::io::Result<()> {
     let path = config_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        yadorilink_fs_platform::durable_dir::create_dir_all_durably(parent)?;
     }
     let cfg = DeviceConfig { config_version: CONFIG_VERSION, ..cfg.clone() };
     write_config_file(&path, &serde_json::to_string_pretty(&cfg)?)

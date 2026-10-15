@@ -265,3 +265,41 @@ fn a_row_may_cite_a_native_head_only_while_it_shows_that_heads_version() {
     write(&db, &record("x", 2, false), Some(&head));
     assert!(require(&db, "x", Some(&head)).is_err());
 }
+
+fn files_of(db: &SyncDatabase, path: &str) -> Vec<(i64, String)> {
+    db.read::<_, SyncSqliteError>(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT version_seq, state FROM files WHERE group_id = ?1 AND path = ?2 \
+             ORDER BY version_seq",
+        )?;
+        let rows = stmt
+            .query_map([GROUP, path], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .unwrap()
+}
+
+#[test]
+fn retiring_a_scaffold_drops_that_row_and_keeps_the_versions_and_real_rows() {
+    let db = db();
+    let repo = FileIndexRepository::new(db.clone());
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    // A path whose only history is a superseded version: the scaffold is its current row.
+    write(&db, &record("x", 1, false), Some(&identity(1)));
+    db.write_immediate::<_, SyncSqliteError>(|tx| {
+        tx.execute("UPDATE files SET state = 'superseded' WHERE path = 'x'", [])?;
+        Ok(())
+    })
+    .unwrap();
+    repo.ensure_bootstrap_row_for_metadata(GROUP, "x").unwrap();
+    assert_eq!(files_of(&db, "x"), vec![(0, "current".into()), (1, "superseded".into())]);
+
+    assert!(repo.retire_bootstrap_scaffold(GROUP, "x", &permit).unwrap());
+
+    assert_eq!(files_of(&db, "x"), vec![(1, "superseded".into())]);
+    // A real current row is never retired.
+    write(&db, &record("y", 1, false), Some(&identity(2)));
+    assert!(!repo.retire_bootstrap_scaffold(GROUP, "y", &permit).unwrap());
+    assert_eq!(files_of(&db, "y"), vec![(1, "current".into())]);
+}

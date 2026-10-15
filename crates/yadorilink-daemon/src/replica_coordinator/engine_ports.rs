@@ -11,7 +11,8 @@ use yadorilink_replica_domain::ids::{BlockHash, FolderGroupId};
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
 use yadorilink_replica_engine::error::ReplicaEngineError;
 use yadorilink_replica_engine::ports::{
-    DurabilityEvidencePort, DurabilityRoot, ReplicaRetentionPolicy,
+    CustodyLeasePort, CustodyLeaseRequest, DurabilityEvidencePort, DurabilityRoot,
+    ReplicaRetentionPolicy,
 };
 use yadorilink_replica_engine::{PeerReplicaEngine, ReplicaEngineDependencies};
 
@@ -135,6 +136,70 @@ impl DurabilityEvidencePort for DurabilityEvidenceAdapter {
     }
 }
 
+/// `CustodyLeasePort` over the replica database's custody lease table, so a
+/// lease is in the same database, and the same GC live set, as the blocks it
+/// keeps.
+pub struct CustodyLeaseAdapter {
+    pub coordinator: Arc<ReplicaCoordinator>,
+}
+
+impl CustodyLeasePort for CustodyLeaseAdapter {
+    fn begin_reference_write(&self) -> Box<dyn Send + '_> {
+        Box::new(self.coordinator.block_liveness_gate().begin_reference_write())
+    }
+
+    fn acquire(&self, request: &CustodyLeaseRequest) -> Result<bool, ReplicaEngineError> {
+        // A device that is handing its leases off takes no new one: a lease
+        // committed after the last one moved would be left behind. Nor does it
+        // take one for a requester the plane has just removed from the group.
+        // The check and the commit are one step against both.
+        let committed = self.coordinator.custody_closing().while_open(
+            &request.group_id,
+            &request.requester_device_id,
+            || {
+                self.coordinator.remote_custody_lease_repository().acquire(
+                    &yadorilink_sync_sqlite::remote_custody_lease::CustodyLeaseRequest {
+                        group_id: request.group_id.clone(),
+                        requester_device_id: request.requester_device_id.clone(),
+                        path: request.path.clone(),
+                        version_hash: request.version_hash,
+                        blocks: request.block_hashes.iter().map(hex::encode).collect(),
+                        membership_generation: request.membership_generation,
+                        attempt_token: request.attempt_token,
+                        now_unix: unix_now(),
+                    },
+                )
+            },
+        );
+        match committed {
+            None => Ok(false),
+            Some(result) => result
+                .map(|acquired| acquired.lease().is_some())
+                .map_err(|error| ReplicaEngineError::Storage(error.to_string())),
+        }
+    }
+
+    fn release(
+        &self,
+        group_id: &str,
+        requester_device_id: &str,
+        path: &str,
+        version_hash: &[u8; 32],
+        attempt_token: &[u8; 16],
+    ) -> Result<bool, ReplicaEngineError> {
+        self.coordinator
+            .remote_custody_lease_repository()
+            .release(group_id, requester_device_id, path, version_hash, attempt_token)
+            .map_err(|error| ReplicaEngineError::Storage(error.to_string()))
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
 /// Builds the `PeerReplicaEngine` a `PeerSyncSession` needs, directly
 /// against `ReplicaCoordinator` and `store` -- the one construction site
 /// for it in real (non-fake) code, shared by the daemon's own composition
@@ -146,5 +211,6 @@ pub fn build_peer_replica_engine(
 ) -> PeerReplicaEngine {
     PeerReplicaEngine::new(ReplicaEngineDependencies {
         durability: Arc::new(DurabilityEvidenceAdapter { coordinator: coordinator.clone(), store }),
+        leases: Arc::new(CustodyLeaseAdapter { coordinator: coordinator.clone() }),
     })
 }

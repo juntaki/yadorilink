@@ -13,9 +13,10 @@
 //!   an edit that is not provably made from the current version never changes it: its bytes are
 //!   kept durably as a conflict-named file (an operation that carries bytes is never refused
 //!   without keeping them);
-//! * nothing is ever replaced: a name that is taken is a collision. A recursive directory delete is
-//!   `rm -r` on the current directory identity (its own echoed token must be current) and deletes
-//!   the subtree as it is at execution time; unseen descendants are not a refusal reason. A file
+//! * nothing is ever replaced: a name that is taken is a collision. A recursive directory delete
+//!   deletes the subtree the user saw: the directory's echoed token covers its whole subtree (any
+//!   descendant change, at any depth, advances it), so an entry added after the view makes the
+//!   delete a stale view instead of being swept away unseen. A file
 //!   delete destroys only an unambiguous view. A destination folder is an identity, not a view;
 //! * no presence evidence is recorded here: what the OS holds is learned only from the ordinary
 //!   handoff and membership route.
@@ -2014,8 +2015,8 @@ fn delete(
     }
 
     // A directory is deleted only on the view the user saw: the echoed token (the directory's shown
-    // version hash and its generation, which advances whenever its child set changes) must be the
-    // current one. An unknown, absent or old token deletes nothing.
+    // version hash and its generation, which advances whenever anything below it changes) must be
+    // the current one. An unknown, absent or old token deletes nothing.
     // The CURRENT directory version (not what was last published or announced): a token whose
     // hash is an older view never passes, even paired with a newer generation.
     let shown_hash = Some(match live_row(tx, group_id, &path)? {

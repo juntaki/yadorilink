@@ -97,18 +97,43 @@ impl ClientCore {
         bridge(async move { core.folder_peer_counts().await }).await
     }
 
-    // ---- folder control ----
-    pub async fn pause_folder(&self, local_path: String) -> Result<(), DesktopError> {
+    // ---- conflicts and kept originals ----
+    pub async fn resolve_conflict(
+        &self,
+        copy_path: String,
+        choice: ConflictChoice,
+    ) -> Result<String, DesktopError> {
         let core = self.inner.clone();
-        bridge(async move { core.pause_folder(local_path).await }).await
+        bridge(async move { core.resolve_conflict(copy_path, choice).await }).await
+    }
+    pub async fn list_retained_originals(&self) -> Result<Vec<RetainedOriginal>, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.list_retained_originals().await }).await
+    }
+    pub async fn release_retained_originals(
+        &self,
+        group_id: String,
+    ) -> Result<Vec<RetainedRelease>, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.release_retained_originals(group_id).await }).await
+    }
+
+    // ---- folder control ----
+    pub async fn pause_folder(
+        &self,
+        local_path: String,
+        duration: PauseDuration,
+    ) -> Result<(), DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.pause_folder(local_path, duration).await }).await
     }
     pub async fn resume_folder(&self, local_path: String) -> Result<(), DesktopError> {
         let core = self.inner.clone();
         bridge(async move { core.resume_folder(local_path).await }).await
     }
-    pub async fn pause_all(&self) -> Result<(), DesktopError> {
+    pub async fn pause_all(&self, duration: PauseDuration) -> Result<(), DesktopError> {
         let core = self.inner.clone();
-        bridge(async move { core.pause_all().await }).await
+        bridge(async move { core.pause_all(duration).await }).await
     }
     pub async fn resume_all(&self) -> Result<(), DesktopError> {
         let core = self.inner.clone();
@@ -179,6 +204,21 @@ impl ClientCore {
         let core = self.inner.clone();
         bridge(async move { core.file_availability(absolute_path).await }).await
     }
+    pub async fn file_retention(
+        &self,
+        absolute_path: String,
+    ) -> Result<FileRetention, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.file_retention(absolute_path).await }).await
+    }
+    pub async fn pin_file(&self, absolute_path: String) -> Result<PinOutcome, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.pin_file(absolute_path).await }).await
+    }
+    pub async fn unpin_file(&self, absolute_path: String) -> Result<FileRetention, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.unpin_file(absolute_path).await }).await
+    }
     pub async fn hydrate_file(&self, absolute_path: String) -> Result<(), DesktopError> {
         let core = self.inner.clone();
         bridge(async move { core.hydrate_file(absolute_path).await }).await
@@ -228,10 +268,37 @@ impl ClientCore {
         bridge(async move { core.receive_transfer(transfer_id, destination_dir).await }).await
     }
 
+    pub async fn cancel_transfer(&self, transfer_id: String) -> Result<(), DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.cancel_transfer(transfer_id).await }).await
+    }
+    pub async fn retry_transfer(
+        &self,
+        transfer_id: String,
+    ) -> Result<ReceivedTransfer, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.retry_transfer(transfer_id).await }).await
+    }
+
     // ---- storage, settings and the daemon ----
     pub async fn run_gc(&self, dry_run: bool) -> Result<GcReport, DesktopError> {
         let core = self.inner.clone();
         bridge(async move { core.run_gc(dry_run).await }).await
+    }
+    pub async fn space_management(&self) -> Result<SpaceManagement, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.space_management().await }).await
+    }
+    pub async fn set_space_management(
+        &self,
+        enabled: bool,
+    ) -> Result<SpaceManagement, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.set_space_management(enabled).await }).await
+    }
+    pub async fn preview_space_reclaim(&self) -> Result<SpaceReclaimPreview, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.preview_space_reclaim().await }).await
     }
     pub async fn bandwidth_limits(&self) -> Result<BandwidthLimits, DesktopError> {
         let core = self.inner.clone();
@@ -269,17 +336,16 @@ impl ClientCore {
         let core = self.inner.clone();
         bridge(async move { core.check_for_updates().await }).await
     }
-    pub async fn install_update(&self) -> Result<UpdateInstallOutcome, DesktopError> {
+    pub async fn download_guidance(&self) -> Result<UpdateDownloadGuidance, DesktopError> {
         let core = self.inner.clone();
-        bridge(async move { core.install_update().await }).await
+        bridge(async move { core.download_guidance().await }).await
     }
-    pub async fn set_update_config(
+    pub async fn set_automatic_update_checks(
         &self,
-        automatic_checks: Option<bool>,
-        install_mode: Option<UpdateInstallMode>,
+        enabled: bool,
     ) -> Result<UpdateConfig, DesktopError> {
         let core = self.inner.clone();
-        bridge(async move { core.set_update_config(automatic_checks, install_mode).await }).await
+        bridge(async move { core.set_automatic_update_checks(enabled).await }).await
     }
 
     // ---- account ----

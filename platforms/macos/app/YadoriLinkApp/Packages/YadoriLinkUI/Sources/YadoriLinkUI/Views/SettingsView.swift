@@ -15,16 +15,22 @@ public struct SettingsView: View {
     }
 
     public var body: some View {
-        TabView {
+        @Bindable var context = context
+        TabView(selection: $context.settingsTab) {
             GeneralSettingsView(extensions: extensions)
+                .tag(SettingsTab.general)
                 .tabItem { Label("General", systemImage: "gearshape") }
-            UpdatesSettingsView(client: context.app.client)
+            UpdatesSettingsView(client: context.app.client, openURL: { NSWorkspace.shared.open($0) })
+                .tag(SettingsTab.updates)
                 .tabItem { Label("Updates", systemImage: "arrow.down.circle") }
             BandwidthSettingsView(client: context.app.client)
+                .tag(SettingsTab.bandwidth)
                 .tabItem { Label("Bandwidth", systemImage: "speedometer") }
             AccountSettingsView(app: context.app)
+                .tag(SettingsTab.account)
                 .tabItem { Label("Account", systemImage: "person.crop.circle") }
             DiagnosticsSettingsView(client: context.app.client)
+                .tag(SettingsTab.diagnostics)
                 .tabItem { Label("Diagnostics", systemImage: "stethoscope") }
         }
         .frame(width: 540)
@@ -83,9 +89,11 @@ struct GeneralSettingsView: View {
                     }
                 }
                 if let error = loginItem.errorText {
-                    Text(error).font(.caption).foregroundStyle(.red)
+                    Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                        .accessibilityLabel("Error: \(error)")
                 }
             }
+            SpaceManagementSection(client: context.app.client)
             if let extensions {
                 Section("Finder") {
                     LabeledContent("Finder integration", value: finderExtensionEnabled ? "On" : "Off")
@@ -103,11 +111,50 @@ struct GeneralSettingsView: View {
     }
 }
 
+/// Automatic space management: only when free disk space is low, downloaded files that are safe to give back go back to online-only.
+struct SpaceManagementSection: View {
+    let client: any YadoriLinkClient
+    @State private var enabled = false
+    @State private var loaded = false
+    @State private var failed = false
+
+    var body: some View {
+        Section("Storage") {
+            Toggle("Automatic space management", isOn: Binding(get: { enabled }, set: { enabled = $0; save() }))
+                .disabled(!loaded)
+            Text("Only when free disk space gets low, YadoriLink automatically frees downloaded files that are safe to remove. Files you keep on this device are never removed.")
+                .font(.caption).foregroundStyle(.secondary)
+            if failed {
+                Text("Could not save this setting. Check that YadoriLink is running.")
+                    .font(.caption).foregroundStyle(.red)
+            }
+        }
+        .task {
+            if let current = try? await client.spaceManagement() {
+                enabled = current.enabled
+                loaded = true
+            }
+        }
+    }
+
+    private func save() {
+        let on = enabled
+        Task {
+            do {
+                enabled = try await client.setSpaceManagement(enabled: on).enabled
+                failed = false
+            } catch {
+                failed = true
+            }
+        }
+    }
+}
+
 struct UpdatesSettingsView: View {
     @State private var model: UpdatesModel
     @State private var showsVersionDetails = false
 
-    init(client: any YadoriLinkClient) { _model = State(initialValue: UpdatesModel(client: client)) }
+    init(client: any YadoriLinkClient, openURL: @escaping (URL) -> Bool) { _model = State(initialValue: UpdatesModel(client: client, openURL: openURL)) }
 
     var body: some View {
         DaemonGate {
@@ -116,18 +163,22 @@ struct UpdatesSettingsView: View {
                     HStack {
                         Text(model.headline).font(.headline)
                         Spacer()
-                        if model.canInstall {
-                            Button("Download the new version") { Task { await model.install() } }.disabled(model.isWorking)
+                        if model.canDownload {
+                            Button(model.downloadButtonTitle) { Task { await model.download() } }.disabled(model.isWorking)
                         } else {
-                            Button("Check Now") { Task { await model.check() } }.disabled(model.isWorking)
+                            Button(model.lookupFailed ? UpdateWording.checkAgainButton : UpdateWording.checkButton) { Task { await model.check() } }.disabled(model.isWorking)
                         }
                     }
                     ForEach(model.notes, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
+                    if model.canDownload, let notes = model.releaseNotesURL {
+                        Link(UpdateWording.releaseNotesButton, destination: notes).font(.caption)
+                    }
                     Text(model.lastChecked).font(.caption).foregroundStyle(.secondary)
-                    Toggle("Check for updates automatically", isOn: Binding(
+                    Toggle(UpdateWording.automaticChecks, isOn: Binding(
                         get: { model.automaticChecks },
                         set: { on in Task { await model.setAutomaticChecks(on) } }
                     ))
+                    Text(UpdateWording.checksOnlyNote).font(.caption).foregroundStyle(.secondary)
                     if let status = model.status {
                         DisclosureGroup("Version details", isExpanded: $showsVersionDetails) {
                             LabeledContent("Version", value: status.currentVersion)
@@ -180,7 +231,10 @@ struct BandwidthSettingsView: View {
                         .multilineTextAlignment(.trailing)
                     Text("MiB/s").foregroundStyle(.secondary)
                 }
-                if let error { Text(error).font(.caption).foregroundStyle(.red) }
+                if let error {
+                    Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                        .accessibilityLabel("Error: \(error)")
+                }
             }
         }
     }
@@ -245,7 +299,15 @@ struct AccountSettingsView: View {
             }
             Group {
                 Section("Devices on your account") {
-                    if model.devices.isEmpty && model.sectionsEnabled { LoadingRow() }
+                    switch model.devicesPhase {
+                    case .loading: LoadingRow()
+                    case .failed(let failure):
+                        RetryRow(LoadWording.devices, notice: failure) { await model.load() }
+                    case .notLoaded, .loaded: EmptyView()
+                    }
+                    if let stale = model.devicesStale {
+                        RetryRow(LoadWording.stale("devices"), notice: stale) { await model.load() }
+                    }
                     ForEach(model.devices) { device in
                         HStack {
                             Text(device.name).help(device.tooltip)

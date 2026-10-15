@@ -27,8 +27,7 @@ fn held_file_detail_lines(link: &LinkStatus, verbose: bool) -> Vec<String> {
     link.held_files
         .iter()
         .map(|h| {
-            let (code, _) = reasons::split_code(&h.reason);
-            let sentence = reasons::explain(code, "", false);
+            let sentence = reasons::explain_held(&h.reason);
             if verbose {
                 format!("    held: {}  {sentence}  (code: {})", h.path, h.reason)
             } else {
@@ -298,7 +297,7 @@ fn overall_state_lines(status: &StatusResponse, verbose: bool) -> Vec<String> {
     for raw in &status.attention_reasons {
         let (code, arg) = reasons::split_code(raw);
         let subject = reason_subject(status, code, arg, verbose);
-        lines.push(format!("  - {}", reasons::explain(raw, &subject, verbose)));
+        lines.push(format!("  - {}", reasons::explain_reason(raw, &subject, verbose)));
     }
     lines
 }
@@ -316,7 +315,10 @@ fn reason_subject(status: &StatusResponse, code: &str, arg: &str, verbose: bool)
         | "fetch_availability_unknown"
         | "conflict"
         | "volume_changed"
-        | "held" => group_label(status, arg),
+        | "held"
+        | "stranded_directory" => group_label(status, arg),
+        // The removals list that could not be read (see the daemon's `overall_status`).
+        "provider_not_ready" if arg == "removals" => "provider folder removals".to_owned(),
         "provider_not_ready" | "provider_stuck" | "kept_edits" => status
             .provider_roots
             .iter()
@@ -384,6 +386,11 @@ fn provider_root_lines(status: &StatusResponse, verbose: bool) -> Vec<String> {
         }
     }
     for removal in &status.provider_removals {
+        if removal.unreadable {
+            // Stands in for the whole list: nothing is known about removals.
+            lines.push(format!("provider folder removals: {}", removal.display_name));
+            continue;
+        }
         lines.push(if removal.removed {
             if removal.preserved_location.is_empty() {
                 format!(
@@ -423,6 +430,20 @@ fn age_text(ms: u64) -> String {
         s if s < 172_800 => format!("{}h", s / 3600),
         s => format!("{}d", s / 86_400),
     }
+}
+
+/// The disk originals a rebootstrap kept take, when there are any.
+fn retained_line(status: &StatusResponse) -> Option<String> {
+    let preserved = status.preserved.as_ref()?;
+    if preserved.retained_originals == 0 {
+        return None;
+    }
+    Some(format!(
+        "Kept originals: {} original(s) kept because removing them could not be proved safe; \
+         see `yadorilink preserved retained list` for the disk they take, \
+         try `yadorilink preserved retained release`",
+        preserved.retained_originals
+    ))
 }
 
 fn preserved_line(status: &StatusResponse) -> Option<String> {
@@ -502,7 +523,7 @@ fn volume_line(volume: &VolumeFreeSpace) -> String {
 /// Byte-count formatter, shared in shape with `format_rate_bytes_per_sec`
 /// above minus the `/s` suffix — block-store usage and the reclaimable
 /// estimate are point-in-time totals, not rates.
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut value = bytes as f64;
     let mut unit = 0;
@@ -560,6 +581,31 @@ fn block_store_summary_line(status: &StatusResponse) -> String {
 /// applicable" discipline, matching `degraded_suffix`/
 /// `held_summary_suffix`). The ETA is explicitly labelled `~`
 /// (best-effort) rather than presented as precise.
+/// "syncing", "paused", or "paused (resumes in 29m)" for a timed pause.
+pub(crate) fn link_state_label(link: &yadorilink_ipc_proto::daemonctl::LinkStatus) -> String {
+    if !link.paused {
+        return "syncing".to_string();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    timed_pause_label(link.paused_until_unix, now)
+}
+
+fn timed_pause_label(paused_until_unix: i64, now_unix: i64) -> String {
+    if paused_until_unix <= 0 {
+        return "paused".to_string();
+    }
+    let minutes = ((paused_until_unix - now_unix).max(0) + 59) / 60;
+    let left = if minutes >= 60 {
+        format!("{}h {}m", minutes / 60, minutes % 60)
+    } else {
+        format!("{minutes}m")
+    };
+    format!("paused (resumes in {left})")
+}
+
 fn transfer_progress_suffix(link: &LinkStatus) -> String {
     if !link.has_active_transfer {
         return String::new();
@@ -632,9 +678,7 @@ fn update_summary_lines(status: &StatusResponse) -> Vec<String> {
     let mut lines = Vec::new();
     if !status.update_available_version.is_empty() {
         let install_plan = if status.update_mandatory {
-            "will install automatically (mandatory security/compatibility update)"
-        } else if status.update_waiting_for_safe_point {
-            "waiting for a safe point to install"
+            "mandatory; download it with `yadorilink update download`"
         } else if !status.update_holdback_reason.is_empty() {
             "held back"
         } else {
@@ -647,8 +691,12 @@ fn update_summary_lines(status: &StatusResponse) -> Vec<String> {
     }
     if !status.update_last_error_category.is_empty() {
         lines.push(format!(
-            "Update error: {}  (see `yadorilink update status` for details)",
-            status.update_last_error_category
+            "Update error: {}",
+            reasons::explain_reason(
+                &format!("update_failed:{}", status.update_last_error_category),
+                "",
+                false
+            )
         ));
     }
     lines
@@ -670,6 +718,19 @@ pub async fn status(watch: bool, verbose: bool) -> Result<(), CliError> {
         println!("--- refreshing every 2s (Ctrl-C to stop) ---");
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
+}
+
+/// `status --json`: the folder list and the overall answer with the availability and protection
+/// dimensions, as the stable snake_case names `yadorilink-product-view` documents.
+pub async fn status_as_json() -> Result<(), CliError> {
+    let status = yadorilink_client_core::ops::folders::status().await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&yadorilink_client_core::dto::status_dimensions_json(
+            &status
+        ))?
+    );
+    Ok(())
 }
 
 /// `status --pending-items N`: the publications waiting on the OS, oldest first.
@@ -719,6 +780,9 @@ fn status_lines(status: &StatusResponse, verbose: bool) -> Vec<String> {
     if let Some(line) = preserved_line(status) {
         lines.push(line);
     }
+    if let Some(line) = retained_line(status) {
+        lines.push(line);
+    }
     lines.extend(provider_root_lines(status, verbose));
     if status.undecided_uploads > 0 {
         lines.push(format!(
@@ -732,7 +796,7 @@ fn status_lines(status: &StatusResponse, verbose: bool) -> Vec<String> {
         lines.push("No linked folders.".to_string());
     }
     for link in &status.links {
-        let state = if link.paused { "paused" } else { "syncing" };
+        let state = link_state_label(link);
         let materialization = local_storage_suffix(link);
         let held = held_summary_suffix(link);
         let degraded = degraded_suffix(link);

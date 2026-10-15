@@ -70,3 +70,43 @@ pub trait DurabilityEvidencePort: Send + Sync {
     fn root_set_summary(&self, group: &FolderGroupId)
         -> Result<RootSetSummary, ReplicaEngineError>;
 }
+
+/// What a requester asks this device to keep, in domain terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyLeaseRequest {
+    pub group_id: String,
+    pub requester_device_id: String,
+    pub path: String,
+    pub version_hash: [u8; 32],
+    pub block_hashes: Vec<Vec<u8>>,
+    pub membership_generation: u64,
+    /// The requester's identifier of this acquire attempt.
+    pub attempt_token: [u8; 16],
+}
+
+/// Durable storage of the custody leases this device holds for others. A
+/// lease is committed before the responder acknowledges it and stays a block
+/// GC live root until released.
+pub trait CustodyLeasePort: Send + Sync {
+    /// Held while an acquire reads the version's root, verifies its blocks and
+    /// commits the lease: block GC cannot run until it is dropped, so it
+    /// either sees the committed lease or never sees the version unrooted.
+    fn begin_reference_write(&self) -> Box<dyn Send + '_>;
+
+    /// Commits the lease, or finds it already committed. `Ok(true)` when the
+    /// requester now holds it; `Ok(false)` when the port refuses to hold it
+    /// (the attempt was already released, or this device is handing its
+    /// leases off).
+    fn acquire(&self, request: &CustodyLeaseRequest) -> Result<bool, ReplicaEngineError>;
+
+    /// Ends the lease held by the attempt `attempt_token` and remembers the
+    /// attempt as released; `Ok(false)` when it held no lease.
+    fn release(
+        &self,
+        group_id: &str,
+        requester_device_id: &str,
+        path: &str,
+        version_hash: &[u8; 32],
+        attempt_token: &[u8; 16],
+    ) -> Result<bool, ReplicaEngineError>;
+}

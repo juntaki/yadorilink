@@ -20,6 +20,10 @@ public struct ShareView: View {
         self.showQRCode = showQRCode
     }
 
+    private func removeButton(_ member: MemberRow) -> some View {
+        Button("Remove Access…", role: .destructive) { confirmRemoval = member }
+    }
+
     public var body: some View {
         VStack(spacing: 0) {
             Form {
@@ -32,6 +36,7 @@ public struct ShareView: View {
                                 NSPasteboard.general.clearContents()
                                 NSPasteboard.general.setString(invite.url, forType: .string)
                             }
+                            .accessibilityLabel("Copy invite link")
                             ShareLink(item: invite.url) { Text("Send…") }
                         }
                         Text("\(invite.role.title) · expires \(invite.expiresAt.formatted(date: .abbreviated, time: .shortened))\(invite.requiresApproval ? " · you approve each device" : "")")
@@ -55,6 +60,9 @@ public struct ShareView: View {
                 }
 
                 Section("People with access") {
+                    if let failure = model.loadFailure {
+                        RetryRow(model.hasLoaded ? LoadWording.stale("who has access") : LoadWording.members, notice: failure) { await model.load() }
+                    }
                     ForEach(model.members) { member in
                         HStack {
                             OnlineDot(online: member.online)
@@ -76,11 +84,12 @@ public struct ShareView: View {
                             } else {
                                 Text(member.roleTitle).foregroundStyle(.secondary)
                             }
+                            if member.canRemove {
+                                RowActionsMenu(label: "Actions for \(member.name)") { removeButton(member) }
+                            }
                         }
                         .contextMenu {
-                            if member.canRemove {
-                                Button("Remove Access…", role: .destructive) { confirmRemoval = member }
-                            }
+                            if member.canRemove { removeButton(member) }
                         }
                     }
                 }
@@ -92,7 +101,9 @@ public struct ShareView: View {
                                 Text(request.title).help(request.tooltip)
                                 Spacer()
                                 Button("Decline") { Task { await model.deny(request) } }
+                                    .accessibilityLabel("Decline device request")
                                 Button("Approve") { Task { await model.approve(request) } }
+                                    .accessibilityLabel("Approve device request")
                             }
                         }
                     }
@@ -105,6 +116,7 @@ public struct ShareView: View {
                                 Text(invite.title)
                                 Spacer()
                                 Button("Cancel Link") { Task { await model.cancelInvite(invite) } }
+                                    .accessibilityLabel("Cancel invite link")
                             }
                         }
                     }
@@ -128,6 +140,8 @@ public struct ShareView: View {
         ) { member in
             Button("Cancel", role: .cancel) {}
             Button("Remove Access", role: .destructive) { Task { await model.removeAccess(member) } }
+        } message: { member in
+            Text("\(member.name) will stop syncing \(model.folderName) and lose access to it. You can invite them again later.")
         }
         .overrideAlert($model.pendingOverride) { await model.confirmOverride() }
         .task { await model.load() }
@@ -238,14 +252,18 @@ struct SignInStatusView: View {
                 .help("YadoriLink opens your browser twice: once to approve this Mac, then to sign in. The result comes back to this Mac directly and is kept in your keychain.")
             if model.phase != .idle {
                 HStack(spacing: 8) {
-                    if model.isRunning { ProgressView().controlSize(.small) }
+                    if model.isRunning { ProgressView().controlSize(.small).accessibilityHidden(true) }
                     if case .failed = model.phase {
                         Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.red)
+                            .accessibilityHidden(true)
                     }
                     if model.phase == .signedIn {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                            .accessibilityHidden(true)
                     }
-                    Text(model.statusText).help(model.errorDetail ?? "")
+                    Text(model.statusText).textSelection(.enabled)
+                        .accessibilityLabel(model.spokenStatusText)
+                        .help(model.errorDetail ?? "")
                 }
             }
         }

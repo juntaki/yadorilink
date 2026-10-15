@@ -57,7 +57,7 @@ impl DaemonInstanceLock {
     fn acquire(config_dir: &std::path::Path) -> anyhow::Result<Self> {
         use std::fs::OpenOptions;
 
-        std::fs::create_dir_all(config_dir)?;
+        yadorilink_fs_platform::durable_dir::create_dir_all_durably(config_dir)?;
         let lock_path = config_dir.join(DAEMON_INSTANCE_LOCK_FILE);
         // `truncate(false)` is explicit, not incidental: this is a lock file,
         // never a content file, so an existing file's bytes (if any) are
@@ -306,7 +306,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     spawn_io_diag_mark_listener();
 
     let dir = config.config_dir;
-    std::fs::create_dir_all(&dir)?;
+    yadorilink_fs_platform::durable_dir::create_dir_all_durably(&dir)?;
     // Acquire before opening the block store/SQLite or touching either Unix
     // socket. In particular, a losing process must never unlink the live
     // daemon's socket before discovering that it does not own this config.
@@ -505,6 +505,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // lease as a GC root; the real daemon keeps the exact-version protocol
     // available for diagnostics and that future lease flow.
     state.install_p2p_custody_confirmer();
+    // Releases the custody leases this device asked peers to keep and no
+    // longer depends on. Runs after the stale-`Evicting` reset above, so every
+    // row is judged against settled state.
+    crate::custody_holds::spawn_custody_hold_reconciler(&state);
 
     // Wire this device's change-history signing key once, so linked folders
     // emit signed changes. Only for a registered device (an unregistered one
@@ -662,6 +666,15 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         let context = shell_context.clone();
         crate::supervise::spawn_logged("provider-prefetch", async move {
             crate::provider_prefetch::run(context).await;
+            Ok(())
+        });
+    }
+
+    #[cfg(any(windows, unix))]
+    {
+        let auto = shell_context.auto_reclaim.clone();
+        crate::supervise::spawn_logged("provider-auto-reclaim", async move {
+            crate::provider_auto_reclaim::run(auto).await;
             Ok(())
         });
     }

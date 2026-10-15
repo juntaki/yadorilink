@@ -875,9 +875,7 @@ fn read_xattrs_filtered(file: &fs::File, allow: impl Fn(&str) -> bool) -> Vec<(S
 /// point in the file does -- the exactness proof must never mistake
 /// "could not check" for "matches."
 #[cfg(target_os = "linux")]
-pub(crate) fn read_replicated_xattrs_strict(
-    file: &fs::File,
-) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+pub fn read_replicated_xattrs_strict(file: &fs::File) -> std::io::Result<Vec<(String, Vec<u8>)>> {
     const LINUX_ALLOWED_PREFIX: &str = "user.";
     use std::os::unix::io::AsRawFd;
     let fd = file.as_raw_fd();

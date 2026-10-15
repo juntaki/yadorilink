@@ -27,6 +27,9 @@ public final class AppModel {
     /// reconciles File Provider domains from it stays fail-closed.
     @ObservationIgnored public var onDemandGroupsChanged: ((Set<String>) -> Void)?
 
+    /// Called with every status snapshot, in order. Not called while the daemon is down.
+    @ObservationIgnored public var onSnapshot: ((StatusSnapshot) -> Void)?
+
     @ObservationIgnored private let pollInterval: TimeInterval
     @ObservationIgnored private var watch: (any StatusWatchHandle)?
     @ObservationIgnored private var watchTask: Task<Void, Never>?
@@ -73,6 +76,7 @@ public final class AppModel {
         switch update {
         case .snapshot(let snapshot):
             status = .ready(snapshot)
+            onSnapshot?(snapshot)
             let onDemand = Set(snapshot.folders.filter { $0.mode == .onDemand }.map(\.groupId))
             if onDemand != lastOnDemandGroups {
                 lastOnDemandGroups = onDemand
@@ -123,15 +127,15 @@ public final class AppModel {
         }
     }
 
-    public func setPaused(_ paused: Bool, for folder: FolderSummary) async {
+    public func setPaused(_ paused: Bool, for folder: FolderSummary, duration: PauseDuration = .untilResumed) async {
         await perform {
-            if paused { try await $0.pauseFolder(localPath: folder.localPath) } else { try await $0.resumeFolder(localPath: folder.localPath) }
+            if paused { try await $0.pauseFolder(localPath: folder.localPath, duration: duration) } else { try await $0.resumeFolder(localPath: folder.localPath) }
         }
     }
 
-    public func setAllPaused(_ paused: Bool) async {
+    public func setAllPaused(_ paused: Bool, duration: PauseDuration = .untilResumed) async {
         await perform {
-            if paused { try await $0.pauseAll() } else { try await $0.resumeAll() }
+            if paused { try await $0.pauseAll(duration: duration) } else { try await $0.resumeAll() }
         }
     }
 
@@ -158,7 +162,8 @@ public final class AppModel {
         case .unavailable: return AppBanner.daemonUnavailable.title
         case .ready(let snapshot):
             if snapshot.folders.isEmpty { return "No folders yet" }
-            if !snapshot.attentionReasons.isEmpty { return Plural.issues(snapshot.attentionReasons.count) }
+            let actionable = snapshot.attentionReasons.filter { $0.kind != .waiting }
+            if !actionable.isEmpty { return Plural.issues(actionable.count) }
             let syncing = snapshot.folders.filter { $0.state == .syncing }.count
             if syncing > 0 { return "Syncing \(Plural.folders(syncing))" }
             if snapshot.folders.allSatisfy(\.paused) { return "Syncing is paused" }

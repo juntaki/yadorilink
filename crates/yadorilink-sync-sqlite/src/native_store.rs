@@ -253,6 +253,7 @@ pub fn init_native_tables(conn: &Connection) -> Result<(), SyncSqliteError> {
     crate::native_recovery_items::init_tables(conn)?;
     crate::native_summary_cache::init_tables(conn)?;
     crate::projection_obligations::init_projection_obligations_schema(conn)?;
+    crate::pinned_items::init_pinned_items_schema(conn)?;
     Ok(())
 }
 

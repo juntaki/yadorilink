@@ -94,7 +94,7 @@ fn is_contended(e: &std::io::Error) -> bool {
 
 pub(super) async fn acquire(path: &Path, timeout: Duration) -> StoreResult<CredentialLock> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
+    yadorilink_fs_platform::durable_dir::create_dir_all_durably(parent)
         .map_err(|source| StoreError::Io { path: parent.to_path_buf(), source })?;
 
     let file = open(path)?;

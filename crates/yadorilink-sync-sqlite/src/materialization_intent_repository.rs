@@ -299,6 +299,28 @@ impl MaterializationTempLedger {
         })
     }
 
+    /// How many directories recorded as stranded for this group still stand.
+    /// A record whose path is gone is not counted but is kept: an unmounted
+    /// volume looks the same, and the record is all that tells the user when
+    /// it comes back. A path that cannot be examined counts.
+    pub fn standing_stranded_count(&self) -> Result<u64, SyncSqliteError> {
+        let recorded = self.database.read::<_, SyncSqliteError>(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT dir_path FROM stranded_directories WHERE group_id = ?1")?;
+            let rows = stmt.query_map([&self.group_id], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })?;
+        Ok(recorded
+            .iter()
+            .filter(|dir| {
+                !matches!(
+                    std::fs::symlink_metadata(dir),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                )
+            })
+            .count() as u64)
+    }
+
     /// Forgets a recorded temp file (recovery, after the file is gone).
     pub fn forget(&self, tmp_path: &str) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
@@ -341,6 +363,27 @@ impl yadorilink_local_storage::TempFileLedger for MaterializationTempLedger {
         })
     }
 
+    fn strand(
+        &self,
+        dir_path: &std::path::Path,
+    ) -> Result<(), yadorilink_local_storage::StorageError> {
+        let dir_path = utf8_tmp_path(dir_path)?;
+        self.database
+            .write::<_, SyncSqliteError>(|conn| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO stranded_directories (group_id, dir_path) \
+                     VALUES (?1, ?2)",
+                    rusqlite::params![self.group_id, dir_path],
+                )?;
+                Ok(())
+            })
+            .map_err(|e| {
+                yadorilink_local_storage::StorageError::Io(std::io::Error::other(format!(
+                    "stranded directory ledger: {e}"
+                )))
+            })
+    }
+
     fn release(&self, tmp_path: &std::path::Path) {
         let Some(tmp_path) = tmp_path.to_str() else { return };
         let full = {
@@ -358,5 +401,38 @@ impl yadorilink_local_storage::TempFileLedger for MaterializationTempLedger {
                 tracing::warn!(%error, "could not write queued temp file releases; recovery clears them");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stranded_tests {
+    use super::*;
+    use yadorilink_local_storage::TempFileLedger;
+
+    fn ledger(group: &str, database: &Arc<SyncDatabase>) -> MaterializationTempLedger {
+        MaterializationTempLedger::new(database.clone(), group, Arc::default())
+    }
+
+    /// A stranded directory is counted while it stands, per group. Once its
+    /// path is gone it is not counted, but the record stays (an unmounted
+    /// volume looks the same) and counts again when the path is back.
+    #[test]
+    fn a_stranded_directory_counts_while_it_stands_and_returns_with_its_path() {
+        let database = crate::replica_tables::open_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".d.discard");
+        std::fs::create_dir(&dir).unwrap();
+        let (a, b) = (ledger("a", &database), ledger("b", &database));
+        assert_eq!(a.standing_stranded_count().unwrap(), 0);
+
+        a.strand(&dir).unwrap();
+        a.strand(&dir).unwrap();
+        assert_eq!(a.standing_stranded_count().unwrap(), 1, "recording twice is one record");
+        assert_eq!(b.standing_stranded_count().unwrap(), 0, "another group is unaffected");
+
+        std::fs::remove_dir(&dir).unwrap();
+        assert_eq!(a.standing_stranded_count().unwrap(), 0);
+        std::fs::create_dir(&dir).unwrap();
+        assert_eq!(a.standing_stranded_count().unwrap(), 1, "the record was kept");
     }
 }

@@ -5,7 +5,8 @@ use std::sync::Arc;
 use crate::application::ports::common::BoxFuture;
 use crate::application::ports::preserved::PreservedPort;
 use crate::daemon_state::DaemonState;
-use crate::preserved_items::{self, PreservedError, PreservedItem, PreservedSummary};
+use crate::preserved_items::{self, PreservedError, PreservedItem, PreservedSummary, RetainedItem};
+use yadorilink_sync_sqlite::native_rebootstrap_retained::RetainedOutcome;
 
 pub(crate) struct DaemonPreservedAdapter {
     state: Arc<DaemonState>,
@@ -44,6 +45,17 @@ impl PreservedPort for DaemonPreservedAdapter {
         item_id: String,
     ) -> BoxFuture<'_, Result<(), PreservedError>> {
         Box::pin(async move { preserved_items::discard(&self.state, &group_id, &item_id).await })
+    }
+
+    fn list_retained(&self) -> BoxFuture<'_, Result<Vec<RetainedItem>, PreservedError>> {
+        Box::pin(async move { preserved_items::list_retained(&self.state).await })
+    }
+
+    fn release_retained(
+        &self,
+        group_id: String,
+    ) -> BoxFuture<'_, Result<Vec<(String, RetainedOutcome)>, PreservedError>> {
+        Box::pin(async move { preserved_items::release_retained(&self.state, &group_id).await })
     }
 
     fn summary(&self) -> PreservedSummary {

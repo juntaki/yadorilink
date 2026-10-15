@@ -30,7 +30,13 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$Path,
-    [switch]$Release
+    [switch]$Release,
+    # A staged payload directory, an unpacked binary archive or an installed
+    # layout (%ProgramFiles%\yadorilink). Every shipped PE file listed in
+    # shipped-binaries.txt must be present there; with -Release each must also
+    # carry a valid Authenticode signature (a missing file or signature fails).
+    # An installed layout's _stage\target\release copies are checked too.
+    [string]$PayloadDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -73,6 +79,30 @@ if ($signature.Status -eq "Valid") {
     Write-Fail "Authenticode signature is not valid: $($signature.Status) (-Release requires a valid signature)"
 } else {
     Write-Note "unsigned/invalid signature ($($signature.Status)) -- expected for local/interim builds; use -Release to enforce signing"
+}
+
+foreach ($dir in @($PayloadDir | Where-Object { $_ })) {
+    Write-Output "== shipped PE files in $dir =="
+    . (Join-Path $PSScriptRoot "shipped-binaries.ps1")
+    $dirs = @($dir)
+    $stage = Join-Path $dir "_stage\target\release"
+    if (Test-Path -LiteralPath $stage) { $dirs += $stage }
+    foreach ($d in $dirs) {
+        foreach ($entry in Get-ShippedBinaries) {
+            $file = Join-Path $d $entry.Name
+            # _stage\target\release holds only the two shell-extension files.
+            if ($d -eq $stage -and $entry.Source -ne "shell") { continue }
+            if (-not (Test-Path -LiteralPath $file)) { Write-Fail "shipped file missing: $file"; continue }
+            $sig = Get-AuthenticodeSignature -LiteralPath $file
+            if ($sig.Status -eq "Valid") {
+                Write-Ok "$file signed ($($sig.SignerCertificate.Subject))"
+            } elseif ($Release) {
+                Write-Fail "$file is not validly signed: $($sig.Status)"
+            } else {
+                Write-Note "$file signature status $($sig.Status) -- use -Release to enforce signing"
+            }
+        }
+    }
 }
 
 Write-Output "== Microsoft Store metadata =="

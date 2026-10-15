@@ -451,12 +451,15 @@ pub fn case_and_normalization_collision<'a>(
 /// where a cache cannot be proven valid, correctness has to lean toward
 /// re-probing, never toward reusing a possibly-stale `true`.
 pub fn is_case_insensitive_filesystem(dir: &Path) -> bool {
-    let canonical = match std::fs::create_dir_all(dir).and_then(|_| std::fs::canonicalize(dir)) {
-        Ok(c) => c,
-        Err(_) => return true, // conservative default — see doc comment
-    };
+    probed_case_insensitivity(dir).unwrap_or(true) // conservative default — see doc comment
+}
 
-    probe_case_insensitive_filesystem(&canonical).unwrap_or(true)
+/// [`is_case_insensitive_filesystem`] without its default: `None` when the probe could not run.
+/// For a caller that may act only on a known answer (the conservative default holds a
+/// collision; it must never be read as permission to drop one name for another).
+pub fn probed_case_insensitivity(dir: &Path) -> Option<bool> {
+    let canonical = std::fs::create_dir_all(dir).and_then(|_| std::fs::canonicalize(dir)).ok()?;
+    probe_case_insensitive_filesystem(&canonical).ok()
 }
 
 /// Bumped once per real probe round trip. Not a uniqueness source — probe
@@ -653,12 +656,14 @@ fn probe_case_insensitive_filesystem(canonical_dir: &Path) -> std::io::Result<bo
 /// factor, not its asymptotic cost, and not the dominant term on this call
 /// either.
 pub fn is_normalization_insensitive_filesystem(dir: &Path) -> bool {
-    let canonical = match std::fs::create_dir_all(dir).and_then(|_| std::fs::canonicalize(dir)) {
-        Ok(c) => c,
-        Err(_) => return true, // conservative default — see doc comment
-    };
+    probed_normalization_insensitivity(dir).unwrap_or(true) // conservative default
+}
 
-    probe_normalization_insensitive_filesystem(&canonical).unwrap_or(true)
+/// [`is_normalization_insensitive_filesystem`] without its default: `None` when the probe could
+/// not run.
+pub fn probed_normalization_insensitivity(dir: &Path) -> Option<bool> {
+    let canonical = std::fs::create_dir_all(dir).and_then(|_| std::fs::canonicalize(dir)).ok()?;
+    probe_normalization_insensitive_filesystem(&canonical).ok()
 }
 
 /// Bumped once per real probe round trip, the [`PROBE_CALL_COUNTER`]

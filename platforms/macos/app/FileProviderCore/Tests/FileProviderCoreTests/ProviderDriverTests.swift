@@ -66,10 +66,10 @@ final class ProviderDriverTests: XCTestCase {
     func testRegistrationRules() {
         let link = FakeLink(), control = FakeControl()
         let d = driver(link, control)
-        link.folders = [HostFolder(root: root(1), displayName: "A", eager: false, ready: false, latestEvidenceSeq: 0)]
+        link.folders = [HostFolder(root: root(1), displayName: "A", ready: false, latestEvidenceSeq: 0)]
         d.reconcile()
         XCTAssertTrue(control.added.isEmpty, "a domain was registered before the namespace was queryable")
-        link.folders![0] = HostFolder(root: root(1), displayName: "A", eager: false, ready: true, latestEvidenceSeq: 0)
+        link.folders![0] = HostFolder(root: root(1), displayName: "A", ready: true, latestEvidenceSeq: 0)
         d.reconcile()
         XCTAssertEqual(control.added, [root(1)])
 
@@ -77,13 +77,13 @@ final class ProviderDriverTests: XCTestCase {
         link.folders = nil
         d.reconcile()
         XCTAssertTrue(control.removed.isEmpty, "a domain was removed with no snapshot")
-        link.folders = [HostFolder(root: root(1), displayName: "A", eager: false, ready: true, latestEvidenceSeq: 0)]
+        link.folders = [HostFolder(root: root(1), displayName: "A", ready: true, latestEvidenceSeq: 0)]
         control.registered = nil
         d.reconcile()
         XCTAssertTrue(control.removed.isEmpty, "a domain was removed when the domain list was unreadable")
         // A domain no root names is an ORPHAN: kept however many snapshots omit it, and reported.
         control.registered = [root(1).hexString, root(2).hexString, root(3).hexString]
-        link.folders!.append(HostFolder(root: root(3), displayName: "C", eager: false, ready: false, latestEvidenceSeq: 0))
+        link.folders!.append(HostFolder(root: root(3), displayName: "C", ready: false, latestEvidenceSeq: 0))
         for _ in 0..<3 { d.reconcile() }
         XCTAssertTrue(control.removed.isEmpty, "an orphan domain was removed on absence alone")
         XCTAssertEqual(link.commands("domain_state").last { $0["root"] as? String == root(2).hexString }?["evidence"] as? String, "orphan")
@@ -108,10 +108,10 @@ final class ProviderDriverTests: XCTestCase {
     func testStuckOSErrorsAreDeclaredResolvedOncePerConnectionForRegisteredRootsOnly() {
         let link = FakeLink(), control = FakeControl()
         let d = driver(link, control)
-        link.folders = [HostFolder(root: root(1), displayName: "A", eager: false, ready: false, latestEvidenceSeq: 0)]
+        link.folders = [HostFolder(root: root(1), displayName: "A", ready: false, latestEvidenceSeq: 0)]
         d.reconcile()
         XCTAssertTrue(control.resolved.isEmpty, "nothing is registered yet, so there is no OS error to resolve")
-        link.folders![0] = HostFolder(root: root(1), displayName: "A", eager: false, ready: true, latestEvidenceSeq: 0)
+        link.folders![0] = HostFolder(root: root(1), displayName: "A", ready: true, latestEvidenceSeq: 0)
         d.reconcile()
         XCTAssertEqual(control.resolved, [root(1)])
         d.reconcile(); d.reconcile()
@@ -126,7 +126,7 @@ final class ProviderDriverTests: XCTestCase {
         let link = FakeLink(), control = FakeControl()
         control.resolveOK = false
         let d = driver(link, control)
-        link.folders = [HostFolder(root: root(1), displayName: "A", eager: false, ready: true, latestEvidenceSeq: 0)]
+        link.folders = [HostFolder(root: root(1), displayName: "A", ready: true, latestEvidenceSeq: 0)]
         d.reconcile(); d.reconcile()
         XCTAssertEqual(control.resolved.count, 2)
         control.resolveOK = true
@@ -136,7 +136,7 @@ final class ProviderDriverTests: XCTestCase {
 
     func testTheWaitsBelowParentsHaveAnOverallDeadline() {
         let link = FakeLink(), control = FakeControl(), store = FakeStore()
-        link.folders = [HostFolder(root: root(1), displayName: "A", eager: false, ready: true, latestEvidenceSeq: 0)]
+        link.folders = [HostFolder(root: root(1), displayName: "A", ready: true, latestEvidenceSeq: 0)]
         var clock: TimeInterval = 100
         let d = ProviderDriver(link: link, control: control, store: store, now: { clock })
         d.reconcile()
@@ -175,7 +175,7 @@ final class ProviderDriverTests: XCTestCase {
     /// snapshot stops listing the root.
     func testAnObservedRemovalSurvivesACrashBeforeItIsReported() {
         let link = FakeLink(), control = FakeControl(), store = FakeStore()
-        link.folders = [HostFolder(root: root(1), displayName: "A", eager: false, ready: true, latestEvidenceSeq: 0)]
+        link.folders = [HostFolder(root: root(1), displayName: "A", ready: true, latestEvidenceSeq: 0)]
         let first = driver(link, control, store)
         first.reconcile()                       // registers
         XCTAssertEqual(control.added, [root(1)])
@@ -203,7 +203,7 @@ final class ProviderDriverTests: XCTestCase {
     func testDomainStateCarriesTheAcknowledgedRevision() {
         let link = FakeLink(), control = FakeControl(), store = FakeStore()
         store.acked[root(1)] = 42
-        link.folders = [HostFolder(root: root(1), displayName: "A", eager: false, ready: true, latestEvidenceSeq: 0)]
+        link.folders = [HostFolder(root: root(1), displayName: "A", ready: true, latestEvidenceSeq: 0)]
         driver(link, control, store).reconcile()
         let state = link.commands("domain_state").first
         XCTAssertEqual(state?["evidence"] as? String, "registered")
@@ -216,7 +216,7 @@ final class ProviderDriverTests: XCTestCase {
     func testTheReporterPagesAFullSnapshotThenSendsDeltas() {
         let link = FakeLink(), control = FakeControl()
         control.materialized = Set((0..<(ProviderDriver.pageSize + 5)).map(item))
-        link.folders = [HostFolder(root: root(1), displayName: "A", eager: false, ready: true, latestEvidenceSeq: 9)]
+        link.folders = [HostFolder(root: root(1), displayName: "A", ready: true, latestEvidenceSeq: 9)]
         let d = driver(link, control)
         d.reconcile()
         let pages = link.commands("report")
@@ -250,7 +250,7 @@ final class ProviderDriverTests: XCTestCase {
     func testReporterRecoveryMintsNewEpochsAndBacksOff() {
         let link = FakeLink(), control = FakeControl()
         control.materialized = [item(1)]
-        link.folders = [HostFolder(root: root(1), displayName: "A", eager: false, ready: true, latestEvidenceSeq: 0)]
+        link.folders = [HostFolder(root: root(1), displayName: "A", ready: true, latestEvidenceSeq: 0)]
         var clock: TimeInterval = 1000
         let d = ProviderDriver(link: link, control: control, store: FakeStore(), now: { clock })
         d.reconcile(); d.reconcile(); d.reconcile()
@@ -274,7 +274,7 @@ final class ProviderDriverTests: XCTestCase {
     /// reported as removed. An unreadable list, a not-ready root and a first absence report nothing.
     func testRemovalEvidenceIsObservedNeverGuessed() {
         let link = FakeLink(), control = FakeControl(), store = FakeStore()
-        link.folders = [HostFolder(root: root(1), displayName: "A", eager: false, ready: false, latestEvidenceSeq: 0)]
+        link.folders = [HostFolder(root: root(1), displayName: "A", ready: false, latestEvidenceSeq: 0)]
         let d = driver(link, control, store)
         func last() -> String? { link.commands("domain_state").last?["evidence"] as? String }
         d.reconcile()
@@ -282,7 +282,7 @@ final class ProviderDriverTests: XCTestCase {
         control.registered = nil
         d.reconcile()
         XCTAssertEqual(last(), "unknown", "an unreadable list was reported as something")
-        link.folders![0] = HostFolder(root: root(1), displayName: "A", eager: false, ready: true, latestEvidenceSeq: 0)
+        link.folders![0] = HostFolder(root: root(1), displayName: "A", ready: true, latestEvidenceSeq: 0)
         control.registered = []
         d.reconcile()
         XCTAssertEqual(last(), "registered")
@@ -299,17 +299,19 @@ final class ProviderDriverTests: XCTestCase {
     }
 
     /// Eager: at most two outstanding, the outstanding ids as exclusions, settled ids freed, a rejection
-    /// reported to the daemon; nothing is asked of a paused or non-Eager root.
+    /// reported to the daemon; nothing is asked of a paused or unknown root. Every known root is
+    /// asked (the daemon decides what it wants downloaded: everything for an Eager root, what the
+    /// user keeps on this device for any other).
     func testTheEagerLoopRespectsItsLimits() {
         let link = FakeLink(), control = FakeControl()
         link.folders = [
-            HostFolder(root: root(1), displayName: "A", eager: true, ready: true, latestEvidenceSeq: 0),
-            HostFolder(root: root(2), displayName: "B", eager: false, ready: true, latestEvidenceSeq: 0),
+            HostFolder(root: root(1), displayName: "A", ready: true, latestEvidenceSeq: 0),
+            HostFolder(root: root(2), displayName: "B", ready: true, latestEvidenceSeq: 0),
         ]
         let d = driver(link, control)
         d.reconcile()
-        d.eagerTick(root: root(2))
-        XCTAssertTrue(link.commands("next_downloads").isEmpty, "a non-Eager root was queried")
+        d.eagerTick(root: root(9))
+        XCTAssertTrue(link.commands("next_downloads").isEmpty, "an unknown root was queried")
         d.eagerTick(root: root(1))
         d.eagerTick(root: root(1))
         XCTAssertEqual(link.commands("next_downloads").count, 1, "two queries were in flight")
@@ -344,12 +346,25 @@ final class ProviderDriverTests: XCTestCase {
         XCTAssertEqual(link.commands("next_downloads").count, before, "a paused root was queried")
     }
 
+    /// A root that is not Eager is asked too: the daemon answers with the files the user keeps on this
+    /// device (a pin) and nothing for a root that keeps none.
+    func testARootThatIsNotEagerIsAskedWhatToKeepDownloaded() {
+        let link = FakeLink(), control = FakeControl()
+        link.folders = [HostFolder(root: root(2), displayName: "B", ready: true, latestEvidenceSeq: 0)]
+        let d = driver(link, control)
+        d.reconcile()
+        d.eagerTick(root: root(2))
+        XCTAssertEqual(link.commands("next_downloads").count, 1)
+        d.handle(["event": "downloads", "downloads": [["item": item(4).hexString, "version": "00"]], "settled": [], "state": 1])
+        XCTAssertEqual(control.requested, [item(4)])
+    }
+
     /// Evict and signal requests are answered as hints with the daemon's own ids; a refused signal is
     /// not acknowledged; the acknowledged revision never goes back; a message naming an unknown root
     /// without items relists the folders.
     func testEvictAndSignalAreAnsweredAsHints() {
         let link = FakeLink(), control = FakeControl(), store = FakeStore()
-        link.folders = [HostFolder(root: root(1), displayName: "A", eager: false, ready: true, latestEvidenceSeq: 0)]
+        link.folders = [HostFolder(root: root(1), displayName: "A", ready: true, latestEvidenceSeq: 0)]
         let d = driver(link, control, store)
         d.reconcile()
         control.evictResult = .busy

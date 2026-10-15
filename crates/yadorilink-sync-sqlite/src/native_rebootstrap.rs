@@ -1034,7 +1034,11 @@ fn delete_rows(conn: &Connection, group: &FolderGroupId) -> Result<(), SyncSqlit
         "native_rebootstrap_recovery_item",
         "native_rebootstrap_quarantine",
     ] {
-        conn.execute(&format!("DELETE FROM {table} WHERE group_id = ?1"), [group.as_str()])?;
+        // A retained original is owned by its quarantine row for good: the object stays under
+        // its claimed name, and the row is the only record of where.
+        let keep =
+            if table == "native_rebootstrap_quarantine" { " AND status != 'retained'" } else { "" };
+        conn.execute(&format!("DELETE FROM {table} WHERE group_id = ?1{keep}"), [group.as_str()])?;
     }
     Ok(())
 }
@@ -2109,13 +2113,22 @@ fn save_remote_only(
                 }
             }
         };
-        let entry = items::manifest_entry(group, head, &body);
-        if !items::item_is_durable(conn, &ctx.items_root, group, &entry)? {
-            items::write_item_files(&ctx.items_root, group, &item_id, &body)
-                .map_err(|e| block(area_failure(e)))?;
-            hook(Failpoint::AfterRemoteOnlyFiles(index)).map_err(|_| BeginError::Crashed)?;
-            items::register_item(conn, group, head, &item_id, &body, recovery_id, ctx.now_unix)?;
-        }
+        let entry = items::save_item(
+            conn,
+            &ctx.items_root,
+            group,
+            head,
+            &item_id,
+            &body,
+            recovery_id,
+            ctx.now_unix,
+            &mut || hook(Failpoint::AfterRemoteOnlyFiles(index)),
+        )
+        .map_err(|e| match e {
+            items::SaveError::Area(e) => block(area_failure(e)),
+            items::SaveError::Crashed => BeginError::Crashed,
+            items::SaveError::Store(e) => e.into(),
+        })?;
         hook(Failpoint::AfterRemoteOnlyRow(index)).map_err(|_| BeginError::Crashed)?;
         entries.push(entry);
     }
@@ -2483,7 +2496,6 @@ pub fn resume_preserved(
     let inconsistent = |detail: String| BlockedReason::ManifestInconsistent { detail };
     let area = RecoveryArea::open_existing(recovery_root, group, &status.recovery_id)
         .map_err(|e| inconsistent(e.to_string()))?;
-    area.remove_temporaries().map_err(|e| inconsistent(e.to_string()))?;
     let intent = area.read_intent().map_err(|e| inconsistent(e.to_string()))?;
     if intent.manifest.recovery_id != status.recovery_id
         || intent.manifest.target_checkpoint_hash != status.target_checkpoint_hash

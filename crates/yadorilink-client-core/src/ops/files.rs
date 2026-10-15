@@ -12,6 +12,9 @@ use yadorilink_ipc_proto::daemonctl::{
     MaterializationStatusResponse, RestoreTrashOperationRequest, RestoreTrashOperationResponse,
     RestoreTrashRequest, RestoreVersionRequest, TrashedFileInfo,
 };
+use yadorilink_ipc_proto::daemonctl::{
+    PinItemRequest, PinItemResponse, UnpinItemRequest, UnpinItemResponse,
+};
 
 use crate::daemon::control;
 use crate::error::CoreError;
@@ -124,3 +127,159 @@ pub async fn evict(absolute_path: String) -> Result<EvictResponse, CoreError> {
     };
     Ok(evict)
 }
+
+/// Why a "free up space" request left something on this device, in words a person can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvictRefusal {
+    /// What stayed and why.
+    pub why: &'static str,
+    /// Whether asking again later can work without the person doing anything else.
+    pub retryable: bool,
+    /// What to do next; empty when there is nothing to do.
+    pub hint: &'static str,
+}
+
+/// The wording for a `retained_reason` code of [`EvictResponse`]. `None` for the empty code (nothing
+/// was kept back); an unknown code gets a generic answer rather than none.
+pub fn evict_refusal(code: &str) -> Option<EvictRefusal> {
+    let again = "Try again in a few seconds.";
+    let (why, retryable, hint) = match code {
+        "" => return None,
+        "custody_not_acquired" => (
+            "no other full replica could confirm it holds this version right now, so nothing \
+             was freed",
+            true,
+            "Try again when another device that keeps full copies is online.",
+        ),
+        "custody_required" => (
+            "no full replica holds this version and the local copy would be the only one",
+            true,
+            "Try again when another device that keeps full copies is online.",
+        ),
+        "custody_unsupported" => ("freeing space is not available on this platform yet", false, ""),
+        "full_replica" => {
+            ("this device is a full replica of the folder and keeps its data", false, "")
+        }
+        "busy" => ("the file is in use by another operation", true, again),
+        "host_busy" => ("a program has the file open", true, "Close it, then try again."),
+        "version_moved" => ("the file changed while it was being evicted", true, again),
+        "nothing_freed" => {
+            ("the data is still referenced by other files on this device", false, "")
+        }
+        "not_confirmed" => {
+            ("the download has not been confirmed yet, or the file is being updated", true, again)
+        }
+        "host_refused" => (
+            "the system would not free it just now; it may have changes that are not shared yet",
+            true,
+            "Wait until it has synced, then try again.",
+        ),
+        _ => ("the daemon kept the data on this device", false, ""),
+    };
+    Some(EvictRefusal { why, retryable, hint })
+}
+
+/// Marks a file or folder "always keep on this device" and downloads what is not here yet.
+pub async fn pin(absolute_path: String) -> Result<PinItemResponse, CoreError> {
+    let resp = control::send(ReqPayload::PinItem(PinItemRequest { absolute_path })).await?;
+    let Some(RespPayload::PinItem(pin)) = resp.payload else {
+        return Err(unexpected());
+    };
+    Ok(pin)
+}
+
+/// Stops keeping a file or folder. Nothing is removed: its space becomes reclaimable.
+pub async fn unpin(absolute_path: String) -> Result<UnpinItemResponse, CoreError> {
+    let resp = control::send(ReqPayload::UnpinItem(UnpinItemRequest { absolute_path })).await?;
+    let Some(RespPayload::UnpinItem(unpin)) = resp.payload else {
+        return Err(unexpected());
+    };
+    Ok(unpin)
+}
+
+/// What to do with a kept copy of a file that was edited on two devices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictChoice {
+    /// The copy becomes the file; the other version is no longer current.
+    KeepThis,
+    /// The copy stays as an ordinary file beside the original, under a
+    /// plain name.
+    KeepBoth,
+}
+
+/// Resolves the live conflicted copy at `copy_path` (absolute). Only a file
+/// copy of a concurrent edit is resolvable here; a copy the daemon does not
+/// list is refused. The change is an ordinary rename inside the folder, which
+/// the daemon then syncs like any other edit. Returns the resulting absolute
+/// path of the kept content.
+pub async fn resolve_conflict(
+    copy_path: &str,
+    choice: ConflictChoice,
+) -> Result<std::path::PathBuf, CoreError> {
+    let conflicts = list_conflicts(None).await?;
+    let info = conflicts
+        .iter()
+        .find(|f| {
+            std::path::Path::new(&f.local_path).join(&f.path) == std::path::Path::new(copy_path)
+        })
+        .ok_or_else(|| CoreError::Other("that file is not a kept conflict copy".into()))?;
+    apply_conflict_choice(info, choice)
+}
+
+fn apply_conflict_choice(
+    info: &ConflictedFileInfo,
+    choice: ConflictChoice,
+) -> Result<std::path::PathBuf, CoreError> {
+    use std::path::Path;
+    use yadorilink_product_view::{conflict_detail, ConflictReason};
+
+    let detail = conflict_detail(info);
+    use yadorilink_ipc_proto::daemonctl::EntryKind;
+    let resolvable = matches!(info.kind(), EntryKind::File | EntryKind::Unspecified)
+        && detail.reason == ConflictReason::ConcurrentEdit
+        && detail.current_path != info.path;
+    if !resolvable {
+        return Err(CoreError::Other("this kept copy cannot be resolved automatically".into()));
+    }
+    let root = Path::new(&info.local_path);
+    let copy = root.join(&info.path);
+    let original = root.join(&detail.current_path);
+    let io = |e: std::io::Error| CoreError::Other(format!("could not update the file: {e}"));
+    if !std::fs::symlink_metadata(&copy).map_err(io)?.is_file() {
+        return Err(CoreError::Other("the kept copy is no longer a file".into()));
+    }
+    match choice {
+        ConflictChoice::KeepThis => {
+            if std::fs::symlink_metadata(&original).is_ok_and(|m| m.is_dir()) {
+                return Err(CoreError::Other("the original name is a folder now".into()));
+            }
+            std::fs::rename(&copy, &original).map_err(io)?;
+            Ok(original)
+        }
+        ConflictChoice::KeepBoth => {
+            let target = other_version_path(&original);
+            std::fs::rename(&copy, &target).map_err(io)?;
+            Ok(target)
+        }
+    }
+}
+
+/// `name (other version).ext`, then `name (other version 2).ext`, ... — the
+/// first that is not taken.
+fn other_version_path(original: &std::path::Path) -> std::path::PathBuf {
+    let stem = original.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = original.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let dir = original.parent().unwrap_or_else(|| std::path::Path::new(""));
+    let mut n = 1u32;
+    loop {
+        let label = if n == 1 { "other version".to_string() } else { format!("other version {n}") };
+        let taken_name = dir.join(format!("{stem} ({label}){ext}"));
+        if std::fs::symlink_metadata(&taken_name).is_err() {
+            return taken_name;
+        }
+        n += 1;
+    }
+}
+
+#[cfg(test)]
+mod conflict_tests;

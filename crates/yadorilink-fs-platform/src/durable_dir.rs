@@ -41,6 +41,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::fs_capabilities::Capability;
 use crate::reserved_namespace::{artefact_component_name, ArtefactKind};
 
+mod judged_remove;
 #[cfg(any(test, feature = "test-support"))]
 pub mod model;
 mod probe;
@@ -53,15 +54,17 @@ mod trace;
 #[cfg(test)]
 mod tests;
 
+pub use judged_remove::{judge_open_file, remove_file_judged, JudgedRemoveError};
 #[cfg(windows)]
 pub use probe::local_volume_file_system;
 pub use probe::probe_directory_durability;
 pub use raw::{durable_flush_directory, rename_no_replace_durable};
 
-/// The one-line flip for Windows. While `false`, [`DurableNamespace::open`]
-/// refuses every Windows volume. Set it to `true` only once the conditions in
-/// the design have been met and the owner has approved.
-pub(crate) const WINDOWS_DIRECTORY_DURABILITY_VALIDATED: bool = false;
+/// The one-line switch for Windows. While `false`, [`DurableNamespace::open`]
+/// refuses every Windows volume. It is `true` now that the conditions in the
+/// design have been met and the owner has approved; which Windows volumes
+/// qualify is still the per-volume probe's decision.
+pub(crate) const WINDOWS_DIRECTORY_DURABILITY_VALIDATED: bool = true;
 
 /// Whether this platform offers durable namespace changes at all: Unix always,
 /// Windows only once its gate is open. Which volumes qualify is
@@ -69,6 +72,26 @@ pub(crate) const WINDOWS_DIRECTORY_DURABILITY_VALIDATED: bool = false;
 /// for the places that cannot name a directory yet.
 pub const fn platform_offers_durable_namespace() -> bool {
     cfg!(unix) || (cfg!(windows) && WINDOWS_DIRECTORY_DURABILITY_VALIDATED)
+}
+
+/// Whether the local bytes held on `dirs` may be deleted: every volume must pass `is_durable`. A
+/// directory that cannot be named (`None`) is an unknown volume and fails closed. Deleting
+/// bytes depends on the volume that holds *them*, so the callers name the block store's
+/// directory (and the sync root where the working-tree copy is deleted too).
+pub fn all_volumes_durable(
+    is_durable: impl Fn(Option<&Path>) -> bool,
+    dirs: &[Option<&Path>],
+) -> bool {
+    dirs.iter().all(|dir| is_durable(*dir))
+}
+
+/// The production verdict for [`all_volumes_durable`]: Unix as before; Windows only when
+/// [`DurableNamespace::open`] (the global gate and the volume's probe) accepts the directory.
+pub fn volume_offers_durable_namespace(dir: Option<&Path>) -> bool {
+    if !cfg!(windows) {
+        return platform_offers_durable_namespace();
+    }
+    dir.is_some_and(|dir| DurableNamespace::open(dir).is_ok())
 }
 
 /// Whether a move may replace an existing target.
@@ -229,6 +252,27 @@ pub enum DiscardOutcome {
     Retained { path: PathBuf, reason: RetainReason },
 }
 
+impl DiscardOutcome {
+    /// For a caller about to record the path absent. Moved away from the path is not the same
+    /// as logically removed: only `Removed`, or `RemovalFailed` whose leftover the caller's
+    /// ledger holds (recovery is guaranteed to finish it), is `Ok`. A directory put back, or
+    /// an object left under a Discard name beside an occupied path, is an error that names the
+    /// leftover. A caller with no ledger must clean up `RemovalFailed` itself (see
+    /// [`remove_file_durably`]) and treat a failed cleanup as an error.
+    pub fn removed(&self) -> io::Result<()> {
+        match self {
+            Self::Removed | Self::Retained { reason: RetainReason::RemovalFailed, .. } => Ok(()),
+            Self::Restored => {
+                Err(io::Error::new(io::ErrorKind::ResourceBusy, "an object occupies the path"))
+            }
+            Self::Retained { path, reason: RetainReason::OriginalOccupied } => Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!("an object occupies the path; the displaced one is at {}", path.display()),
+            )),
+        }
+    }
+}
+
 /// An object moved to its Discard name: the removal is committed.
 #[derive(Debug)]
 pub struct Discarded {
@@ -303,12 +347,37 @@ impl DurableNamespace {
         if cfg!(windows) && !WINDOWS_DIRECTORY_DURABILITY_VALIDATED {
             return Err(NsError::Unavailable(UnavailableReason::GateClosed));
         }
-        match probe::cached_verdict(dir) {
+        Self::from_verdict(probe::cached_verdict(dir), dir)
+    }
+
+    /// The handle for `dir` given its volume's probe verdict: only `Supported` opens.
+    fn from_verdict(verdict: Capability, dir: &Path) -> Result<Self, NsError> {
+        match verdict {
             Capability::Supported => {
                 Ok(Self { volume: Some(probe::volume_key(dir).map_err(NsError::Io)?) })
             }
             Capability::Unsupported => Err(NsError::Unavailable(UnavailableReason::Unsupported)),
             Capability::Unknown => Err(NsError::Unavailable(UnavailableReason::Unknown)),
+        }
+    }
+
+    /// [`Self::open`] for a writer that keeps its pre-validation behaviour (a plain
+    /// rename, no durability claim) only while the global Windows gate is closed:
+    /// `Ok(None)` is that, and nothing else. A volume the probe judged
+    /// `Unsupported` or `Unknown` is an error the caller must propagate, so once
+    /// the gate opens no writer can fall back to a plain rename on a volume that
+    /// was refused. This is the only fallback the writers may take.
+    pub fn open_unless_gate_closed(dir: &Path) -> Result<Option<Self>, NsError> {
+        Self::only_a_closed_gate_may_fall_back(Self::open(dir))
+    }
+
+    fn only_a_closed_gate_may_fall_back(
+        opened: Result<Self, NsError>,
+    ) -> Result<Option<Self>, NsError> {
+        match opened {
+            Ok(ns) => Ok(Some(ns)),
+            Err(NsError::Unavailable(UnavailableReason::GateClosed)) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -512,12 +581,20 @@ impl DurableNamespace {
         ledger: &dyn NameLedger,
         kind: Kind,
     ) -> Result<DiscardOutcome, NsError> {
+        run_before_remove_hook();
         #[cfg(windows)]
         {
             let discarded = self.discard(target, ledger)?;
             let moved_is_dir = is_directory(discarded.path())?;
             if moved_is_dir != Some(kind == Kind::EmptyDirectory) {
-                return Ok(discarded.put_back(self, ledger));
+                // Another kind of object was moved: a failed put-back is no removal either,
+                // so it is reported as the displaced object it is, never as `RemovalFailed`.
+                return Ok(match discarded.put_back(self, ledger) {
+                    DiscardOutcome::Retained { path, .. } => {
+                        DiscardOutcome::Retained { path, reason: RetainReason::OriginalOccupied }
+                    }
+                    other => other,
+                });
             }
             Ok(discarded.finish(self, ledger))
         }
@@ -578,8 +655,16 @@ impl DurableNamespace {
 /// occupied `target` with [`Replace::No`] is `AlreadyExists` either way, and a
 /// failed publish removes `staged`.
 pub fn publish_durably(staged: &Path, target: &Path, replace: Replace) -> io::Result<()> {
-    if let Ok(ns) = DurableNamespace::open(directory_of(target)) {
-        return ns.publish(staged, target, replace, &NoLedger).map_err(io::Error::from);
+    match DurableNamespace::open_unless_gate_closed(directory_of(target)) {
+        Ok(Some(ns)) => {
+            return ns.publish(staged, target, replace, &NoLedger).map_err(io::Error::from)
+        }
+        Ok(None) => {}
+        Err(error) => {
+            // A refused volume: nothing is published, and the staged file does not outlive it.
+            let _ = fs::remove_file(staged);
+            return Err(error.into());
+        }
     }
     publish_without_a_durable_move(staged, target, replace)
 }
@@ -607,6 +692,55 @@ fn publish_without_a_durable_move(
     }
 }
 
+/// Creates `path` and every missing ancestor, each as its own published directory where the
+/// volume offers durable moves (the first ancestor that exists is trusted as it is), otherwise
+/// with a plain `create_dir_all` (only while the Windows gate is closed). For the parents of the
+/// private records whose loss changes what a restart concludes.
+///
+/// Policy for a directory that already exists: it is trusted as it is and nothing about it is
+/// flushed. Only what this call creates is made durable, so a parent that an earlier call
+/// created is durable already (every creation of such a parent goes through here), and one that
+/// predates the product (a profile folder) is not the product's to prove.
+pub fn create_dir_all_durably(path: &Path) -> io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    let (path, existing) = absolute_with_existing_ancestor(path)?;
+    if let Some(existing) = existing {
+        if let Some(ns) = DurableNamespace::open_unless_gate_closed(&existing)? {
+            return ns.create_dir_all(&path, &NoLedger).map_err(io::Error::from);
+        }
+    }
+    fs::create_dir_all(&path)
+}
+
+/// `path` resolved against the current directory, and the nearest ancestor of it that exists.
+/// A relative path (a config directory given as `state/config`) has no existing ancestor among
+/// its own relative spellings, which would silently turn the durable creation into a plain one.
+fn absolute_with_existing_ancestor(path: &Path) -> io::Result<(PathBuf, Option<PathBuf>)> {
+    let path = std::path::absolute(path)?;
+    let existing = path.ancestors().find(|dir| dir.is_dir()).map(Path::to_path_buf);
+    Ok((path, existing))
+}
+
+#[cfg(test)]
+mod relative_path_tests {
+    use super::*;
+
+    #[test]
+    fn a_relative_path_finds_its_existing_ancestor_in_the_current_directory() {
+        let name = format!("yl-rel-{}", std::process::id());
+        let relative = Path::new(&name).join("config").join("deeper");
+        let (absolute, existing) = absolute_with_existing_ancestor(&relative).unwrap();
+        assert_eq!(absolute, std::env::current_dir().unwrap().join(&relative));
+        assert_eq!(existing, Some(std::env::current_dir().unwrap()));
+
+        create_dir_all_durably(&relative).unwrap();
+        assert!(relative.is_dir());
+        let _ = fs::remove_dir_all(&name);
+    }
+}
+
 /// Moves `from` to `to` and returns once that is durable, for a caller that
 /// owns neither name's content beyond the move (a user file or directory kept
 /// under another name): [`DurableNamespace::durable_move`] where the volume
@@ -614,7 +748,7 @@ fn publish_without_a_durable_move(
 /// [`Replace::No`]) and a sync of the directory where the platform has one.
 /// Unlike [`publish_durably`], a failed move leaves `from` where it was.
 pub fn move_durably(from: &Path, to: &Path, replace: Replace) -> io::Result<()> {
-    if let Ok(ns) = DurableNamespace::open(directory_of(to)) {
+    if let Some(ns) = DurableNamespace::open_unless_gate_closed(directory_of(to))? {
         return ns.durable_move(from, to, replace).map_err(io::Error::from);
     }
     raw::move_entry(from, to, replace)?;
@@ -626,11 +760,8 @@ pub fn move_durably(from: &Path, to: &Path, replace: Replace) -> io::Result<()> 
 /// durable moves, otherwise an unlink followed by a sync of the directory where
 /// the platform has one. For the same small private files as [`publish_durably`].
 pub fn remove_file_durably(target: &Path) -> io::Result<()> {
-    if let Ok(ns) = DurableNamespace::open(directory_of(target)) {
-        return match ns.remove_file(target, &NoLedger) {
-            Ok(_) | Err(NsError::NotFound) => Ok(()),
-            Err(error) => Err(error.into()),
-        };
+    if let Some(ns) = DurableNamespace::open_unless_gate_closed(directory_of(target))? {
+        return remove_file_with(&ns, target);
     }
     match fs::remove_file(target) {
         Ok(()) => {}
@@ -638,6 +769,22 @@ pub fn remove_file_durably(target: &Path) -> io::Result<()> {
         Err(error) => return Err(error),
     }
     sync_directory_if_any(target)
+}
+
+/// [`remove_file_durably`] on a volume that offers durable moves.
+fn remove_file_with(ns: &DurableNamespace, target: &Path) -> io::Result<()> {
+    match ns.remove_file(target, &NoLedger) {
+        Ok(outcome) => {
+            outcome.removed()?;
+            // No ledger, so no recovery will ever finish a leftover: remove it now or say so.
+            if let DiscardOutcome::Retained { path, .. } = &outcome {
+                fs::remove_file(path)?;
+            }
+            Ok(())
+        }
+        Err(NsError::NotFound) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The directory sync a writer without durable moves can still do: Unix only,
@@ -666,12 +813,25 @@ fn abandon(stage: &Path, ledger: &dyn NameLedger) {
 
 /// Removes `path` (never recursively) and releases its record once the name's
 /// disappearance is durable: on Unix after a sync of the parent, which a
-/// failure keeps the record for. Windows has no such contract, so the record
-/// is released as soon as the removal returned.
+/// failure keeps the record for. Windows documents no durability for an unlink,
+/// so the record is NOT released on that unproven boundary: a power loss could
+/// bring the name back with no record naming it. The next recovery reads the
+/// record, finds the path absent (and drops the record) or present (and
+/// removes it again, non-recursively).
 fn remove_and_release(path: &Path, ledger: &dyn NameLedger) -> io::Result<()> {
+    remove_and_release_with(path, ledger, cfg!(unix))
+}
+
+fn remove_and_release_with(
+    path: &Path,
+    ledger: &dyn NameLedger,
+    unlink_is_durable: bool,
+) -> io::Result<()> {
     ops::remove(path)?;
     ops::sync_parent_after_removal(path)?;
-    ledger.release(path);
+    if unlink_is_durable {
+        ledger.release(path);
+    }
     Ok(())
 }
 
@@ -763,6 +923,30 @@ pub(crate) fn is_quiet() -> bool {
 pub fn arm_failpoint(failpoint: NsFailpoint) {
     ARMED.with(|armed| armed.set(Some(failpoint)));
 }
+
+/// Test seam: runs `f` once, on this thread, right before the next
+/// `remove_file` / `remove_empty_dir` acts on the path its caller just judged
+/// (the window in which another process can swap the object).
+#[cfg(any(test, feature = "test-support"))]
+pub fn before_next_remove_object(f: impl FnOnce() + 'static) {
+    BEFORE_REMOVE.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static BEFORE_REMOVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn run_before_remove_hook() {
+    if let Some(f) = BEFORE_REMOVE.with(|hook| hook.borrow_mut().take()) {
+        f();
+    }
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn run_before_remove_hook() {}
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn disarm_failpoint() {

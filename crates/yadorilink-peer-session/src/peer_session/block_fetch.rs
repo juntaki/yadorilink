@@ -264,6 +264,12 @@ impl PeerSyncSession {
             tracing::debug!(%error, peer = %self.peer_device_id, "block request header could not be sent");
             return FetchOutcome::NotFound;
         }
+        yadorilink_fs_platform::join_timeline::mark_with_peer(
+            &self.local_device_id,
+            group_id,
+            yadorilink_fs_platform::join_timeline::Milestone::BlockRequestSent,
+            &self.peer_device_id,
+        );
         // Nothing else will be sent on this side, and saying so lets the
         // responder stop waiting on a direction that has nothing left in
         // it.
@@ -286,6 +292,12 @@ impl PeerSyncSession {
                 return FetchOutcome::Unusable;
             }
         };
+        yadorilink_fs_platform::join_timeline::mark_with_peer(
+            &self.local_device_id,
+            group_id,
+            yadorilink_fs_platform::join_timeline::Milestone::BlockResponseReceived,
+            &self.peer_device_id,
+        );
         use yadorilink_sync_wire::BlockResponseOutcomeFrame as Outcome;
         let (size, echoed_hash, compression) = match response.outcome {
             Outcome::Found { size, hash, compression } => (size, hash, compression),

@@ -103,18 +103,15 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             // A version the OS names is passed on: the daemon refuses bytes that are not that
             // version (old bytes are never returned), and the OS retries against the current one.
             let wanted = ItemToken.requestedContentHash(of: requestedVersion?.contentVersion)
-            switch client.materialize(item: id, requestID: Data(UUID().uuidString.utf8), requestedHash: wanted) {
+            // The bytes are verified (exact size, paired item) before the OS is told they exist.
+            switch client.fetchContents(
+                item: id, requestID: Data(UUID().uuidString.utf8), requestedHash: wanted,
+                handoffDirectory: handoff, fileSize: regularFileSize)
+            {
             case .failure(let failure):
                 completionHandler(nil, nil, osError(failure))
-            case .success(let bytes):
-                // The item returned for these bytes names the token they are PAIRED with.
-                guard case .success(let shown) = client.item(id) else {
-                    completionHandler(nil, nil, NSFileProviderError(.serverUnreachable))
-                    return
-                }
-                completionHandler(
-                    handoff.appendingPathComponent(bytes.handoffName),
-                    ProviderItem(shown, pairedContentVersion: bytes.token), nil)
+            case .success(let fetched):
+                completionHandler(fetched.url, ProviderItem(fetched.item, pairedContentVersion: fetched.bytes.token), nil)
             }
         }
         return progress

@@ -5,6 +5,10 @@
 //! outstanding and sends their item ids as exclusions; every call recomputes the best candidates
 //! from the durable rows and the host's membership report:
 //!
+//! * which files are wanted depends on the root: an Eager root wants every file, any other root
+//!   only the files the user keeps on this device (`Scope::Kept`, a pin on the file or on a folder
+//!   above it), so a pin on a provider folder is carried out by the OS like an Eager download and
+//!   a file the OS drops later (Finder's Remove Download) is offered again while the pin stands;
 //! * wanted = a live regular file (a real current row) that is not held, not paused, and whose
 //!   current content is not present on the OS (`provider_local_presence`), ordered by size and
 //!   then path;
@@ -37,6 +41,35 @@ use crate::replica_coordinator::ReplicaCoordinator;
 pub(crate) const ASSEMBLIES: usize = 6;
 /// How many of them Eager downloads may hold; the rest are for the user's own fetches.
 pub(crate) const EAGER_ASSEMBLIES: usize = 4;
+
+/// The files of a root the driver wants downloaded.
+pub(crate) enum Scope {
+    /// Eager root: every file.
+    All,
+    /// Any other root: the files covered by one of these pinned paths.
+    Kept(Vec<String>),
+}
+
+impl Scope {
+    /// Whether the candidate query is limited to the kept files.
+    fn kept_only(&self) -> bool {
+        matches!(self, Self::Kept(_))
+    }
+
+    fn covers(&self, path: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Kept(pinned) => {
+                yadorilink_sync_sqlite::pinned_items::path_is_covered(pinned, path)
+            }
+        }
+    }
+
+    /// Nothing is kept: nothing is wanted.
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Kept(pinned) if pinned.is_empty())
+    }
+}
 
 /// What the driver needs to know about the machine.
 pub(crate) trait EagerEnvironment: Send + Sync {
@@ -92,6 +125,9 @@ pub(crate) struct EagerStatus {
     pub(crate) current: u64,
     /// Items past `stuck_after` failures: (path, failures).
     pub(crate) stuck: Vec<(String, u32)>,
+    /// A repository read failed during the scan: the counters are partial and the state is never
+    /// Done.
+    pub(crate) unreadable: bool,
 }
 
 /// The daemon-wide assembly limiter: `ASSEMBLIES` in all, `EAGER_ASSEMBLIES` for Eager.
@@ -227,6 +263,40 @@ impl EagerDriver {
 
     /// Whether the item's failure (of its CURRENT version) still holds it back, and whether it
     /// counts as stuck.
+    ///
+    /// `None` when the failure record or the version could not be read: nothing is known then.
+    fn failure_state_checked(
+        &self,
+        coordinator: &ReplicaCoordinator,
+        root_id: &str,
+        item: &ItemId,
+        now_ms: i64,
+    ) -> Option<(bool, bool)> {
+        let repo = coordinator.provider_repository();
+        let failure = match repo.download_failure(root_id, item) {
+            Ok(Some(failure)) => failure,
+            Ok(None) => return Some((false, false)),
+            Err(error) => {
+                tracing::warn!(root_id, %error, "could not read a download failure record");
+                return None;
+            }
+        };
+        match repo.current_version_hash(root_id, item) {
+            Ok(Some(current)) if current == failure.version_hash => Some((
+                failure.next_attempt_ms > now_ms,
+                failure.failures >= self.config.stuck_after,
+            )),
+            // A newer version, or the item is gone: the failure is about something else.
+            Ok(_) => Some((false, false)),
+            Err(error) => {
+                tracing::warn!(root_id, %error, "could not read an item's current version");
+                None
+            }
+        }
+    }
+
+    /// [`Self::failure_state_checked`] for the decisions that must hold an item back when nothing
+    /// is known: an unreadable record counts as "in backoff", never as "no failure".
     fn failure_state(
         &self,
         coordinator: &ReplicaCoordinator,
@@ -234,35 +304,48 @@ impl EagerDriver {
         item: &ItemId,
         now_ms: i64,
     ) -> (bool, bool) {
-        let repo = coordinator.provider_repository();
-        let Ok(Some(failure)) = repo.download_failure(root_id, item) else { return (false, false) };
-        match repo.current_version_hash(root_id, item) {
-            Ok(Some(current)) if current == failure.version_hash => {
-                (failure.next_attempt_ms > now_ms, failure.failures >= self.config.stuck_after)
-            }
-            // A newer version, or the item is gone: the failure is about something else.
-            _ => (false, false),
-        }
+        self.failure_state_checked(coordinator, root_id, item, now_ms).unwrap_or((true, false))
     }
 
     fn declared_eager_root(
         &self,
         coordinator: &ReplicaCoordinator,
         root_id: &str,
-    ) -> Option<ProviderRoot> {
-        let root = coordinator
-            .provider_repository()
-            .list_declared_roots()
-            .ok()?
-            .into_iter()
-            .find(|r| r.root_id == root_id)?;
+    ) -> Result<Option<ProviderRoot>, String> {
+        let roots =
+            coordinator.provider_repository().list_declared_roots().map_err(|e| e.to_string())?;
+        let Some(root) = roots.into_iter().find(|r| r.root_id == root_id) else { return Ok(None) };
         // The link's own policy: the coordinator's reader answers OnDemand for every provider
-        // root, because no provider root ever writes eagerly to a directory.
-        let eager = matches!(
-            coordinator.link_repository().materialization_policy_for_group(&root.group_id),
-            Ok(Some(MaterializationPolicy::Eager))
-        );
-        eager.then_some(root)
+        // root, because no provider root ever writes eagerly to a directory. A policy that cannot
+        // be read is an error, not "OnDemand".
+        let policy = coordinator
+            .link_repository()
+            .materialization_policy_for_group(&root.group_id)
+            .map_err(|e| e.to_string())?;
+        Ok((policy == Some(MaterializationPolicy::Eager)).then_some(root))
+    }
+
+    /// The root and what the driver downloads of it: everything for an Eager root, the kept files
+    /// for any other (possibly none), and `None` for a root that is not declared. A pin list that
+    /// cannot be read is an error (nothing is offered, and it never reads as done).
+    fn download_scope(
+        &self,
+        coordinator: &ReplicaCoordinator,
+        root_id: &str,
+    ) -> Result<Option<(ProviderRoot, Scope)>, String> {
+        let roots =
+            coordinator.provider_repository().list_declared_roots().map_err(|e| e.to_string())?;
+        let Some(root) = roots.into_iter().find(|r| r.root_id == root_id) else { return Ok(None) };
+        let policy = coordinator
+            .link_repository()
+            .materialization_policy_for_group(&root.group_id)
+            .map_err(|e| e.to_string())?;
+        if policy == Some(MaterializationPolicy::Eager) {
+            return Ok(Some((root, Scope::All)));
+        }
+        let pinned =
+            coordinator.pinned_item_repository().list(&root.group_id).map_err(|e| e.to_string())?;
+        Ok(Some((root, Scope::Kept(pinned))))
     }
 
     /// Answers one `NextProviderDownloads` query.
@@ -278,7 +361,15 @@ impl EagerDriver {
             settled_item_ids: Vec::new(),
             state: DriverState::Unspecified as i32,
         };
-        let Some(root) = self.declared_eager_root(coordinator, &root_id) else { return response };
+        let (root, scope) = match self.download_scope(coordinator, &root_id) {
+            Ok(Some(found)) => found,
+            Ok(None) => return response,
+            Err(error) => {
+                tracing::warn!(root_id, %error, "could not read the root to download");
+                response.state = DriverState::Running as i32;
+                return response;
+            }
+        };
         let now = self.environment.now_ms();
         let repo = coordinator.provider_repository();
 
@@ -290,16 +381,35 @@ impl EagerDriver {
             .filter_map(|bytes| ItemId::try_from(bytes.as_slice()).ok())
             .collect();
         for (item, raw) in exclusions.iter().zip(request.exclude_item_ids.iter()) {
-            let live_file = matches!(repo.path_for_item(&root_id, item), Ok(Some((_, true))))
-                && repo.current_version_hash(&root_id, item).ok().flatten().is_some();
+            // A lookup that fails settles nothing: the host would stop asking for an item that
+            // may still be wanted.
+            let live_file = match (
+                repo.path_for_item(&root_id, item),
+                repo.current_version_hash(&root_id, item),
+            ) {
+                // An item that is no longer wanted (its pin was removed) settles like a gone one.
+                (Ok(Some((path, true))), Ok(version)) => version.is_some() && scope.covers(&path),
+                (Ok(_), Ok(_)) => false,
+                (Err(error), _) | (_, Err(error)) => {
+                    tracing::warn!(root_id, %error, "could not look up an excluded item; not settled");
+                    continue;
+                }
+            };
             let present = live_file
                 && provider_local_presence(coordinator, inputs.membership, &root_id, item)
                     .current_content_present;
-            let (in_backoff, _) = self.failure_state(coordinator, &root_id, item, now);
+            let Some((in_backoff, _)) =
+                self.failure_state_checked(coordinator, &root_id, item, now)
+            else {
+                continue;
+            };
             if !live_file || present || in_backoff {
                 response.settled_item_ids.push(raw.clone());
                 self.finished(&root_id, item);
             }
+        }
+        if scope.is_empty() {
+            return response;
         }
         let outstanding: HashSet<ItemId> = exclusions
             .iter()
@@ -334,14 +444,21 @@ impl EagerDriver {
         }
         let mut chosen: Vec<(String, u64, Option<ItemId>)> = Vec::new();
         let mut after: Option<(u64, String)> = None;
+        let mut read_failed = false;
         'scan: while chosen.len() < want {
             let page = match repo.eager_page(
                 &root_id,
+                scope.kept_only(),
                 after.as_ref().map(|(size, path)| (*size, path.as_str())),
                 self.config.page,
             ) {
                 Ok(page) if !page.is_empty() => page,
-                _ => break,
+                Ok(_) => break,
+                Err(error) => {
+                    tracing::warn!(root_id, %error, "could not read the Eager candidates");
+                    read_failed = true;
+                    break;
+                }
             };
             after = page.last().map(|c| (c.size, c.path.clone()));
             for candidate in page {
@@ -355,10 +472,11 @@ impl EagerDriver {
             }
         }
         if chosen.is_empty() {
-            response.state = if outstanding.is_empty() {
+            // A failed read found nothing because it could not look, which is not "done".
+            response.state = if outstanding.is_empty() && !read_failed {
                 // Nothing wanted that is not held back: done, if the scan really found nothing
                 // left that is merely waiting out a backoff.
-                self.idle_state(coordinator, inputs, &root, now) as i32
+                self.idle_state(coordinator, inputs, &root, &scope, now) as i32
             } else {
                 DriverState::Running as i32
             };
@@ -442,18 +560,29 @@ impl EagerDriver {
                 return true;
             }
         }
-        self.held_or_paused(coordinator, &root.group_id, &candidate.path)
+        // Not offered while unknown; the scan reports the failed read, so it never reads as done.
+        self.held_or_paused(coordinator, &root.group_id, &candidate.path).unwrap_or(true)
     }
 
-    fn held_or_paused(&self, coordinator: &ReplicaCoordinator, group_id: &str, path: &str) -> bool {
-        if coordinator.held_path_repository().is_held(group_id, path).unwrap_or(true) {
-            return true;
+    /// Whether the path is held or paused; `None` when that could not be read.
+    fn held_or_paused(
+        &self,
+        coordinator: &ReplicaCoordinator,
+        group_id: &str,
+        path: &str,
+    ) -> Option<bool> {
+        let held = coordinator.held_path_repository().is_held(group_id, path);
+        let paused = coordinator.paused_item_repository().list(group_id);
+        match (held, paused) {
+            (Ok(true), _) => Some(true),
+            (Ok(false), Ok(paused)) => {
+                Some(yadorilink_sync_sqlite::paused_items::path_is_covered(&paused, path))
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                tracing::warn!(group_id, %error, "could not read whether a path is held or paused");
+                None
+            }
         }
-        coordinator
-            .paused_item_repository()
-            .list(group_id)
-            .map(|paused| yadorilink_sync_sqlite::paused_items::path_is_covered(&paused, path))
-            .unwrap_or(true)
     }
 
     /// The state when nothing can be offered right now and nothing is outstanding: DONE when
@@ -464,17 +593,31 @@ impl EagerDriver {
         coordinator: &ReplicaCoordinator,
         inputs: &EagerInputs<'_>,
         root: &ProviderRoot,
+        scope: &Scope,
         now_ms: i64,
     ) -> DriverState {
-        let status = self.scan(coordinator, inputs, root, now_ms);
+        let status = self.scan(coordinator, inputs, root, scope, now_ms);
         status.state
     }
 
     /// The root's full status: one pass over its files.
     pub(crate) fn status(&self, inputs: &EagerInputs<'_>, root_id: &str) -> Option<EagerStatus> {
-        let root = self.declared_eager_root(inputs.coordinator, root_id)?;
+        let root = match self.declared_eager_root(inputs.coordinator, root_id) {
+            Ok(root) => root?,
+            Err(error) => {
+                tracing::warn!(root_id, %error, "could not read the Eager root for status");
+                return Some(EagerStatus {
+                    state: DriverState::Running,
+                    remote: 0,
+                    hydrating: 0,
+                    current: 0,
+                    stuck: Vec::new(),
+                    unreadable: true,
+                });
+            }
+        };
         let now = self.environment.now_ms();
-        let mut status = self.scan(inputs.coordinator, inputs, &root, now);
+        let mut status = self.scan(inputs.coordinator, inputs, &root, &Scope::All, now);
         let outstanding = self
             .requested
             .lock()
@@ -498,6 +641,7 @@ impl EagerDriver {
         coordinator: &ReplicaCoordinator,
         inputs: &EagerInputs<'_>,
         root: &ProviderRoot,
+        scope: &Scope,
         now_ms: i64,
     ) -> EagerStatus {
         let repo = coordinator.provider_repository();
@@ -507,24 +651,37 @@ impl EagerDriver {
             hydrating: 0,
             current: 0,
             stuck: Vec::new(),
+            unreadable: false,
         };
         let provider_state = self.provider_state(root, inputs);
         let mut waiting_on_backoff = false;
         let mut open_work = false;
         let mut after: Option<(u64, String)> = None;
+        let mut read_failed = false;
         loop {
             let page = match repo.eager_page(
                 &root.root_id,
+                scope.kept_only(),
                 after.as_ref().map(|(size, path)| (*size, path.as_str())),
                 self.config.page,
             ) {
                 Ok(page) if !page.is_empty() => page,
-                _ => break,
+                Ok(_) => break,
+                Err(error) => {
+                    tracing::warn!(root_id = %root.root_id, %error, "could not read the Eager candidates for status");
+                    read_failed = true;
+                    break;
+                }
             };
             after = page.last().map(|c| (c.size, c.path.clone()));
             for candidate in page {
-                if self.held_or_paused(coordinator, &root.group_id, &candidate.path) {
-                    continue;
+                match self.held_or_paused(coordinator, &root.group_id, &candidate.path) {
+                    Some(false) => {}
+                    Some(true) => continue,
+                    None => {
+                        read_failed = true;
+                        continue;
+                    }
                 }
                 let present = candidate.item_id.is_some_and(|item| {
                     provider_local_presence(coordinator, inputs.membership, &root.root_id, &item)
@@ -535,10 +692,15 @@ impl EagerDriver {
                     continue;
                 }
                 status.remote += 1;
-                let (in_backoff, stuck) = candidate
-                    .item_id
-                    .map(|item| self.failure_state(coordinator, &root.root_id, &item, now_ms))
-                    .unwrap_or((false, false));
+                let (in_backoff, stuck) = match candidate.item_id {
+                    None => (false, false),
+                    Some(item) => self
+                        .failure_state_checked(coordinator, &root.root_id, &item, now_ms)
+                        .unwrap_or_else(|| {
+                            read_failed = true;
+                            (true, false)
+                        }),
+                };
                 if stuck {
                     let failures = candidate
                         .item_id
@@ -552,9 +714,10 @@ impl EagerDriver {
                 }
             }
         }
+        status.unreadable = read_failed;
         status.state = if provider_state != DriverState::Running {
             provider_state
-        } else if !open_work && !waiting_on_backoff {
+        } else if !open_work && !waiting_on_backoff && !read_failed {
             DriverState::Done
         } else if open_work && !self.environment.peers_available(&root.group_id) {
             DriverState::WaitingPeers

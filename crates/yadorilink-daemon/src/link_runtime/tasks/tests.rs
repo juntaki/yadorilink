@@ -1,6 +1,13 @@
 #![cfg(test)]
 
-use super::{resolve_duplicate_recovery_gate, DuplicateRecoveryOutcome};
+use super::{
+    resolve_duplicate_recovery_gate, send_committed_chunk, spawn_chunk_announcer,
+    DuplicateRecoveryOutcome, ANNOUNCE_QUEUE_CAPACITY,
+};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use yadorilink_local_capture::LocalCaptureError;
+use yadorilink_replica_domain::file::FileRecord;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FakeError;
@@ -87,4 +94,85 @@ fn unreadable_pending_state_fails_closed_without_running_corroboration() {
         },
     );
     assert_eq!(outcome, DuplicateRecoveryOutcome::UnknownFailClosed);
+}
+
+fn chunk(i: usize) -> Vec<FileRecord> {
+    vec![FileRecord {
+        path: format!("f{i}"),
+        size: 0,
+        mtime_unix_nanos: 0,
+        blocks: Vec::new(),
+        deleted: false,
+    }]
+}
+
+// A stalled consumer must apply backpressure: the producer (a blocking
+// scan callback) can have at most the queue capacity plus the chunk being
+// announced plus the one blocked in `send` outstanding, however many chunks
+// the tree produces. Once the consumer resumes, every chunk is announced in
+// commit order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_announcer_bounds_the_committed_chunk_queue() {
+    const TOTAL: usize = 200;
+    let release = Arc::new(AtomicBool::new(false));
+    let announced = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (tx, task) = {
+        let release = release.clone();
+        let announced = announced.clone();
+        spawn_chunk_announcer(move |records| {
+            let release = release.clone();
+            let announced = announced.clone();
+            async move {
+                while !release.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                announced.lock().unwrap().push(records[0].path.clone());
+            }
+        })
+    };
+    let sent = Arc::new(AtomicUsize::new(0));
+    let producer = {
+        let sent = sent.clone();
+        tokio::task::spawn_blocking(move || {
+            for i in 0..TOTAL {
+                send_committed_chunk(&tx, &chunk(i)).unwrap();
+                sent.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let outstanding = sent.load(Ordering::SeqCst);
+    assert!(
+        outstanding <= ANNOUNCE_QUEUE_CAPACITY + 1,
+        "a stalled consumer must block the producer: {outstanding} chunks were accepted"
+    );
+    assert!(!producer.is_finished(), "the producer must be blocked on the full queue");
+
+    release.store(true, Ordering::SeqCst);
+    producer.await.unwrap();
+    task.await.unwrap();
+    let expected: Vec<String> = (0..TOTAL).map(|i| format!("f{i}")).collect();
+    assert_eq!(*announced.lock().unwrap(), expected, "chunks must be announced in commit order");
+}
+
+// A dead consumer must surface to the producer as an error rather than being
+// ignored, and the task's failure must be visible to the joiner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_announcer_fails_the_producer_and_the_join() {
+    let (tx, task) = spawn_chunk_announcer(|_records| async move {
+        panic!("injected announce failure");
+    });
+    let result = tokio::task::spawn_blocking(move || {
+        for i in 0..1000 {
+            send_committed_chunk(&tx, &chunk(i))?;
+        }
+        Ok::<(), LocalCaptureError>(())
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(result, Err(LocalCaptureError::StreamingConsumerClosed)),
+        "the producer must observe the dead consumer, got {result:?}"
+    );
+    assert!(task.await.is_err(), "the announcer panic must reach the joiner");
 }

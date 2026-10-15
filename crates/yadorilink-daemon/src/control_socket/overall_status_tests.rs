@@ -32,6 +32,19 @@ fn empty_status_is_healthy() {
     assert!(reasons.is_empty());
 }
 
+/// A directory a removal moved aside and could not put back needs attention,
+/// naming the affected group.
+#[test]
+fn a_stranded_directory_is_attention() {
+    let response = StatusResponse {
+        links: vec![LinkStatus { stranded_directory_count: 1, ..protected_link("group-1") }],
+        ..Default::default()
+    };
+    let (state, reasons) = overall_status(&response);
+    assert_eq!(state, OverallState::Attention);
+    assert_eq!(reasons, vec!["stranded_directory:group-1".to_string()]);
+}
+
 /// A merely-paused link with nothing else wrong stays healthy — pause
 /// is a deliberate user action, not an error state.
 #[test]
@@ -130,6 +143,8 @@ fn unavailable_fetch_with_protected_durability_is_attention_not_degraded() {
         links: vec![LinkStatus {
             fetch_availability: yadorilink_ipc_proto::daemonctl::FetchAvailability::UnavailableNow
                 as i32,
+            hydrating_count: 1,
+            requested_content_count: 1,
             ..protected_link("group-1")
         }],
         ..Default::default()
@@ -137,6 +152,25 @@ fn unavailable_fetch_with_protected_durability_is_attention_not_degraded() {
     let (state, reasons) = overall_status(&response);
     assert_eq!(state, OverallState::Attention);
     assert_eq!(reasons, vec!["fetch_unavailable:group-1".to_string()]);
+}
+
+/// An idle On-Demand folder (remote placeholders, no file being fetched) with unavailable or
+/// unconfirmed content is a healthy steady state, not attention.
+#[test]
+fn unavailable_fetch_without_wanted_content_is_healthy() {
+    use yadorilink_ipc_proto::daemonctl::{FetchAvailability, LocalStorageState};
+    for f in [FetchAvailability::UnavailableNow, FetchAvailability::Unknown] {
+        let response = StatusResponse {
+            links: vec![LinkStatus {
+                fetch_availability: f as i32,
+                local_storage_state: LocalStorageState::OnDemand as i32,
+                placeholder_count: 5,
+                ..protected_link("group-1")
+            }],
+            ..Default::default()
+        };
+        assert_eq!(overall_status(&response), (OverallState::Healthy, Vec::new()), "{f:?}");
+    }
 }
 
 /// A link that is durably `Protected` but whose `fetch_availability`
@@ -152,6 +186,8 @@ fn unknown_fetch_availability_with_protected_durability_is_attention() {
     let response = StatusResponse {
         links: vec![LinkStatus {
             fetch_availability: yadorilink_ipc_proto::daemonctl::FetchAvailability::Unknown as i32,
+            hydrating_count: 1,
+            requested_content_count: 1,
             ..protected_link("group-1")
         }],
         ..Default::default()
@@ -268,4 +304,183 @@ fn an_ownership_lost_link_reports_its_own_reason() {
     let (state, reasons) = overall_status(&response);
     assert_eq!(state, OverallState::Degraded);
     assert_eq!(reasons, vec!["ownership_lost:group-1".to_string()]);
+}
+
+/// The daemon's rollup and the canonical product summary must not disagree about whether a
+/// folder needs the user. Every per-link attention condition here is `NeedsAttention` in both;
+/// a healthy link is neither. Fetch availability is the one deliberate difference: the rollup
+/// calls it attention, the summary calls it `Waiting` (never `UpToDate`), and both raise it only
+/// while content is wanted: an idle On-Demand folder is healthy / up to date in both.
+#[test]
+fn the_rollup_and_the_canonical_product_summary_agree_on_what_needs_attention() {
+    use yadorilink_product_view::summary::{ProductState, ProductStatusSummary};
+
+    let attention: Vec<(&str, LinkStatus)> = vec![
+        ("conflict", LinkStatus { conflict_count: 1, ..protected_link("g") }),
+        ("conflict_pending", LinkStatus { conflicts_pending: 1, ..protected_link("g") }),
+        ("held", LinkStatus { held_file_count: 1, ..protected_link("g") }),
+        ("stranded", LinkStatus { stranded_directory_count: 1, ..protected_link("g") }),
+        ("volume_changed", LinkStatus { capture_volume_changed: true, ..protected_link("g") }),
+        ("degraded", LinkStatus { degraded: true, ..protected_link("g") }),
+        ("ambiguous", LinkStatus { ambiguous: true, ..protected_link("g") }),
+        (
+            "durability_at_risk",
+            LinkStatus {
+                durability_status: yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus::AtRisk
+                    as i32,
+                ..protected_link("g")
+            },
+        ),
+        (
+            "durability_unknown",
+            LinkStatus {
+                durability_status: yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus::Unknown
+                    as i32,
+                ..protected_link("g")
+            },
+        ),
+    ];
+    for (name, link) in attention {
+        let response = StatusResponse { links: vec![link.clone()], ..Default::default() };
+        assert_ne!(overall_status(&response).0, OverallState::Healthy, "{name}: rollup");
+        assert_eq!(
+            ProductStatusSummary::for_folder(&link).state,
+            ProductState::NeedsAttention,
+            "{name}: summary"
+        );
+    }
+
+    for link in [
+        protected_link("g"),
+        LinkStatus { paused: true, ..protected_link("g") },
+        LinkStatus { skipped_symlink_count: 2, ..protected_link("g") },
+    ] {
+        let response = StatusResponse { links: vec![link.clone()], ..Default::default() };
+        assert_eq!(overall_status(&response).0, OverallState::Healthy);
+        assert_ne!(ProductStatusSummary::for_folder(&link).state, ProductState::NeedsAttention);
+    }
+
+    for availability in [
+        yadorilink_ipc_proto::daemonctl::FetchAvailability::UnavailableNow,
+        yadorilink_ipc_proto::daemonctl::FetchAvailability::Unknown,
+    ] {
+        let blocked = LinkStatus {
+            fetch_availability: availability as i32,
+            hydrating_count: 1,
+            requested_content_count: 1,
+            ..protected_link("g")
+        };
+        let response = StatusResponse { links: vec![blocked.clone()], ..Default::default() };
+        assert_eq!(overall_status(&response).0, OverallState::Attention);
+        assert_eq!(ProductStatusSummary::for_folder(&blocked).state, ProductState::Waiting);
+
+        let idle = LinkStatus {
+            fetch_availability: availability as i32,
+            local_storage_state: yadorilink_ipc_proto::daemonctl::LocalStorageState::OnDemand
+                as i32,
+            placeholder_count: 5,
+            ..protected_link("g")
+        };
+        let response = StatusResponse { links: vec![idle.clone()], ..Default::default() };
+        assert_eq!(overall_status(&response).0, OverallState::Healthy);
+        assert_eq!(ProductStatusSummary::for_folder(&idle).state, ProductState::UpToDate);
+    }
+}
+
+/// An On-Demand open queued for an assembly slot is requested content though no file is
+/// hydrating yet: unavailable fetching is attention.
+#[test]
+fn a_queued_open_with_unavailable_fetch_is_attention() {
+    use yadorilink_ipc_proto::daemonctl::{FetchAvailability, LocalStorageState};
+    let response = StatusResponse {
+        links: vec![LinkStatus {
+            fetch_availability: FetchAvailability::UnavailableNow as i32,
+            local_storage_state: LocalStorageState::OnDemand as i32,
+            placeholder_count: 5,
+            requested_content_count: 1,
+            ..protected_link("group-1")
+        }],
+        ..Default::default()
+    };
+    let (state, reasons) = overall_status(&response);
+    assert_eq!(state, OverallState::Attention);
+    assert_eq!(reasons, vec!["fetch_unavailable:group-1".to_string()]);
+}
+
+/// Files being evicted are not requested content: an idle folder is healthy whatever the
+/// fetch availability says.
+#[test]
+fn an_idle_evicting_folder_with_unavailable_fetch_is_healthy() {
+    use yadorilink_ipc_proto::daemonctl::{FetchAvailability, LocalStorageState};
+    let response = StatusResponse {
+        links: vec![LinkStatus {
+            fetch_availability: FetchAvailability::UnavailableNow as i32,
+            local_storage_state: LocalStorageState::OnDemand as i32,
+            placeholder_count: 5,
+            requested_content_count: 0,
+            ..protected_link("group-1")
+        }],
+        ..Default::default()
+    };
+    assert_eq!(overall_status(&response), (OverallState::Healthy, Vec::new()));
+}
+
+/// A removals list that could not be read is not "no removals": the status carries one row that
+/// says so, and the rollup must ask for attention for it like for any other unreadable provider
+/// state. An ordinary removal (in progress or done) is not attention.
+#[test]
+fn an_unreadable_removals_list_is_attention() {
+    use yadorilink_ipc_proto::daemonctl::ProviderRemovalStatus;
+    let mut response = StatusResponse {
+        provider_removals: vec![ProviderRemovalStatus {
+            display_name: "Going".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (state, reasons) = overall_status(&response);
+    assert_eq!(state, OverallState::Healthy, "{reasons:?}");
+
+    response.provider_removals = vec![ProviderRemovalStatus {
+        display_name: "removals unreadable: boom".into(),
+        unreadable: true,
+        ..Default::default()
+    }];
+    let (state, reasons) = overall_status(&response);
+    assert_eq!(state, OverallState::Attention, "{reasons:?}");
+    assert!(reasons.iter().any(|r| r == "provider_not_ready:removals"), "{reasons:?}");
+}
+
+/// The protection each link reports and the rollup's durability reasons describe the same fact:
+/// a confirmed single copy is the rollup's degraded reason, an unconfirmed one its attention
+/// reason, and a copy that is protected or on its way is neither.
+#[test]
+fn the_reported_protection_and_the_rollup_agree() {
+    use yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus as Durability;
+    use yadorilink_product_view::Protection;
+
+    let cases = [
+        (Durability::AtRisk, false, Protection::AtRisk, Some("durability_at_risk:g")),
+        (Durability::Unknown, false, Protection::Unknown, Some("durability_unknown:g")),
+        (Durability::Unspecified, false, Protection::Unknown, Some("durability_unknown:g")),
+        (Durability::Unknown, true, Protection::Pending, None),
+        (Durability::Protecting, false, Protection::Pending, None),
+        (Durability::Protected, false, Protection::Protected, None),
+    ];
+    for (durability, check_pending, protection, reason) in cases {
+        let mut response = StatusResponse {
+            links: vec![LinkStatus {
+                durability_status: durability as i32,
+                durability_check_pending: check_pending,
+                ..protected_link("g")
+            }],
+            ..Default::default()
+        };
+        super::status_dimensions::fill_link_dimensions(&mut response);
+        let reported =
+            yadorilink_product_view::ProtectionSummary::from_link(&response.links[0]).protection;
+        assert_eq!(reported, protection, "{durability:?}");
+        let (_, reasons) = overall_status(&response);
+        assert_eq!(reasons.first().map(String::as_str), reason, "{durability:?}");
+    }
 }

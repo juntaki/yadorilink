@@ -18,9 +18,11 @@ pub mod ports;
 use std::sync::Arc;
 
 pub use engine::{DurableVersionQuery, PeerReplicaEngine};
-pub use ports::DurabilityEvidencePort;
+pub use ports::{CustodyLeasePort, DurabilityEvidencePort};
 
 /// `PeerReplicaEngine`'s port dependency.
+#[derive(Clone)]
 pub struct ReplicaEngineDependencies {
     pub durability: Arc<dyn DurabilityEvidencePort>,
+    pub leases: Arc<dyn CustodyLeasePort>,
 }

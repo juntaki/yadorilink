@@ -21,8 +21,10 @@
 //! On macOS the gap described next is closed by never registering a watch
 //! after startup: the root is watched once, recursively (see
 //! [`RootWatch`]), and a new directory only has its contents re-reported.
-//! The per-directory registration below is what inotify and
-//! `ReadDirectoryChangesW` use, where adding a watch leaves the others
+//! Windows watches the root once, recursively, too: a
+//! `ReadDirectoryChangesW` handle per directory would make NTFS refuse to
+//! rename any directory above a watched one. The per-directory registration
+//! below is what inotify uses, where adding a watch leaves the others
 //! alone.
 //!
 //! Moving `watch` off the callback thread closed that deadlock, but not a
@@ -71,7 +73,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use notify::event::{ModifyKind, RenameMode};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
+
+/// The OS watcher: `notify`'s, except on Windows, where `notify` ignores a
+/// buffer overflow and the loss would go unnoticed (see `win_watch`).
+#[cfg(not(windows))]
+type PlatformWatcher = notify::RecommendedWatcher;
+#[cfg(windows)]
+type PlatformWatcher = crate::win_watch::RootWatcher;
 use tokio::sync::mpsc;
 
 use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
@@ -193,7 +202,7 @@ pub fn watch_folder_with_capacity_and_ignore(
     let (tx, rx) = mpsc::channel(capacity);
     let overflowed = Arc::new(AtomicBool::new(false));
     let callback_overflowed = overflowed.clone();
-    let watcher_holder: Arc<Mutex<Option<RecommendedWatcher>>> = Arc::new(Mutex::new(None));
+    let watcher_holder: Arc<Mutex<Option<PlatformWatcher>>> = Arc::new(Mutex::new(None));
     let watched_dirs = Arc::new(Mutex::new(BTreeSet::new()));
     let callback_root = root.clone();
     let callback_ignore_set = ignore_set.clone();
@@ -220,100 +229,121 @@ pub fn watch_folder_with_capacity_and_ignore(
     let registrar_tx = tx.clone();
     let registrar_overflowed = overflowed.clone();
 
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-        let Ok(event) = res else { return };
-        let enqueue_path = |path: PathBuf, kind: FsChangeKind| {
-            if !should_queue_path(&callback_root, &callback_ignore_set, &path, kind) {
+    let mut watcher = PlatformWatcher::new(
+        move |res: notify::Result<Event>| {
+            // Changes may have been lost (an overflowed buffer, a failed
+            // watcher): only a full reconciliation restores a correct index.
+            // The flag is only looked at when the debouncer runs, so a
+            // synthetic event for the root wakes it.
+            if crate::win_watch::result_means_changes_were_lost(&res) {
+                callback_overflowed.store(true, Ordering::Relaxed);
+                let _ = tx.try_send(FsChangeEvent {
+                    path: callback_root.clone(),
+                    kind: FsChangeKind::CreatedOrModified,
+                });
                 return;
             }
-            // `path.is_dir` follows a symlink to decide, which would let
-            // a freshly-created symlink-to-directory register recursive
-            // watches into whatever it points to (including outside
-            // `root`) — use an lstat-equivalent check instead so a
-            // symlink is never treated as something to descend into,
-            // matching the scanner's lstat-first classification.
-            if matches!(kind, FsChangeKind::CreatedOrModified) && is_real_directory(&path) {
-                // Send-only, off this callback thread — see the module
-                // doc comment and `spawn_new_directory_registrar` below.
-                // `send` on an unbounded channel only fails if the
-                // receiving task is gone (shutdown race), never because
-                // it's full; either way there is nothing more to do here.
-                let _ = callback_new_dir_tx.send(RegistrarTrigger::NewDirectory(path.clone()));
-            }
-            // A removal may be a watched directory's: the registrar drops
-            // it (and what was below it) from the registered set, so the
-            // directory is registered again if it is made anew.
-            if matches!(kind, FsChangeKind::ObservedRemoval) {
-                let _ = callback_new_dir_tx.send(RegistrarTrigger::Removed(path.clone()));
-            }
-            // Zero-field `phase T_*` marker: a timestamp anchor for offline
-            // timing analysis of captured logs.
-            if matches!(kind, FsChangeKind::CreatedOrModified) {
-                tracing::trace!("phase T_watch: raw filesystem watcher event received");
-            }
-            if tx.try_send(FsChangeEvent { path, kind }).is_err() {
-                callback_overflowed.store(true, Ordering::Relaxed);
-            }
-        };
-
-        // A plain `EventKind::Modify(_) => CreatedOrModified` blanket
-        // match (the previous behavior) misclassifies a rename's *source*
-        // path as a live edit — `process_event` then sees the path no
-        // longer exists on disk and just drops the event (`None`), so the
-        // old path's index row is never tombstoned and propagates to
-        // peers as live forever. `ModifyKind::Name` carries a `RenameMode`
-        // telling us which of the (possibly two) `event.paths` is the old
-        // path, the new path, or both — classify each accordingly instead
-        // of collapsing every rename mode to `CreatedOrModified`.
-        if let EventKind::Modify(ModifyKind::Name(rename_mode)) = event.kind {
-            let pairs: Vec<(PathBuf, FsChangeKind)> = match rename_mode {
-                RenameMode::From => {
-                    event.paths.into_iter().map(|p| (p, FsChangeKind::ObservedRemoval)).collect()
+            let Ok(event) = res else { return };
+            let enqueue_path = |path: PathBuf, kind: FsChangeKind| {
+                if !should_queue_path(&callback_root, &callback_ignore_set, &path, kind) {
+                    return;
                 }
-                RenameMode::To => {
-                    event.paths.into_iter().map(|p| (p, FsChangeKind::CreatedOrModified)).collect()
+                // `path.is_dir` follows a symlink to decide, which would let
+                // a freshly-created symlink-to-directory register recursive
+                // watches into whatever it points to (including outside
+                // `root`) — use an lstat-equivalent check instead so a
+                // symlink is never treated as something to descend into,
+                // matching the scanner's lstat-first classification.
+                if matches!(kind, FsChangeKind::CreatedOrModified) && is_real_directory(&path) {
+                    // Send-only, off this callback thread — see the module
+                    // doc comment and `spawn_new_directory_registrar` below.
+                    // `send` on an unbounded channel only fails if the
+                    // receiving task is gone (shutdown race), never because
+                    // it's full; either way there is nothing more to do here.
+                    let _ = callback_new_dir_tx.send(RegistrarTrigger::NewDirectory(path.clone()));
                 }
-                RenameMode::Both => {
-                    let mut paths = event.paths.into_iter();
-                    match (paths.next(), paths.next()) {
-                        (Some(from), Some(to)) => {
-                            vec![
-                                (from, FsChangeKind::ObservedRemoval),
-                                (to, FsChangeKind::CreatedOrModified),
-                            ]
-                        }
-                        // Malformed (should always carry exactly two paths
-                        // per notify's own contract) — fail soft rather
-                        // than panic or silently drop.
-                        (Some(only), None) => vec![(only, FsChangeKind::CreatedOrModified)],
-                        (None, _) => vec![],
-                    }
+                // A removal may be a watched directory's: the registrar drops
+                // it (and what was below it) from the registered set, so the
+                // directory is registered again if it is made anew.
+                if matches!(kind, FsChangeKind::ObservedRemoval) {
+                    let _ = callback_new_dir_tx.send(RegistrarTrigger::Removed(path.clone()));
                 }
-                // `Any`/`Other`: the backend can't tell us which side this
-                // is. Treating it as a removal risks false-tombstoning a
-                // file that was actually just renamed *in* (not deleted);
-                // treating it as CreatedOrModified — the previous,
-                // unconditional behavior — is the conservative choice
-                // here, same as before this fix for these two modes.
-                RenameMode::Any | RenameMode::Other => {
-                    event.paths.into_iter().map(|p| (p, FsChangeKind::CreatedOrModified)).collect()
+                // Zero-field `phase T_*` marker: a timestamp anchor for offline
+                // timing analysis of captured logs.
+                if matches!(kind, FsChangeKind::CreatedOrModified) {
+                    tracing::trace!("phase T_watch: raw filesystem watcher event received");
+                }
+                if tx.try_send(FsChangeEvent { path, kind }).is_err() {
+                    callback_overflowed.store(true, Ordering::Relaxed);
                 }
             };
-            for (path, kind) in pairs {
+
+            // A plain `EventKind::Modify(_) => CreatedOrModified` blanket
+            // match (the previous behavior) misclassifies a rename's *source*
+            // path as a live edit — `process_event` then sees the path no
+            // longer exists on disk and just drops the event (`None`), so the
+            // old path's index row is never tombstoned and propagates to
+            // peers as live forever. `ModifyKind::Name` carries a `RenameMode`
+            // telling us which of the (possibly two) `event.paths` is the old
+            // path, the new path, or both — classify each accordingly instead
+            // of collapsing every rename mode to `CreatedOrModified`.
+            if let EventKind::Modify(ModifyKind::Name(rename_mode)) = event.kind {
+                let pairs: Vec<(PathBuf, FsChangeKind)> = match rename_mode {
+                    RenameMode::From => event
+                        .paths
+                        .into_iter()
+                        .map(|p| (p, FsChangeKind::ObservedRemoval))
+                        .collect(),
+                    RenameMode::To => event
+                        .paths
+                        .into_iter()
+                        .map(|p| (p, FsChangeKind::CreatedOrModified))
+                        .collect(),
+                    RenameMode::Both => {
+                        let mut paths = event.paths.into_iter();
+                        match (paths.next(), paths.next()) {
+                            (Some(from), Some(to)) => {
+                                vec![
+                                    (from, FsChangeKind::ObservedRemoval),
+                                    (to, FsChangeKind::CreatedOrModified),
+                                ]
+                            }
+                            // Malformed (should always carry exactly two paths
+                            // per notify's own contract) — fail soft rather
+                            // than panic or silently drop.
+                            (Some(only), None) => vec![(only, FsChangeKind::CreatedOrModified)],
+                            (None, _) => vec![],
+                        }
+                    }
+                    // `Any`/`Other`: the backend can't tell us which side this
+                    // is. Treating it as a removal risks false-tombstoning a
+                    // file that was actually just renamed *in* (not deleted);
+                    // treating it as CreatedOrModified — the previous,
+                    // unconditional behavior — is the conservative choice
+                    // here, same as before this fix for these two modes.
+                    RenameMode::Any | RenameMode::Other => event
+                        .paths
+                        .into_iter()
+                        .map(|p| (p, FsChangeKind::CreatedOrModified))
+                        .collect(),
+                };
+                for (path, kind) in pairs {
+                    enqueue_path(path, kind);
+                }
+                return;
+            }
+
+            let kind = match event.kind {
+                EventKind::Create(_) | EventKind::Modify(_) => FsChangeKind::CreatedOrModified,
+                EventKind::Remove(_) => FsChangeKind::ObservedRemoval,
+                _ => return,
+            };
+            for path in event.paths {
                 enqueue_path(path, kind);
             }
-            return;
-        }
-
-        let kind = match event.kind {
-            EventKind::Create(_) | EventKind::Modify(_) => FsChangeKind::CreatedOrModified,
-            EventKind::Remove(_) => FsChangeKind::ObservedRemoval,
-            _ => return,
-        };
-        for path in event.paths {
-            enqueue_path(path, kind);
-        }
-    })
+        },
+        notify::Config::default(),
+    )
     .map_err(WatcherError::from)?;
 
     {
@@ -489,7 +519,7 @@ impl FolderWatchSource for SimulatedFolderWatchSource {
 /// caller: `link_manager::start_link_watch` runs inside the daemon's tokio
 /// runtime, and this module's own tests are all `#[tokio::test]`.
 fn spawn_new_directory_registrar(
-    watcher_holder: Weak<Mutex<Option<RecommendedWatcher>>>,
+    watcher_holder: Weak<Mutex<Option<PlatformWatcher>>>,
     watched_dirs: Arc<Mutex<BTreeSet<PathBuf>>>,
     root: PathBuf,
     ignore_set: Arc<EffectiveIgnoreSet>,
@@ -682,11 +712,40 @@ fn reconcile_new_directory_subtree(
     }
 }
 
-/// Whether this platform's watcher backend recreates its whole event
-/// stream to register a new directory, which blinds it for that moment
-/// over every watched path: FSEvents (see the module doc comment). inotify
-/// and `ReadDirectoryChangesW` add a watch without touching the others.
-const REGISTRATION_RECREATES_STREAM: bool = cfg!(target_os = "macos");
+/// The watcher backends whose root-watch policy differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchBackend {
+    /// FSEvents: registering a directory recreates the whole event stream,
+    /// blinding it over every watched path.
+    FsEvents,
+    /// `ReadDirectoryChangesW`: a handle is held open on every watched
+    /// directory, and NTFS refuses to rename a directory while any handle
+    /// is open on a descendant of it -- so per-directory watches make
+    /// renaming any folder that contains a subfolder fail with access
+    /// denied.
+    ReadDirectoryChanges,
+    /// inotify and anything else: adding a watch touches no other.
+    Other,
+}
+
+/// The backend this build runs on.
+const WATCH_BACKEND: WatchBackend = if cfg!(target_os = "macos") {
+    WatchBackend::FsEvents
+} else if cfg!(windows) {
+    WatchBackend::ReadDirectoryChanges
+} else {
+    WatchBackend::Other
+};
+
+/// How `backend` is to be watched: one recursive watch of the root where
+/// per-directory registration is harmful (FSEvents, Windows), one watch
+/// per directory otherwise.
+const fn root_watch_for(backend: WatchBackend) -> RootWatch {
+    match backend {
+        WatchBackend::FsEvents | WatchBackend::ReadDirectoryChanges => RootWatch::Recursive,
+        WatchBackend::Other => RootWatch::PerDirectory,
+    }
+}
 
 /// What the directory registrar is told by the watcher callback.
 #[derive(Debug)]
@@ -715,18 +774,18 @@ enum RootWatch {
     /// directory is first seen: inotify's model, where adding a watch
     /// touches no other.
     PerDirectory,
-    /// One recursive watch of the root, registered once. On a backend whose
-    /// every registration recreates its whole event stream (FSEvents),
+    /// One recursive watch of the root, registered once. On FSEvents,
     /// registering each new directory would blind the stream for every
     /// watched path each time a directory appears, and an event anywhere
-    /// in the tree during that moment is never delivered. A recursive watch
-    /// of the root never registers again, so that window does not exist.
+    /// in the tree during that moment is never delivered. On Windows, a
+    /// handle per directory blocks renaming any directory above a watched
+    /// one. A recursive watch of the root never registers again and holds
+    /// one handle, at the root.
     Recursive,
 }
 
 /// This platform's [`RootWatch`].
-const ROOT_WATCH: RootWatch =
-    if REGISTRATION_RECREATES_STREAM { RootWatch::Recursive } else { RootWatch::PerDirectory };
+const ROOT_WATCH: RootWatch = root_watch_for(WATCH_BACKEND);
 
 /// The watches a new watcher starts with: the root recursively, or every
 /// non-ignored directory under it one by one. Every path watched is
@@ -860,7 +919,7 @@ fn is_real_directory(path: &Path) -> bool {
 /// cycle on the underlying OS watch — see the module doc comment — so the
 /// caller reconciles each one's contents).
 fn register_new_directory_tree(
-    watcher_holder: &Weak<Mutex<Option<RecommendedWatcher>>>,
+    watcher_holder: &Weak<Mutex<Option<PlatformWatcher>>>,
     watched_dirs: &Arc<Mutex<BTreeSet<PathBuf>>>,
     root: &Path,
     start: &Path,

@@ -105,6 +105,9 @@ pub struct EvictionRevalidationSnapshot {
     pub current_version: Option<yadorilink_replica_domain::session_state::CurrentVersionRecord>,
     pub materialization_state: Option<MaterializationState>,
     pub path_dirty: bool,
+    /// The user asked for the path to be kept on this device. Read here, under the same lock
+    /// as the rest, so a pin set before the commit point is never overtaken by an eviction.
+    pub pinned: bool,
 }
 
 /// The reads `repair_interrupted_materializations_inner`'s per-path loop
@@ -367,6 +370,17 @@ impl yadorilink_local_storage::TempFileLedger for GroupTempLedger<'_> {
     fn release(&self, tmp_path: &std::path::Path) {
         self.port.release_temp_file(self.group_id, tmp_path);
     }
+
+    fn strand(
+        &self,
+        dir_path: &std::path::Path,
+    ) -> Result<(), yadorilink_local_storage::StorageError> {
+        self.port.record_stranded_directory(self.group_id, dir_path).map_err(|error| {
+            yadorilink_local_storage::StorageError::Io(std::io::Error::other(format!(
+                "stranded directory ledger: {error}"
+            )))
+        })
+    }
 }
 
 pub trait MaterializationExecutionPort: Send + Sync {
@@ -380,6 +394,15 @@ pub trait MaterializationExecutionPort: Send + Sync {
 
     /// Forgets a recorded temp file once it is renamed away or removed.
     fn release_temp_file(&self, group_id: &str, tmp_path: &Path);
+
+    /// Records a directory a durable removal moved aside and could not put
+    /// back, so status can report it (see
+    /// `yadorilink_local_storage::TempFileLedger::strand`).
+    fn record_stranded_directory(
+        &self,
+        group_id: &str,
+        dir_path: &Path,
+    ) -> Result<(), MaterializationExecutionError>;
 
     fn get_file(
         &self,
@@ -819,12 +842,30 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// implementor revalidates the custody's exact version, the pin and
     /// materialization state, and the custody confirmation itself before
     /// freeing any block no other indexed row still references.
+    ///
+    /// `siblings` are other placeholders sharing blocks with the path, whose own exact-version
+    /// custody was verified too: the blocks only they still reference are freed with this one.
+    /// A sibling that no longer qualifies by then stays a reference.
     fn reclaim_verified_cached_blocks(
         &self,
         deletion_guard: &BlockPhysicalDeletionGuard<'_>,
         custody: VerifiedCustody<'_>,
+        siblings: Vec<VerifiedCustody<'_>>,
         store: &dyn BlockReclamationStore,
     ) -> Result<GcReport, MaterializationExecutionError>;
+
+    /// The other current placeholder rows `(group, path, exact version)` that share a block with
+    /// `blocks`. Their retained blocks are the only thing that can keep an eviction's blocks
+    /// alive once the last hydrated referrer is gone.
+    fn remote_siblings_sharing_blocks(
+        &self,
+        group_id: &str,
+        path: &str,
+        blocks: &[yadorilink_replica_domain::file::VersionBlock],
+    ) -> Result<
+        Vec<(String, String, yadorilink_replica_domain::file::FileVersion)>,
+        MaterializationExecutionError,
+    >;
 
     /// Bumps `path`'s filesystem-side mutation fence, invalidating any
     /// actual-state proof

@@ -15,7 +15,8 @@
 #  2. `pkgutil --check-signature` — reports signed/unsigned status.
 #  3. `spctl -a -vvv -t install` — Gatekeeper's install-time verdict.
 #  4. `xcrun stapler validate` — whether a notarization ticket is stapled.
-#  5. Payload contents (YadoriLink.app present, no eframe status app).
+#  5. Payload contents (YadoriLink.app, the CLI, the daemon and uninstall.sh
+#  present, no eframe status app). A missing file fails in every mode.
 #  6. --release only: signatures of what ships. For the app, both
 #     extensions and every nested Mach-O (incl. usr/local/bin/*):
 #     `codesign --verify --strict --deep`, Authority = Developer ID
@@ -140,6 +141,13 @@ if pkgutil --expand-full "$PKG" "$EXPAND_DIR/expanded" >/tmp/verify-pkg-expand.$
     else
         fail "payload does not include Applications/YadoriLink.app"
     fi
+    for shipped in usr/local/bin/yadorilink usr/local/bin/yadorilink-daemon usr/local/share/yadorilink/uninstall.sh; do
+        if find "$EXPAND_DIR/expanded" -type f -path "*/$shipped" | grep -q .; then
+            ok "payload includes $shipped"
+        else
+            fail "payload does not include $shipped"
+        fi
+    done
     if find "$EXPAND_DIR/expanded" -name "yadorilink-status-app" | grep -q .; then
         fail "payload still includes yadorilink-status-app"
     else
@@ -152,11 +160,13 @@ fi
 rm -f /tmp/verify-pkg-expand.$$
 
 # --- 6. Payload signatures (release only) ---------------------------------
-# Expected entitlements live in the repo; the extensions must carry exactly
-# those security entitlements (Developer ID signing may add identifier keys).
+# Expected entitlements live in the repo; the host app and the extensions must
+# carry exactly those security entitlements (Developer ID signing may add
+# identifier keys).
 APP_DIR="$(dirname "$0")/../app"
 expected_ent_for() {
     case "$1" in
+        */YadoriLink.app) echo "$APP_DIR/YadoriLinkApp/App/App.entitlements" ;;
         *YadoriLinkFinderSync.appex) echo "$APP_DIR/YadoriLinkFinderSync/Extension/Extension.entitlements" ;;
         *YadoriLinkFileProvider.appex) echo "$APP_DIR/YadoriLinkFileProvider/Extension/Extension.entitlements" ;;
     esac
@@ -215,6 +225,10 @@ if [ "$RELEASE_MODE" -eq 1 ]; then
             [ -d "$APP/Contents/PlugIns/$appex.appex" ] || fail "missing PlugIns/$appex.appex"
         done
         check_item "$APP"
+        # All three signed bundles embed a Developer ID profile for their own
+        # bundle id that authorizes the App Group each signs.
+        python3 "$(dirname "$0")/validate-macos-profiles.py" built-app "$APP" >&2 \
+            || fail "embedded provisioning profiles of YadoriLink.app and its extensions are invalid"
         for appex in "$APP"/Contents/PlugIns/*.appex; do [ -d "$appex" ] && check_item "$appex"; done
         # Every other Mach-O: nested frameworks/dylibs/helpers and the CLI.
         while IFS= read -r f; do

@@ -296,3 +296,75 @@ final class FileProviderCoreTests: XCTestCase {
         XCTAssertEqual(offences, [], "a log line names a user file, folder or path")
     }
 }
+
+/// A fetch whose daemon failed, dropped or handed over short bytes must complete as an error,
+/// never as a file the OS could take for an empty or truncated item.
+final class ContentFetchTests: XCTestCase {
+    private let dir = URL(fileURLWithPath: "/handoff")
+
+    private func client(_ transport: FakeTransport) -> ProviderClient {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("oplog-\(UUID().uuidString).json")
+        return ProviderClient(root: Data(repeating: 9, count: 16), transport: transport, log: OperationLog(url: url))
+    }
+
+    private func materialized(size: UInt64 = 100) -> [String: Any] {
+        ["ok": true, "handoff_name": "h1", "size": size, "content_version": token(1, 5).hex]
+    }
+
+    private func shown(hash: UInt8 = 1, size: UInt64 = 100) -> [String: Any] {
+        ["ok": true, "item": ["item_id": "01", "name": "f", "entry_kind": "file", "size": size, "content_version": token(hash, 6).hex]]
+    }
+
+    private func fetch(_ daemon: FakeTransport, fileSize: @escaping (URL) -> UInt64?) -> Result<FetchedContents, ProviderFailure> {
+        client(daemon).fetchContents(item: Data([1]), requestID: Data([7]), requestedHash: Data(), handoffDirectory: dir, fileSize: fileSize)
+    }
+
+    func testAnExactFileIsASuccess() {
+        let daemon = FakeTransport()
+        daemon.replies = [materialized(), shown()]
+        guard case .success(let got) = fetch(daemon, fileSize: { _ in 100 }) else { return XCTFail() }
+        XCTAssertEqual(got.url, dir.appendingPathComponent("h1"))
+    }
+
+    func testADroppedDaemonIsAFailureNotAnEmptyFile() {
+        let daemon = FakeTransport()
+        daemon.replies = [nil]
+        XCTAssertEqual(fetch(daemon, fileSize: { _ in 0 }), .failure(.unreachable))
+    }
+
+    func testAnEmptyHandoffForANonEmptyItemIsAFailure() {
+        let daemon = FakeTransport()
+        daemon.replies = [materialized(), shown()]
+        guard case .failure = fetch(daemon, fileSize: { _ in 0 }) else { return XCTFail("an empty file was accepted") }
+    }
+
+    func testAShortHandoffIsAFailure() {
+        let daemon = FakeTransport()
+        daemon.replies = [materialized(), shown()]
+        guard case .failure = fetch(daemon, fileSize: { _ in 99 }) else { return XCTFail("a short file was accepted") }
+    }
+
+    func testAMissingHandoffIsAFailure() {
+        let daemon = FakeTransport()
+        daemon.replies = [materialized(), shown()]
+        guard case .failure = fetch(daemon, fileSize: { _ in nil }) else { return XCTFail() }
+    }
+
+    func testAnItemSizeThatDisagreesWithTheBytesIsAFailure() {
+        let daemon = FakeTransport()
+        daemon.replies = [materialized(size: 0), shown(size: 100)]
+        guard case .failure = fetch(daemon, fileSize: { _ in 0 }) else { return XCTFail("a zero-byte file for a 100-byte item was accepted") }
+    }
+
+    func testAnItemThatMovedToAnotherContentIsAFailure() {
+        let daemon = FakeTransport()
+        daemon.replies = [materialized(), shown(hash: 2)]
+        XCTAssertEqual(fetch(daemon, fileSize: { _ in 100 }), .failure(.versionOutOfDate))
+    }
+
+    func testTheItemLookupDroppingAfterTheBytesIsAFailure() {
+        let daemon = FakeTransport()
+        daemon.replies = [materialized(), nil]
+        XCTAssertEqual(fetch(daemon, fileSize: { _ in 100 }), .failure(.unreachable))
+    }
+}

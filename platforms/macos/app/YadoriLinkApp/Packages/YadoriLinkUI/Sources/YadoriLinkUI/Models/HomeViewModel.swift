@@ -14,6 +14,7 @@ public struct FolderRow: Identifiable, Equatable, Sendable {
     public var summaryIsWarning: Bool
     /// Only when the folder is not protected.
     public var detail: String?
+    public var protectionTone: StatusTone
     /// The path, shown on hover over the name.
     public var pathTooltip: String
     /// 0...1 while transferring.
@@ -25,12 +26,13 @@ public struct FolderRow: Identifiable, Equatable, Sendable {
         name = folder.name
         stateTitle = folder.state.title
         stateTone = folder.state.tone
-        var parts = [folder.durability.title, Plural.devices(folder.fullReplicaDeviceIds.count)]
+        var parts = [folder.protection.protection.sentence(copies: folder.protection.deviceIds.count).0]
         if let volume = folder.volume { parts.append(Format.freeSpace(volume)) }
         summary = parts.joined(separator: " · ")
         summaryIsWarning = folder.volume.map { Format.freeSpaceIsWarning($0.state) } ?? false
-        detail = folder.durability.detail
-        pathTooltip = folder.localPath
+        detail = folder.protection.protection.detail
+        protectionTone = folder.protection.protection.sentence(copies: folder.protection.deviceIds.count).1
+        pathTooltip = folder.provider ? "" : folder.localPath
         if let t = folder.transfer, t.bytesTotal > 0 {
             progress = Double(t.bytesDone) / Double(t.bytesTotal)
             var text = "\(Format.bytes(t.bytesDone)) of \(Format.bytes(t.bytesTotal))"
@@ -95,6 +97,8 @@ public enum FetchPhase<Value: Equatable & Sendable>: Equatable, Sendable {
 public final class HomeViewModel {
     public let app: AppModel
     public private(set) var devices: FetchPhase<[DeviceSummary]> = .notLoaded
+    /// A refresh failed while an earlier list is still shown.
+    public private(set) var devicesStale: Notice?
     @ObservationIgnored private let now: () -> Date
 
     public init(app: AppModel, now: @escaping () -> Date = Date.init) {
@@ -117,15 +121,46 @@ public final class HomeViewModel {
     /// Devices come from the account, so they need sign-in as well.
     public var showsDevicesSection: Bool { app.snapshot != nil && app.isSignedIn }
 
-    public var attentionLines: [TextLine] {
+    /// Resolved or short-lived problems, secondary to `attentionLines`.
+    public var recentProblemLines: [TextLine] {
         guard let snapshot = app.snapshot else { return [] }
-        let names = Dictionary((devices.value ?? []).map { ($0.deviceId, $0.displayName) }, uniquingKeysWith: { a, _ in a })
-        return snapshot.attentionReasons.map { reason in
-            TextLine(
+        return RecentProblems.items(errors: snapshot.recentErrors, activeReasons: snapshot.attentionReasons, now: now()).map {
+            TextLine(text: [$0.text, $0.age].compactMap { $0 }.joined(separator: " · "), tooltip: $0.tooltip, folderLocalPath: nil)
+        }
+    }
+
+    public var summary: ProductSummary {
+        ProductSummary.make(snapshot: app.snapshot, daemonUnavailable: app.isDaemonUnavailable, deviceNames: deviceNames)
+    }
+
+    private var deviceNames: [String: String] {
+        Dictionary((devices.value ?? []).map { ($0.deviceId, $0.displayName) }, uniquingKeysWith: { a, _ in a })
+    }
+
+    /// Current problems, each with what to do about it. The daemon's raw code is never shown.
+    public var attentionItems: [AttentionItem] {
+        guard let snapshot = app.snapshot else { return [] }
+        let names = deviceNames
+        return RecentProblems.attentionReasons(snapshot.attentionReasons).filter { $0.kind != .waiting }.map { reason in
+            func offer(_ action: ProductAction) -> ActionOffer {
+                ActionOffer(action: action, title: action.title, destination: action.destination(for: reason, in: snapshot))
+            }
+            return AttentionItem(
+                id: reason.raw,
                 text: reason.category.sentence(subject: Self.subjectName(reason, snapshot: snapshot, deviceNames: names)),
-                tooltip: reason.raw,
+                primary: offer(reason.primaryAction),
+                secondary: reason.secondaryAction.map(offer),
                 folderLocalPath: reason.folderLocalPath
             )
+        }
+    }
+
+    /// Things the app is waiting on, as plain sentences. They need no action from the user.
+    public var waitingLines: [String] {
+        guard let snapshot = app.snapshot else { return [] }
+        let names = deviceNames
+        return RecentProblems.attentionReasons(snapshot.attentionReasons).filter { $0.kind == .waiting }.map {
+            $0.category.sentence(subject: Self.subjectName($0, snapshot: snapshot, deviceNames: names))
         }
     }
 
@@ -149,21 +184,36 @@ public final class HomeViewModel {
     }
 
     public var showsNoDevicesMessage: Bool {
-        app.snapshot != nil && devices.value?.contains { !$0.isThisDevice } == false
+        app.snapshot != nil && devicesStale == nil && devices.value?.contains { !$0.isThisDevice } == false
     }
 
-    public var devicesError: String? {
-        if case .failed(let notice) = devices { return notice.text }
+    /// The first read failed: nothing to show, so the section offers Retry.
+    public var devicesError: Notice? {
+        if case .failed(let notice) = devices { return notice }
         return nil
     }
 
     public func loadDevices() async {
+        // Another account may sign in next; never carry this roster over.
+        if !app.isSignedIn {
+            devices = .notLoaded
+            devicesStale = nil
+        }
         guard app.isSignedIn, !app.isDaemonUnavailable else { return }
         if devices.value == nil { devices = .loading }
         do {
-            devices = .loaded(try await app.client.listFolderDevices())
+            let list = try await app.client.listFolderDevices()
+            // Signed out while the read was in flight: that roster belongs to the old account.
+            guard app.isSignedIn else { return }
+            devices = .loaded(list)
+            devicesStale = nil
         } catch {
-            devices = .failed(.failure(error))
+            guard app.isSignedIn else { return }
+            if devices.value == nil {
+                devices = .failed(.failure(error))
+            } else {
+                devicesStale = .failure(error)
+            }
         }
     }
 }
@@ -181,6 +231,8 @@ public struct MenuBarPresentation {
     public var allPaused: Bool
     public var showsStartAction: Bool
     public var updateLine: String?
+    /// "Protected · another device has a copy", "Checking protection"; nil without folders or a daemon.
+    public var protectionLine: String?
 
     public init(app: AppModel) {
         headline = app.headline
@@ -190,6 +242,9 @@ public struct MenuBarPresentation {
         folders = snapshot?.folders.map(FolderRow.init) ?? []
         canPause = snapshot.map { !$0.folders.isEmpty } ?? false
         allPaused = snapshot.map { !$0.folders.isEmpty && $0.folders.allSatisfy(\.paused) } ?? false
+        if let snapshot, !snapshot.folders.isEmpty {
+            protectionLine = snapshot.protection.protection.sentence(copies: snapshot.protection.deviceIds.count).0
+        }
         pauseTitle = allPaused ? "Resume Syncing" : "Pause Syncing"
 
         if let snapshot, !snapshot.transfers.isEmpty {
@@ -201,7 +256,10 @@ public struct MenuBarPresentation {
             let progress = snapshot.folders.compactMap(\.transfer)
             let done = progress.reduce(0) { $0 + $1.bytesDone }
             let total = progress.reduce(0) { $0 + $1.bytesTotal }
-            transferLine = "\(verb) \(Plural.files(snapshot.transfers.count)) · \(Format.percent(done: done, total: total))%"
+            transferLine = TransferRate.appending(
+                rate: TransferRate.text(snapshot.bandwidth),
+                to: "\(verb) \(Plural.files(snapshot.transfers.count)) · \(Format.percent(done: done, total: total))%"
+            )
             transferProgress = total > 0 ? Double(done) / Double(total) : nil
         }
 

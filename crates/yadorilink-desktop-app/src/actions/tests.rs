@@ -34,3 +34,40 @@ fn unlimited_preset_is_the_zero_convention() {
 fn unknown_menu_id_maps_to_no_preset() {
     assert_eq!(BandwidthPreset::from_menu_id("not_a_real_id"), None);
 }
+
+fn reply(outcome: &str, guidance: &str, url: &str) -> UpdateInstallResponse {
+    UpdateInstallResponse {
+        outcome: outcome.into(),
+        guidance: guidance.into(),
+        download_url: url.into(),
+    }
+}
+
+/// The desktop app refuses a reply that claims anything but a manual
+/// download, exactly like the client core does.
+#[test]
+fn a_download_reply_that_is_not_manual_is_refused() {
+    for outcome in ["installing", "deferred", "store_managed", "whatever", ""] {
+        assert!(plan_update_download(&reply(outcome, "x", "")).is_err(), "{outcome}");
+    }
+}
+
+#[test]
+fn only_the_structured_official_page_is_opened() {
+    let page = "https://github.com/juntaki/yadorilink/releases";
+    assert_eq!(
+        plan_update_download(&reply("manual_download", "Download from the page", page)).unwrap(),
+        UpdatePlan::Open(page.to_owned())
+    );
+    // A link inside the sentence is display text: the steps are shown, nothing is opened.
+    assert_eq!(
+        plan_update_download(&reply(
+            "manual_download",
+            "Run `brew upgrade`, see https://evil.test",
+            ""
+        ))
+        .unwrap(),
+        UpdatePlan::Show("Run `brew upgrade`, see https://evil.test".to_owned())
+    );
+    assert!(plan_update_download(&reply("manual_download", "g", "https://evil.test/x")).is_err());
+}

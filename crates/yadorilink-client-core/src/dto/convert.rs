@@ -84,14 +84,6 @@ fn update_state(raw: &str) -> UpdateState {
     }
 }
 
-fn install_mode(raw: &str) -> UpdateInstallMode {
-    match raw {
-        "automatic" => UpdateInstallMode::Automatic,
-        "manual" => UpdateInstallMode::Manual,
-        other => UpdateInstallMode::Other { raw: other.to_owned() },
-    }
-}
-
 fn reachability(peer: Option<&PeerStatus>) -> PeerReachability {
     match peer.map(PeerStatus::reachability) {
         Some(wire::PeerReachability::Connecting) => PeerReachability::Connecting,
@@ -123,6 +115,7 @@ pub fn status_snapshot(
     captured_at: SystemTime,
 ) -> StatusSnapshot {
     let links = &response.links;
+    let product = view::ProductStatusSummary::global(links);
     StatusSnapshot {
         captured_at,
         overall: match response.overall_state.as_str() {
@@ -138,6 +131,8 @@ pub fn status_snapshot(
             .collect(),
         this_device_id,
         folders: links.iter().map(|l| folder_summary(l, &response.volumes)).collect(),
+        availability: availability_summary(product.availability),
+        protection: protection_summary(product.protection),
         peers: response.peers.iter().map(peer_summary).collect(),
         transfers: response
             .active_transfers
@@ -187,7 +182,6 @@ fn update_badge(response: &StatusResponse) -> UpdateBadge {
         state: update_state(&response.update_state),
         available_version: text(&response.update_available_version),
         mandatory: response.update_mandatory,
-        waiting_for_safe_point: response.update_waiting_for_safe_point,
         last_error_category: text(&response.update_last_error_category),
         channel: response.update_channel.clone(),
         install_source: response.update_install_source.clone(),
@@ -225,31 +219,77 @@ fn peer_summary(peer: &PeerStatus) -> PeerSummary {
 /// Only the first colon splits, so a subject may contain one. A reason about
 /// a folder group names the folder linked to it here.
 pub fn attention_reason(raw: &str, links: &[LinkStatus]) -> AttentionReason {
-    let (name, subject) = raw.split_once(':').unwrap_or((raw, ""));
-    let (category, folder_scoped) = match name {
-        "degraded" => (AttentionCategory::Degraded, true),
-        "durability_at_risk" => (AttentionCategory::DurabilityAtRisk, true),
-        "durability_unknown" => (AttentionCategory::DurabilityUnknown, true),
-        "fetch_unavailable" => (AttentionCategory::FetchUnavailable, true),
-        "fetch_availability_unknown" => (AttentionCategory::FetchAvailabilityUnknown, true),
-        "conflict" => (AttentionCategory::Conflict, true),
-        "held" => (AttentionCategory::Held, true),
-        "low_disk_critical" => (AttentionCategory::LowDiskCritical, false),
-        "low_disk" => (AttentionCategory::LowDisk, false),
-        "peer_disconnected" => (AttentionCategory::PeerDisconnected, false),
-        "recent_error" => (AttentionCategory::RecentError, false),
-        "update_failed" => (AttentionCategory::UpdateFailed, false),
-        _ => (AttentionCategory::Unrecognized, false),
+    let attention = view::Attention::from_reason(raw);
+    let category = attention_category(attention.item);
+    let (subject, folder_scoped) = match attention.scope {
+        view::AttentionScope::Folder(id) => (id, true),
+        view::AttentionScope::ProviderFolder(id)
+        | view::AttentionScope::Device(id)
+        | view::AttentionScope::Volume(id) => (id, false),
+        view::AttentionScope::General => {
+            (raw.split_once(':').map_or_else(String::new, |(_, s)| s.to_owned()), false)
+        }
     };
     AttentionReason {
         category,
-        subject: subject.to_owned(),
         folder_local_path: if folder_scoped {
-            folder_path_of(links, subject).map(str::to_owned)
+            folder_path_of(links, &subject).map(str::to_owned)
         } else {
             None
         },
+        subject,
         raw: raw.to_owned(),
+        kind: match attention.item.kind() {
+            view::AttentionKind::Waiting => AttentionKind::Waiting,
+            view::AttentionKind::Retryable => AttentionKind::Retryable,
+            view::AttentionKind::Permanent => AttentionKind::Permanent,
+        },
+        primary_action: product_action(attention.item.primary_action()),
+        secondary_action: attention.item.secondary_action().map(product_action),
+    }
+}
+
+fn product_action(action: view::ProductAction) -> ProductAction {
+    match action {
+        view::ProductAction::Retry => ProductAction::Retry,
+        view::ProductAction::ReviewConflict => ProductAction::ReviewConflict,
+        view::ProductAction::FreeUpSpace => ProductAction::FreeUpSpace,
+        view::ProductAction::RevealPath => ProductAction::RevealPath,
+        view::ProductAction::OpenSettings => ProductAction::OpenSettings,
+        view::ProductAction::DownloadUpdate => ProductAction::DownloadUpdate,
+        view::ProductAction::ViewDetails => ProductAction::ViewDetails,
+    }
+}
+
+/// The reporting category a shell already knows for an item; items with no category yet read as
+/// unrecognized until the shells learn them.
+fn attention_category(item: view::AttentionItem) -> AttentionCategory {
+    use view::AttentionItem as I;
+    match item {
+        I::FolderStopped => AttentionCategory::Degraded,
+        I::NoSafeCopy => AttentionCategory::DurabilityAtRisk,
+        I::SafeCopyUnconfirmed => AttentionCategory::DurabilityUnknown,
+        I::ContentUnavailable => AttentionCategory::FetchUnavailable,
+        I::ContentAvailabilityUnknown => AttentionCategory::FetchAvailabilityUnknown,
+        I::ConflictNeedsReview => AttentionCategory::Conflict,
+        I::FileHeld => AttentionCategory::Held,
+        I::StrandedDirectory => AttentionCategory::StrandedDirectory,
+        I::DiskFull => AttentionCategory::LowDiskCritical,
+        I::DiskLow => AttentionCategory::LowDisk,
+        I::PeerUnavailable => AttentionCategory::PeerDisconnected,
+        I::RetryableFailure => AttentionCategory::RecentError,
+        I::UpdateFailed => AttentionCategory::UpdateFailed,
+        I::LinkedTwice => AttentionCategory::Ambiguous,
+        I::OwnershipLost => AttentionCategory::OwnershipLost,
+        I::VolumeChanged => AttentionCategory::VolumeChanged,
+        I::ProviderNotReady => AttentionCategory::ProviderNotReady,
+        I::ProviderFilesFailing => AttentionCategory::ProviderStuck,
+        I::EditsKeptBeside => AttentionCategory::KeptEdits,
+        I::ProviderOrphan => AttentionCategory::ProviderOrphanDomain,
+        // Held-file reasons never arrive through the rollup, so no shell category exists for them.
+        I::UnsupportedFilename | I::FileNotReadable | I::Unrecognized => {
+            AttentionCategory::Unrecognized
+        }
     }
 }
 
@@ -273,6 +313,7 @@ pub fn folder_summary(link: &LinkStatus, volumes: &[VolumeFreeSpace]) -> FolderS
             view::FolderState::Attention => FolderState::Attention,
         },
         paused: derived.paused,
+        paused_until: if derived.paused { unix_secs(link.paused_until_unix) } else { None },
         conflict_count: derived.conflict_count,
         hydrated_file_count: derived.files_hydrated,
         placeholder_file_count: derived.files_placeholder,
@@ -314,6 +355,8 @@ pub fn folder_summary(link: &LinkStatus, volumes: &[VolumeFreeSpace]) -> FolderS
                 FetchAvailability::Unknown
             }
         },
+        availability: availability_summary(view::AvailabilitySummary::from_link(link)),
+        protection: protection_summary(view::ProtectionSummary::from_link(link)),
         full_replica_device_ids: derived.full_replica_device_ids,
         policy_stale: derived.policy_stale,
         ambiguous: derived.ambiguous,
@@ -322,6 +365,70 @@ pub fn folder_summary(link: &LinkStatus, volumes: &[VolumeFreeSpace]) -> FolderS
         degraded_reason: text(&derived.degraded_reason),
         volume: volumes.iter().find(|v| v.path == link.local_path).map(volume_summary),
         provider: !link.provider_display_name.is_empty(),
+    }
+}
+
+/// The folders' availability and protection and the overall answer as JSON, for `status --json`.
+/// States are the stable snake_case names `yadorilink-product-view` documents; device ids are for
+/// lookup, never display.
+pub fn status_dimensions_json(response: &StatusResponse) -> serde_json::Value {
+    fn availability(summary: &view::AvailabilitySummary) -> serde_json::Value {
+        serde_json::json!({
+            "state": summary.availability.as_str(),
+            "reachable_device_ids": summary.reachable_device_ids,
+            "offline_device_ids": summary.offline_device_ids,
+        })
+    }
+    fn protection(summary: &view::ProtectionSummary) -> serde_json::Value {
+        serde_json::json!({
+            "state": summary.protection.as_str(),
+            "device_ids": summary.device_ids,
+        })
+    }
+
+    let overall = view::ProductStatusSummary::global(&response.links);
+    let folders: Vec<_> = response
+        .links
+        .iter()
+        .map(|link| {
+            serde_json::json!({
+                "local_path": link.local_path,
+                "group_id": link.group_id,
+                "availability": availability(&view::AvailabilitySummary::from_link(link)),
+                "protection": protection(&view::ProtectionSummary::from_link(link)),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "overall_state": response.overall_state,
+        "availability": availability(&overall.availability),
+        "protection": protection(&overall.protection),
+        "folders": folders,
+    })
+}
+
+fn availability_summary(summary: view::AvailabilitySummary) -> AvailabilitySummary {
+    AvailabilitySummary {
+        availability: match summary.availability {
+            view::Availability::Available => Availability::Available,
+            view::Availability::WaitingForPeer => Availability::WaitingForPeer,
+            view::Availability::WaitingForExactContent => Availability::WaitingForExactContent,
+            view::Availability::Unknown => Availability::Unknown,
+        },
+        reachable_device_ids: summary.reachable_device_ids,
+        offline_device_ids: summary.offline_device_ids,
+    }
+}
+
+fn protection_summary(summary: view::ProtectionSummary) -> ProtectionSummary {
+    ProtectionSummary {
+        protection: match summary.protection {
+            view::Protection::Protected => Protection::Protected,
+            view::Protection::AtRisk => Protection::AtRisk,
+            view::Protection::Pending => Protection::Pending,
+            view::Protection::Unknown => Protection::Unknown,
+        },
+        device_ids: summary.device_ids,
     }
 }
 
@@ -452,6 +559,24 @@ pub fn file_availability(status: &MaterializationStatusResponse) -> FileAvailabi
                 wire::LocalTransition::None => MaterializationState::Placeholder,
             },
         },
+    }
+}
+
+/// The retention policy a status reply carries. A reply without one (nothing says the path is
+/// kept) reads as reclaimable.
+pub fn file_retention(retention: Option<&wire::RetentionState>) -> FileRetention {
+    match retention {
+        Some(state) if state.policy() == wire::RetentionPolicy::Pinned => {
+            FileRetention { policy: RetentionPolicy::Pinned, inherited: !state.explicit }
+        }
+        _ => FileRetention { policy: RetentionPolicy::Reclaimable, inherited: false },
+    }
+}
+
+pub fn pin_outcome(response: &wire::PinItemResponse) -> PinOutcome {
+    PinOutcome {
+        retention: file_retention(response.retention.as_ref()),
+        download_error: Some(response.download_error.clone()).filter(|e| !e.is_empty()),
     }
 }
 
@@ -663,8 +788,74 @@ pub fn incoming_transfer(transfer: &InboxTransfer) -> IncomingTransfer {
             "pending" => IncomingTransferStatus::Pending,
             "in_progress" => IncomingTransferStatus::InProgress,
             "completed" => IncomingTransferStatus::Completed,
+            "failed" => IncomingTransferStatus::Failed,
+            "canceled" => IncomingTransferStatus::Canceled,
             other => IncomingTransferStatus::Other { raw: other.to_owned() },
         },
+    }
+}
+
+pub fn retained_original(
+    item: &yadorilink_ipc_proto::daemonctl::RetainedOriginal,
+) -> RetainedOriginal {
+    RetainedOriginal {
+        group_id: item.group_id.clone(),
+        path: item.path.clone(),
+        size: item.size,
+        reachable: item.reachable,
+        group_removed: item.group_removed,
+    }
+}
+
+pub fn retained_release(
+    done: &yadorilink_ipc_proto::daemonctl::RetainedRelease,
+) -> RetainedRelease {
+    RetainedRelease {
+        path: done.path.clone(),
+        outcome: match done.outcome.as_str() {
+            "removed" => RetainedReleaseOutcome::Removed,
+            "gone" => RetainedReleaseOutcome::Gone,
+            "still_retained" => RetainedReleaseOutcome::StillRetained,
+            "saved_then_removed" => RetainedReleaseOutcome::SavedThenRemoved,
+            "saved_still_retained" => RetainedReleaseOutcome::SavedStillRetained,
+            "left" => RetainedReleaseOutcome::Left,
+            _ => RetainedReleaseOutcome::Unknown,
+        },
+        detail: done.detail.clone(),
+    }
+}
+
+pub fn space_management(
+    settings: Option<&yadorilink_ipc_proto::daemonctl::SpaceManagementSettings>,
+) -> SpaceManagement {
+    // An answer without settings is Off, never On.
+    settings.map_or(SpaceManagement { enabled: false }, |s| SpaceManagement { enabled: s.enabled })
+}
+
+pub fn space_reclaim_preview(
+    response: &yadorilink_ipc_proto::daemonctl::PreviewSpaceReclaimResponse,
+) -> SpaceReclaimPreview {
+    use yadorilink_ipc_proto::daemonctl::SpaceReclaimVerdict as Wire;
+    SpaceReclaimPreview {
+        items: response
+            .items
+            .iter()
+            .map(|item| SpaceReclaimPreviewItem {
+                group_id: item.group_id.clone(),
+                path: item.path.clone(),
+                verdict: match item.verdict() {
+                    Wire::Eligible => SpaceReclaimVerdict::Eligible,
+                    Wire::Pinned => SpaceReclaimVerdict::Pinned,
+                    Wire::UnsupportedRoot => SpaceReclaimVerdict::UnsupportedRoot,
+                    Wire::CustodyUnavailable => SpaceReclaimVerdict::CustodyUnavailable,
+                    Wire::Busy => SpaceReclaimVerdict::Busy,
+                    Wire::Changed => SpaceReclaimVerdict::Changed,
+                    // An unset or unknown verdict never reads as eligible.
+                    Wire::SafetyBlocked | Wire::Unspecified => SpaceReclaimVerdict::SafetyBlocked,
+                },
+            })
+            .collect(),
+        unreadable_roots: response.unreadable_roots,
     }
 }
 
@@ -695,32 +886,26 @@ pub fn update_status(status: &UpdateStatusResponse) -> UpdateStatus {
         release_notes_url: text(&status.release_notes_url),
         mandatory: status.mandatory,
         holdback_reason: text(&status.holdback_reason),
-        waiting_for_safe_point: status.waiting_for_safe_point,
         last_error_category: text(&status.last_error_category),
         last_error_message: text(&status.last_error_message),
-        config: UpdateConfig {
-            automatic_checks: status.automatic_checks_enabled,
-            install_mode: install_mode(&status.automatic_install_mode),
-        },
+        package_managed: crate::ops::updates::is_package_managed(&status.install_source),
+        config: UpdateConfig { automatic_checks: status.automatic_checks_enabled },
     }
 }
 
 pub fn update_config(config: &UpdateConfigResponse) -> UpdateConfig {
-    UpdateConfig {
-        automatic_checks: config.automatic_checks_enabled,
-        install_mode: install_mode(&config.automatic_install_mode),
-    }
+    UpdateConfig { automatic_checks: config.automatic_checks_enabled }
 }
 
-pub fn update_install_outcome(outcome: &UpdateInstallResponse) -> UpdateInstallOutcome {
-    match outcome.outcome.as_str() {
-        "installing" => UpdateInstallOutcome::Installing,
-        "deferred" => UpdateInstallOutcome::Deferred,
-        "manual_download" | "store_managed" => {
-            UpdateInstallOutcome::StoreManaged { guidance: outcome.guidance.clone() }
-        }
-        other => UpdateInstallOutcome::Other { raw: other.to_owned() },
-    }
+/// The checked download reply (see [`crate::ops::updates::check_download_reply`]).
+///
+/// # Errors
+/// The reason the reply is refused.
+pub fn update_download_guidance(
+    response: &UpdateInstallResponse,
+) -> Result<UpdateDownloadGuidance, String> {
+    let (guidance, url) = crate::ops::updates::check_download_reply(response)?;
+    Ok(UpdateDownloadGuidance { guidance, url })
 }
 
 pub fn account_deletion_status(status: &DeletionStatus) -> AccountDeletionStatus {

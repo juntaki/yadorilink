@@ -115,10 +115,21 @@ enum Command {
         #[arg(long)]
         to: Option<String>,
     },
+    /// Stop or restart a transfer another device offered to this device.
+    Transfer {
+        #[command(subcommand)]
+        action: TransferAction,
+    },
+    /// Download a file that is stored on demand, so it is available offline.
+    Hydrate { local_path: String },
     /// Free local disk space by removing a downloaded file's contents. The file stays listed.
     Evict { local_path: String },
-    /// Show whether a file is stored locally or fetched on demand.
+    /// Show whether a file is stored locally or fetched on demand, and whether it is kept.
     MaterializationStatus { local_path: String },
+    /// Always keep a file or folder on this device: download it and never free its space.
+    Pin { local_path: String },
+    /// Stop keeping a file or folder on this device. Its content stays until you free it.
+    Unpin { local_path: String },
     /// Control the sync daemon.
     Daemon {
         #[command(subcommand)]
@@ -127,8 +138,11 @@ enum Command {
     /// Show sync status.
     Status {
         /// Keep refreshing the status instead of printing it once.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "json")]
         watch: bool,
+        /// Print the folders' availability and protection as JSON instead of text.
+        #[arg(long)]
+        json: bool,
         /// Also list up to N publications per provider folder that are waiting on the OS (a file in
         /// use, or a release still pending).
         #[arg(long, value_name = "N")]
@@ -164,6 +178,11 @@ enum Command {
     Limits {
         #[command(subcommand)]
         action: LimitsAction,
+    },
+    /// Automatic space management for provider folders.
+    Space {
+        #[command(subcommand)]
+        action: SpaceAction,
     },
     /// Inspect ignore patterns for a linked folder.
     Ignore {
@@ -221,9 +240,6 @@ enum UpdateAction {
         /// Automatic checks: `on` or `off`.
         #[arg(long)]
         checks: Option<String>,
-        /// Install mode: only `manual` is supported (updates are installed manually).
-        #[arg(long)]
-        install: Option<String>,
     },
 }
 
@@ -352,6 +368,11 @@ enum PreservedAction {
     Restore { item_id: String },
     /// Re-submit your own changes that were held back, once this device can write again.
     Retry { item_id: String },
+    /// Originals a reset kept in the folder because no writer exclusion could be proved.
+    Retained {
+        #[command(subcommand)]
+        action: RetainedAction,
+    },
     /// Permanently delete a preserved item.
     Discard {
         item_id: String,
@@ -359,6 +380,30 @@ enum PreservedAction {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum RetainedAction {
+    /// List the kept originals with the disk they take.
+    List,
+    /// Try to remove the kept originals; one that may still be written to stays.
+    Release {
+        /// Only this folder group (default: every group that has any).
+        #[arg(long)]
+        group: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SpaceAction {
+    /// Show whether it is on.
+    Show,
+    /// Turn it on: when free disk space gets low, safe downloaded files are given back.
+    On,
+    /// Turn it off.
+    Off,
+    /// Show what it would do now, file by file; nothing is removed.
+    Preview,
 }
 
 #[derive(Subcommand)]
@@ -609,13 +654,25 @@ enum ShareAction {
 }
 
 #[derive(Subcommand)]
+enum TransferAction {
+    /// Stop an incoming transfer. Safe to repeat.
+    Cancel { transfer_id: String },
+    /// Resume a failed or canceled incoming transfer after re-checking the sender and destination.
+    Retry { transfer_id: String },
+}
+
+#[derive(Subcommand)]
 enum DaemonAction {
     /// Start the sync daemon.
     Start,
     /// Stop the sync daemon.
     Stop,
-    /// Pause syncing.
-    Pause,
+    /// Pause syncing, until you resume or for a set time.
+    Pause {
+        /// How long to pause: 30m, 1h or tomorrow (until local midnight). Omit to pause until resumed.
+        #[arg(long = "for", value_enum)]
+        duration: Option<commands::daemon::PauseFor>,
+    },
     /// Resume syncing after a pause.
     Resume,
     /// Show or change the daemon's metrics endpoint; changes apply on the next start.
@@ -653,6 +710,27 @@ enum TrashAction {
 enum ConflictsAction {
     /// List conflicted copies across all linked folders.
     List,
+    /// Make a kept copy the file, replacing the other version.
+    Keep {
+        /// The kept copy, as listed by `conflicts list`.
+        copy_path: String,
+    },
+    /// Keep both versions as separate files with plain names.
+    KeepBoth {
+        /// The kept copy, as listed by `conflicts list`.
+        copy_path: String,
+    },
+}
+
+impl From<ConflictsAction> for commands::version_history::ConflictsCommand {
+    fn from(action: ConflictsAction) -> Self {
+        use commands::version_history::ConflictsCommand as C;
+        match action {
+            ConflictsAction::List => C::List,
+            ConflictsAction::Keep { copy_path } => C::Keep(copy_path),
+            ConflictsAction::KeepBoth { copy_path } => C::KeepBoth(copy_path),
+        }
+    }
 }
 
 #[tokio::main]
@@ -690,6 +768,30 @@ async fn run_provider_folder(action: ProviderFolderAction) -> Result<(), CliErro
         ProviderFolderAction::Remove { display_name, force } => {
             commands::provider_folder::remove(display_name, force).await
         }
+    }
+}
+
+async fn run_preserved(action: PreservedAction) -> Result<(), CliError> {
+    match action {
+        PreservedAction::List => commands::preserved::list().await,
+        PreservedAction::Restore { item_id } => commands::preserved::restore(&item_id).await,
+        PreservedAction::Retry { item_id } => commands::preserved::retry(&item_id).await,
+        PreservedAction::Retained { action } => match action {
+            RetainedAction::List => commands::preserved::retained_list().await,
+            RetainedAction::Release { group } => commands::preserved::retained_release(group).await,
+        },
+        PreservedAction::Discard { item_id, yes } => {
+            commands::preserved::discard(&item_id, yes).await
+        }
+    }
+}
+
+async fn run_space(action: SpaceAction) -> Result<(), CliError> {
+    match action {
+        SpaceAction::Show => commands::space::show().await,
+        SpaceAction::On => commands::space::set(true).await,
+        SpaceAction::Off => commands::space::set(false).await,
+        SpaceAction::Preview => commands::space::preview().await,
     }
 }
 
@@ -777,28 +879,36 @@ async fn run(command: Command) -> Result<(), CliError> {
                 commands::version_history::trash_restore(local_path).await
             }
         },
-        Command::Conflicts { action } => match action {
-            ConflictsAction::List => commands::version_history::conflicts_list().await,
-        },
+        Command::Conflicts { action } => commands::version_history::conflicts(action.into()).await,
         Command::Send { source_path, target_device } => {
             commands::send::send(source_path, target_device).await
         }
         Command::Inbox => commands::send::inbox().await,
+        Command::Transfer { action } => match action {
+            TransferAction::Cancel { transfer_id } => commands::send::cancel(transfer_id).await,
+            TransferAction::Retry { transfer_id } => commands::send::retry(transfer_id).await,
+        },
         Command::Receive { transfer_id, to } => commands::send::receive(transfer_id, to).await,
+        Command::Hydrate { local_path } => commands::materialization::hydrate(local_path).await,
         Command::Evict { local_path } => commands::materialization::evict(local_path).await,
         Command::MaterializationStatus { local_path } => {
             commands::materialization::status(local_path).await
         }
+        Command::Pin { local_path } => commands::materialization::pin(local_path).await,
+        Command::Unpin { local_path } => commands::materialization::unpin(local_path).await,
         Command::Daemon { action } => match action {
             DaemonAction::Start => commands::daemon::start().await,
             DaemonAction::Stop => commands::daemon::stop().await,
-            DaemonAction::Pause => commands::daemon::pause().await,
+            DaemonAction::Pause { duration } => commands::daemon::pause(duration).await,
             DaemonAction::Resume => commands::daemon::resume().await,
             DaemonAction::Metrics { enable, disable, addr, show } => {
                 commands::daemon::metrics(enable, disable, addr, show)
             }
         },
-        Command::Status { watch, pending_items, verbose } => {
+        Command::Status { watch, json, pending_items, verbose } => {
+            if json {
+                return commands::status::status_as_json().await;
+            }
             commands::status::status(watch, verbose).await?;
             match pending_items {
                 Some(limit) => commands::status::pending_items(limit, verbose).await,
@@ -807,15 +917,9 @@ async fn run(command: Command) -> Result<(), CliError> {
         }
         Command::Feedback => commands::feedback::run(),
         Command::Gc { dry_run } => commands::gc::run(dry_run).await,
-        Command::Preserved { action } => match action {
-            PreservedAction::List => commands::preserved::list().await,
-            PreservedAction::Restore { item_id } => commands::preserved::restore(&item_id).await,
-            PreservedAction::Retry { item_id } => commands::preserved::retry(&item_id).await,
-            PreservedAction::Discard { item_id, yes } => {
-                commands::preserved::discard(&item_id, yes).await
-            }
-        },
+        Command::Preserved { action } => run_preserved(action).await,
         Command::Rewind { group, at, verbose } => commands::rewind::run(group, at, verbose).await,
+        Command::Space { action } => run_space(action).await,
         Command::Limits { action } => match action {
             LimitsAction::Set { up, down } => commands::limits::set(up, down).await,
             LimitsAction::Show => commands::limits::show().await,
@@ -882,9 +986,7 @@ async fn run(command: Command) -> Result<(), CliError> {
             UpdateAction::Status => commands::update::status().await,
             UpdateAction::Check => commands::update::check().await,
             UpdateAction::Download => commands::update::download().await,
-            UpdateAction::Config { checks, install } => {
-                commands::update::config(checks, install).await
-            }
+            UpdateAction::Config { checks } => commands::update::config(checks).await,
         },
         Command::Doctor => commands::connection_ops::doctor().await,
         Command::Connections { peer } => commands::connection_ops::traces(peer).await,

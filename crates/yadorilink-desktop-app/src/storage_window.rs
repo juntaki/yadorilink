@@ -24,10 +24,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use yadorilink_ipc_proto::daemonctl::{GcResponse, StatusResponse};
+use yadorilink_ipc_proto::daemonctl::{
+    GcResponse, RetainedOriginal, RetainedRelease, StatusResponse,
+};
 use yadorilink_product_view::FolderSummary;
 
 use crate::onboarding::executor::EventSink;
+
+/// Section and action names, kept apart so the three kinds of storage and the actions that
+/// change them cannot be confused: local files, YadoriLink's own data, disk free space.
+const FILES_SECTION: &str = "Files on this Mac";
+const INTERNAL_SECTION: &str = "YadoriLink internal storage";
+const INTERNAL_TOTAL_LABEL: &str = "YadoriLink data";
+const CLEANABLE_LABEL: &str = "Internal space that can be cleaned up (last estimate)";
+const CHECK_ACTION: &str = "Check internal space";
+const CLEAN_UP_ACTION: &str = "Clean up YadoriLink data";
+const CLEAN_UP_EXPLANATION: &str = "Old versions and other internal data YadoriLink no longer \
+    needs. This does not change the files in your folders and does not make downloaded files \
+    online only. It never removes a version you could still restore.";
+const FILES_EXPLANATION: &str = "File counts only; sizes are not measured per file. Free disk \
+    space is shown separately for each folder's own disk.";
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -37,6 +53,8 @@ enum Event {
     StatusFetched(Result<Box<StatusResponse>, String>),
     /// `dry_run`, then the sweep's own report.
     GcDone(bool, Result<GcResponse, String>),
+    RetainedFetched(Result<Vec<RetainedOriginal>, String>),
+    ReleaseDone(Result<String, String>),
 }
 
 /// Entry point for `--window storage`. Must run on the process main thread
@@ -101,6 +119,39 @@ fn spawn_fetch(sink: EventSink<Event>) {
     spawn_task(sink, fetch_status(), |result| Event::StatusFetched(result.map(Box::new)));
 }
 
+fn spawn_retained_fetch(sink: EventSink<Event>) {
+    spawn_task(
+        sink,
+        async move { crate::actions::list_retained_originals().await.map_err(|e| e.to_string()) },
+        Event::RetainedFetched,
+    );
+}
+
+/// Tries to release the kept originals of each of `groups`, one after the other.
+fn spawn_release(sink: EventSink<Event>, groups: Vec<String>) {
+    spawn_task(
+        sink,
+        async move {
+            // A group that cannot be released (its folder is not watched, a rebootstrap runs)
+            // does not stop the others; its error is reported with the result.
+            let mut releases = Vec::new();
+            let mut errors = Vec::new();
+            for group in groups {
+                match crate::actions::release_retained_originals(&group).await {
+                    Ok(done) => releases.extend(done),
+                    Err(e) => errors.push(format!("{group}: {e}")),
+                }
+            }
+            if errors.is_empty() {
+                Ok(release_message(&releases))
+            } else {
+                Err(format!("{} -- {}", release_message(&releases), errors.join("; ")))
+            }
+        },
+        Event::ReleaseDone,
+    );
+}
+
 fn spawn_gc(sink: EventSink<Event>, dry_run: bool) {
     spawn_task(
         sink,
@@ -118,6 +169,13 @@ struct StorageApp {
     last_fetch_started: Option<Instant>,
     gc_in_flight: bool,
     last_gc_message: Option<Result<String, String>>,
+    retained: Vec<RetainedOriginal>,
+    /// The status count the listing was last fetched for: the listing measures every kept file,
+    /// so it is fetched again only when that count changes or after a release.
+    retained_listed_for: Option<u32>,
+    retained_in_flight: bool,
+    release_in_flight: bool,
+    last_release_message: Option<Result<String, String>>,
 }
 
 impl StorageApp {
@@ -131,6 +189,11 @@ impl StorageApp {
             last_fetch_started: None,
             gc_in_flight: false,
             last_gc_message: None,
+            retained: Vec::new(),
+            retained_listed_for: None,
+            retained_in_flight: false,
+            release_in_flight: false,
+            last_release_message: None,
         }
     }
 
@@ -144,9 +207,39 @@ impl eframe::App for StorageApp {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 Event::StatusFetched(Ok(status)) => {
+                    // The status carries only the count; the listing, which measures each
+                    // kept file, is fetched only while there is any.
+                    let kept = status.preserved.as_ref().map_or(0, |p| p.retained_originals);
                     self.status = Some(*status);
                     self.error = None;
                     self.fetch_in_flight = false;
+                    if kept == 0 {
+                        self.retained.clear();
+                        self.retained_listed_for = None;
+                    } else if !self.retained_in_flight && self.retained_listed_for != Some(kept) {
+                        self.retained_listed_for = Some(kept);
+                        self.retained_in_flight = true;
+                        spawn_retained_fetch(self.sink.clone());
+                    }
+                }
+                Event::RetainedFetched(result) => {
+                    self.retained_in_flight = false;
+                    match result {
+                        Ok(items) => self.retained = items,
+                        // A failed listing is asked for again by the next status.
+                        Err(_) => self.retained_listed_for = None,
+                    }
+                }
+                Event::ReleaseDone(result) => {
+                    self.release_in_flight = false;
+                    self.last_release_message = Some(result);
+                    // What was listed before the release may be stale, even if a fetch is
+                    // running: the next status asks again.
+                    self.retained_listed_for = None;
+                    if !self.retained_in_flight {
+                        self.retained_in_flight = true;
+                        spawn_retained_fetch(self.sink.clone());
+                    }
                 }
                 Event::StatusFetched(Err(e)) => {
                     self.error = Some(e);
@@ -202,6 +295,12 @@ impl StorageApp {
         ui.add_space(10.0);
 
         self.render_block_store(ui);
+        if !self.retained.is_empty() {
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(10.0);
+            self.render_retained(ui);
+        }
         ui.add_space(14.0);
         ui.separator();
         ui.add_space(10.0);
@@ -209,7 +308,7 @@ impl StorageApp {
     }
 
     fn render_block_store(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("Block store").strong());
+        ui.label(egui::RichText::new(INTERNAL_SECTION).strong());
         match &self.status {
             None => {
                 ui.horizontal(|ui| {
@@ -219,34 +318,22 @@ impl StorageApp {
                 return;
             }
             Some(status) => {
-                field_row(ui, "Total usage", &format_bytes(status.block_store_total_bytes));
+                field_row(ui, INTERNAL_TOTAL_LABEL, &format_bytes(status.block_store_total_bytes));
                 field_row(ui, "Blocks stored", &status.block_store_block_count.to_string());
                 field_row(ui, "Last cleanup", &last_gc_summary(status.last_gc_unix));
-                field_row(
-                    ui,
-                    "Reclaimable now (last estimate)",
-                    &format_bytes(status.gc_reclaimable_estimate_bytes),
-                );
+                field_row(ui, CLEANABLE_LABEL, &format_bytes(status.gc_reclaimable_estimate_bytes));
             }
         }
-        ui.label(
-            egui::RichText::new(
-                "Reclaimable space is blocks no current file version anywhere on this device \
-                 still needs -- superseded/trashed content past its retention window. This \
-                 never touches a version you could still restore.",
-            )
-            .weak()
-            .small(),
-        );
+        ui.label(egui::RichText::new(CLEAN_UP_EXPLANATION).weak().small());
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             let busy = self.gc_in_flight;
-            if ui.add_enabled(!busy, egui::Button::new("Check reclaimable space")).clicked() {
+            if ui.add_enabled(!busy, egui::Button::new(CHECK_ACTION)).clicked() {
                 self.gc_in_flight = true;
                 spawn_gc(self.sink.clone(), true);
             }
-            if ui.add_enabled(!busy, egui::Button::new("Reclaim space now")).clicked() {
+            if ui.add_enabled(!busy, egui::Button::new(CLEAN_UP_ACTION)).clicked() {
                 self.gc_in_flight = true;
                 spawn_gc(self.sink.clone(), false);
             }
@@ -267,8 +354,54 @@ impl StorageApp {
         }
     }
 
+    fn render_retained(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Kept originals").strong());
+        if let Some(summary) = retained_summary(&self.retained) {
+            ui.label(summary);
+        }
+        ui.label(
+            egui::RichText::new(
+                "A reset kept these files in their folders because this system could not prove \
+                 that no program still writes to them. Releasing removes one only when that can \
+                 be proved and it is unchanged; a changed one is saved as a preserved item first.",
+            )
+            .weak()
+            .small(),
+        );
+        for row in retained_rows(&self.retained) {
+            ui.label(egui::RichText::new(row).small());
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let busy = self.release_in_flight;
+            if ui.add_enabled(!busy, egui::Button::new("Release kept originals")).clicked() {
+                self.release_in_flight = true;
+                let mut groups: Vec<String> =
+                    self.retained.iter().map(|item| item.group_id.clone()).collect();
+                groups.sort();
+                groups.dedup();
+                spawn_release(self.sink.clone(), groups);
+            }
+            if busy {
+                ui.spinner();
+            }
+        });
+        if let Some(msg) = &self.last_release_message {
+            ui.add_space(4.0);
+            match msg {
+                Ok(text) => {
+                    ui.colored_label(egui::Color32::from_rgb(0x2e, 0x9e, 0x5b), text);
+                }
+                Err(text) => {
+                    ui.colored_label(egui::Color32::from_rgb(0xc0, 0x39, 0x2b), text);
+                }
+            }
+        }
+    }
+
     fn render_folders(&self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("Per-folder storage").strong());
+        ui.label(egui::RichText::new(FILES_SECTION).strong());
+        ui.label(egui::RichText::new(FILES_EXPLANATION).weak().small());
         if self.status.is_some() && self.links().is_empty() {
             ui.label(egui::RichText::new("No folders linked yet.").weak());
             return;
@@ -296,9 +429,12 @@ impl StorageApp {
                 ui.label(egui::RichText::new(hydration_summary(&folder)).weak().small());
                 if let Some(volume) = crate::folder_detail::disk_usage_for(link, volumes) {
                     ui.label(
-                        egui::RichText::new(crate::folder_detail::disk_usage_label(volume))
-                            .weak()
-                            .small(),
+                        egui::RichText::new(format!(
+                            "Free disk space: {}",
+                            crate::folder_detail::disk_usage_label(volume)
+                        ))
+                        .weak()
+                        .small(),
                     );
                 }
             });
@@ -341,13 +477,13 @@ fn hydration_summary(folder: &FolderSummary) -> String {
 fn gc_report_message(report: &GcResponse, dry_run: bool) -> String {
     if dry_run {
         format!(
-            "Dry run: would delete {} block(s), reclaiming {}",
+            "Dry run: would delete {} internal block(s), cleaning up {}",
             report.blocks_deleted,
             format_bytes(report.bytes_reclaimed)
         )
     } else {
         format!(
-            "Deleted {} block(s), reclaimed {}",
+            "Deleted {} internal block(s), cleaned up {}",
             report.blocks_deleted,
             format_bytes(report.bytes_reclaimed)
         )
@@ -396,6 +532,53 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// The one line above the kept originals: how many and the disk they take, saying so when the
+/// size of some is unknown because their folder is not watched. `None` when none are kept.
+fn retained_summary(items: &[RetainedOriginal]) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let known: u64 = items.iter().filter(|item| item.reachable).map(|item| item.size).sum();
+    let unknown = items.iter().filter(|item| !item.reachable).count();
+    let mut line = format!("{} original(s), {}", items.len(), format_bytes(known));
+    if unknown > 0 {
+        line.push_str(&format!(" (size unknown for {unknown}: its folder is not watched)"));
+    }
+    Some(line)
+}
+
+/// One row per kept original: the folder group, the path and the size.
+fn retained_rows(items: &[RetainedOriginal]) -> Vec<String> {
+    items
+        .iter()
+        .map(|item| {
+            let size =
+                if item.reachable { format_bytes(item.size) } else { "size unknown".to_string() };
+            format!("{} · {} · {size}", item.group_id, item.path)
+        })
+        .collect()
+}
+
+/// What a release did, in one sentence for the window.
+fn release_message(releases: &[RetainedRelease]) -> String {
+    if releases.is_empty() {
+        return "There was nothing to release.".to_string();
+    }
+    let count = |outcomes: &[&str]| {
+        releases.iter().filter(|r| outcomes.contains(&r.outcome.as_str())).count()
+    };
+    let released = count(&["removed", "gone", "saved_then_removed"]);
+    let kept = releases.len() - released;
+    let saved = count(&["saved_then_removed", "saved_still_retained"]);
+    let mut message = format!("{released} released, {kept} kept");
+    if saved > 0 {
+        message.push_str(&format!(
+            "; {saved} changed and saved as preserved items first (see `yadorilink preserved list`)"
+        ));
+    }
+    message
 }
 
 fn field_row(ui: &mut egui::Ui, label: &str, value: &str) {

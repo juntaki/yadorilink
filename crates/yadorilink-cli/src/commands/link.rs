@@ -232,7 +232,7 @@ fn links_lines(links: &[LinkStatus]) -> Vec<String> {
             "{}  group={}  {}{}{}{}{}",
             place,
             link.group_id,
-            if link.paused { "paused" } else { "syncing" },
+            crate::commands::status::link_state_label(link),
             if link.conflict_count > 0 {
                 format!("  conflicts={}", link.conflict_count)
             } else {

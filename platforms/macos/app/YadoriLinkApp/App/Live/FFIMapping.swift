@@ -71,19 +71,54 @@ extension YadoriLinkModel.AttentionCategory {
         case .fetchAvailabilityUnknown: self = .fetchAvailabilityUnknown
         case .conflict: self = .conflict
         case .held: self = .held
+        case .strandedDirectory: self = .strandedDirectory
         case .lowDiskCritical: self = .lowDiskCritical
         case .lowDisk: self = .lowDisk
         case .peerDisconnected: self = .peerDisconnected
         case .recentError: self = .recentError
         case .updateFailed: self = .updateFailed
+        case .ambiguous: self = .ambiguous
+        case .ownershipLost: self = .ownershipLost
+        case .volumeChanged: self = .volumeChanged
+        case .providerNotReady: self = .providerNotReady
+        case .providerStuck: self = .providerStuck
+        case .keptEdits: self = .keptEdits
+        case .providerOrphanDomain: self = .providerOrphanDomain
         case .unrecognized: self = .unrecognized
+        }
+    }
+}
+
+extension YadoriLinkModel.AttentionKind {
+    init(_ value: YadoriLinkFFI.AttentionKind) {
+        switch value {
+        case .waiting: self = .waiting
+        case .retryable: self = .retryable
+        case .permanent: self = .permanent
         }
     }
 }
 
 extension YadoriLinkModel.AttentionReason {
     init(_ value: YadoriLinkFFI.AttentionReason) {
-        self.init(category: YadoriLinkModel.AttentionCategory(value.category), subject: value.subject, folderLocalPath: value.folderLocalPath, raw: value.raw)
+        self.init(category: YadoriLinkModel.AttentionCategory(value.category), subject: value.subject, folderLocalPath: value.folderLocalPath, raw: value.raw, kind: YadoriLinkModel.AttentionKind(value.kind), primaryAction: YadoriLinkModel.ProductAction(value.primaryAction), secondaryAction: value.secondaryAction.map { YadoriLinkModel.ProductAction($0) })
+    }
+}
+
+extension YadoriLinkModel.Availability {
+    init(_ value: YadoriLinkFFI.Availability) {
+        switch value {
+        case .available: self = .available
+        case .waitingForPeer: self = .waitingForPeer
+        case .waitingForExactContent: self = .waitingForExactContent
+        case .unknown: self = .unknown
+        }
+    }
+}
+
+extension YadoriLinkModel.AvailabilitySummary {
+    init(_ value: YadoriLinkFFI.AvailabilitySummary) {
+        self.init(availability: YadoriLinkModel.Availability(value.availability), reachableDeviceIds: value.reachableDeviceIds, offlineDeviceIds: value.offlineDeviceIds)
     }
 }
 
@@ -104,6 +139,15 @@ extension YadoriLinkModel.BrowserPurpose {
         switch value {
         case .approveDevice: self = .approveDevice
         case .signIn: self = .signIn
+        }
+    }
+}
+
+extension YadoriLinkModel.ConflictChoice {
+    init(_ value: YadoriLinkFFI.ConflictChoice) {
+        switch value {
+        case .keepThis: self = .keepThis
+        case .keepBoth: self = .keepBoth
         }
     }
 }
@@ -253,6 +297,12 @@ extension YadoriLinkModel.FileAvailability {
     }
 }
 
+extension YadoriLinkModel.FileRetention {
+    init(_ value: YadoriLinkFFI.FileRetention) {
+        self.init(policy: YadoriLinkModel.RetentionPolicy(value.policy), inherited: value.inherited)
+    }
+}
+
 extension YadoriLinkModel.FileVersion {
     init(_ value: YadoriLinkFFI.FileVersion) {
         self.init(versionSeq: value.versionSeq, size: value.size, modifiedAt: value.modifiedAt, state: value.state, originDeviceId: value.originDeviceId, unixMode: value.unixMode, isCurrent: value.isCurrent, kind: YadoriLinkModel.EntryKind(value.kind))
@@ -300,7 +350,7 @@ extension YadoriLinkModel.FolderState {
 
 extension YadoriLinkModel.FolderSummary {
     init(_ value: YadoriLinkFFI.FolderSummary) {
-        self.init(localPath: value.localPath, groupId: value.groupId, name: value.name, mode: YadoriLinkModel.FolderMode(value.mode), state: YadoriLinkModel.FolderState(value.state), paused: value.paused, conflictCount: value.conflictCount, hydratedFileCount: value.hydratedFileCount, placeholderFileCount: value.placeholderFileCount, hydratingFileCount: value.hydratingFileCount, heldFileCount: value.heldFileCount, skippedSymlinkCount: value.skippedSymlinkCount, transfer: value.transfer.map { YadoriLinkModel.FolderTransferProgress($0) }, durability: YadoriLinkModel.DurabilityStatus(value.durability), durabilityEvidence: YadoriLinkModel.DurabilityEvidence(value.durabilityEvidence), localStorage: YadoriLinkModel.LocalStorageState(value.localStorage), fetchAvailability: YadoriLinkModel.FetchAvailability(value.fetchAvailability), fullReplicaDeviceIds: value.fullReplicaDeviceIds, policyStale: value.policyStale, ambiguous: value.ambiguous, ambiguousLocalPaths: value.ambiguousLocalPaths, degraded: value.degraded, degradedReason: value.degradedReason, volume: value.volume.map { YadoriLinkModel.VolumeSummary($0) }, provider: value.provider)
+        self.init(localPath: value.localPath, groupId: value.groupId, name: value.name, mode: YadoriLinkModel.FolderMode(value.mode), state: YadoriLinkModel.FolderState(value.state), paused: value.paused, pausedUntil: value.pausedUntil, conflictCount: value.conflictCount, hydratedFileCount: value.hydratedFileCount, placeholderFileCount: value.placeholderFileCount, hydratingFileCount: value.hydratingFileCount, heldFileCount: value.heldFileCount, skippedSymlinkCount: value.skippedSymlinkCount, transfer: value.transfer.map { YadoriLinkModel.FolderTransferProgress($0) }, durability: YadoriLinkModel.DurabilityStatus(value.durability), durabilityEvidence: YadoriLinkModel.DurabilityEvidence(value.durabilityEvidence), localStorage: YadoriLinkModel.LocalStorageState(value.localStorage), fetchAvailability: YadoriLinkModel.FetchAvailability(value.fetchAvailability), availability: YadoriLinkModel.AvailabilitySummary(value.availability), protection: YadoriLinkModel.ProtectionSummary(value.protection), fullReplicaDeviceIds: value.fullReplicaDeviceIds, policyStale: value.policyStale, ambiguous: value.ambiguous, ambiguousLocalPaths: value.ambiguousLocalPaths, degraded: value.degraded, degradedReason: value.degradedReason, volume: value.volume.map { YadoriLinkModel.VolumeSummary($0) }, provider: value.provider)
     }
 }
 
@@ -369,6 +419,8 @@ extension YadoriLinkModel.IncomingTransferStatus {
         case .pending: self = .pending
         case .inProgress: self = .inProgress
         case .completed: self = .completed
+        case .failed: self = .failed
+        case .canceled: self = .canceled
         case let .other(raw): self = .other(raw: raw)
         }
     }
@@ -517,6 +569,17 @@ extension YadoriLinkModel.OverallState {
     }
 }
 
+extension YadoriLinkModel.PauseDuration {
+    init(_ value: YadoriLinkFFI.PauseDuration) {
+        switch value {
+        case .untilResumed: self = .untilResumed
+        case .thirtyMinutes: self = .thirtyMinutes
+        case .oneHour: self = .oneHour
+        case .untilTomorrow: self = .untilTomorrow
+        }
+    }
+}
+
 extension YadoriLinkModel.PeerReachability {
     init(_ value: YadoriLinkFFI.PeerReachability) {
         switch value {
@@ -557,6 +620,12 @@ extension YadoriLinkModel.PermissionDeniedReason {
     }
 }
 
+extension YadoriLinkModel.PinOutcome {
+    init(_ value: YadoriLinkFFI.PinOutcome) {
+        self.init(retention: YadoriLinkModel.FileRetention(value.retention), downloadError: value.downloadError)
+    }
+}
+
 extension YadoriLinkModel.PreflightIssue {
     init(_ value: YadoriLinkFFI.PreflightIssue) {
         switch value {
@@ -577,6 +646,37 @@ extension YadoriLinkModel.PreflightIssue {
 extension YadoriLinkModel.PreflightResult {
     init(_ value: YadoriLinkFFI.PreflightResult) {
         self.init(resolvedPath: value.resolvedPath, pathExists: value.pathExists, isDirectory: value.isDirectory, entryCount: value.entryCount, ignoredEntryCount: value.ignoredEntryCount, totalSizeBytes: value.totalSizeBytes, scanTruncated: value.scanTruncated, freeSpace: value.freeSpace.map { YadoriLinkModel.FreeSpace($0) }, issues: value.issues.map { YadoriLinkModel.PreflightIssue($0) }, requiresAcknowledgement: value.requiresAcknowledgement)
+    }
+}
+
+extension YadoriLinkModel.ProductAction {
+    init(_ value: YadoriLinkFFI.ProductAction) {
+        switch value {
+        case .retry: self = .retry
+        case .reviewConflict: self = .reviewConflict
+        case .freeUpSpace: self = .freeUpSpace
+        case .revealPath: self = .revealPath
+        case .openSettings: self = .openSettings
+        case .downloadUpdate: self = .downloadUpdate
+        case .viewDetails: self = .viewDetails
+        }
+    }
+}
+
+extension YadoriLinkModel.Protection {
+    init(_ value: YadoriLinkFFI.Protection) {
+        switch value {
+        case .protected: self = .protected
+        case .atRisk: self = .atRisk
+        case .pending: self = .pending
+        case .unknown: self = .unknown
+        }
+    }
+}
+
+extension YadoriLinkModel.ProtectionSummary {
+    init(_ value: YadoriLinkFFI.ProtectionSummary) {
+        self.init(protection: YadoriLinkModel.Protection(value.protection), deviceIds: value.deviceIds)
     }
 }
 
@@ -601,6 +701,41 @@ extension YadoriLinkModel.RecentError {
 extension YadoriLinkModel.ReplicaCopy {
     init(_ value: YadoriLinkFFI.ReplicaCopy) {
         self.init(deviceId: value.deviceId, reachability: YadoriLinkModel.PeerReachability(value.reachability), route: YadoriLinkModel.RouteKind(value.route))
+    }
+}
+
+extension YadoriLinkModel.RetainedOriginal {
+    init(_ value: YadoriLinkFFI.RetainedOriginal) {
+        self.init(groupId: value.groupId, path: value.path, size: value.size, reachable: value.reachable, groupRemoved: value.groupRemoved)
+    }
+}
+
+extension YadoriLinkModel.RetainedRelease {
+    init(_ value: YadoriLinkFFI.RetainedRelease) {
+        self.init(path: value.path, outcome: YadoriLinkModel.RetainedReleaseOutcome(value.outcome), detail: value.detail)
+    }
+}
+
+extension YadoriLinkModel.RetainedReleaseOutcome {
+    init(_ value: YadoriLinkFFI.RetainedReleaseOutcome) {
+        switch value {
+        case .removed: self = .removed
+        case .gone: self = .gone
+        case .stillRetained: self = .stillRetained
+        case .savedThenRemoved: self = .savedThenRemoved
+        case .savedStillRetained: self = .savedStillRetained
+        case .left: self = .left
+        case .unknown: self = .unknown
+        }
+    }
+}
+
+extension YadoriLinkModel.RetentionPolicy {
+    init(_ value: YadoriLinkFFI.RetentionPolicy) {
+        switch value {
+        case .reclaimable: self = .reclaimable
+        case .pinned: self = .pinned
+        }
     }
 }
 
@@ -682,9 +817,41 @@ extension YadoriLinkModel.SignOutOutcome {
     }
 }
 
+extension YadoriLinkModel.SpaceManagement {
+    init(_ value: YadoriLinkFFI.SpaceManagement) {
+        self.init(enabled: value.enabled)
+    }
+}
+
+extension YadoriLinkModel.SpaceReclaimPreview {
+    init(_ value: YadoriLinkFFI.SpaceReclaimPreview) {
+        self.init(items: value.items.map { YadoriLinkModel.SpaceReclaimPreviewItem($0) }, unreadableRoots: value.unreadableRoots)
+    }
+}
+
+extension YadoriLinkModel.SpaceReclaimPreviewItem {
+    init(_ value: YadoriLinkFFI.SpaceReclaimPreviewItem) {
+        self.init(groupId: value.groupId, path: value.path, verdict: YadoriLinkModel.SpaceReclaimVerdict(value.verdict))
+    }
+}
+
+extension YadoriLinkModel.SpaceReclaimVerdict {
+    init(_ value: YadoriLinkFFI.SpaceReclaimVerdict) {
+        switch value {
+        case .eligible: self = .eligible
+        case .pinned: self = .pinned
+        case .unsupportedRoot: self = .unsupportedRoot
+        case .custodyUnavailable: self = .custodyUnavailable
+        case .busy: self = .busy
+        case .changed: self = .changed
+        case .safetyBlocked: self = .safetyBlocked
+        }
+    }
+}
+
 extension YadoriLinkModel.StatusSnapshot {
     init(_ value: YadoriLinkFFI.StatusSnapshot) {
-        self.init(capturedAt: value.capturedAt, overall: YadoriLinkModel.OverallState(value.overall), attentionReasons: value.attentionReasons.map { YadoriLinkModel.AttentionReason($0) }, thisDeviceId: value.thisDeviceId, folders: value.folders.map { YadoriLinkModel.FolderSummary($0) }, peers: value.peers.map { YadoriLinkModel.PeerSummary($0) }, transfers: value.transfers.map { YadoriLinkModel.TransferSummary($0) }, bandwidth: YadoriLinkModel.BandwidthStatus(value.bandwidth), volumes: value.volumes.map { YadoriLinkModel.VolumeSummary($0) }, storage: YadoriLinkModel.StorageSummary(value.storage), update: YadoriLinkModel.UpdateBadge(value.update), recentErrors: value.recentErrors.map { YadoriLinkModel.RecentError($0) })
+        self.init(capturedAt: value.capturedAt, overall: YadoriLinkModel.OverallState(value.overall), attentionReasons: value.attentionReasons.map { YadoriLinkModel.AttentionReason($0) }, thisDeviceId: value.thisDeviceId, folders: value.folders.map { YadoriLinkModel.FolderSummary($0) }, availability: YadoriLinkModel.AvailabilitySummary(value.availability), protection: YadoriLinkModel.ProtectionSummary(value.protection), peers: value.peers.map { YadoriLinkModel.PeerSummary($0) }, transfers: value.transfers.map { YadoriLinkModel.TransferSummary($0) }, bandwidth: YadoriLinkModel.BandwidthStatus(value.bandwidth), volumes: value.volumes.map { YadoriLinkModel.VolumeSummary($0) }, storage: YadoriLinkModel.StorageSummary(value.storage), update: YadoriLinkModel.UpdateBadge(value.update), recentErrors: value.recentErrors.map { YadoriLinkModel.RecentError($0) })
     }
 }
 
@@ -740,34 +907,19 @@ extension YadoriLinkModel.UnreachableCategory {
 
 extension YadoriLinkModel.UpdateBadge {
     init(_ value: YadoriLinkFFI.UpdateBadge) {
-        self.init(state: YadoriLinkModel.UpdateState(value.state), availableVersion: value.availableVersion, mandatory: value.mandatory, waitingForSafePoint: value.waitingForSafePoint, lastErrorCategory: value.lastErrorCategory, channel: value.channel, installSource: value.installSource, holdbackReason: value.holdbackReason)
+        self.init(state: YadoriLinkModel.UpdateState(value.state), availableVersion: value.availableVersion, mandatory: value.mandatory, lastErrorCategory: value.lastErrorCategory, channel: value.channel, installSource: value.installSource, holdbackReason: value.holdbackReason)
     }
 }
 
 extension YadoriLinkModel.UpdateConfig {
     init(_ value: YadoriLinkFFI.UpdateConfig) {
-        self.init(automaticChecks: value.automaticChecks, installMode: YadoriLinkModel.UpdateInstallMode(value.installMode))
+        self.init(automaticChecks: value.automaticChecks)
     }
 }
 
-extension YadoriLinkModel.UpdateInstallMode {
-    init(_ value: YadoriLinkFFI.UpdateInstallMode) {
-        switch value {
-        case .automatic: self = .automatic
-        case .manual: self = .manual
-        case let .other(raw): self = .other(raw: raw)
-        }
-    }
-}
-
-extension YadoriLinkModel.UpdateInstallOutcome {
-    init(_ value: YadoriLinkFFI.UpdateInstallOutcome) {
-        switch value {
-        case .installing: self = .installing
-        case .deferred: self = .deferred
-        case let .storeManaged(guidance): self = .storeManaged(guidance: guidance)
-        case let .other(raw): self = .other(raw: raw)
-        }
+extension YadoriLinkModel.UpdateDownloadGuidance {
+    init(_ value: YadoriLinkFFI.UpdateDownloadGuidance) {
+        self.init(guidance: value.guidance, url: value.url)
     }
 }
 
@@ -793,7 +945,7 @@ extension YadoriLinkModel.UpdateState {
 
 extension YadoriLinkModel.UpdateStatus {
     init(_ value: YadoriLinkFFI.UpdateStatus) {
-        self.init(currentVersion: value.currentVersion, channel: value.channel, installSource: value.installSource, lastCheckedAt: value.lastCheckedAt, state: YadoriLinkModel.UpdateState(value.state), availableVersion: value.availableVersion, releaseNotesUrl: value.releaseNotesUrl, mandatory: value.mandatory, holdbackReason: value.holdbackReason, waitingForSafePoint: value.waitingForSafePoint, lastErrorCategory: value.lastErrorCategory, lastErrorMessage: value.lastErrorMessage, config: YadoriLinkModel.UpdateConfig(value.config))
+        self.init(currentVersion: value.currentVersion, channel: value.channel, installSource: value.installSource, lastCheckedAt: value.lastCheckedAt, state: YadoriLinkModel.UpdateState(value.state), availableVersion: value.availableVersion, releaseNotesUrl: value.releaseNotesUrl, mandatory: value.mandatory, holdbackReason: value.holdbackReason, lastErrorCategory: value.lastErrorCategory, lastErrorMessage: value.lastErrorMessage, packageManaged: value.packageManaged, config: YadoriLinkModel.UpdateConfig(value.config))
     }
 }
 
@@ -867,19 +1019,54 @@ extension YadoriLinkFFI.AttentionCategory {
         case .fetchAvailabilityUnknown: self = .fetchAvailabilityUnknown
         case .conflict: self = .conflict
         case .held: self = .held
+        case .strandedDirectory: self = .strandedDirectory
         case .lowDiskCritical: self = .lowDiskCritical
         case .lowDisk: self = .lowDisk
         case .peerDisconnected: self = .peerDisconnected
         case .recentError: self = .recentError
         case .updateFailed: self = .updateFailed
+        case .ambiguous: self = .ambiguous
+        case .ownershipLost: self = .ownershipLost
+        case .volumeChanged: self = .volumeChanged
+        case .providerNotReady: self = .providerNotReady
+        case .providerStuck: self = .providerStuck
+        case .keptEdits: self = .keptEdits
+        case .providerOrphanDomain: self = .providerOrphanDomain
         case .unrecognized: self = .unrecognized
+        }
+    }
+}
+
+extension YadoriLinkFFI.AttentionKind {
+    init(_ value: YadoriLinkModel.AttentionKind) {
+        switch value {
+        case .waiting: self = .waiting
+        case .retryable: self = .retryable
+        case .permanent: self = .permanent
         }
     }
 }
 
 extension YadoriLinkFFI.AttentionReason {
     init(_ value: YadoriLinkModel.AttentionReason) {
-        self.init(category: YadoriLinkFFI.AttentionCategory(value.category), subject: value.subject, folderLocalPath: value.folderLocalPath, raw: value.raw)
+        self.init(category: YadoriLinkFFI.AttentionCategory(value.category), subject: value.subject, folderLocalPath: value.folderLocalPath, raw: value.raw, kind: YadoriLinkFFI.AttentionKind(value.kind), primaryAction: YadoriLinkFFI.ProductAction(value.primaryAction), secondaryAction: value.secondaryAction.map { YadoriLinkFFI.ProductAction($0) })
+    }
+}
+
+extension YadoriLinkFFI.Availability {
+    init(_ value: YadoriLinkModel.Availability) {
+        switch value {
+        case .available: self = .available
+        case .waitingForPeer: self = .waitingForPeer
+        case .waitingForExactContent: self = .waitingForExactContent
+        case .unknown: self = .unknown
+        }
+    }
+}
+
+extension YadoriLinkFFI.AvailabilitySummary {
+    init(_ value: YadoriLinkModel.AvailabilitySummary) {
+        self.init(availability: YadoriLinkFFI.Availability(value.availability), reachableDeviceIds: value.reachableDeviceIds, offlineDeviceIds: value.offlineDeviceIds)
     }
 }
 
@@ -900,6 +1087,15 @@ extension YadoriLinkFFI.BrowserPurpose {
         switch value {
         case .approveDevice: self = .approveDevice
         case .signIn: self = .signIn
+        }
+    }
+}
+
+extension YadoriLinkFFI.ConflictChoice {
+    init(_ value: YadoriLinkModel.ConflictChoice) {
+        switch value {
+        case .keepThis: self = .keepThis
+        case .keepBoth: self = .keepBoth
         }
     }
 }
@@ -1049,6 +1245,12 @@ extension YadoriLinkFFI.FileAvailability {
     }
 }
 
+extension YadoriLinkFFI.FileRetention {
+    init(_ value: YadoriLinkModel.FileRetention) {
+        self.init(policy: YadoriLinkFFI.RetentionPolicy(value.policy), inherited: value.inherited)
+    }
+}
+
 extension YadoriLinkFFI.FileVersion {
     init(_ value: YadoriLinkModel.FileVersion) {
         self.init(versionSeq: value.versionSeq, size: value.size, modifiedAt: value.modifiedAt, state: value.state, originDeviceId: value.originDeviceId, unixMode: value.unixMode, isCurrent: value.isCurrent, kind: YadoriLinkFFI.EntryKind(value.kind))
@@ -1096,7 +1298,7 @@ extension YadoriLinkFFI.FolderState {
 
 extension YadoriLinkFFI.FolderSummary {
     init(_ value: YadoriLinkModel.FolderSummary) {
-        self.init(localPath: value.localPath, groupId: value.groupId, name: value.name, mode: YadoriLinkFFI.FolderMode(value.mode), state: YadoriLinkFFI.FolderState(value.state), paused: value.paused, conflictCount: value.conflictCount, hydratedFileCount: value.hydratedFileCount, placeholderFileCount: value.placeholderFileCount, hydratingFileCount: value.hydratingFileCount, heldFileCount: value.heldFileCount, skippedSymlinkCount: value.skippedSymlinkCount, transfer: value.transfer.map { YadoriLinkFFI.FolderTransferProgress($0) }, durability: YadoriLinkFFI.DurabilityStatus(value.durability), durabilityEvidence: YadoriLinkFFI.DurabilityEvidence(value.durabilityEvidence), localStorage: YadoriLinkFFI.LocalStorageState(value.localStorage), fetchAvailability: YadoriLinkFFI.FetchAvailability(value.fetchAvailability), fullReplicaDeviceIds: value.fullReplicaDeviceIds, policyStale: value.policyStale, ambiguous: value.ambiguous, ambiguousLocalPaths: value.ambiguousLocalPaths, degraded: value.degraded, degradedReason: value.degradedReason, volume: value.volume.map { YadoriLinkFFI.VolumeSummary($0) }, provider: value.provider)
+        self.init(localPath: value.localPath, groupId: value.groupId, name: value.name, mode: YadoriLinkFFI.FolderMode(value.mode), state: YadoriLinkFFI.FolderState(value.state), paused: value.paused, pausedUntil: value.pausedUntil, conflictCount: value.conflictCount, hydratedFileCount: value.hydratedFileCount, placeholderFileCount: value.placeholderFileCount, hydratingFileCount: value.hydratingFileCount, heldFileCount: value.heldFileCount, skippedSymlinkCount: value.skippedSymlinkCount, transfer: value.transfer.map { YadoriLinkFFI.FolderTransferProgress($0) }, durability: YadoriLinkFFI.DurabilityStatus(value.durability), durabilityEvidence: YadoriLinkFFI.DurabilityEvidence(value.durabilityEvidence), localStorage: YadoriLinkFFI.LocalStorageState(value.localStorage), fetchAvailability: YadoriLinkFFI.FetchAvailability(value.fetchAvailability), availability: YadoriLinkFFI.AvailabilitySummary(value.availability), protection: YadoriLinkFFI.ProtectionSummary(value.protection), fullReplicaDeviceIds: value.fullReplicaDeviceIds, policyStale: value.policyStale, ambiguous: value.ambiguous, ambiguousLocalPaths: value.ambiguousLocalPaths, degraded: value.degraded, degradedReason: value.degradedReason, volume: value.volume.map { YadoriLinkFFI.VolumeSummary($0) }, provider: value.provider)
     }
 }
 
@@ -1165,6 +1367,8 @@ extension YadoriLinkFFI.IncomingTransferStatus {
         case .pending: self = .pending
         case .inProgress: self = .inProgress
         case .completed: self = .completed
+        case .failed: self = .failed
+        case .canceled: self = .canceled
         case let .other(raw): self = .other(raw: raw)
         }
     }
@@ -1313,6 +1517,17 @@ extension YadoriLinkFFI.OverallState {
     }
 }
 
+extension YadoriLinkFFI.PauseDuration {
+    init(_ value: YadoriLinkModel.PauseDuration) {
+        switch value {
+        case .untilResumed: self = .untilResumed
+        case .thirtyMinutes: self = .thirtyMinutes
+        case .oneHour: self = .oneHour
+        case .untilTomorrow: self = .untilTomorrow
+        }
+    }
+}
+
 extension YadoriLinkFFI.PeerReachability {
     init(_ value: YadoriLinkModel.PeerReachability) {
         switch value {
@@ -1353,6 +1568,12 @@ extension YadoriLinkFFI.PermissionDeniedReason {
     }
 }
 
+extension YadoriLinkFFI.PinOutcome {
+    init(_ value: YadoriLinkModel.PinOutcome) {
+        self.init(retention: YadoriLinkFFI.FileRetention(value.retention), downloadError: value.downloadError)
+    }
+}
+
 extension YadoriLinkFFI.PreflightIssue {
     init(_ value: YadoriLinkModel.PreflightIssue) {
         switch value {
@@ -1373,6 +1594,37 @@ extension YadoriLinkFFI.PreflightIssue {
 extension YadoriLinkFFI.PreflightResult {
     init(_ value: YadoriLinkModel.PreflightResult) {
         self.init(resolvedPath: value.resolvedPath, pathExists: value.pathExists, isDirectory: value.isDirectory, entryCount: value.entryCount, ignoredEntryCount: value.ignoredEntryCount, totalSizeBytes: value.totalSizeBytes, scanTruncated: value.scanTruncated, freeSpace: value.freeSpace.map { YadoriLinkFFI.FreeSpace($0) }, issues: value.issues.map { YadoriLinkFFI.PreflightIssue($0) }, requiresAcknowledgement: value.requiresAcknowledgement)
+    }
+}
+
+extension YadoriLinkFFI.ProductAction {
+    init(_ value: YadoriLinkModel.ProductAction) {
+        switch value {
+        case .retry: self = .retry
+        case .reviewConflict: self = .reviewConflict
+        case .freeUpSpace: self = .freeUpSpace
+        case .revealPath: self = .revealPath
+        case .openSettings: self = .openSettings
+        case .downloadUpdate: self = .downloadUpdate
+        case .viewDetails: self = .viewDetails
+        }
+    }
+}
+
+extension YadoriLinkFFI.Protection {
+    init(_ value: YadoriLinkModel.Protection) {
+        switch value {
+        case .protected: self = .protected
+        case .atRisk: self = .atRisk
+        case .pending: self = .pending
+        case .unknown: self = .unknown
+        }
+    }
+}
+
+extension YadoriLinkFFI.ProtectionSummary {
+    init(_ value: YadoriLinkModel.ProtectionSummary) {
+        self.init(protection: YadoriLinkFFI.Protection(value.protection), deviceIds: value.deviceIds)
     }
 }
 
@@ -1397,6 +1649,41 @@ extension YadoriLinkFFI.RecentError {
 extension YadoriLinkFFI.ReplicaCopy {
     init(_ value: YadoriLinkModel.ReplicaCopy) {
         self.init(deviceId: value.deviceId, reachability: YadoriLinkFFI.PeerReachability(value.reachability), route: YadoriLinkFFI.RouteKind(value.route))
+    }
+}
+
+extension YadoriLinkFFI.RetainedOriginal {
+    init(_ value: YadoriLinkModel.RetainedOriginal) {
+        self.init(groupId: value.groupId, path: value.path, size: value.size, reachable: value.reachable, groupRemoved: value.groupRemoved)
+    }
+}
+
+extension YadoriLinkFFI.RetainedRelease {
+    init(_ value: YadoriLinkModel.RetainedRelease) {
+        self.init(path: value.path, outcome: YadoriLinkFFI.RetainedReleaseOutcome(value.outcome), detail: value.detail)
+    }
+}
+
+extension YadoriLinkFFI.RetainedReleaseOutcome {
+    init(_ value: YadoriLinkModel.RetainedReleaseOutcome) {
+        switch value {
+        case .removed: self = .removed
+        case .gone: self = .gone
+        case .stillRetained: self = .stillRetained
+        case .savedThenRemoved: self = .savedThenRemoved
+        case .savedStillRetained: self = .savedStillRetained
+        case .left: self = .left
+        case .unknown: self = .unknown
+        }
+    }
+}
+
+extension YadoriLinkFFI.RetentionPolicy {
+    init(_ value: YadoriLinkModel.RetentionPolicy) {
+        switch value {
+        case .reclaimable: self = .reclaimable
+        case .pinned: self = .pinned
+        }
     }
 }
 
@@ -1478,9 +1765,41 @@ extension YadoriLinkFFI.SignOutOutcome {
     }
 }
 
+extension YadoriLinkFFI.SpaceManagement {
+    init(_ value: YadoriLinkModel.SpaceManagement) {
+        self.init(enabled: value.enabled)
+    }
+}
+
+extension YadoriLinkFFI.SpaceReclaimPreview {
+    init(_ value: YadoriLinkModel.SpaceReclaimPreview) {
+        self.init(items: value.items.map { YadoriLinkFFI.SpaceReclaimPreviewItem($0) }, unreadableRoots: value.unreadableRoots)
+    }
+}
+
+extension YadoriLinkFFI.SpaceReclaimPreviewItem {
+    init(_ value: YadoriLinkModel.SpaceReclaimPreviewItem) {
+        self.init(groupId: value.groupId, path: value.path, verdict: YadoriLinkFFI.SpaceReclaimVerdict(value.verdict))
+    }
+}
+
+extension YadoriLinkFFI.SpaceReclaimVerdict {
+    init(_ value: YadoriLinkModel.SpaceReclaimVerdict) {
+        switch value {
+        case .eligible: self = .eligible
+        case .pinned: self = .pinned
+        case .unsupportedRoot: self = .unsupportedRoot
+        case .custodyUnavailable: self = .custodyUnavailable
+        case .busy: self = .busy
+        case .changed: self = .changed
+        case .safetyBlocked: self = .safetyBlocked
+        }
+    }
+}
+
 extension YadoriLinkFFI.StatusSnapshot {
     init(_ value: YadoriLinkModel.StatusSnapshot) {
-        self.init(capturedAt: value.capturedAt, overall: YadoriLinkFFI.OverallState(value.overall), attentionReasons: value.attentionReasons.map { YadoriLinkFFI.AttentionReason($0) }, thisDeviceId: value.thisDeviceId, folders: value.folders.map { YadoriLinkFFI.FolderSummary($0) }, peers: value.peers.map { YadoriLinkFFI.PeerSummary($0) }, transfers: value.transfers.map { YadoriLinkFFI.TransferSummary($0) }, bandwidth: YadoriLinkFFI.BandwidthStatus(value.bandwidth), volumes: value.volumes.map { YadoriLinkFFI.VolumeSummary($0) }, storage: YadoriLinkFFI.StorageSummary(value.storage), update: YadoriLinkFFI.UpdateBadge(value.update), recentErrors: value.recentErrors.map { YadoriLinkFFI.RecentError($0) })
+        self.init(capturedAt: value.capturedAt, overall: YadoriLinkFFI.OverallState(value.overall), attentionReasons: value.attentionReasons.map { YadoriLinkFFI.AttentionReason($0) }, thisDeviceId: value.thisDeviceId, folders: value.folders.map { YadoriLinkFFI.FolderSummary($0) }, availability: YadoriLinkFFI.AvailabilitySummary(value.availability), protection: YadoriLinkFFI.ProtectionSummary(value.protection), peers: value.peers.map { YadoriLinkFFI.PeerSummary($0) }, transfers: value.transfers.map { YadoriLinkFFI.TransferSummary($0) }, bandwidth: YadoriLinkFFI.BandwidthStatus(value.bandwidth), volumes: value.volumes.map { YadoriLinkFFI.VolumeSummary($0) }, storage: YadoriLinkFFI.StorageSummary(value.storage), update: YadoriLinkFFI.UpdateBadge(value.update), recentErrors: value.recentErrors.map { YadoriLinkFFI.RecentError($0) })
     }
 }
 
@@ -1536,34 +1855,19 @@ extension YadoriLinkFFI.UnreachableCategory {
 
 extension YadoriLinkFFI.UpdateBadge {
     init(_ value: YadoriLinkModel.UpdateBadge) {
-        self.init(state: YadoriLinkFFI.UpdateState(value.state), availableVersion: value.availableVersion, mandatory: value.mandatory, waitingForSafePoint: value.waitingForSafePoint, lastErrorCategory: value.lastErrorCategory, channel: value.channel, installSource: value.installSource, holdbackReason: value.holdbackReason)
+        self.init(state: YadoriLinkFFI.UpdateState(value.state), availableVersion: value.availableVersion, mandatory: value.mandatory, lastErrorCategory: value.lastErrorCategory, channel: value.channel, installSource: value.installSource, holdbackReason: value.holdbackReason)
     }
 }
 
 extension YadoriLinkFFI.UpdateConfig {
     init(_ value: YadoriLinkModel.UpdateConfig) {
-        self.init(automaticChecks: value.automaticChecks, installMode: YadoriLinkFFI.UpdateInstallMode(value.installMode))
+        self.init(automaticChecks: value.automaticChecks)
     }
 }
 
-extension YadoriLinkFFI.UpdateInstallMode {
-    init(_ value: YadoriLinkModel.UpdateInstallMode) {
-        switch value {
-        case .automatic: self = .automatic
-        case .manual: self = .manual
-        case let .other(raw): self = .other(raw: raw)
-        }
-    }
-}
-
-extension YadoriLinkFFI.UpdateInstallOutcome {
-    init(_ value: YadoriLinkModel.UpdateInstallOutcome) {
-        switch value {
-        case .installing: self = .installing
-        case .deferred: self = .deferred
-        case let .storeManaged(guidance): self = .storeManaged(guidance: guidance)
-        case let .other(raw): self = .other(raw: raw)
-        }
+extension YadoriLinkFFI.UpdateDownloadGuidance {
+    init(_ value: YadoriLinkModel.UpdateDownloadGuidance) {
+        self.init(guidance: value.guidance, url: value.url)
     }
 }
 
@@ -1589,7 +1893,7 @@ extension YadoriLinkFFI.UpdateState {
 
 extension YadoriLinkFFI.UpdateStatus {
     init(_ value: YadoriLinkModel.UpdateStatus) {
-        self.init(currentVersion: value.currentVersion, channel: value.channel, installSource: value.installSource, lastCheckedAt: value.lastCheckedAt, state: YadoriLinkFFI.UpdateState(value.state), availableVersion: value.availableVersion, releaseNotesUrl: value.releaseNotesUrl, mandatory: value.mandatory, holdbackReason: value.holdbackReason, waitingForSafePoint: value.waitingForSafePoint, lastErrorCategory: value.lastErrorCategory, lastErrorMessage: value.lastErrorMessage, config: YadoriLinkFFI.UpdateConfig(value.config))
+        self.init(currentVersion: value.currentVersion, channel: value.channel, installSource: value.installSource, lastCheckedAt: value.lastCheckedAt, state: YadoriLinkFFI.UpdateState(value.state), availableVersion: value.availableVersion, releaseNotesUrl: value.releaseNotesUrl, mandatory: value.mandatory, holdbackReason: value.holdbackReason, lastErrorCategory: value.lastErrorCategory, lastErrorMessage: value.lastErrorMessage, packageManaged: value.packageManaged, config: YadoriLinkFFI.UpdateConfig(value.config))
     }
 }
 

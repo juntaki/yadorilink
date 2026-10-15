@@ -2,9 +2,9 @@
 
 use super::{about, existing_directory, offering_force, ClientCore};
 use crate::dto::{
-    self, ConflictSummary, EvictOutcome, FileAvailability, FileVersion, FolderMode,
-    FolderRestoreOutcome, LinkOutcome, PreflightResult, ProviderFolderOutcome, StorageModeOutcome,
-    TrashedFile, UnlinkOutcome,
+    self, ConflictSummary, EvictOutcome, FileAvailability, FileRetention, FileVersion, FolderMode,
+    FolderRestoreOutcome, LinkOutcome, PauseDuration, PinOutcome, PreflightResult,
+    ProviderFolderOutcome, StorageModeOutcome, TrashedFile, UnlinkOutcome,
 };
 use crate::error::DesktopError;
 use crate::ops;
@@ -14,12 +14,63 @@ fn on_demand(mode: FolderMode) -> bool {
 }
 
 impl ClientCore {
+    // ---- conflicts and kept originals ----------------------------------------------
+
+    /// Resolves the conflicted copy at the absolute `copy_path` and returns the absolute path
+    /// of the kept content. A copy the daemon does not list as a live conflict is refused.
+    ///
+    /// # Errors
+    /// Refusals and daemon failures.
+    pub async fn resolve_conflict(
+        &self,
+        copy_path: String,
+        choice: dto::ConflictChoice,
+    ) -> Result<String, DesktopError> {
+        let choice = match choice {
+            dto::ConflictChoice::KeepThis => ops::files::ConflictChoice::KeepThis,
+            dto::ConflictChoice::KeepBoth => ops::files::ConflictChoice::KeepBoth,
+        };
+        let kept = ops::files::resolve_conflict(&copy_path, choice).await?;
+        Ok(kept.to_string_lossy().into_owned())
+    }
+
+    /// # Errors
+    /// Daemon failures.
+    pub async fn list_retained_originals(
+        &self,
+    ) -> Result<Vec<dto::RetainedOriginal>, DesktopError> {
+        Ok(ops::storage::list_retained_originals()
+            .await?
+            .iter()
+            .map(dto::retained_original)
+            .collect())
+    }
+
+    /// Releases the originals kept for `group_id`, one outcome per original.
+    ///
+    /// # Errors
+    /// Daemon failures.
+    pub async fn release_retained_originals(
+        &self,
+        group_id: String,
+    ) -> Result<Vec<dto::RetainedRelease>, DesktopError> {
+        Ok(ops::storage::release_retained_originals(&group_id)
+            .await?
+            .iter()
+            .map(dto::retained_release)
+            .collect())
+    }
+
     // ---- folder control ----------------------------------------------------------
 
     /// # Errors
     /// Daemon failures.
-    pub async fn pause_folder(&self, local_path: String) -> Result<(), DesktopError> {
-        Ok(ops::folders::pause_folder(local_path).await?)
+    pub async fn pause_folder(
+        &self,
+        local_path: String,
+        duration: PauseDuration,
+    ) -> Result<(), DesktopError> {
+        Ok(ops::folders::pause_folder(local_path, duration).await?)
     }
 
     /// # Errors
@@ -30,8 +81,8 @@ impl ClientCore {
 
     /// # Errors
     /// Daemon failures.
-    pub async fn pause_all(&self) -> Result<(), DesktopError> {
-        Ok(ops::folders::pause_all().await?)
+    pub async fn pause_all(&self, duration: PauseDuration) -> Result<(), DesktopError> {
+        Ok(ops::folders::pause_all(duration).await?)
     }
 
     /// # Errors
@@ -40,7 +91,10 @@ impl ClientCore {
         Ok(ops::folders::resume_all().await?)
     }
 
-    /// Stops syncing the folder at `local_path`.
+    /// Stops syncing the folder whose link key is `local_path`, exactly as
+    /// the status snapshot reports it: a directory's recorded path, or a
+    /// provider-backed folder's synthetic key, which is not a filesystem
+    /// path and must reach the daemon unchanged.
     ///
     /// # Errors
     /// Without `force`, `DurabilityBlocked{can_force: true}` when this device
@@ -51,7 +105,7 @@ impl ClientCore {
         force: bool,
     ) -> Result<UnlinkOutcome, DesktopError> {
         let handoff =
-            ops::links::send_unlink(&local_path, force).await.map_err(offering_force(force))?;
+            ops::links::send_unlink_key(&local_path, force).await.map_err(offering_force(force))?;
         Ok(UnlinkOutcome { handoff: handoff.as_ref().map(dto::handoff_summary) })
     }
 
@@ -148,6 +202,37 @@ impl ClientCore {
     ) -> Result<FileAvailability, DesktopError> {
         let status = ops::files::materialization_status(absolute_path).await?;
         Ok(dto::file_availability(&status))
+    }
+
+    /// The retention policy in force at the path.
+    ///
+    /// # Errors
+    /// Daemon failures.
+    pub async fn file_retention(
+        &self,
+        absolute_path: String,
+    ) -> Result<FileRetention, DesktopError> {
+        let status = ops::files::materialization_status(absolute_path).await?;
+        Ok(dto::file_retention(status.retention.as_ref()))
+    }
+
+    /// Keeps the file or folder on this device: records the choice, then downloads what is not
+    /// here yet. A failed download is reported in the outcome and the pin stands.
+    ///
+    /// # Errors
+    /// Daemon failures (the choice could not be recorded).
+    pub async fn pin_file(&self, absolute_path: String) -> Result<PinOutcome, DesktopError> {
+        let pin = ops::files::pin(absolute_path).await?;
+        Ok(dto::pin_outcome(&pin))
+    }
+
+    /// Stops keeping the file or folder; its content stays until it is freed.
+    ///
+    /// # Errors
+    /// Daemon failures.
+    pub async fn unpin_file(&self, absolute_path: String) -> Result<FileRetention, DesktopError> {
+        let unpin = ops::files::unpin(absolute_path).await?;
+        Ok(dto::file_retention(unpin.retention.as_ref()))
     }
 
     /// # Errors

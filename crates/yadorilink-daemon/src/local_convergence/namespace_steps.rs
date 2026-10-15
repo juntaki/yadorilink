@@ -499,6 +499,26 @@ impl super::LocalConvergenceExecutor {
         Ok(self.exact_name_folded_elsewhere(&out_path)?.is_some())
     }
 
+    /// Whether an entry of the parent directory is `path`'s last component as this volume
+    /// lists it: the same bytes, or (on a volume that stores names decomposed) the same name
+    /// up to Unicode normalisation. Case is never folded: a lookup of the name proves nothing
+    /// of the kind, which is why the directory is listed.
+    pub(crate) fn exact_leaf_listed(
+        &self,
+        group_id: &str,
+        path: &str,
+        volume: super::types::VolumeFolding,
+    ) -> Result<bool, PeerSessionError> {
+        let out_path = self.local_file_path(group_id, path)?;
+        let (Some(parent), Some(name)) = (out_path.parent(), out_path.file_name()) else {
+            return Ok(false);
+        };
+        let Ok(entries) = std::fs::read_dir(parent) else { return Ok(false) };
+        Ok(entries.flatten().any(|entry| {
+            listed_name_is(&entry.file_name(), name, volume.normalization_insensitive)
+        }))
+    }
+
     /// When `out_path` answers a lookup but no entry of its parent has its
     /// exact name, the name of the entry that answered (the one the volume
     /// folds it to). `None` when the exact name exists, or nothing answers.
@@ -511,6 +531,28 @@ impl super::LocalConvergenceExecutor {
         };
         let Ok(target) = std::fs::symlink_metadata(out_path) else { return Ok(None) };
         Ok(entry_answering_under_another_name(parent, name, &target)?)
+    }
+}
+
+/// Whether a listed entry name is `name`: byte-equal, or, when the volume does not tell
+/// normalisation forms apart, equal after NFC (case still exact).
+pub(super) fn listed_name_is(
+    listed: &std::ffi::OsStr,
+    name: &std::ffi::OsStr,
+    normalization_insensitive: bool,
+) -> bool {
+    if listed == name {
+        return true;
+    }
+    if !normalization_insensitive {
+        return false;
+    }
+    match (listed.to_str(), name.to_str()) {
+        (Some(listed), Some(name)) => {
+            yadorilink_fs_platform::canonical_fold::nfc(listed)
+                == yadorilink_fs_platform::canonical_fold::nfc(name)
+        }
+        _ => false,
     }
 }
 
@@ -606,5 +648,27 @@ mod tests {
         let found = entry_answering_under_another_name(dir.path(), "a".as_ref(), &target).unwrap();
 
         assert_eq!(found, None);
+    }
+}
+
+#[cfg(test)]
+mod listed_name_tests {
+    use super::listed_name_is;
+    use std::ffi::OsStr;
+
+    const COMPOSED: &str = "caf\u{e9}.jpg";
+    const DECOMPOSED: &str = "cafe\u{301}.jpg";
+
+    #[test]
+    fn a_decomposed_listing_is_the_composed_name_on_a_normalisation_blind_volume_only() {
+        assert!(listed_name_is(OsStr::new(DECOMPOSED), OsStr::new(COMPOSED), true));
+        assert!(!listed_name_is(OsStr::new(DECOMPOSED), OsStr::new(COMPOSED), false));
+    }
+
+    #[test]
+    fn case_is_never_folded() {
+        assert!(!listed_name_is(OsStr::new("Photo.jpg"), OsStr::new("photo.jpg"), true));
+        assert!(!listed_name_is(OsStr::new("Caf\u{e9}.jpg"), OsStr::new(COMPOSED), true));
+        assert!(listed_name_is(OsStr::new("photo.jpg"), OsStr::new("photo.jpg"), false));
     }
 }

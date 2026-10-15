@@ -9,7 +9,7 @@
 //! `coordination_client::request_authorization_checkpoint`.
 //!
 //! Wired into the daemon's reconnect event loop by
-//! `peer_orchestrator.rs::spawn_flush_pending_checkpoints_on_reconnect` and
+//! `peer_orchestrator/ws_netmap.rs::spawn_flush_pending_checkpoints` and
 //! surfaced by `connection_trace.rs`'s `checkpoint_pending` doctor
 //! category. This is the ONLY local-publication path —
 //! there is no second way for a locally authored Change to become

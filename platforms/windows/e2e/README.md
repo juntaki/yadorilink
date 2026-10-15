@@ -23,6 +23,7 @@ two daemons on one Windows machine, device A with a Cloud Files provider folder 
 | 15 | a local edit made while a large file is being hydrated is kept (bytes before and after untouched) and reaches device B |
 | 16 | the other device changes the file while it is being hydrated: the read returns a whole version (old or new, never a mix) and Windows settles on the new one |
 | 14 | the remote delete of the iteration directory reaches Windows (clean-up, also checked) |
+| 17 | only with `-OnDemandObserver`: the on-demand external observer (see `-OnDemandObserver`) |
 
 ## Running
 
@@ -41,6 +42,10 @@ two daemons on one Windows machine, device A with a Cloud Files provider folder 
   account, because an account only takes so many devices.
 * `-Scenarios 1,8,9` runs a subset; scenario 1 always has to be part of it, it creates the files the others use.
 * Without `-Fresh` a run continues from `<WorkDir>\state.json` (the next iteration, results so far).
+* `-OnDemandObserver <script>` adds scenario 17: the Python script (an external observer) writes a corpus into device B's folder, waits for the placeholders on device A, and measures
+  allocated bytes of the folder and of device A's block store (`<WorkDir>\cfga\blocks`) before hydration, after it and after
+  `yadorilink evict`, plus first-open latency. `-ObserverFullCorpus` selects the full corpus (4 KiB x 200, 1 MiB x 200, 1 GiB x 1)
+  instead of the smoke one. The result is written to `<WorkDir>\observer-itNN.json`.
 * `-HoldMB` sets the size of the two files read in scenario 10 (default 96), `-RaceMB` of those in 15 and 16 (default 64).
 * Waits have fixed budgets (`-SyncTimeoutSec`, default 90 s); a slow run fails instead of waiting longer.
   After a daemon start the script waits until `yadorilink status` shows the peer connected and no "cannot fetch now"

@@ -38,6 +38,18 @@ pub enum SendError {
     #[error("no known signing key for device {0}")]
     NoKnownDeviceKey(String),
 
+    #[error("transfer {0} was canceled; retry it to resume")]
+    TransferCanceled(String),
+
+    #[error("transfer {0} is already being received")]
+    AlreadyReceiving(String),
+
+    #[error("transfer {transfer_id} cannot be retried while it is {status}")]
+    NotRetryable { transfer_id: String, status: &'static str },
+
+    #[error("destination {0} cannot be used: {1}")]
+    BadDestination(String, String),
+
     #[error("peer rejected the offer: {0}")]
     OfferRejected(String),
 

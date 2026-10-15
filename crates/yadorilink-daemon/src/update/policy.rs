@@ -53,32 +53,6 @@ impl UpdateState {
     }
 }
 
-/// v1 ships manual updates, so `Manual` is the only mode. The old
-/// persisted value `"automatic"` is still accepted when loading an
-/// existing policy file and reads as `Manual`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AutoInstallMode {
-    #[default]
-    #[serde(alias = "automatic")]
-    Manual,
-}
-
-impl AutoInstallMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AutoInstallMode::Manual => "manual",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "manual" => Some(AutoInstallMode::Manual),
-            _ => None,
-        }
-    }
-}
-
 /// A coarse, stable category for the last update-attempt failure — never
 /// the raw error text — matching `CliError::report_category`'s
 /// established convention in this workspace.
@@ -89,7 +63,6 @@ pub type ErrorCategory = String;
 pub struct UpdatePolicy {
     pub channel: String,
     pub automatic_checks_enabled: bool,
-    pub automatic_install_mode: AutoInstallMode,
     /// Unix seconds; `None` means "never checked".
     pub last_check_unix: Option<i64>,
     pub last_error_category: Option<ErrorCategory>,
@@ -156,7 +129,6 @@ impl Default for UpdatePolicy {
             // until release packaging introduces one.
             channel: "beta".to_string(),
             automatic_checks_enabled: true,
-            automatic_install_mode: AutoInstallMode::default(),
             last_check_unix: None,
             last_error_category: None,
             last_error_message: None,

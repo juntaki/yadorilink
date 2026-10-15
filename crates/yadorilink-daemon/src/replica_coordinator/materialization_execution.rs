@@ -75,6 +75,17 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         self.temp_ledger(group_id).release(tmp_path);
     }
 
+    fn record_stranded_directory(
+        &self,
+        group_id: &str,
+        dir_path: &Path,
+    ) -> Result<(), MaterializationExecutionError> {
+        use yadorilink_local_storage::TempFileLedger;
+        self.temp_ledger(group_id).strand(dir_path).map_err(|error| {
+            MaterializationExecutionError::from(SyncError::CorruptState(error.to_string()))
+        })
+    }
+
     fn get_file(
         &self,
         group_id: &str,
@@ -537,6 +548,12 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
                 .dirty_path_repository()
                 .is_path_dirty(group_id, path)
                 .map_err(SyncError::from)?,
+            pinned: self
+                .pinned_item_repository()
+                .retention(group_id, path)
+                .map_err(SyncError::from)?
+                .policy
+                == yadorilink_sync_sqlite::RetentionPolicy::Pinned,
         })
     }
 
@@ -593,9 +610,49 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         &self,
         deletion_guard: &BlockPhysicalDeletionGuard<'_>,
         custody: VerifiedCustody<'_>,
+        siblings: Vec<VerifiedCustody<'_>>,
         store: &dyn BlockReclamationStore,
     ) -> Result<GcReport, MaterializationExecutionError> {
-        Ok(self.reclaim_cached_blocks(deletion_guard, custody, store).map_err(SyncError::from)?)
+        Ok(self
+            .reclaim_cached_blocks(deletion_guard, custody, &siblings, store)
+            .map_err(SyncError::from)?)
+    }
+
+    fn remote_siblings_sharing_blocks(
+        &self,
+        group_id: &str,
+        path: &str,
+        blocks: &[yadorilink_replica_domain::file::VersionBlock],
+    ) -> Result<
+        Vec<(String, String, yadorilink_replica_domain::file::FileVersion)>,
+        MaterializationExecutionError,
+    > {
+        let rows = self
+            .materialization_state_repository()
+            .remote_rows_sharing_blocks(group_id, path, blocks)
+            .map_err(SyncError::from)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (row_group, row_path) in rows {
+            // A full replica is the durable holder of its group: its placeholders keep their
+            // blocks whatever custody says, exactly as `is_local_full_replica` decides for the
+            // evicting file itself.
+            if matches!(
+                self.link_repository().materialization_policy_for_group(&row_group),
+                Ok(Some(yadorilink_replica_domain::session_state::MaterializationPolicy::Eager))
+            ) {
+                continue;
+            }
+            if let Some(current) = self
+                .sqlite()
+                .dag_get_current_version_record(&row_group, &row_path)
+                .map_err(SyncError::from)?
+            {
+                if !current.deleted {
+                    out.push((row_group, row_path, current.to_file_version()));
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn dag_bump_mutation_fence(

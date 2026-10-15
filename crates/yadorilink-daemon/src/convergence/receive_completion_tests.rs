@@ -945,6 +945,9 @@ async fn a_crash_between_the_metadata_commit_and_the_open(mode: u8) -> (Vec<Stri
     f.admit("warm.txt", &f.content_version(b"warm-up", 100));
     drive_until(&f, &engine, "the warm-up path closes", |f| obligation(f, "warm.txt").is_none())
         .await;
+    // A window must not flush on its 20 ms latency bound while the three
+    // files are still arriving, or the batch splits under load.
+    long_deadline(&f);
     executor(&f).batch_metadata_override.store(mode, std::sync::atomic::Ordering::Relaxed);
     f.state.replica_coordinator.test_observers.metadata_batch_sizes.lock().unwrap().clear();
     let window = admit_window(&f, "k", 3, ONE_BLOCK);
@@ -1107,6 +1110,9 @@ async fn a_crash_after_the_open_before_any_byte(mode: u8) -> (Vec<String>, Vec<S
     f.admit("warm.txt", &f.content_version(b"warm-up", 100));
     drive_until(&f, &engine, "the warm-up path closes", |f| obligation(f, "warm.txt").is_none())
         .await;
+    // A window must not flush on its 20 ms latency bound while the three
+    // files are still arriving, or the batch splits under load.
+    long_deadline(&f);
     executor(&f).batch_open_override.store(mode, std::sync::atomic::Ordering::Relaxed);
     f.state.replica_coordinator.test_observers.open_batch_sizes.lock().unwrap().clear();
     let window = admit_window(&f, "o", 3, multi_block());

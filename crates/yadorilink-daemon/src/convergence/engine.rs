@@ -393,9 +393,9 @@ pub async fn run(engine: Arc<ConvergenceEngine>) {
                 "engine loop draining an immediate backlog without waiting"
             );
             tokio::task::yield_now().await;
-            // Per-tick wall time at `info`: the one engine-throughput number
-            // a benchmark run needs, and silent under the default filter.
-            tracing::info!(local_device_id = %state.device_id, tick, run_once_wall_ms, "convergence tick end");
+            // Per-tick wall time at `debug`: the one engine-throughput number
+            // a benchmark run needs, enabled only by an explicit filter.
+            tracing::debug!(local_device_id = %state.device_id, tick, run_once_wall_ms, "convergence tick end");
             continue;
         }
         tracing::debug!(local_device_id = %state.device_id, tick, run_once_wall_ms, "engine loop about to wait for next wake");
@@ -410,7 +410,7 @@ pub async fn run(engine: Arc<ConvergenceEngine>) {
                 tracing::debug!(local_device_id = %state.device_id, tick, select_ms, "engine loop woken by fallback poll");
             }
         }
-        tracing::info!(local_device_id = %state.device_id, tick, run_once_wall_ms, "convergence tick end");
+        tracing::debug!(local_device_id = %state.device_id, tick, run_once_wall_ms, "convergence tick end");
     }
 }
 

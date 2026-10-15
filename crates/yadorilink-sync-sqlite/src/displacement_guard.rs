@@ -35,12 +35,16 @@ pub enum DisplacementGuard {
 }
 
 /// The guard for `path`, which is about to show `planned` (`None` for a
-/// directory or nothing).
+/// directory or nothing). `folds_onto_path` says of another path whether this volume folds it
+/// onto `path` (a pure name test, taking no connection): such a path can never be on disk while `path` is, so waiting for it to hold
+/// the version would wait for the very removal that is being decided (a case-only rename),
+/// and it is not a place the content lives on.
 pub fn displacement_guard(
     conn: &Connection,
     group_id: &str,
     path: &str,
     planned: Option<&VersionHash>,
+    folds_onto_path: &dyn Fn(&str) -> bool,
 ) -> Result<DisplacementGuard, SyncSqliteError> {
     // What the disk at `path` may hold: the version the row shows, and the
     // version of the last materialization proof even when its fence has moved
@@ -78,6 +82,11 @@ pub fn displacement_guard(
             crate::native_store::native_paths_with_version(conn, &group, version)?
                 .into_iter()
                 .filter(|other| other != path)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter(|other| {
+                    !(folds_onto_path(other) && plan_shows_version(conn, group_id, other, version))
+                })
                 .collect();
         if elsewhere.is_empty() {
             continue;
@@ -103,6 +112,21 @@ pub fn displacement_guard(
     } else {
         DisplacementGuard::Guarded(holders)
     })
+}
+
+/// Whether native's plan puts exactly `version` as a plain entry at `path`, read on the
+/// guard's own connection.
+fn plan_shows_version(
+    conn: &Connection,
+    group_id: &str,
+    path: &str,
+    version: &VersionHash,
+) -> bool {
+    use yadorilink_replica_domain::native_plan::NativePlannedNode;
+    matches!(
+        crate::native_desired_state::native_plan_node(conn, group_id, path),
+        Ok(Some(NativePlannedNode::Entry { head, .. })) if head.version() == *version
+    )
 }
 
 /// Whether `path` is the copy of content that a materialization proof of the

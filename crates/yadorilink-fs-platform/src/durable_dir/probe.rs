@@ -6,16 +6,13 @@ use std::io;
 use std::path::Path;
 use std::sync::Mutex;
 
-use super::{DiscardOutcome, DurableNamespace, NoLedger, NsError, Replace};
+use super::{DiscardOutcome, DurableNamespace, NoLedger, NsError, Replace, RetainReason};
 use crate::fs_capabilities::Capability;
 
 #[cfg(any(windows, test))]
 const DRIVE_FIXED: u32 = 3;
 
 const PROBE_LABEL: &str = "dir-durability";
-/// A probe directory older than this is the residue of a probe that never
-/// finished (a crash), not of one running now.
-const STALE_AFTER_NANOS: u128 = 3_600_000_000_000;
 
 /// Verdicts per volume, so the probe runs once per volume and process. A probe
 /// that could not run (`Unknown`) is not kept.
@@ -23,6 +20,11 @@ static VERDICTS: Mutex<Vec<(u64, Capability)>> = Mutex::new(Vec::new());
 
 pub(super) fn cached_verdict(dir: &Path) -> Capability {
     let Ok(volume) = volume_key(dir) else { return Capability::Unknown };
+    verdict_for(volume, || probe(dir))
+}
+
+/// The cached verdict for `volume`, or `probe_now`'s, kept unless it is `Unknown`.
+fn verdict_for(volume: u64, probe_now: impl FnOnce() -> Capability) -> Capability {
     let known = VERDICTS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -31,15 +33,44 @@ pub(super) fn cached_verdict(dir: &Path) -> Capability {
     if let Some(verdict) = known {
         return verdict;
     }
-    let verdict = probe(dir);
+    let verdict = probe_now();
     if verdict != Capability::Unknown {
         VERDICTS.lock().unwrap_or_else(|p| p.into_inner()).push((volume, verdict));
     }
     verdict
 }
 
-/// Identifies the volume under `dir`: the device number on Unix, the volume
-/// serial number on Windows.
+/// A number for `key`, the same one every time and never shared with another key,
+/// so a volume stays a plain `u64` to the callers.
+#[cfg(any(windows, test))]
+fn intern(key: String) -> u64 {
+    static KEYS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut keys = KEYS.lock().unwrap_or_else(|p| p.into_inner());
+    let at = keys.iter().position(|k| *k == key).unwrap_or_else(|| {
+        keys.push(key);
+        keys.len() - 1
+    });
+    at as u64
+}
+
+/// The identity of a Windows volume: its serial number alone is not unique (two
+/// volumes may share one, and a verdict, or a same-volume check, must not carry
+/// from one to the other), so the key adds the file system name and the volume
+/// part of the final path by volume GUID (`Volume{guid}`, which also tells apart
+/// volumes mounted in folders; a share gives `UNC\server\share`).
+#[cfg(any(windows, test))]
+fn windows_volume_key(serial: u32, fs_name: &str, volume_path: &str) -> String {
+    let rest = volume_path.strip_prefix(r"\\?\").unwrap_or(volume_path);
+    let volume_part = if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("UNC\\") {
+        rest.splitn(4, '\\').take(3).collect::<Vec<_>>().join("\\")
+    } else {
+        rest.split('\\').next().unwrap_or(rest).to_owned()
+    };
+    format!("{serial:08x}|{}|{}", fs_name.to_ascii_lowercase(), volume_part.to_ascii_lowercase())
+}
+
+/// Identifies the volume under `dir`: the device number on Unix, on Windows
+/// [`windows_volume_key`].
 pub(super) fn volume_key(dir: &Path) -> io::Result<u64> {
     #[cfg(unix)]
     {
@@ -48,7 +79,8 @@ pub(super) fn volume_key(dir: &Path) -> io::Result<u64> {
     }
     #[cfg(windows)]
     {
-        windows::volume_serial(dir)
+        let d = windows::describe(dir)?;
+        Ok(intern(windows_volume_key(d.serial, &d.fs_name, &d.volume_path)))
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -66,7 +98,6 @@ pub(super) fn probe(dir: &Path) -> Capability {
             return Capability::Unsupported;
         }
     }
-    sweep_stale(dir);
     let Ok(base) = crate::fs_capabilities::probe_artefact_name(PROBE_LABEL) else {
         return Capability::Unknown;
     };
@@ -75,59 +106,136 @@ pub(super) fn probe(dir: &Path) -> Capability {
         return Capability::Unknown;
     }
     let verdict = super::quiet(|| shapes_work(&work));
+    // Only this probe's own directory, made just above: never a directory found by its name.
     let _ = std::fs::remove_dir_all(&work);
-    if verdict {
-        Capability::Supported
-    } else {
-        Capability::Unsupported
+    verdict
+}
+
+/// The steps of the probe, where a test can make the volume answer "busy".
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    FirstPublish,
+    SecondPublish,
+    CreateDir,
+    ReplacePublish,
+    ReadBack,
+    Discard,
+    Removal,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BUSY_AT: std::cell::Cell<Option<(Step, io::ErrorKind)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Makes the next probe on this thread meet an error of `kind` at `step`
+/// (`ResourceBusy` is a sharing violation).
+#[cfg(test)]
+fn inject_at(step: Step, kind: io::ErrorKind) {
+    BUSY_AT.with(|b| b.set(Some((step, kind))));
+}
+
+#[cfg(test)]
+fn busy_at(step: Step) -> bool {
+    BUSY_AT.with(|b| b.get()).is_some_and(|(at, _)| at == step)
+}
+
+/// The injected sharing violation of `step`, if a test armed it.
+#[cfg(test)]
+fn busy_step(step: Step) -> Result<(), Fail> {
+    let Some((at, kind)) = BUSY_AT.with(|b| b.get()) else { return Ok(()) };
+    if at != step {
+        return Ok(());
+    }
+    let error = io::Error::from(kind);
+    Err(NsError::from_io(error).into())
+}
+
+/// How a probe step went wrong. `Unsupported` is a definite wrong answer: the shape
+/// succeeded where it must be refused, did not do what it must, or the volume says it cannot
+/// do it. `Unknown` is any other error (a sharing violation or lock from a reader, an indexer
+/// or a scanner, a full disk, an I/O error): the volume has not answered, so nothing is
+/// concluded, and the verdict is not kept.
+enum Fail {
+    Unsupported,
+    Unknown,
+}
+
+impl From<NsError> for Fail {
+    fn from(error: NsError) -> Self {
+        let says_unsupported = |e: &io::Error| {
+            matches!(e.kind(), io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput)
+        };
+        match error {
+            // The shape did not do what it must: the entry it just made is not there, a fresh
+            // name is occupied, a file is a directory.
+            NsError::AlreadyExists
+            | NsError::NotFound
+            | NsError::NotEmpty
+            | NsError::CrossVolume => Self::Unsupported,
+            NsError::Io(e) | NsError::NotDurable(e) if says_unsupported(&e) => Self::Unsupported,
+            _ => Self::Unknown,
+        }
     }
 }
 
 /// The five things the contract needs, on throwaway entries under `work`: a
 /// published file, a refused second no-replace publish, a published directory,
-/// a replacing publish and a discard.
-fn shapes_work(work: &Path) -> bool {
-    let ns = DurableNamespace::unchecked();
-    let result = (|| -> Result<bool, NsError> {
-        let (file, sub) = (work.join("f"), work.join("d"));
-        ns.create_file(&file, Replace::No, &NoLedger, |f| io::Write::write_all(f, b"probe"))?;
-        let refused = matches!(
-            ns.create_file(&file, Replace::No, &NoLedger, |f| io::Write::write_all(f, b"again")),
-            Err(NsError::AlreadyExists)
-        );
-        ns.create_dir(&sub, &NoLedger)?;
-        ns.create_file(&file, Replace::Yes, &NoLedger, |f| io::Write::write_all(f, b"second"))?;
-        let replaced = std::fs::read(&file).map_err(NsError::Io)? == b"second";
-        let outcome = ns.discard(&file, &NoLedger)?.finish(&ns, &NoLedger);
-        Ok(refused && replaced && outcome == DiscardOutcome::Removed)
-    })();
-    result.unwrap_or(false)
+/// a replacing publish and a discard. A busy step (see [`Fail`]) is `Unknown`.
+fn shapes_work(work: &Path) -> Capability {
+    match try_shapes(work) {
+        Ok(()) => Capability::Supported,
+        Err(Fail::Unsupported) => Capability::Unsupported,
+        Err(Fail::Unknown) => Capability::Unknown,
+    }
 }
 
-/// Removes this probe's own residue (reserved name, this label, old enough).
-fn sweep_stale(dir: &Path) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some((crate::reserved_namespace::ArtefactKind::Probe, id)) =
-            crate::reserved_namespace::parse_artefact_component(&name)
-        else {
-            continue;
-        };
-        // `<pid>-<nanos>-<counter>-<label>`
-        let mut parts = id.splitn(4, '-');
-        let (_pid, nanos, _counter, label) =
-            (parts.next(), parts.next(), parts.next(), parts.next());
-        let old = nanos
-            .and_then(|n| n.parse::<u128>().ok())
-            .is_some_and(|n| now.saturating_sub(n) > STALE_AFTER_NANOS);
-        if label == Some(PROBE_LABEL) && old && entry.path().is_dir() {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
+fn try_shapes(work: &Path) -> Result<(), Fail> {
+    let ns = DurableNamespace::unchecked();
+    let (file, sub) = (work.join("f"), work.join("d"));
+    let put =
+        |content: &'static [u8]| move |f: &mut std::fs::File| io::Write::write_all(f, content);
+    #[cfg(test)]
+    busy_step(Step::FirstPublish)?;
+    ns.create_file(&file, Replace::No, &NoLedger, put(b"probe"))?;
+    // The occupied name must be refused as occupied: success, or a refusal of another kind
+    // that is not busy, is the wrong answer.
+    #[cfg(test)]
+    busy_step(Step::SecondPublish)?;
+    match ns.create_file(&file, Replace::No, &NoLedger, put(b"again")) {
+        Err(NsError::AlreadyExists) => {}
+        Err(other) => return Err(other.into()),
+        Ok(()) => return Err(Fail::Unsupported),
+    }
+    #[cfg(test)]
+    busy_step(Step::CreateDir)?;
+    ns.create_dir(&sub, &NoLedger)?;
+    #[cfg(test)]
+    busy_step(Step::ReplacePublish)?;
+    ns.create_file(&file, Replace::Yes, &NoLedger, put(b"second"))?;
+    #[cfg(test)]
+    busy_step(Step::ReadBack)?;
+    if std::fs::read(&file).map_err(NsError::from_io)? != b"second" {
+        return Err(Fail::Unsupported);
+    }
+    #[cfg(test)]
+    busy_step(Step::Discard)?;
+    let discarded = ns.discard(&file, &NoLedger)?;
+    #[cfg(test)]
+    let outcome = if busy_at(Step::Removal) {
+        DiscardOutcome::Retained { path: file.clone(), reason: RetainReason::RemovalFailed }
+    } else {
+        discarded.finish(&ns, &NoLedger)
+    };
+    #[cfg(not(test))]
+    let outcome = discarded.finish(&ns, &NoLedger);
+    match outcome {
+        DiscardOutcome::Removed => Ok(()),
+        // The removal of a file the probe just moved aside failed: the entry is committed
+        // away but a holder kept it, which says nothing about the shapes.
+        DiscardOutcome::Retained { reason: RetainReason::RemovalFailed, .. } => Err(Fail::Unknown),
+        _ => Err(Fail::Unsupported),
     }
 }
 
@@ -160,6 +268,52 @@ fn final_path_is_on_fixed_drive(final_path: &str, drive_type: impl Fn(&str) -> u
     drive_type(&format!("{}:\\", &rest[..1])) == DRIVE_FIXED
 }
 
+/// The volume GUID path of the directory `dir`, for tests.
+#[cfg(all(windows, test))]
+pub(super) fn volume_guid_path_for_test(dir: &Path) -> String {
+    windows::describe(dir).unwrap().volume_path
+}
+
+/// The Windows removal of [`super::remove_file_judged`]: the file is opened once (a final link is
+/// the object, not followed), the verdict is asked about the directory its handle names by
+/// volume GUID, and the file is deleted through that handle.
+#[cfg(windows)]
+pub(super) fn remove_file_through_handle(
+    path: &Path,
+    judge: impl FnOnce(&Path) -> bool,
+) -> Result<(), super::JudgedRemoveError> {
+    use super::JudgedRemoveError::Io;
+    let file = windows::open_for_delete(path).map_err(Io)?;
+    judge_open_file(&file, judge)?;
+    windows::delete_through(&file).map_err(Io)
+}
+
+/// Asks `judge` about the directory the open `file` lives in, named by volume GUID so it leads to
+/// the volume of the object the handle is on, not to wherever a path spelling resolves now.
+#[cfg(windows)]
+pub(super) fn judge_open_file(
+    file: &std::fs::File,
+    judge: impl FnOnce(&Path) -> bool,
+) -> Result<(), super::JudgedRemoveError> {
+    use super::JudgedRemoveError::{Io, Refused};
+    let seen = windows::describe_handle(file).map_err(Io)?;
+    let named = std::path::PathBuf::from(&seen.volume_path);
+    let parent = named.parent().ok_or_else(|| {
+        Io(io::Error::new(io::ErrorKind::InvalidInput, "a file has a parent directory"))
+    })?;
+    let key = windows_volume_key(seen.serial, &seen.fs_name, &seen.volume_path);
+    if !judge(parent) {
+        return Err(Refused);
+    }
+    // The directory the verdict looked at must still be on the volume of the object: a swap
+    // while the verdict ran is refused rather than trusted.
+    let after = windows::describe(parent).map_err(Io)?;
+    if windows_volume_key(after.serial, &after.fs_name, &after.volume_path) != key {
+        return Err(Refused);
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 mod windows {
     use super::*;
@@ -167,10 +321,13 @@ mod windows {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        GetDriveTypeW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
-        GetVolumeInformationByHandleW, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        VOLUME_NAME_DOS,
+        FileDispositionInfo, FileDispositionInfoEx, GetDriveTypeW, GetFileInformationByHandle,
+        GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, SetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_DISPOSITION_FLAG_DELETE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        VOLUME_NAME_DOS, VOLUME_NAME_GUID,
     };
 
     /// A handle to the directory itself. Followed on purpose (no
@@ -187,22 +344,78 @@ mod windows {
         Ok(handle)
     }
 
-    pub(super) fn volume_serial(dir: &Path) -> io::Result<u64> {
-        let handle = open_dir(dir)?;
+    /// A handle to the file itself, for deleting through it. A final link is not followed.
+    pub(super) fn open_for_delete(path: &Path) -> io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+
+    /// Deletes the file `handle` is open on, as soon as the name is released (POSIX semantics
+    /// where the file system has them, else on close).
+    pub(super) fn delete_through(handle: &std::fs::File) -> io::Result<()> {
         let raw = handle.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        let ex = FILE_DISPOSITION_INFO_EX {
+            Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        };
+        // SAFETY: `raw` is open for the call; `ex` is a live FILE_DISPOSITION_INFO_EX.
+        let done = unsafe {
+            SetFileInformationByHandle(
+                raw,
+                FileDispositionInfoEx,
+                std::ptr::addr_of!(ex).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+            )
+        };
+        if done != 0 {
+            return Ok(());
+        }
+        let ex_error = io::Error::last_os_error();
+        let plain = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+        // SAFETY: as above, with a live FILE_DISPOSITION_INFO.
+        let done = unsafe {
+            SetFileInformationByHandle(
+                raw,
+                FileDispositionInfo,
+                std::ptr::addr_of!(plain).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if done != 0 {
+            Ok(())
+        } else {
+            // The extended form's error says why, unless the plain one failed differently.
+            let plain_error = io::Error::last_os_error();
+            Err(if ex_error.raw_os_error() == Some(87) { plain_error } else { ex_error })
+        }
+    }
+
+    pub(super) struct Described {
+        pub serial: u32,
+        pub fs_name: String,
+        pub final_path: String,
+        /// The final path by volume GUID, which names the volume even when it is
+        /// mounted in a folder; the DOS path where the volume has no GUID (a share).
+        pub volume_path: String,
+    }
+
+    /// Serial number, file system name and final path, all read from one handle to `dir`.
+    pub(super) fn describe(dir: &Path) -> io::Result<Described> {
+        describe_handle(&open_dir(dir)?)
+    }
+
+    /// [`describe`] for a handle that is already open.
+    pub(super) fn describe_handle(handle: &std::fs::File) -> io::Result<Described> {
+        let raw = handle.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+
         // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid out-value.
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: `raw` is open for the call and `info` is writable.
         if unsafe { GetFileInformationByHandle(raw, &mut info) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(u64::from(info.dwVolumeSerialNumber))
-    }
-
-    /// `(file system name, is a local fixed disk)` of the volume under `dir`.
-    pub(super) fn volume_of(dir: &Path) -> io::Result<(String, bool)> {
-        let handle = open_dir(dir)?;
-        let raw = handle.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
 
         let mut fs_name = [0u16; 64];
         // SAFETY: `raw` is open for the call; unused out-parameters are null and
@@ -225,23 +438,43 @@ mod windows {
         let end = fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len());
         let name = std::ffi::OsString::from_wide(&fs_name[..end]).to_string_lossy().into_owned();
 
-        let mut path = [0u16; 1024];
-        // SAFETY: as above; `path` is writable for its length.
-        let len = unsafe {
-            GetFinalPathNameByHandleW(
-                raw,
-                path.as_mut_ptr(),
-                path.len() as u32,
-                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
-            )
-        } as usize;
-        if len == 0 || len >= path.len() {
-            return Err(io::Error::last_os_error());
-        }
-        let final_path = String::from_utf16_lossy(&path[..len]);
+        let final_path_with = |flags| -> io::Result<String> {
+            // A result longer than the buffer is reported by its needed length (with the
+            // terminator): ask again with room for it rather than cut the path short.
+            let mut path = vec![0u16; 1024];
+            loop {
+                // SAFETY: `raw` is open for the call; `path` is writable for its length.
+                let len = unsafe {
+                    GetFinalPathNameByHandleW(raw, path.as_mut_ptr(), path.len() as u32, flags)
+                } as usize;
+                if len == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if len < path.len() {
+                    return Ok(String::from_utf16_lossy(&path[..len]));
+                }
+                path = vec![0u16; len + 1];
+            }
+        };
+        // A volume mounted only in a folder has no DOS path; it is named by its GUID path
+        // alone (and is not a drive-letter volume, which `volume_of` then reports).
+        let guid = final_path_with(FILE_NAME_NORMALIZED | VOLUME_NAME_GUID);
+        let dos = final_path_with(FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        let (final_path, volume_path) = match (dos, guid) {
+            (Ok(dos), Ok(guid)) => (dos, guid),
+            (Ok(dos), Err(_)) => (dos.clone(), dos),
+            (Err(_), Ok(guid)) => (guid.clone(), guid),
+            (Err(e), Err(_)) => return Err(e),
+        };
+        Ok(Described { serial: info.dwVolumeSerialNumber, fs_name: name, final_path, volume_path })
+    }
+
+    /// `(file system name, is a local fixed disk)` of the volume under `dir`.
+    pub(super) fn volume_of(dir: &Path) -> io::Result<(String, bool)> {
+        let d = describe(dir)?;
         Ok((
-            name,
-            final_path_is_on_fixed_drive(&final_path, |root| {
+            d.fs_name,
+            final_path_is_on_fixed_drive(&d.final_path, |root| {
                 let wide: Vec<u16> = root.encode_utf16().chain(Some(0)).collect();
                 // SAFETY: `wide` is NUL-terminated.
                 unsafe { GetDriveTypeW(wide.as_ptr()) }
@@ -265,5 +498,115 @@ mod tests {
             assert_eq!(root, "D:\\");
             4 // DRIVE_REMOTE
         }));
+    }
+
+    #[test]
+    fn volumes_sharing_a_serial_have_different_keys() {
+        let ntfs_c = windows_volume_key(0x1234, "NTFS", r"\\?\C:\data");
+        assert_ne!(ntfs_c, windows_volume_key(0x1234, "NTFS", r"\\?\D:\data"));
+        assert_ne!(ntfs_c, windows_volume_key(0x1234, "FAT32", r"\\?\C:\data"));
+        assert_ne!(
+            windows_volume_key(0x1234, "NTFS", r"\\?\Volume{a}\x"),
+            windows_volume_key(0x1234, "NTFS", r"\\?\Volume{b}\x")
+        );
+        assert_ne!(
+            windows_volume_key(1, "NTFS", r"\\?\UNC\srv\one\x"),
+            windows_volume_key(1, "NTFS", r"\\?\UNC\srv\two\x")
+        );
+        // The same volume reached through different directories is one key.
+        assert_eq!(ntfs_c, windows_volume_key(0x1234, "ntfs", r"\\?\c:\other\dir"));
+    }
+
+    #[test]
+    fn a_verdict_is_not_reused_for_another_volume() {
+        let supported = intern(windows_volume_key(7, "NTFS", r"\\?\C:\a"));
+        let other = intern(windows_volume_key(7, "NTFS", r"\\?\Volume{zz}\a"));
+        assert_ne!(supported, other);
+        assert_eq!(verdict_for(supported, || Capability::Supported), Capability::Supported);
+        // Not probed again for the same volume ...
+        assert_eq!(verdict_for(supported, || panic!("probed twice")), Capability::Supported);
+        // ... but a different volume with the same serial gets its own probe.
+        assert_eq!(verdict_for(other, || Capability::Unsupported), Capability::Unsupported);
+    }
+
+    #[test]
+    fn a_directory_and_its_child_share_one_volume_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        assert_eq!(volume_key(dir.path()).unwrap(), volume_key(&child).unwrap());
+    }
+
+    /// A sharing violation or a failed removal at any probe step is the volume being busy, not a
+    /// wrong answer about the shapes: the verdict is `Unknown`, is not kept, and the next probe
+    /// (nothing in the way) is `Supported`.
+    #[test]
+    fn a_busy_step_is_unknown_and_is_not_kept() {
+        for step in [
+            Step::FirstPublish,
+            Step::SecondPublish,
+            Step::CreateDir,
+            Step::ReplacePublish,
+            Step::ReadBack,
+            Step::Discard,
+            Step::Removal,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            inject_at(step, io::ErrorKind::ResourceBusy);
+            let verdict = probe(dir.path());
+            BUSY_AT.with(|b| b.set(None));
+            assert_eq!(verdict, Capability::Unknown, "{step:?}");
+            // Not kept: the same volume is probed again and answers.
+            let volume = intern(format!("busy-test-{step:?}"));
+            assert_eq!(verdict_for(volume, || verdict), Capability::Unknown);
+            assert_eq!(
+                verdict_for(volume, || probe(dir.path())),
+                Capability::Supported,
+                "{step:?}"
+            );
+        }
+    }
+
+    /// Only an error that says the volume cannot do the shape, or a shape that did the wrong
+    /// thing, is `Unsupported`; a full disk or an I/O error at any step says nothing about the
+    /// shapes and is `Unknown`.
+    #[test]
+    fn only_a_definite_answer_is_unsupported() {
+        for step in [
+            Step::FirstPublish,
+            Step::SecondPublish,
+            Step::CreateDir,
+            Step::ReplacePublish,
+            Step::ReadBack,
+            Step::Discard,
+        ] {
+            for (kind, expected) in [
+                (io::ErrorKind::StorageFull, Capability::Unknown),
+                (io::ErrorKind::Other, Capability::Unknown),
+                (io::ErrorKind::Unsupported, Capability::Unsupported),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                inject_at(step, kind);
+                let verdict = probe(dir.path());
+                BUSY_AT.with(|b| b.set(None));
+                assert_eq!(verdict, expected, "{step:?} {kind:?}");
+            }
+        }
+    }
+
+    /// A probe leaves nothing of its own behind, and it never deletes what it did not create.
+    #[test]
+    fn a_probe_never_deletes_an_old_directory_it_did_not_make() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = crate::reserved_namespace::artefact_component_name(
+            crate::reserved_namespace::ArtefactKind::Probe,
+            &format!("1-1-1-{PROBE_LABEL}"),
+        )
+        .unwrap();
+        let old = dir.path().join(name);
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("keep"), b"x").unwrap();
+        assert_eq!(probe(dir.path()), Capability::Supported);
+        assert!(old.join("keep").exists());
     }
 }

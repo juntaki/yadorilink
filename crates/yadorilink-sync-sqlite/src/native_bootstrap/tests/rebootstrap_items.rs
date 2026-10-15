@@ -95,8 +95,8 @@ fn a_remote_only_head_is_a_durable_complete_item_before_the_barrier() {
     assert_eq!(item.content, ItemContent::Complete);
     assert_eq!(item.path.as_str(), "x");
     assert_eq!(item.version, version(1).version_hash);
-    assert_eq!(item.dot.author, o.a);
-    assert_eq!(item.dot.seq.get(), 1);
+    assert_eq!(item.dot().unwrap().author, o.a);
+    assert_eq!(item.dot().unwrap().seq.get(), 1);
     assert_eq!(
         read_item_content(&o.b, &items_root_of(area.path()), &group(), &item.item_id).unwrap(),
         vec![1u8],
@@ -277,6 +277,190 @@ fn a_crash_at_each_step_of_item_writing_resumes_without_loss_or_duplication() {
     }
 }
 
+// --- an item never becomes weaker ----------------------------------------------------------------
+
+/// Saves the head as a complete item, then abandons that rebootstrap, so a later one saves the
+/// same head again.
+fn complete_item_then_abandoned() -> (Offline, tempfile::TempDir) {
+    let o = one_remote_only_head();
+    let area = private_tempdir();
+    let outcome = begin_with(
+        &o.b,
+        built(&o.sealer),
+        area.path(),
+        &mut crash_at(Failpoint::AfterRemoteOnlyRow(0)),
+    );
+    assert!(matches!(outcome, Err(BeginError::Crashed)), "{outcome:?}");
+    let outcome = recover_after_restart(&o.b, area.path(), &group()).unwrap();
+    assert!(matches!(outcome, RestartOutcome::Abandoned { .. }), "{outcome:?}");
+    assert_eq!(items_of(&o.b)[0].content, ItemContent::Complete);
+    (o, area)
+}
+
+fn assert_still_complete(o: &Offline, area: &Path) {
+    let items = items_of(&o.b);
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0].content, ItemContent::Complete);
+    assert_eq!(
+        read_item_content(&o.b, &items_root_of(area), &group(), &items[0].item_id).unwrap(),
+        vec![1u8],
+        "the bytes are still there"
+    );
+}
+
+#[test]
+fn a_complete_item_is_not_downgraded_by_a_later_save_without_the_bytes() {
+    let (o, area) = complete_item_then_abandoned();
+    let mut rewritten = false;
+    let mut hook = |point: Failpoint| {
+        rewritten |= point == Failpoint::AfterRemoteOnlyFiles(0);
+        Ok(())
+    };
+    let setup = Setup { content: &NoContent, ..Setup::default() };
+
+    begin_custom(&o.b, built(&o.sealer), area.path(), &setup, &mut hook).unwrap();
+
+    assert!(!rewritten, "the item's files were written again");
+    assert_still_complete(&o, area.path());
+}
+
+#[test]
+fn a_complete_item_is_not_downgraded_by_a_later_save_without_the_record() {
+    let (o, area) = complete_item_then_abandoned();
+    o.b.execute("DELETE FROM file_versions", []).unwrap();
+
+    begin_with(&o.b, built(&o.sealer), area.path(), &mut no_hook).unwrap();
+
+    assert_still_complete(&o, area.path());
+}
+
+#[test]
+fn an_unavailable_item_becomes_complete_when_the_bytes_are_held_and_a_complete_one_is_idempotent() {
+    let o = one_remote_only_head();
+    let area = private_tempdir();
+    let setup = Setup { content: &NoContent, ..Setup::default() };
+    let outcome = begin_custom(
+        &o.b,
+        built(&o.sealer),
+        area.path(),
+        &setup,
+        &mut crash_at(Failpoint::AfterRemoteOnlyRow(0)),
+    );
+    assert!(matches!(outcome, Err(BeginError::Crashed)), "{outcome:?}");
+    recover_after_restart(&o.b, area.path(), &group()).unwrap();
+    assert_eq!(items_of(&o.b)[0].content, ItemContent::Unavailable);
+
+    begin_with(&o.b, built(&o.sealer), area.path(), &mut no_hook).unwrap();
+
+    assert_still_complete(&o, area.path());
+    assert_eq!(item_rows(&o.b), 1);
+}
+
+#[test]
+fn a_complete_item_whose_files_are_damaged_is_reported_not_rebuilt() {
+    let (o, area) = complete_item_then_abandoned();
+    let items_root = items_root_of(area.path());
+    let dirs = item_dirs(&items_root);
+    assert_eq!(dirs.len(), 1);
+    let content = fs::read_dir(&dirs[0])
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| fs::read(p).is_ok_and(|b| b == [1u8]))
+        .expect("the saved bytes");
+    fs::write(&content, [9u8]).unwrap();
+
+    let outcome = begin_with(&o.b, built(&o.sealer), area.path(), &mut no_hook);
+
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert_eq!(fs::read(&content).unwrap(), vec![9u8], "nothing was rewritten");
+    assert_eq!(items_of(&o.b)[0].content, ItemContent::Complete);
+}
+
+/// The manifest states an item as unavailable; the item is completed before the install. The
+/// stronger row still satisfies the manifest, so the install goes through.
+#[test]
+fn an_item_completed_after_the_manifest_was_written_still_satisfies_it() {
+    let o = head_of(real_block_version(b"abcd"));
+    let area = private_tempdir();
+    let setup = Setup { content: &NoContent, ..Setup::default() };
+    let preserved =
+        begin_custom(&o.b, built(&o.sealer), area.path(), &setup, &mut no_hook).unwrap();
+    let items_root = items_root_of(area.path());
+    let item = items_of(&o.b).remove(0);
+    assert_eq!(item.content, ItemContent::Unavailable);
+    crate::native_recovery_items::complete_unavailable_item(
+        &o.b,
+        &items_root,
+        &group(),
+        &item.item_id,
+        b"abcd",
+    )
+    .unwrap();
+    assert_eq!(items_of(&o.b)[0].content, ItemContent::Complete);
+    let manifest = RecoveryArea::open_dir(&preserved.dir).unwrap().read_intent().unwrap().manifest;
+    assert_eq!(manifest.remote_only[0].content, "unavailable");
+
+    let root = tempfile::tempdir().unwrap();
+    install(&o.b, area.path(), &FsRoot::new(root.path())).unwrap();
+
+    assert_eq!(items_of(&o.b)[0].content, ItemContent::Complete);
+}
+
+/// A row whose size no longer matches its saved bytes does not satisfy the manifest.
+#[test]
+fn a_completed_item_whose_size_was_altered_does_not_satisfy_the_manifest() {
+    let o = head_of(real_block_version(b"abcd"));
+    let area = private_tempdir();
+    let setup = Setup { content: &NoContent, ..Setup::default() };
+    begin_custom(&o.b, built(&o.sealer), area.path(), &setup, &mut no_hook).unwrap();
+    let item = items_of(&o.b).remove(0);
+    crate::native_recovery_items::complete_unavailable_item(
+        &o.b,
+        &items_root_of(area.path()),
+        &group(),
+        &item.item_id,
+        b"abcd",
+    )
+    .unwrap();
+    o.b.execute("UPDATE native_recovery_item SET size = size + 1", []).unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let outcome = install(&o.b, area.path(), &FsRoot::new(root.path()));
+
+    assert!(outcome.is_err(), "{outcome:?}");
+}
+
+/// A later save of the same unavailable item that holds more blocks extends the blocks the
+/// row keeps alive; none is dropped.
+#[test]
+fn a_later_save_of_an_unavailable_item_extends_its_retained_blocks() {
+    let o = three_block_head();
+    let area = private_tempdir();
+    let first = Setup { content: &HoldsBlocks(vec![BLOCK_A]), ..Setup::default() };
+    let outcome = begin_custom(
+        &o.b,
+        built(&o.sealer),
+        area.path(),
+        &first,
+        &mut crash_at(Failpoint::AfterRemoteOnlyRow(0)),
+    );
+    assert!(matches!(outcome, Err(BeginError::Crashed)), "{outcome:?}");
+    recover_after_restart(&o.b, area.path(), &group()).unwrap();
+    assert_eq!(items_of(&o.b)[0].retained_blocks, vec![block_hex(BLOCK_A)]);
+
+    let second = Setup { content: &HoldsBlocks(vec![BLOCK_B]), ..Setup::default() };
+    begin_custom(&o.b, built(&o.sealer), area.path(), &second, &mut no_hook).unwrap();
+
+    let items = items_of(&o.b);
+    assert_eq!(items.len(), 1);
+    let mut want = vec![block_hex(BLOCK_A), block_hex(BLOCK_B)];
+    want.sort();
+    let mut got = items[0].retained_blocks.clone();
+    got.sort();
+    assert_eq!(got, want);
+}
+
 // --- survival and deletion ----------------------------------------------------------------------------
 
 #[test]
@@ -438,11 +622,11 @@ fn restoring_an_item_authors_one_ordinary_put_with_a_new_dot_and_keeps_the_item(
         .filter(|(dot, payload)| dot.author == author && payload.version == version(1).version_hash)
         .collect();
     assert_eq!(restored.len(), 1, "no ordinary put of the item's version: {state:?}");
-    assert_ne!(*restored[0].0, saved[0].dot, "the original dot was restored");
+    assert_ne!(restored[0].0, saved[0].dot().unwrap(), "the original dot was restored");
     assert_eq!(items_of(&o.b), saved, "restoring removed the item");
 }
 
-/// #63 item 5: the restore saw nothing at the path, so it never supersedes a head
+/// The restore saw nothing at the path, so it never supersedes a head
 /// another author has live there; it lands beside it.
 #[test]
 fn restoring_never_supersedes_a_live_head_of_another_author() {
@@ -598,13 +782,34 @@ impl RecoveryContentSource for HoldsBlocks {
 
 /// Like `one_remote_only_head`, but the head is the three-block version.
 fn three_block_head() -> Offline {
+    head_of(three_block_version())
+}
+
+/// A one-block version whose block really hashes to `bytes`, so the item can be completed.
+fn real_block_version(bytes: &[u8]) -> FileVersion {
+    FileVersion::new(
+        vec![VersionBlock {
+            hash: BlockHash(crate::native_rebootstrap_recovery::sha256(bytes).to_vec()),
+            size: bytes.len() as u32,
+        }],
+        bytes.len() as u64,
+        FileMeta {
+            mtime_unix_nanos: 9,
+            unix_mode: Some(0o644),
+            symlink_target: None,
+            record_kind: RecordKind::File,
+            xattrs: Vec::new(),
+        },
+    )
+}
+
+fn head_of(version: FileVersion) -> Offline {
     let b = conn();
     let b1 =
         crate::author_incarnation::ensure_incarnation(&b, &environment("device-b")).unwrap().author;
     let sealer = conn();
     seed_versions(&b);
     seed_versions(&sealer);
-    let version = three_block_version();
     crate::dag_store::put_file_version(&b, GROUP, &version).unwrap();
     crate::dag_store::put_file_version(&sealer, GROUP, &version).unwrap();
     let a = incarnation_of("device-a", 1);

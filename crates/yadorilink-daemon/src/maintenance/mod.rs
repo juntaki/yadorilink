@@ -24,6 +24,7 @@ pub(crate) mod disk_reconcile_backstop;
 pub(crate) mod durability_confirmation;
 pub(crate) mod gc_idle;
 pub(crate) mod materialization_repair;
+pub(crate) mod pause_expiry;
 pub(crate) mod recovery;
 pub(crate) mod retention_expiry;
 // The update-check scheduler never spawns under `test` builds
