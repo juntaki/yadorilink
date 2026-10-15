@@ -288,7 +288,7 @@ jobs:
             "release/linux/yadorilink-${version}-linux-${arch}-binaries.tar.gz" \
             release/linux/*.deb
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: yadorilink-linux-artifacts
           path: release/linux
@@ -425,7 +425,7 @@ jobs:
           )
           py -3 .github/release/generate-release-checksums.py --out release/windows/SHA256SUMS @artifacts
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: yadorilink-windows-build-health
           path: release/windows
@@ -629,7 +629,7 @@ jobs:
           }
           Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'yadorilink-codesign.pfx') -Force -ErrorAction SilentlyContinue
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: yadorilink-windows-artifacts
           path: release/windows
@@ -683,7 +683,7 @@ jobs:
             --out release/macos/SHA256SUMS \
             "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: yadorilink-macos-build-health
           path: release/macos
@@ -835,7 +835,7 @@ jobs:
           rm -f "${NOTARY_KEY_PATH:-}" "$RUNNER_TEMP"/*.p12 "$RUNNER_TEMP"/*.p8
           true
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: yadorilink-macos-artifacts
           path: release/macos
